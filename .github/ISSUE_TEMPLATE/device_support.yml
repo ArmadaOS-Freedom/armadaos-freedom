@@ -1,0 +1,50 @@
+name: "新机型适配 / Device support"
+description: "申请或参与新机型适配。Request or help bring up a new device."
+title: "[Device]: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: device-model
+    attributes:
+      label: 机型 / Device model
+      description: 品牌、型号和代号。Brand, model and codename.
+    validations:
+      required: true
+
+  - type: input
+    id: soc
+    attributes:
+      label: 芯片 / SoC
+      description: 例如 SM8650。For example SM8650.
+    validations:
+      required: true
+
+  - type: input
+    id: bootloader
+    attributes:
+      label: 安卓版本与 BL 状态 / Android version and bootloader
+      description: 安卓系统版本，BL 是否已解锁或能否解锁。Android build, and whether the bootloader is or can be unlocked.
+    validations:
+      required: true
+
+  - type: textarea
+    id: resources
+    attributes:
+      label: 已有资料 / Available resources
+      description: 内核源码、设备树、固件、9008 工具、已有的 Linux 移植等，附链接。Kernel source, device tree, firmware, 9008 tools, existing Linux ports; include links.
+    validations:
+      required: true
+
+  - type: textarea
+    id: help
+    attributes:
+      label: 能提供的帮助 / How you can help
+      description: 例如真机测试、提供日志或分区备份、提交代码。For example testing on hardware, logs or partition dumps, code.
+
+  - type: input
+    id: ai-disclosure
+    attributes:
+      label: AI 使用情况 / AI usage
+      description: 工具＋模型名称；未使用填“未使用”。Tool + model name, or None.
+    validations:
+      required: true
