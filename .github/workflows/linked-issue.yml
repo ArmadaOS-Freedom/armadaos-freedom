@@ -1,0 +1,78 @@
+---
+name: Linked issue
+
+# A PR into main has to link the issue it addresses, so every change can be
+# traced from issue to PR to merge commit. Linking means a closing keyword in the
+# PR description (Fixes/Closes/Resolves #123) or the Development sidebar; a bare
+# #123 does not count. Make the "Linked issue" check required on main to enforce
+# it. The job only reads, so it runs the same for PRs from forks.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  linked-issue:
+    name: Linked issue
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a linked issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+        run: |
+          set -euo pipefail
+          # Dependency bots (Dependabot, Renovate) cannot open an issue first.
+          if [ "${AUTHOR_TYPE}" = "Bot" ]; then
+            echo "::notice::${AUTHOR} is a bot; no linked issue required."
+            exit 0
+          fi
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          query='query($owner: String!, $repo: String!, $pr: Int!) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pr) {
+                closingIssuesReferences(first: 25) {
+                  nodes { url repository { owner { login } } }
+                }
+              }
+            }
+          }'
+          # Issues in any repository of this organization count, so a change
+          # spanning repositories can point at one issue. The keyword in a new
+          # description may take a moment to be linked, hence the retries.
+          linked=""
+          for attempt in 1 2 3; do
+            linked="$(gh api graphql -f query="${query}" -f owner="${owner}" -f repo="${repo}" -F pr="${PR}" |
+              jq -r --arg owner "${owner}" '.data.repository.pullRequest.closingIssuesReferences.nodes[]
+                | select((.repository.owner.login | ascii_downcase) == ($owner | ascii_downcase))
+                | .url')"
+            [ -z "${linked}" ] || break
+            [ "${attempt}" -eq 3 ] || sleep 5
+          done
+
+          if [ -z "${linked}" ]; then
+            echo "::error::PR #${PR} 没有关联 issue。请在 PR 说明里写 \`Fixes #编号\`（或 Closes、Resolves），或在 PR 页面右侧 Development 里关联，然后重新运行此检查。只写 \`#编号\` 不算关联。 / PR #${PR} links no issue. Add \`Fixes #123\` (or Closes/Resolves) to the description, or link one under Development, then re-run this check. A bare \`#123\` does not link."
+            exit 1
+          fi
+
+          echo "Linked issues:"
+          printf '%s\n' "${linked}"
+          {
+            echo "### Linked issues"
+            printf -- '- %s\n' ${linked}
+          } >> "${GITHUB_STEP_SUMMARY}"

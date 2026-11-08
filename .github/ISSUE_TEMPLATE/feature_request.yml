@@ -1,5 +1,5 @@
 name: "功能建议 / Feature request"
-description: "提出功能或适配建议。Suggest a feature or device support."
+description: "提出功能建议；新机型请用“新机型适配”。Suggest a feature; use Device support for new devices."
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
