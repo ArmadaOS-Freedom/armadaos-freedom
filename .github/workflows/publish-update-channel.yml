@@ -177,9 +177,11 @@ jobs:
           SCRATCH: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          # release-view reports "present: false" only for a verified HTTP 404;
-          # every other API failure aborts here instead of being mistaken for a
-          # missing release.
+          # release-view reads every page of the release listing, which returns
+          # drafts to this write-capable token, so an existing empty or partial
+          # draft is resumed instead of being created again. "present: false"
+          # means a completed listing had no release with this tag; malformed
+          # responses and API, network, or auth failures abort here instead.
           python3 .github/scripts/update-publication.py release-view \
             --repository "${REPOSITORY}" \
             --tag "${TAG}" \

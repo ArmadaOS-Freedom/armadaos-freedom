@@ -46,6 +46,7 @@ API_ROOT = "https://api.github.com"
 DEFAULT_TRUSTED_KEY = ROOT / "system_files/etc/pki/containers/armadaos-freedom.pub"
 MAX_REMOTE_BYTES = 64 * 1024 * 1024
 CHECKSUM_CHUNK_BYTES = 1024 * 1024
+RELEASE_PAGE_SIZE = 100
 _NETWORK_TIMEOUT = 60
 _GITHUB_HOSTS = frozenset((
     "github.com",
@@ -864,14 +865,48 @@ def command_plan_release(args) -> int:
     return 0
 
 
+def find_release(github, tag: str):
+    """Return the one release in the listing tagged ``tag``, or None.
+
+    ``GET /releases/tags/{tag}`` is documented to return published releases
+    only, so a draft GitHub already holds is missing there and every rerun
+    would create yet another draft.  The list endpoint also returns drafts to a
+    token with write access, and it is paged, so every page is read.  A tag
+    held by more than one release (a published release plus a draft, or several
+    drafts) is ambiguous and is never resumed as if it were one release.
+    """
+    found = None
+    page = 1
+    while True:
+        listing = github.get_json(
+            f"/repos/{github.repository}/releases"
+            f"?per_page={RELEASE_PAGE_SIZE}&page={page}"
+        )
+        if not isinstance(listing, list):
+            raise PublicationError("the release listing must be an array")
+        for release in listing:
+            if not isinstance(release, dict):
+                raise PublicationError("release listing entries must be objects")
+            if release.get("tag_name") != tag:
+                continue
+            if found is not None:
+                raise PublicationError(
+                    f"more than one release is tagged {tag}; refusing to resume "
+                    "an ambiguous release"
+                )
+            found = release
+        if len(listing) < RELEASE_PAGE_SIZE:
+            return found
+        page += 1
+
+
 def command_release_view(args) -> int:
     tag = release_tag(args.tag)
     github = GitHub(args.repository, _token())
-    payload = github.get_optional_json(
-        f"/repos/{github.repository}/releases/tags/{tag}")
+    # Drafts never appear in releases/tags/{tag}, so the listing is read in
+    # full; only a listing that completed without this tag is "absent".
+    payload = find_release(github, tag)
     if payload is None:
-        # Only a verified HTTP 404 means the release does not exist; any other
-        # failure raised out of get_optional_json must abort the run.
         result = {"present": False, "tag": tag}
     else:
         assets = payload.get("assets")

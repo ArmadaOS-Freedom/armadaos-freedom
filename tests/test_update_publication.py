@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -33,6 +34,7 @@ _SPEC.loader.exec_module(publication)
 
 REPOSITORY = "ArmadaOS-Freedom/armadaos-freedom"
 PUBLISHED_AT = "2026-04-19T12:00:00Z"
+RELEASE_TAG = "2026.04.19-1"
 
 
 def _release_url(tag, name):
@@ -251,6 +253,46 @@ class FakeReleaseAssets:
         return sha256(data).hexdigest()
 
 
+class ReleaseListingAPI:
+    """Stand-in for the GitHub transport that serves paginated release listings.
+
+    It serves only the list endpoint.  The published-only
+    ``releases/tags/{tag}`` lookup that cannot see drafts is rejected, so a
+    regression to that implementation fails instead of quietly passing.
+    """
+
+    def __init__(self, pages):
+        self.pages = dict(pages)
+        self.requests = []
+
+    def __call__(self, method, url, payload=None, authenticated=True):
+        self.requests.append((method, url))
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        if (method != "GET"
+                or not parsed.path.endswith(f"/repos/{REPOSITORY}/releases")
+                or query.get("per_page") != ["100"]):
+            raise AssertionError(url)
+        page = int(query["page"][0])
+        return self.pages.get(page, _listing_page())
+
+
+def _listing_page(*releases):
+    """A 200 response body holding the releases on one listing page."""
+    return 200, json.dumps(list(releases)).encode("utf-8")
+
+
+def _release_entry(tag, *, release_id=4242, draft=True, assets=()):
+    """One release as the list endpoint reports it."""
+    return {
+        "id": release_id,
+        "tag_name": tag,
+        "draft": draft,
+        "target_commitish": "a" * 40,
+        "assets": list(assets),
+    }
+
+
 class PublicationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -379,6 +421,157 @@ class PublicationTest(unittest.TestCase):
 
     def _release(self, assets, *, present=True, draft=True):
         return {"present": present, "isDraft": draft, "assets": assets}
+
+    def _view(self, pages, *, tag=RELEASE_TAG):
+        """Run release-view itself against a fake paginated listing transport."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out = Path(tmp.name) / "release.json"
+        api = ReleaseListingAPI(pages)
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "fixture"}):
+            with mock.patch.object(publication.GitHub, "_request", api):
+                code = publication.command_release_view(type("Args", (), {
+                    "repository": REPOSITORY,
+                    "tag": tag,
+                    "out": out,
+                })())
+        self.assertEqual(code, 0)
+        return json.loads(out.read_text(encoding="utf-8")), api
+
+    def _view_failure(self, pages, *, tag=RELEASE_TAG):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out = Path(tmp.name) / "release.json"
+        api = ReleaseListingAPI(pages)
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "fixture"}):
+            with mock.patch.object(publication.GitHub, "_request", api):
+                with self.assertRaises(publication.PublicationError):
+                    publication.command_release_view(type("Args", (), {
+                        "repository": REPOSITORY,
+                        "tag": tag,
+                        "out": out,
+                    })())
+        self.assertFalse(out.exists(), "no release metadata may be written")
+        return api
+
+    def _fillers(self, count=100):
+        return [
+            {"tag_name": f"unrelated-{index:03d}", "id": index}
+            for index in range(count)
+        ]
+
+    def test_release_view_finds_an_empty_draft_and_resumes_it(self):
+        viewed, api = self._view({1: _listing_page(_release_entry(RELEASE_TAG))})
+        self.assertEqual(viewed, {
+            "present": True,
+            "tag": RELEASE_TAG,
+            "releaseId": 4242,
+            "isDraft": True,
+            "targetCommitish": "a" * 40,
+            "assets": [],
+        })
+        self.assertEqual(api.requests, [(
+            "GET",
+            "https://api.github.com/repos/"
+            f"{REPOSITORY}/releases?per_page=100&page=1",
+        )])
+        # The empty draft stays resumable: no second draft is created.
+        state = publication.release_state(self._plan_assets(), viewed)
+        self.assertEqual(state["state"], "incomplete")
+        self.assertEqual(state["missing"], ["pkg.zip.001", "pkg.zip.002"])
+
+    def test_release_view_keeps_partial_draft_assets(self):
+        uploaded = {
+            "name": "pkg.zip.001",
+            "size": 10,
+            "digest": "sha256:" + "a" * 64,
+            "state": "uploaded",
+            "url": "https://api.github.com/repos/x/releases/assets/1",
+            "browser_download_url":
+                "https://github.com/x/releases/download/tag/pkg.zip.001",
+        }
+        viewed, _ = self._view({1: _listing_page(
+            _release_entry(RELEASE_TAG, assets=[uploaded]))})
+        self.assertEqual(viewed["assets"], [uploaded])
+        state = publication.release_state(
+            self._plan_assets(), viewed, hashes={"pkg.zip.001": "a" * 64})
+        self.assertEqual(state, {"state": "incomplete", "missing": ["pkg.zip.002"]})
+
+    def test_release_view_reports_a_published_release(self):
+        published = [
+            {"name": "pkg.zip.001", "size": 10, "digest": "sha256:" + "a" * 64},
+            {"name": "pkg.zip.002", "size": 5, "digest": "sha256:" + "b" * 64},
+        ]
+        viewed, _ = self._view({1: _listing_page(
+            _release_entry(RELEASE_TAG, draft=False, assets=published))})
+        self.assertTrue(viewed["present"])
+        self.assertFalse(viewed["isDraft"])
+        self.assertEqual(viewed["releaseId"], 4242)
+        state = publication.release_state(
+            self._plan_assets(), viewed,
+            hashes={"pkg.zip.001": "a" * 64, "pkg.zip.002": "b" * 64},
+        )
+        self.assertEqual(state["state"], "matching")
+
+    def test_release_view_reads_every_page_until_a_short_page(self):
+        viewed, api = self._view({
+            1: _listing_page(*self._fillers()),
+            2: _listing_page(_release_entry(RELEASE_TAG)),
+        })
+        self.assertTrue(viewed["present"])
+        self.assertEqual(viewed["releaseId"], 4242)
+        self.assertEqual([url for _, url in api.requests], [
+            "https://api.github.com/repos/"
+            f"{REPOSITORY}/releases?per_page=100&page=1",
+            "https://api.github.com/repos/"
+            f"{REPOSITORY}/releases?per_page=100&page=2",
+        ])
+
+    def test_release_view_rejects_duplicate_tags_on_one_page(self):
+        self._view_failure({1: _listing_page(
+            _release_entry(RELEASE_TAG, release_id=1),
+            _release_entry(RELEASE_TAG, release_id=2),
+        )})
+
+    def test_release_view_rejects_duplicate_tags_across_pages(self):
+        # The matching tag is already found on the first page, but a second
+        # release with it on a later page makes the choice ambiguous.
+        self._view_failure({
+            1: _listing_page(
+                *self._fillers(99), _release_entry(RELEASE_TAG, release_id=1)),
+            2: _listing_page(
+                _release_entry(RELEASE_TAG, release_id=2, draft=False)),
+        })
+
+    def test_release_view_reports_absent_only_after_the_last_page(self):
+        viewed, api = self._view({
+            1: _listing_page(*self._fillers()),
+            2: _listing_page({"tag_name": "unrelated-999", "id": 999}),
+        })
+        self.assertEqual(viewed, {"present": False, "tag": RELEASE_TAG})
+        self.assertEqual(len(api.requests), 2)
+
+    def test_release_view_rejects_malformed_listings(self):
+        for body in (
+            json.dumps({"releases": []}).encode("utf-8"),
+            json.dumps([RELEASE_TAG]).encode("utf-8"),
+            b"not json",
+        ):
+            with self.subTest(body=body):
+                self._view_failure({1: (200, body)})
+
+    def test_release_view_propagates_api_errors_including_404(self):
+        for status in (404, 403, 500):
+            with self.subTest(status=status):
+                api = self._view_failure({1: (status, b'{"message": "denied"}')})
+                self.assertTrue(api.requests)
+        # A failure after a page of unrelated releases is still an error, not
+        # a release that does not exist.
+        api = self._view_failure({
+            1: _listing_page(*self._fillers()),
+            2: (502, b""),
+        })
+        self.assertEqual(len(api.requests), 2)
 
     def test_release_state_distinguishes_missing_empty_draft_and_conflict(self):
         assets = self._plan_assets()
