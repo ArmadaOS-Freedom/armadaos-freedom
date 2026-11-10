@@ -284,6 +284,5 @@ assert_content "$WORK/homebrew/services/.loader.version" 'v3.1.0'
 PATH="$WORK/bin:$PATH" "$WORK/sync"
 assert_content "$WORK/homebrew/services/.loader.version" 'v3.9.0'
 assert_exists "$WORK/homebrew/plugins/locked-demo/main.py"
-grep -q '^Restart=on-failure
- "$ROOT/system_files/usr/lib/systemd/system/armada-decky-sync.service"
+grep -q '^Restart=on-failure$' "$ROOT/system_files/usr/lib/systemd/system/armada-decky-sync.service"
 printf 'decky sync tests passed\n'
