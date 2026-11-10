@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -18,8 +17,6 @@ from . import (
     offline_prepare,
     package_contract,
     physical_slots,
-    recovery_authorization,
-    recovery_context,
     recovery_device,
     signature,
     slot_activation,
@@ -149,27 +146,9 @@ def _check_recovery_ack(recovery_ack, *, tx, plan, manifest):
         raise ValueError('recovery acknowledgement file set does not match manifest')
 
 
-def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=None):
+def _preflight(work, recovery_ack, updater_version, trusted_key):
     if work.is_symlink() or not work.is_dir() or work.resolve(strict=True) != work:
         raise ValueError('work directory must be canonical, symlinks rejected')
-    if recovery is not None:
-        if (not isinstance(recovery, dict) or
-                set(recovery) != {'identity', 'temporary_boot_sha256', 'context'}):
-            raise ValueError('recovery preflight context has invalid keys')
-        temporary_boot_sha256 = recovery['temporary_boot_sha256']
-        if not _is_sha(temporary_boot_sha256):
-            raise ValueError('temporary boot SHA-256 must be strict lowercase hex')
-        identity = recovery_authorization._session(
-            json.dumps(recovery['identity']).encode())
-        if type(identity.get('schemaVersion')) is not int or identity['schemaVersion'] != 2:
-            raise ValueError('recovery identity must use schema 2')
-        context = recovery['context']
-        installed = context.get('installed') if isinstance(context, dict) else None
-        if (not isinstance(installed, dict) or
-                context.get('runtime') != 'recovery' or
-                context.get('phase') != 'recovery_context_checked_update' or
-                installed.get('installedDeployment') != identity['installedDeployment']):
-            raise ValueError('recovery context identity or phase mismatch')
     saved_status, _ = _load_json(work, 'status.json')
     if (not _is_schema_one(saved_status.get('schemaVersion')) or
             saved_status.get('operation') != 'offline-upgrade' or
@@ -212,11 +191,6 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
     if (plan.get('transactionId') != tx or manifest.get('transactionId') != tx or
             saved_status.get('transactionId') != tx):
         raise ValueError('documents do not bind the same transaction')
-    if recovery is not None:
-        expected_work = (Path(context['sysrootPath']) / '.armada-update' /
-                         identity['sessionId'] / 'transaction')
-        if work != expected_work:
-            raise ValueError('work directory does not match recovery session/transaction')
     if (not _is_sha(prepared.get('planSha256')) or
             _sha256(plan_bytes) != prepared.get('planSha256')):
         raise ValueError('plan digest mismatch')
@@ -234,8 +208,7 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
 
     package = package_contract.load_package(
         package_doc, signature_b64, trusted_key=trusted_key)
-    initial = (physical_slots.inspect_recovery_slots() if recovery is not None
-               else physical_slots.inspect_physical_slots())
+    initial = (physical_slots.inspect_physical_slots())
     if initial['model'] not in ('TB322FC', 'TB323FU'):
         raise ValueError('unsupported physical model')
     package_contract.require_operation(
@@ -243,26 +216,7 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
     for key in ('releaseId', 'version', 'sourceRevision', 'ociDigest', 'ostreeCommit'):
         if plan.get(key) != package[key]:
             raise ValueError('plan %s does not match authenticated package' % key)
-    if recovery is None:
-        current_binding = initial['deployment']
-    else:
-        current_binding = identity['installedDeployment']
-        if (context.get('physical') != initial or
-                initial.get('phase') != 'recovery_slots_checked' or
-                'deployment' in initial or 'booted' in initial or
-                initial.get('model') != identity['model'] or
-                initial.get('recoveryPartUuid') != identity['recoveryPartUuid'] or
-                initial.get('actualSlot') != identity['entrySlot'] or
-                plan.get('runtime') != 'recovery' or
-                manifest.get('runtime') != 'recovery' or
-                plan.get('recoverySessionId') != identity['sessionId'] or
-                manifest.get('recoverySessionId') != identity['sessionId'] or
-                plan.get('temporaryBootSha256') != temporary_boot_sha256 or
-                manifest.get('temporaryBootSha256') != temporary_boot_sha256 or
-                trust.get('phase') != 'recovery_boot_trust_checked' or
-                trust.get('sources', {}).get('recoverySessionId') != identity['sessionId'] or
-                plan.get('channel') != context.get('channel')):
-            raise ValueError('recovery slots, plan, manifest, or trust binding mismatch')
+    current_binding = initial['deployment']
     old = system_transaction._binding(current_binding)
     new = system_transaction._binding(plan.get('newDeployment'))
     if (new[0] != old[0] or new[1] != plan['ostreeCommit'] or new[1] == old[1] or
@@ -275,8 +229,6 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
     if (not root.is_absolute() or root.is_symlink() or not root.is_dir() or
             root.resolve(strict=True) != root):
         raise ValueError('plan sysrootPath must be canonical directory')
-    if recovery is not None and raw_root != context.get('sysrootPath'):
-        raise ValueError('plan sysrootPath does not match recovery context')
     if _under(root / 'ostree', work) or _under(root / 'boot', work):
         raise ValueError('work directory cannot be inside sysroot ostree or boot')
     dep_opts = deployment_options.read_deployment_options(
@@ -316,13 +268,6 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
             source_sha=original['sha256'])
         if plan['originalBootSha256'][slot] != original['sha256']:
             raise ValueError('plan original boot digest mismatch for slot %s' % slot)
-        if recovery is not None:
-            original_identity = identity['originalBoots'][slot]
-            if (original['sha256'] != original_identity['sha256'] or
-                    original['bytes'] != original_identity['bytes'] or
-                    sources['partitions']['boot_%s' % slot]['partitionUuid'] !=
-                    original_identity['partitionUuid']):
-                raise ValueError('recovery original boot identity mismatch for slot %s' % slot)
         candidate_claim = boot_candidate._verify_claim(candidate['candidate'],
                                                        'new boot %s' % slot)
         if not _under(work, Path(candidate_claim['path'])):
@@ -383,10 +328,6 @@ def _preflight(work, recovery_ack, updater_version, trusted_key, *, recovery=Non
     result = {'initial': initial, 'old': old, 'new': new, 'tx': tx, 'plan': plan,
               'trust': trust, 'candidates': candidates, 'manifest': manifest,
               'journal': journal, 'saved_status': saved_status}
-    if recovery is not None:
-        result['recovery'] = {
-            'identity': identity, 'temporary_boot_sha256': temporary_boot_sha256,
-            'context': context}
     return result
 
 
@@ -419,25 +360,10 @@ def execute_offline_update(*, work_dir, recovery_ack,
         updater_version=updater_version, trusted_key=trusted_key)
 
 
-def execute_recovery_offline_update(
-        *, session_identity, temporary_boot_sha256, recovery_ack,
-        parent_dir='/run/armada-update-recovery', updater_version='0.8.0',
-        trusted_key=signature.DEFAULT_TRUSTED_KEY):
-    return _execute_offline_update(
-        recovery_ack=recovery_ack, updater_version=updater_version,
-        trusted_key=trusted_key,
-        recovery={'session_identity': session_identity,
-                  'temporary_boot_sha256': temporary_boot_sha256,
-                  'parent_dir': parent_dir})
-
-
 def _execute_offline_update(*, work_dir=None, recovery_ack,
                             updater_version='0.8.0',
-                            trusted_key=signature.DEFAULT_TRUSTED_KEY,
-                            recovery=None):
-    with trial_confirmation._locked(), ExitStack() as stack:
-        recovery_request = recovery
-        recovery = None
+                            trusted_key=signature.DEFAULT_TRUSTED_KEY):
+    with trial_confirmation._locked():
         work = Path(work_dir) if work_dir is not None else None
         status = None
         started = False
@@ -447,44 +373,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
         journal_attempted = False
         activation_started = False
         try:
-            if recovery_request is not None:
-                if (not isinstance(recovery_request, dict) or
-                        set(recovery_request) != {
-                            'session_identity', 'temporary_boot_sha256', 'parent_dir'}):
-                    raise ValueError('recovery execution request has invalid keys')
-                identity = recovery_authorization._session(
-                    json.dumps(recovery_request['session_identity']).encode())
-                if (type(identity.get('schemaVersion')) is not int or
-                        identity['schemaVersion'] != 2):
-                    raise ValueError('recovery identity must use schema 2')
-                temporary_boot_sha256 = recovery_request['temporary_boot_sha256']
-                if not _is_sha(temporary_boot_sha256):
-                    raise ValueError('temporary boot SHA-256 must be strict lowercase hex')
-                initial = physical_slots.inspect_recovery_slots()
-                if (initial.get('model') != identity['model'] or
-                        initial.get('recoveryPartUuid') != identity['recoveryPartUuid'] or
-                        initial.get('actualSlot') != identity['entrySlot'] or
-                        initial.get('phase') != 'recovery_slots_checked' or
-                        'deployment' in initial or 'booted' in initial):
-                    raise ValueError('recovery physical state does not match identity')
-                context = stack.enter_context(
-                    recovery_context.opened_recovery_update_context(
-                        expected_binding=identity['installedDeployment'],
-                        expected_physical=initial,
-                        parent_dir=recovery_request['parent_dir'],
-                        expected_selected_slot_after=initial['inactiveSlot']))
-                work = (Path(context['sysrootPath']) / '.armada-update' /
-                        identity['sessionId'] / 'transaction')
-                recovery = {
-                    'identity': identity,
-                    'temporary_boot_sha256': temporary_boot_sha256,
-                    'context': context}
-            ctx = _preflight(work, recovery_ack, updater_version, trusted_key,
-                             recovery=recovery)
+            ctx = _preflight(work, recovery_ack, updater_version, trusted_key)
             status = dict(ctx['saved_status'])
-            if recovery is not None:
-                status.update(runtime='recovery',
-                              recoverySessionId=recovery['identity']['sessionId'])
             initial, plan = ctx['initial'], ctx['plan']
             actual, inactive = initial['actualSlot'], initial['inactiveSlot']
             record = _build_record(ctx, ctx['saved_status']['planSha256'])
@@ -500,15 +390,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 system_transaction._save_json(work, 'status.json', status)
 
             write_call_started = True
-            if recovery is None:
-                report = offline_boot_writer.write_offline_boots(
-                    ctx['trust'], ctx['candidates'], progress=progress)
-            else:
-                report = offline_boot_writer.write_recovery_offline_boots(
-                    ctx['trust'], ctx['candidates'],
-                    session_identity=recovery['identity'],
-                    temporary_boot_sha256=recovery['temporary_boot_sha256'],
-                    progress=progress)
+            report = offline_boot_writer.write_offline_boots(
+                ctx['trust'], ctx['candidates'], progress=progress)
             boots_written = True
             if ( not isinstance(report, dict) or
                     report.get('phase') != 'dual_boots_written' or
@@ -520,15 +403,6 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                     report.get('slotOrder') != [inactive, actual] or
                     set(report.get('writes', {})) != {'a', 'b'}):
                 raise ValueError('offline dual boot write report mismatch')
-            if recovery is not None and (
-                    report.get('runtime') != 'recovery' or
-                    report.get('recoverySessionId') !=
-                    recovery['identity']['sessionId'] or
-                    report.get('oldDeployment') !=
-                    recovery['identity']['installedDeployment'] or
-                    report.get('temporaryBootSha256') !=
-                    recovery['temporary_boot_sha256']):
-                raise ValueError('recovery offline boot write report binding mismatch')
             for slot in _SLOTS:
                 evidence = report['writes'][slot]
                 claim = boot_candidate._verify_claim(evidence['candidate'],
@@ -543,9 +417,7 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             system_transaction._save_json(work, 'write-report.json', report)
             system_transaction._save_json(work, 'status.json', status)
 
-            after_write = (physical_slots.inspect_recovery_slots()
-                           if recovery is not None
-                           else physical_slots.inspect_physical_slots())
+            after_write = (physical_slots.inspect_physical_slots())
             if after_write != initial:
                 raise ValueError('physical slots changed after boot writes')
             status['phase'] = 'preparing_trial'
@@ -567,12 +439,7 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             status.update(phase='activating', activationOutcome='attempting')
             system_transaction._save_json(work, 'status.json', status)
             activation_started = True
-            if recovery is None:
-                activated = slot_activation.activate_offline_slots(report)
-            else:
-                activated = slot_activation.activate_recovery_offline_slots(
-                    report, session_identity=recovery['identity'],
-                    temporary_boot_sha256=recovery['temporary_boot_sha256'])
+            activated = slot_activation.activate_offline_slots(report)
             if (activated.get('phase') != 'offline_slots_activated' or
                     activated.get('model') != initial['model'] or
                     activated.get('fromSlot') != actual or
@@ -584,35 +451,18 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                     activated.get('currentReadbackSha256') != plan['newBootSha256'][actual] or
                     activated.get('targetReadbackSha256') != plan['newBootSha256'][inactive]):
                 raise ValueError('offline slot activation report mismatch')
-            if recovery is not None and (
-                    activated.get('runtime') != 'recovery' or
-                    activated.get('recoverySessionId') !=
-                    recovery['identity']['sessionId'] or
-                    activated.get('oldDeployment') !=
-                    recovery['identity']['installedDeployment']):
-                raise ValueError('recovery slot activation report binding mismatch')
             status.update(state='awaiting_reboot', phase='awaiting_reboot',
                           requiresReboot=True, activationOutcome='activated',
                           bootWriteState='written')
             system_transaction._save_json(work, 'activation-report.json', activated)
             system_transaction._save_json(work, 'status.json', status)
-            if recovery is not None:
-                stack.close()
             return status
         except Exception as exc:
             if isinstance(exc, system_transaction.SystemTransactionError):
-                try:
-                    stack.__exit__(type(exc), exc, exc.__traceback__)
-                except Exception as cleanup_exc:
-                    exc.result['cleanupError'] = str(cleanup_exc)
                 raise
             if not started:
                 result = {'phase': 'preflight', 'state': 'failed',
                           'error': str(exc), 'requiresReboot': False}
-                try:
-                    stack.__exit__(type(exc), exc, exc.__traceback__)
-                except Exception as cleanup_exc:
-                    result['cleanupError'] = str(cleanup_exc)
                 raise system_transaction.SystemTransactionError(
                     str(exc), result) from exc
             status['failedPhase'] = status.get('phase')
@@ -650,8 +500,4 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 system_transaction._save_json(work, 'status.json', status)
             except Exception as save_exc:
                 status['persistenceError'] = str(save_exc)
-            try:
-                stack.__exit__(type(exc), exc, exc.__traceback__)
-            except Exception as cleanup_exc:
-                status['cleanupError'] = str(cleanup_exc)
             raise system_transaction.SystemTransactionError(str(exc), status) from exc

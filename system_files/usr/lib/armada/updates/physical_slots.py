@@ -248,14 +248,6 @@ def _read_boot_state():
     return dict(booted), dict(context)
 
 
-def _read_recovery_boot_state():
-    try:
-        context = boot_context.read_boot_slot()
-    except Exception as error:
-        raise PhysicalSlotsError(f'invalid boot context: {error}') from error
-    return None, dict(context)
-
-
 def _inspect_slots(reader, phase):
     saved_booted, context = reader()
     saved_context = dict(context)
@@ -271,18 +263,14 @@ def _inspect_slots(reader, phase):
         for lun in sorted(found):
             item = found[lun]
             fds.append(_device_fd(item['path'], item['rdev']))
-        if phase == 'recovery_slots_checked':
-            current, bootable_slots = _read_slot_flags(fds, found)
-            selected_slot = 'ab'[current]
-        else:
-            current = _run_inspection(fds, found)
-            selected_slot = 'ab'[current]
-            if selected_slot != context['actualSlot']:
-                raise PhysicalSlotsError(
-                    'actual boot != next selected slot; restart or repair required '
-                    f'(witness={context["actualSlot"]}, controller reports slot index {current})'
-                )
-            bootable_slots = {'a': True, 'b': True}
+        current = _run_inspection(fds, found)
+        selected_slot = 'ab'[current]
+        if selected_slot != context['actualSlot']:
+            raise PhysicalSlotsError(
+                'actual boot != next selected slot; restart or repair required '
+                f'(witness={context["actualSlot"]}, controller reports slot index {current})'
+            )
+        bootable_slots = {'a': True, 'b': True}
         for lun, fd in zip(sorted(found), fds):
             info = os.fstat(fd)
             if not stat.S_ISBLK(info.st_mode) or info.st_rdev != found[lun]['rdev']:
@@ -317,8 +305,7 @@ def _inspect_slots(reader, phase):
             'actualSlot': context['actualSlot'],
             'inactiveSlot': context['inactiveSlot'],
         }
-        if phase == 'physical_slots_checked':
-            report['deployment'] = context['deployment']
+        report['deployment'] = context['deployment']
         report['selectedSlot'] = selected_slot
         report['bootableSlots'] = dict(bootable_slots)
         report['recoveryPartUuid'] = part_uuid
@@ -336,11 +323,3 @@ def _inspect_slots(reader, phase):
 def inspect_physical_slots():
     """Perform the read-only physical A/B slot precheck and return its report."""
     return _inspect_slots(_read_boot_state, 'physical_slots_checked')
-
-
-def inspect_recovery_slots():
-    """Read-only RAM precheck of the firmware witness plus UFS inventory.
-
-    Reports no deployment and no booted record; it is not authorization to update.
-    """
-    return _inspect_slots(_read_recovery_boot_state, 'recovery_slots_checked')

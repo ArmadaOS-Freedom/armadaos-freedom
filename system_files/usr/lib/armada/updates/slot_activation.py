@@ -2,7 +2,6 @@
 """Internal physical UFS A/B slot activation after inactive boot write."""
 
 import ctypes
-import json
 import os
 import re
 import stat
@@ -12,13 +11,12 @@ from pathlib import Path
 from . import (
     boot_health,
     physical_slots,
-    recovery_authorization,
     recovery_device,
     trial_record,
     trial_store,
 )
 from .boot_candidate import _require_positive_int, _verify_claim
-from .boot_sources import _load_locator, _locate, _rehash_region, _uuid_text
+from .boot_sources import _load_locator, _locate, _rehash_region
 from .boot_writer import _inventory
 from .deployment_store import _parse_binding
 
@@ -140,48 +138,15 @@ def activate_offline_slots(write_report):
     return _activate_prepared_slots(write_report, offline=True)
 
 
-def activate_recovery_offline_slots(write_report, *, session_identity, temporary_boot_sha256):
-    if session_identity is None:
-        raise ActivationError('recovery activation requires a session identity')
-    return _activate_prepared_slots(
-        write_report,
-        offline=True,
-        session_identity=session_identity,
-        temporary_boot_sha256=temporary_boot_sha256,
-    )
-
-
-def _activate_prepared_slots(write_report, offline, session_identity=None, temporary_boot_sha256=None):
+def _activate_prepared_slots(write_report, offline):
     own_fds = []
     attempted = False
     native_rc = None
     try:
-        recovery_session = None
         if not isinstance(write_report, dict):
             raise ActivationError('write_report must be a dict')
         if _exact_int(write_report.get('schemaVersion'), 'schemaVersion') != 1:
             raise ActivationError('unsupported write_report schemaVersion')
-        if session_identity is not None:
-            if not offline:
-                raise ActivationError('recovery activation requires offline mode')
-            recovery_session = recovery_authorization._session(
-                json.dumps(session_identity).encode()
-            )
-            if recovery_session.get('schemaVersion') != 2:
-                raise ActivationError('recovery session schemaVersion must be 2')
-            if recovery_session.get('model') != write_report.get('model'):
-                raise ActivationError('recovery session model does not match write_report model')
-            if (
-                not isinstance(temporary_boot_sha256, str)
-                or re.fullmatch(r'[0-9a-f]{64}', temporary_boot_sha256) is None
-            ):
-                raise ActivationError(
-                    'temporary_boot_sha256 must be canonical lowercase SHA-256'
-                )
-            if write_report.get('temporaryBootSha256') != temporary_boot_sha256:
-                raise ActivationError(
-                    'write_report temporaryBootSha256 does not match argument'
-                )
         expected_phase = 'dual_boots_written' if offline else 'inactive_boot_written'
         if write_report.get('phase') != expected_phase:
             raise ActivationError(f'write_report phase must be {expected_phase}')
@@ -213,12 +178,8 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
         initial = write_report.get('physical')
         if not isinstance(initial, dict):
             raise ActivationError('write_report.physical must be a dict')
-        if recovery_session is not None:
-            inspect_slots = physical_slots.inspect_recovery_slots
-            read_boot_state = physical_slots._read_recovery_boot_state
-        else:
-            inspect_slots = physical_slots.inspect_physical_slots
-            read_boot_state = physical_slots._read_boot_state
+        inspect_slots = physical_slots.inspect_physical_slots
+        read_boot_state = physical_slots._read_boot_state
         if inspect_slots() != initial:
             raise ActivationError('live physical slots report does not match initial report')
         if (
@@ -228,24 +189,6 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
             or initial.get('selectedSlot') != from_slot
         ):
             raise ActivationError('write_report slot/model metadata disagrees with physical report')
-        if recovery_session is not None:
-            if initial.get('phase') != 'recovery_slots_checked':
-                raise ActivationError('initial physical phase must be recovery_slots_checked')
-            if 'deployment' in initial or 'booted' in initial:
-                raise ActivationError('recovery physical report must omit deployment/booted')
-            session_id = recovery_session.get('sessionId')
-            session_deployment = recovery_session.get('installedDeployment')
-            entry_slot = recovery_session.get('entrySlot')
-            original_boots = recovery_session.get('originalBoots')
-            if (
-                initial.get('actualSlot') != entry_slot
-                or initial.get('recoveryPartUuid') != recovery_session.get('recoveryPartUuid')
-                or write_report.get('runtime') != 'recovery'
-                or write_report.get('recoverySessionId') != session_id
-                or write_report.get('oldDeployment') != session_deployment
-                or write_report.get('temporaryBootSha256') != temporary_boot_sha256
-            ):
-                raise ActivationError('write_report disagrees with recovery session identity')
 
         current_readback_sha = None
         source_boot_sha = None
@@ -314,24 +257,9 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
         if str(tx_uuid) != tx_str or tx_uuid.bytes == b'\x00' * 16:
             raise ActivationError('transactionUuid must be canonical lowercase non-zero UUID')
 
-        if recovery_session is not None:
-            session_rec_uuid = recovery_session.get('recoveryPartUuid')
-            original_boots = recovery_session.get('originalBoots')
-            for slot in ('a', 'b'):
-                if source_boot_shas[slot] != original_boots[slot]['sha256']:
-                    raise ActivationError(
-                        f'writes.{slot}.sourceBootSha256 does not match recovery original boot'
-                    )
-                if candidates[slot]['bytes'] != original_boots[slot]['bytes']:
-                    raise ActivationError(
-                        f'writes.{slot}.candidate bytes do not match recovery original boot bytes'
-                    )
 
         new_deployment = write_report.get('deployment')
-        if recovery_session is not None:
-            old_deployment = recovery_session.get('installedDeployment')
-        else:
-            old_deployment = initial.get('deployment')
+        old_deployment = initial.get('deployment')
         old_os, old_commit_hex, old_serial = _parse_binding(old_deployment)
         new_os, new_commit_hex, new_serial = _parse_binding(new_deployment)
         if old_os != new_os or (old_commit_hex, old_serial) == (new_commit_hex, new_serial):
@@ -345,10 +273,6 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
             or rec_uuid_str != initial.get('recoveryPartUuid')
         ):
             raise ActivationError('recovery partition disagrees with initial physical report')
-        if recovery_session is not None and rec_uuid_str != session_rec_uuid:
-            raise ActivationError(
-                'recovery partition does not match recovery session identity'
-            )
         anchor, found = _inventory(initial, rec_rdev)
         bsg_desc = _bsg_descriptor(anchor, found)
         luns = sorted(found)
@@ -364,20 +288,6 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
         new_ext = _locate(locator, ro_fds, luns, found, enabled, new_label)
         old_ext_id = _extent_id(old_ext)
         new_ext_id = _extent_id(new_ext)
-        if recovery_session is not None:
-            for slot, ext in (
-                (from_slot, old_ext),
-                (target_slot, new_ext),
-            ):
-                expected_boot = original_boots[slot]
-                if _uuid_text(ext['uuid']) != expected_boot['partitionUuid']:
-                    raise ActivationError(
-                        f'boot_{slot} partition UUID does not match recovery original boot'
-                    )
-                if ext['bytes'] != expected_boot['bytes']:
-                    raise ActivationError(
-                        f'boot_{slot} extent bytes do not match recovery original boot'
-                    )
         if new_ext['bytes'] != candidate['bytes']:
             raise ActivationError('target boot partition size does not match candidate bytes')
         if _rehash_region(
@@ -525,10 +435,6 @@ def _activate_prepared_slots(write_report, offline, session_identity=None, tempo
                 if offline:
                     result['currentReadbackSha256'] = current_readback_sha
                     result['targetReadbackSha256'] = readback_sha
-                if recovery_session is not None:
-                    result['runtime'] = 'recovery'
-                    result['recoverySessionId'] = session_id
-                    result['oldDeployment'] = session_deployment
                 return result
             if native_rc == -30:
                 raise ActivationError(

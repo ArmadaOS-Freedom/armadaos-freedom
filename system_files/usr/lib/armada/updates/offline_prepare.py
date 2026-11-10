@@ -4,9 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import copy
-import json
-from contextlib import ExitStack
 from pathlib import Path
 import uuid
 
@@ -20,8 +17,6 @@ from . import (
     offline_payload,
     package_contract,
     physical_slots,
-    recovery_authorization,
-    recovery_context,
     signature,
     system_transaction,
     trial_confirmation,
@@ -97,112 +92,41 @@ def prepare_offline_update(*, document, signature_b64, payload_directory,
         dtb_helper_path=dtb_helper_path, trusted_key=trusted_key)
 
 
-def prepare_recovery_offline_update(*, document, signature_b64,
-                                    expected_channel, session_identity,
-                                    original_boots, temporary_boot_sha256,
-                                    parent_dir='/run/armada-update-recovery',
-                                    updater_version='0.8.0',
-                                    boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
-                                    dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
-                                    trusted_key=signature.DEFAULT_TRUSTED_KEY):
-    return _prepare_offline_update(
-        document=document, signature_b64=signature_b64,
-        expected_channel=expected_channel,
-        updater_version=updater_version, boot_tool_path=boot_tool_path,
-        dtb_helper_path=dtb_helper_path, trusted_key=trusted_key,
-        recovery={'session_identity': session_identity,
-                  'original_boots': original_boots,
-                  'temporary_boot_sha256': temporary_boot_sha256,
-                  'parent_dir': parent_dir})
-
-
 def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                             expected_channel, sysroot_path=None, work_dir=None,
                             updater_version='0.8.0',
                             boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
                             dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
-                            trusted_key=signature.DEFAULT_TRUSTED_KEY,
-                            recovery=None):
+                            trusted_key=signature.DEFAULT_TRUSTED_KEY):
     status = {'component': 'system', 'operation': 'offline-upgrade',
               'policy': 'offline-dual', 'schemaVersion': 1,
               'phase': 'preparing', 'state': 'preparing',
               'bootWriteState': 'not_started', 'requiresReboot': False}
     work = None
     created = False
-    with trial_confirmation._locked(), ExitStack() as contexts:
+    with trial_confirmation._locked():
         try:
             if type(expected_channel) is not str or expected_channel not in _CHANNELS:
                 raise ValueError('invalid expected_channel')
-            if recovery is None:
-                if not isinstance(sysroot_path, (str, Path)) or not isinstance(work_dir, (str, Path)):
-                    raise ValueError('sysroot_path and work_dir must be paths')
-                root, requested_work = Path(sysroot_path), Path(work_dir)
-                if not root.is_absolute() or not requested_work.is_absolute():
-                    raise ValueError('sysroot_path and work_dir must be absolute')
-                if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
-                    raise ValueError('sysroot path must be canonical, symlinks rejected')
-                inspect_slots = physical_slots.inspect_physical_slots
-            else:
-                identity = recovery_authorization._session(
-                    json.dumps(recovery['session_identity']).encode())
-                if identity['schemaVersion'] != 2:
-                    raise ValueError('unsupported recovery authorization schema')
-                temporary = recovery['temporary_boot_sha256']
-                if (type(temporary) is not str or len(temporary) != 64 or
-                        any(c not in '0123456789abcdef' for c in temporary)):
-                    raise ValueError('temporary boot sha256 must be lowercase hex')
-                supplied = copy.deepcopy(recovery['original_boots'])
-                if type(supplied) is not dict or set(supplied) != {'a', 'b'}:
-                    raise ValueError('original_boots must contain exactly slots a and b')
-                original_boots = {}
-                for slot in ('a', 'b'):
-                    claim = boot_candidate._verify_claim(
-                        supplied[slot], 'original boot %s' % slot)
-                    sealed = identity['originalBoots'][slot]
-                    if (claim['bytes'] != sealed['bytes'] or
-                            claim['sha256'] != sealed['sha256']):
-                        raise ValueError('original boot does not match authorization')
-                    original_boots[slot] = claim
-                inspect_slots = physical_slots.inspect_recovery_slots
+            if not isinstance(sysroot_path, (str, Path)) or not isinstance(work_dir, (str, Path)):
+                raise ValueError('sysroot_path and work_dir must be paths')
+            root, requested_work = Path(sysroot_path), Path(work_dir)
+            if not root.is_absolute() or not requested_work.is_absolute():
+                raise ValueError('sysroot_path and work_dir must be absolute')
+            if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
+                raise ValueError('sysroot path must be canonical, symlinks rejected')
+            inspect_slots = physical_slots.inspect_physical_slots
 
             initial = inspect_slots()
             if initial['model'] not in ('TB322FC', 'TB323FU'):
                 raise ValueError('unsupported physical model')
-            if recovery is not None:
-                if (initial['model'] != identity['model'] or
-                        initial.get('phase') != 'recovery_slots_checked' or
-                        initial['recoveryPartUuid'] != identity['recoveryPartUuid'] or
-                        initial['actualSlot'] != identity['entrySlot'] or
-                        'deployment' in initial or 'booted' in initial):
-                    raise ValueError('recovery slots do not match authorization')
-                update_context = contexts.enter_context(
-                    recovery_context.opened_recovery_update_context(
-                        expected_binding=identity['installedDeployment'],
-                        expected_physical=initial,
-                        parent_dir=recovery['parent_dir']))
-                if (update_context.get('runtime') != 'recovery' or
-                        update_context.get('phase') != 'recovery_context_checked_update' or
-                        update_context.get('physical') != initial or
-                        update_context.get('channel') != expected_channel or
-                        update_context.get('installed', {}).get('installedDeployment')
-                        != identity['installedDeployment']):
-                    raise ValueError('recovery update context mismatch')
-                root = Path(update_context['sysrootPath'])
-                if (not root.is_absolute() or root.is_symlink() or
-                        not root.is_dir() or root.resolve(strict=True) != root):
-                    raise ValueError('sysroot path must be canonical, symlinks rejected')
-                session_base = root / '.armada-update' / identity['sessionId']
-                payload_directory = session_base / 'incoming'
-                requested_work = session_base / 'transaction'
-                current_binding = identity['installedDeployment']
-            else:
-                snapshot = armada_os.snapshot()
-                if (snapshot['repository'] not in armada_os.REPOSITORIES or
-                        snapshot['staged'] or snapshot['rollback_queued']):
-                    raise ValueError('legacy OSTree transaction conflict')
-                if system_transaction._snapshot_channel(snapshot) != expected_channel:
-                    raise ValueError('requested channel differs from configured channel')
-                current_binding = initial['deployment']
+            snapshot = armada_os.snapshot()
+            if (snapshot['repository'] not in armada_os.REPOSITORIES or
+                    snapshot['staged'] or snapshot['rollback_queued']):
+                raise ValueError('legacy OSTree transaction conflict')
+            if system_transaction._snapshot_channel(snapshot) != expected_channel:
+                raise ValueError('requested channel differs from configured channel')
+            current_binding = initial['deployment']
             old = system_transaction._binding(current_binding)
             journal = system_transaction._check_recovery(initial, old)
 
@@ -216,7 +140,6 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                           oldDeployment=current_binding)
             if package['ostreeCommit'] == old[1]:
                 status.update(state='up_to_date', phase='complete')
-                contexts.close()
                 return status
 
             boot_materials._validate_output_dir(
@@ -244,24 +167,11 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             status['phase'] = 'capturing_boot_trust'
             system_transaction._save_json(work, 'status.json', status)
-            if recovery is None:
-                trust = boot_trust.capture_boot_trust(
-                    output_dir=work / 'trust', boot_tool_path=boot_tool_path)
-                if (trust['physical'] != initial or
-                        trust['sources']['physical'] != initial):
-                    raise ValueError('boot trust physical report mismatch')
-            else:
-                trust = boot_trust.capture_recovery_boot_trust(
-                    output_dir=work / 'trust', original_boots=original_boots,
-                    session_identity=identity,
-                    temporary_boot_sha256=recovery['temporary_boot_sha256'],
-                    boot_tool_path=boot_tool_path)
-                if (trust.get('phase') != 'recovery_boot_trust_checked' or
-                        trust['physical'] != initial or
-                        trust['sources']['physical'] != initial or
-                        trust['sources'].get('recoverySessionId')
-                        != identity['sessionId']):
-                    raise ValueError('recovery boot trust report mismatch')
+            trust = boot_trust.capture_boot_trust(
+                output_dir=work / 'trust', boot_tool_path=boot_tool_path)
+            if (trust['physical'] != initial or
+                    trust['sources']['physical'] != initial):
+                raise ValueError('boot trust physical report mismatch')
 
             status['phase'] = 'deploying'
             system_transaction._save_json(work, 'status.json', status)
@@ -330,10 +240,6 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'partitions': sources['partitions'],
                 'files': _recovery_files(work, sources, journal),
             }
-            if recovery is not None:
-                manifest['runtime'] = 'recovery'
-                manifest['recoverySessionId'] = identity['sessionId']
-                manifest['temporaryBootSha256'] = recovery['temporary_boot_sha256']
             if manifest['recoveryPartUuid'] != initial['recoveryPartUuid']:
                 raise ValueError('recovery identity mismatch')
             manifest_bytes = system_transaction._save_json(
@@ -355,10 +261,6 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'recoveryManifestSha256': manifest_sha,
                 'packageDescriptorSha256': document_sha,
             }
-            if recovery is not None:
-                plan['runtime'] = 'recovery'
-                plan['recoverySessionId'] = identity['sessionId']
-                plan['temporaryBootSha256'] = recovery['temporary_boot_sha256']
             plan_sha = _sha256(system_transaction._save_json(work, 'plan.json', plan))
             prepared = {
                 'schemaVersion': 1, 'operation': 'offline-upgrade',
@@ -385,7 +287,6 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 recoveryManifestSha256=manifest_sha,
                 recoveryManifestBytes=len(manifest_bytes), planSha256=plan_sha)
             system_transaction._save_json(work, 'status.json', status)
-            contexts.close()
             return status
         except Exception as exc:
             status.update(failedPhase=status.get('phase'), phase='failed',
