@@ -47,6 +47,19 @@ class SystemApplyWorkerTests(unittest.TestCase):
         self.sysroot_path.mkdir(mode=0o755)
         self.state_dir = self.base / "state" / "updates" / "system"
 
+        original_lstat = Path.lstat
+        fixture_owner = os.getuid()
+        def root_owned_fixture(candidate, *args, **kwargs):
+            info = original_lstat(candidate, *args, **kwargs)
+            if candidate.is_relative_to(self.base) and info.st_uid == fixture_owner:
+                values = list(info)
+                values[4] = 0
+                return os.stat_result(values)
+            return info
+        ownership = patch.object(Path, "lstat", new=root_owned_fixture)
+        ownership.start()
+        self.addCleanup(ownership.stop)
+
         for attr, value in (
             ("CONFIG_PATH", self.config_path),
             ("COMPATIBLE_PATH", self.compatible_path),
@@ -300,6 +313,17 @@ class SystemApplyWorkerTests(unittest.TestCase):
                 self.assertEqual(result["state"], "failed")
                 self.assertEqual(result["phase"], "preflight")
                 self.assertIn(match, result["error"])
+
+    def test_state_root_wrong_owner_rejected(self):
+        self.state_dir.mkdir(parents=True, mode=0o700)
+        values = list(self.state_dir.lstat())
+        values[4] = 12345
+        with patch.object(Path, "lstat", return_value=os.stat_result(values)), \
+             patch("armada_os.snapshot", return_value=snapshot()), \
+             patch.object(system_apply, "run_online_transaction") as run_tx:
+            result = system_apply.execute("stable", VALID_JOB)
+        run_tx.assert_not_called()
+        self.assertIn("not root owned", result["error"])
 
     def test_snapshot_subprocess_error_returns_structured_preflight_failure(self):
         err = subprocess.CalledProcessError(1, ["ostree", "admin", "status"], stderr="boom")
