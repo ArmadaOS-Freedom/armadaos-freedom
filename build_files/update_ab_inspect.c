@@ -234,7 +234,7 @@ static int update_ab_init_media(const int fds[KSHIM_AB_LUNS],
         if ((flags & O_PATH) != 0)
             return KSHIM_STORAGE_ARG;
 #endif
-        if ((flags & O_ACCMODE) != expected_accmode)
+        if ((flags & O_ACCMODE) != expected_accmode || (rw && (flags & O_APPEND)))
             return KSHIM_STORAGE_ARG;
         if (fstat(fds[i], &stats[i]) != 0)
             return KSHIM_STORAGE_IO;

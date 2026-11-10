@@ -16,6 +16,7 @@ EOF
 chmod +x "$WORK/bin/chcon"
 
 sed \
+    -e "s|flock -w 30|flock -w 1|" \
     -e "s|user_name=armada|user_name=$(id -un)|" \
     -e "s|homebrew=\"/var/home/\${user_name}/homebrew\"|homebrew=\"$WORK/homebrew\"|" \
     -e "s|loader_src=/usr/share/decky-loader/PluginLoader|loader_src=$WORK/bundled/PluginLoader|" \
@@ -279,4 +280,10 @@ assert_content "$WORK/homebrew/services/PluginLoader" 'sentinel'
 assert_content "$WORK/homebrew/services/.loader.version" 'v3.1.0'
 [[ ! -e "$WORK/homebrew/plugins/locked-demo" ]] || fail "plugins seeded while update lock was held"
 
+# A later retry must complete both loader and plugin seeding after lock release.
+PATH="$WORK/bin:$PATH" "$WORK/sync"
+assert_content "$WORK/homebrew/services/.loader.version" 'v3.9.0'
+assert_exists "$WORK/homebrew/plugins/locked-demo/main.py"
+grep -q '^Restart=on-failure
+ "$ROOT/system_files/usr/lib/systemd/system/armada-decky-sync.service"
 printf 'decky sync tests passed\n'

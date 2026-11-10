@@ -13,7 +13,7 @@ extern int armada_update_ab_select_fds(const int[6], const uint32_t[6],
 extern int armada_update_ab_mark_success_fds(const int[6], const uint32_t[6],
     const uint64_t[6], const uint8_t[6], int, uint32_t, uint32_t[3]);
 
-enum kind { NORMAL, STALE, RO_LUN, RO_BSG, DUP_FD, PWRITE_ONCE,
+enum kind { NORMAL, STALE, RO_LUN, RO_BSG, DUP_FD, APPEND_LUN, PWRITE_ONCE,
     FSYNC_ONCE, FSYNC_ALWAYS, PARTIAL, BSG_WRITE, POST_INSPECT };
 enum { NONE, WRITE_ONCE, FLUSH_ONCE, FLUSH_ALWAYS, WRITE_HALF };
 struct testfix {
@@ -120,7 +120,9 @@ static struct testfix *open_case(unsigned bs, enum kind kind)
     }
     t->bsg = open("/dev/null", O_RDWR);
     CHECK(t->bsg >= 0);
-    if (kind == RO_LUN) {
+    if (kind == APPEND_LUN) {
+        CHECK(fcntl(t->fd[0], F_SETFL, fcntl(t->fd[0], F_GETFL) | O_APPEND) == 0);
+    } else if (kind == RO_LUN) {
         close(t->fd[0]);
         t->fd[0] = open(t->path[0], O_RDONLY);
         CHECK(t->fd[0] >= 0 && lseek(t->fd[0], 7, SEEK_SET) == 7);
@@ -344,6 +346,7 @@ int main(void)
     success_case(4096);
     rejection_case(STALE);
     rejection_case(RO_LUN);
+    rejection_case(APPEND_LUN);
     rejection_case(RO_BSG);
     rejection_case(DUP_FD);
     rollback_case(PWRITE_ONCE);

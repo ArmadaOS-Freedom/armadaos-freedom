@@ -11,7 +11,7 @@ update_lock=/run/lock/armada-update.lock
 update_state=/var/lib/armada/updates/decky
 
 exec 9>"${update_lock}"
-if ! flock -n 9; then
+if ! flock -w 30 9; then
     printf 'armada-decky-sync: update lock busy (%s)\n' "${update_lock}" >&2
     exit 75
 fi

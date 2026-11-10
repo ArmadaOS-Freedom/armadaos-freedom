@@ -804,13 +804,13 @@ def build_dtb(inputs, bootargs, boot_stage="maintenance", root_medium=None,
     transaction_bytes = None
     if transaction_uuid is not None:
         if not isinstance(transaction_uuid, str):
-            raise StageError("transaction UUID must be a canonical string")
+            raise StageError(STAGE, "transaction UUID must be a canonical string")
         try:
             parsed_transaction = uuid.UUID(transaction_uuid)
         except ValueError as exc:
-            raise StageError("invalid transaction UUID") from exc
+            raise StageError(STAGE, "invalid transaction UUID") from exc
         if parsed_transaction.int == 0 or str(parsed_transaction) != transaction_uuid:
-            raise StageError("transaction UUID must be canonical and nonzero")
+            raise StageError(STAGE, "transaction UUID must be canonical and nonzero")
         transaction_bytes = parsed_transaction.bytes
 
     def tagged(name):
@@ -938,10 +938,10 @@ def build_dtb(inputs, bootargs, boot_stage="maintenance", root_medium=None,
         try:
             got_values = [int(token, 16) for token in tokens]
         except ValueError:
-            raise StageError("dtb:derived-update-transaction: malformed "
+            raise StageError(STAGE, "dtb:derived-update-transaction: malformed "
                              "byte token in %r" % (tokens,))
         if len(got_values) != 16 or any(value < 0 or value > 255 for value in got_values):
-            raise StageError("dtb:derived-update-transaction: expected 16 "
+            raise StageError(STAGE, "dtb:derived-update-transaction: expected 16 "
                              "bytes, got %r" % (tokens,))
         got_transaction = bytes(got_values)
         check("dtb:derived-update-transaction",

@@ -34,6 +34,17 @@ class InstalledChannelTests(unittest.TestCase):
             self.root / "trial.lock")
         self.lock_patch.start()
         self.addCleanup(self.lock_patch.stop)
+        if os.geteuid() != 0:
+            original_fstat = os.fstat
+            owner = os.geteuid()
+            def root_owned_fixture(fd):
+                values = list(original_fstat(fd))
+                if values[4] == owner:
+                    values[4] = 0
+                return os.stat_result(values)
+            ownership = mock.patch.object(selection.os, "fstat", side_effect=root_owned_fixture)
+            ownership.start()
+            self.addCleanup(ownership.stop)
 
     def read(self, ref, path=None):
         return selection.read_installed_channel(
@@ -44,6 +55,7 @@ class InstalledChannelTests(unittest.TestCase):
         self.state.write_bytes(content)
         self.state.chmod(0o644)
 
+    @unittest.skipUnless(os.geteuid() == 0, "channel writer requires root")
     def test_all_channels_written_by_set_channel_override_origin(self):
         for channel in selection.CHANNELS:
             with self.subTest(channel=channel):
@@ -62,7 +74,7 @@ class InstalledChannelTests(unittest.TestCase):
         digest_ref = FREEDOM + "@sha256:" + DIGEST
         with self.assertRaisesRegex(ValueError, "installed channel state"):
             self.read(digest_ref)
-        selection.set_channel("testing", self.state)
+        self.write_state(b"testing\n")
         self.assertEqual("testing", self.read(digest_ref))
 
     def test_exact_transports_and_repositories(self):
@@ -87,7 +99,7 @@ class InstalledChannelTests(unittest.TestCase):
                         "beta", self.read(origin(repository, "beta", transport)))
 
     def test_invalid_origins_rejected_even_with_valid_state(self):
-        selection.set_channel("testing", self.state)
+        self.write_state(b"testing\n")
         tagged = origin(channel="beta")
         invalid = (
             FREEDOM,
@@ -173,7 +185,7 @@ class InstalledChannelTests(unittest.TestCase):
                     self.read(origin())
 
     def test_read_does_not_change_file_or_directory_inventory(self):
-        selection.set_channel("beta", self.state)
+        self.write_state(b"beta\n")
         before_content = self.state.read_bytes()
         before_stat = self.state.stat()
         before_inventory = sorted(

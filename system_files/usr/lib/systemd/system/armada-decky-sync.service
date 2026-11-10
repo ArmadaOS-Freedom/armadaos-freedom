@@ -6,6 +6,8 @@ Before=plugin_loader.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5s
 ExecStart=/usr/lib/decky-loader/armada-decky-sync
 
 [Install]
