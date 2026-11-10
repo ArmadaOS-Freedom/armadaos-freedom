@@ -14,6 +14,24 @@ sys.path.insert(
 from updates import coordinator as module  # noqa: E402
 from updates.coordinator import BusyError, Coordinator  # noqa: E402
 
+SERVICE_UNIT = (
+    Path(__file__).resolve().parents[1]
+    / "system_files/usr/lib/systemd/system/armada-updates.service"
+)
+
+
+def service_settings():
+    settings = {}
+    section = None
+    for line in SERVICE_UNIT.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Service" and "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            settings[key.strip()] = value.strip()
+    return settings
+
 
 class FakeManager:
     def __init__(self, component):
@@ -368,6 +386,14 @@ class CoordinatorTest(unittest.TestCase):
                 decky_mgr.gate.set()
                 closer.join(2.0)
                 self.assertFalse(closer.is_alive())
+
+    def test_service_unit_shutdown_contract_lets_worker_finish(self):
+        # The D-Bus main loop quits on SIGTERM and close() joins the
+        # system_apply worker, so systemd must signal only the main process
+        # and leave the worker the full stop budget to finish.
+        settings = service_settings()
+        self.assertEqual(settings.get("KillMode"), "mixed")
+        self.assertEqual(settings.get("TimeoutStopSec"), "15min")
 
     def test_sequential_jobs_clean_up_worker_tracking(self):
         with self.env() as (coord, sys_mgr, decky_mgr):

@@ -86,12 +86,18 @@ class TestDeckyManager(unittest.TestCase):
         self.old_bytes = make_elf(b"loader-v1-legacy")
 
     def _make_manager(self, service: FakeDeckyService) -> DeckyManager:
-        return DeckyManager(
+        mgr = DeckyManager(
             services_dir=self.services_dir,
             state_dir=self.state_dir,
             lock_path=self.lock_path,
             service=service,
         )
+        # Only this fixture manager bypasses the root gate; ownership checks
+        # elsewhere still rely on the real effective uid.
+        root_guard = mock.patch.object(mgr, "_require_root", return_value=None)
+        root_guard.start()
+        self.addCleanup(root_guard.stop)
+        return mgr
 
     def _seed_installed(self, version: str, data: bytes, mode: int = 0o755) -> None:
         self.services_dir.mkdir(parents=True, exist_ok=True)
