@@ -447,6 +447,15 @@ int main(void)
     test_export_behavior_and_security();
     test_export_nospace_clears_forged_witness();
     test_snapshot_freeze_flow();
+    {
+        uint8_t packed[TEST_FDT_BUF_SIZE];
+        init_fdt_with_chosen(packed, sizeof(packed), 1);
+        assert(fdt_pack(packed) == 0);
+        assert(fdt_open_into(packed, packed, sizeof(packed)) == 0);
+        assert(kshim_boot_witness_export(packed, 1) == 0);
+        assert(fdt_pack(packed) == 0);
+        assert(fdt_check_header(packed) == 0);
+    }
 
     printf("PASS: boot_witness_test\n");
     return 0;
