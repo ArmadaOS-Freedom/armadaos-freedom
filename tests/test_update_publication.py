@@ -597,7 +597,7 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(again["state"], "unchanged")
         self.assertEqual(unchanged.ref_writes, [])
 
-    def _signed_channel(self, artifact, channel="testing"):
+    def _signed_channel(self, artifact, channel="testing", *, withdrawn=False):
         descriptor_url = _release_url(
             artifact.package["releaseId"],
             f"{artifact.archive_name}.update.json",
@@ -611,6 +611,7 @@ class PublicationTest(unittest.TestCase):
             signature_url=signature_url,
             published_at=PUBLISHED_AT,
             expected_oci_digest=artifact.package["ociDigest"],
+            withdrawn=withdrawn,
             trusted_key=self.pub,
         )
         channel_bytes = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
@@ -691,6 +692,61 @@ class PublicationTest(unittest.TestCase):
                 expected_digest=artifact.package["ociDigest"],
                 expected_revision=artifact.package["sourceRevision"],
                 workdir=workdir,
+            )
+
+    def test_fetch_channel_rejects_a_withdrawn_channel_before_downloading(self):
+        artifact = self.artifact()
+        for channel in ("testing", "beta"):
+            with self.subTest(channel=channel):
+                channel_bytes, channel_signature, _, _ = self._signed_channel(
+                    artifact, channel, withdrawn=True)
+                # No downloads are staged: reaching one would already fail.
+                source = FakeChannelSource(
+                    {
+                        f"{channel}.json": channel_bytes,
+                        f"{channel}.json.sig": channel_signature,
+                    },
+                    {},
+                )
+                workdir = Path(artifact.root) / f"withdrawn-{channel}"
+                with self.assertRaisesRegex(
+                        publication.PublicationError, "withdrawn"):
+                    publication.fetch_published_channel(
+                        source,
+                        channel=channel,
+                        trusted_key=self.pub,
+                        expected_digest=artifact.package["ociDigest"],
+                        expected_revision=artifact.package["sourceRevision"],
+                        workdir=workdir,
+                    )
+                # Only the signed channel pair was read, and nothing was written.
+                self.assertEqual(source.file_reads, [
+                    (f"{channel}.json", source.head),
+                    (f"{channel}.json.sig", source.head),
+                ])
+                self.assertFalse(workdir.exists())
+
+        # Signature verification still comes first: a forged withdrawn document
+        # fails verification rather than being reported as withdrawn.
+        channel_bytes, _, _, _ = self._signed_channel(
+            artifact, "testing", withdrawn=True)
+        forged = FakeChannelSource(
+            {
+                "testing.json": channel_bytes,
+                "testing.json.sig": cr_fixture._sign_bytes(
+                    channel_bytes, self.other_priv),
+            },
+            {},
+        )
+        with self.assertRaisesRegex(
+                publication.PublicationError, "verification failed"):
+            publication.fetch_published_channel(
+                forged,
+                channel="testing",
+                trusted_key=self.pub,
+                expected_digest=artifact.package["ociDigest"],
+                expected_revision=artifact.package["sourceRevision"],
+                workdir=Path(artifact.root) / "forged-withdrawn",
             )
 
     def test_fetch_channel_requires_a_published_branch(self):

@@ -754,6 +754,14 @@ def fetch_published_channel(github, *, channel, trusted_key, expected_digest,
     except CatalogError as exc:
         raise PublicationError(f"channel verification failed: {exc}") from exc
 
+    # Only the authenticated document decides withdrawal, and a withdrawn
+    # release must not reach descriptor downloads, the workdir, or a tag.
+    if channel_doc["withdrawn"]:
+        raise PublicationError(
+            f"the published {channel} channel has been withdrawn; "
+            "nothing may be promoted from it"
+        )
+
     descriptor_url = channel_doc["packageDescriptor"]["url"]
     signature_url = channel_doc["packageDescriptor"]["signatureUrl"]
     descriptor = github.get_url_bytes(

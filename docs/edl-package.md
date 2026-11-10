@@ -347,6 +347,12 @@ the online OCI update instead rotates only the non-current slot. A signature
 alone does not make a package upgrade-capable: the descriptor must declare
 offline-upgrade and the installed updater must meet `minimumUpdaterVersion`.
 
+Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
+(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) may
+still appear in the universal initial-install package, but its update slot
+backend is not implemented yet, so being listed in a package is not
+offline-upgrade support for that model.
+
 Recovery manifests describe the RAM rescue path and are not a prerequisite here:
 this package ships no rescue artifacts, and the object may be absent or partial.
 Every entry that is present is still validated against the same schema and file
