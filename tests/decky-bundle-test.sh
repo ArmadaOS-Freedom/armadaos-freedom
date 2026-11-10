@@ -32,6 +32,7 @@ sed \
     -e "s|/packages/decky-store-dist|$FAKE/packages/decky-store-dist|g" \
     -e "s|/usr/share/decky-plugins|$FAKE/usr/share/decky-plugins|g" \
     -e "s|/usr/share/decky-loader|$FAKE/usr/share/decky-loader|g" \
+    -e "s|/usr/lib/armada|$FAKE/usr/lib/armada|g" \
     -e "s|/usr/lib/decky-loader/armada-decky-sync|$FAKE/usr/lib/decky-loader/armada-decky-sync|g" \
     -e "s|/etc/systemd/system/plugin_loader.service|$FAKE/etc/systemd/system/plugin_loader.service|g" \
     -e "s|/run/secrets/decky_releases|$FAKE/run/secrets/decky_releases|g" \
@@ -46,7 +47,7 @@ url=""
 while (($#)); do
     case "$1" in
         -o|--output) out=$2; shift 2 ;;
-        --retry|--retry-delay|--connect-timeout|--max-time|-m|-w|--write-out|-H|--header|-A|--user-agent) shift 2 ;;
+        --retry|--retry-delay|--connect-timeout|--max-time|-m|-w|--write-out|-H|--header|-A|--user-agent|--proto|--proto-redir) shift 2 ;;
         -*) shift ;;
         *) url=$1; shift ;;
     esac
@@ -143,65 +144,91 @@ def sha256(body):
     return hashlib.sha256(body).hexdigest()
 
 
-def asset(name, body, body_digest=None):
+def asset(name, body, asset_id, body_digest=None, url=None):
     return {
+        "id": asset_id,
         "name": name,
         "size": len(body),
         "digest": "sha256:" + (body_digest or sha256(body)),
-        "browser_download_url": base + "/" + name,
+        "browser_download_url": url or (base + "/" + name),
     }
 
 
 arm = elf(183, b"arm64-fixture")
 x86 = elf(62, b"x86-fixture")
 served_arm = x86 if mode == "wrong-arch" else arm
+ARM_ID = 9002
 
 if mode == "success":
-    assets = [asset("PluginLoader", x86), asset("PluginLoader-arm64", served_arm)]
+    assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
 elif mode == "missing-arm64":
-    assets = [asset("PluginLoader", x86)]
+    assets = [asset("PluginLoader", x86, 9001)]
 elif mode == "digest-mismatch":
     assets = [
-        asset("PluginLoader", x86),
-        asset("PluginLoader-arm64", served_arm, sha256(b"not the served bytes")),
+        asset("PluginLoader", x86, 9001),
+        asset("PluginLoader-arm64", served_arm, ARM_ID, sha256(b"not the served bytes")),
+    ]
+elif mode == "size-mismatch":
+    arm_asset = asset("PluginLoader-arm64", served_arm, ARM_ID)
+    arm_asset["size"] = len(served_arm) + 1
+    assets = [asset("PluginLoader", x86, 9001), arm_asset]
+elif mode == "missing-digest":
+    arm_asset = asset("PluginLoader-arm64", served_arm, ARM_ID)
+    del arm_asset["digest"]
+    assets = [asset("PluginLoader", x86, 9001), arm_asset]
+elif mode == "bad-origin":
+    assets = [
+        asset("PluginLoader", x86, 9001),
+        asset("PluginLoader-arm64", served_arm, ARM_ID, url="https://evil.example/PluginLoader-arm64"),
     ]
 elif mode == "wrong-arch":
-    assets = [asset("PluginLoader", x86), asset("PluginLoader-arm64", served_arm)]
+    assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
 elif mode == "no-preview":
-    assets = [asset("PluginLoader", x86), asset("PluginLoader-arm64", served_arm)]
+    assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
 else:
     raise SystemExit("unknown fixture mode: " + mode)
 
+# The older prerelease carries its own valid ARM64 asset with distinct IDs, so
+# a missing-arm64 refusal on the target proves there is no old-release fallback.
+older_base = "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.2.10-pre1"
+older_assets = [
+    asset("PluginLoader", x86, 8001, url=older_base + "/PluginLoader"),
+    asset("PluginLoader-arm64", arm, 8002, url=older_base + "/PluginLoader-arm64"),
+]
 
-def release(tag_name, published_at, prerelease, draft):
-    # Non-target entries reuse the target assets: selecting the wrong release
-    # is detected by the version and service expectations, not by asset URLs.
+
+def release(rel_id, tag_name, published_at, prerelease, draft, rel_assets=None):
+    # Non-target entries reuse the target assets unless overridden: selecting
+    # the wrong release is detected by the version and service expectations,
+    # not by asset URLs.
     return {
+        "id": rel_id,
         "tag_name": tag_name,
         "published_at": published_at,
         "draft": draft,
         "prerelease": prerelease,
-        "assets": assets,
+        "assets": rel_assets if rel_assets is not None else assets,
     }
 
 
 if mode == "no-preview":
     # Stable plus a draft prerelease only: no eligible preview release.
     releases = [
-        release("v3.3.0", "2026-10-20T12:00:00Z", False, False),
-        release("v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
+        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
+        release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
     ]
 else:
     releases = [
         # Newest stable, listed first: preview filtering must skip it.
-        release("v3.3.0", "2026-10-20T12:00:00Z", False, False),
-        # Older prerelease before the target: latest-by-published_at must win,
-        # not the first preview in array order.
-        release("v3.2.10-pre1", "2026-09-02T03:04:05Z", True, False),
+        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
+        # Older prerelease with a valid ARM64 asset: latest-by-published_at
+        # must win, not the first preview in array order, and refusal cases
+        # must not fall back to this release's assets.
+        release(102, "v3.2.10-pre1", "2026-09-02T03:04:05Z", True, False, older_assets),
         # Target: newest published non-draft prerelease.
-        release("v3.3.0-pre1", "2026-10-18T01:21:08Z", True, False),
+        release(103, "v3.3.0-pre1", "2026-10-18T01:21:08Z", True, False),
         # Still newer draft prerelease: drafts must be filtered out.
-        release("v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
+        release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
     ]
 
 with open(os.path.join(out, "releases.json"), "w") as handle:
@@ -272,7 +299,10 @@ setup_case() {
     rm -rf "$FAKE"
     mkdir -p "$FAKE/ctx/decky" "$FAKE/packages" \
         "$FAKE/usr/share/decky-loader" "$FAKE/usr/lib/decky-loader" \
-        "$FAKE/etc/systemd/system"
+        "$FAKE/etc/systemd/system" "$FAKE/usr/lib/armada"
+    # Real updates module from the system tree, not a stub: the installer must
+    # exercise the actual updates.decky_release selector under PYTHONPATH.
+    cp -a "$ROOT/system_files/usr/lib/armada/updates" "$FAKE/usr/lib/armada/updates"
 
     local plugin dist
     for plugin in armada-control armada-store; do
@@ -348,6 +378,35 @@ success_case() {
         [[ "$(<"$version_file")" == "$TARGET_TAG" ]] || case_fail "wrong recorded loader version"
     else
         case_fail "missing .loader.version"
+    fi
+
+    local release_json="$FAKE/usr/share/decky-loader/release.json"
+    if [[ -f "$release_json" ]]; then
+        python3 - "$release_json" "$FIXTURES/$name/arm64.bin" <<'PY' || case_fail "release.json does not match the installed release"
+import hashlib
+import json
+import sys
+
+meta_path, blob_path = sys.argv[1], sys.argv[2]
+with open(meta_path) as handle:
+    meta = json.load(handle)
+with open(blob_path, "rb") as handle:
+    blob = handle.read()
+expected = {
+    "release_id": 103,
+    "tag": "v3.3.0-pre1",
+    "published_at": "2026-10-18T01:21:08Z",
+    "asset_id": 9002,
+    "url": "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.0-pre1/PluginLoader-arm64",
+    "size": len(blob),
+    "sha256": hashlib.sha256(blob).hexdigest(),
+}
+for key, value in expected.items():
+    if meta.get(key) != value:
+        raise SystemExit("release.json %s: %r != %r" % (key, meta.get(key), value))
+PY
+    else
+        case_fail "missing release.json"
     fi
 
     local service="$FAKE/etc/systemd/system/plugin_loader.service"
@@ -448,6 +507,7 @@ refusal_case() {
         esac
     fi
     assert_absent "$FAKE/usr/share/decky-loader/.loader.version"
+    assert_absent "$FAKE/usr/share/decky-loader/release.json"
     if [[ -s "$SYSTEMCTL_LOG" ]]; then
         case_fail "enabled services after refusing the release"
     fi
@@ -472,6 +532,23 @@ refusal_case() {
             if [[ -f "$FAKE/usr/share/decky-loader/PluginLoader" ]] &&
                 cmp -s "$FAKE/usr/share/decky-loader/PluginLoader" "$FIXTURES/$name/x86.bin"; then
                 case_fail "installed a non-AArch64 ELF"
+            fi
+            ;;
+        size-mismatch)
+            grep -qxF "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/$TARGET_TAG/PluginLoader-arm64" "$CURL_LOG" ||
+                case_fail "did not attempt the ARM64 asset"
+            ;;
+        bad-origin)
+            if grep -qF 'https://evil.example/PluginLoader-arm64' "$CURL_LOG"; then
+                case_fail "attempted to download an asset from a non-official origin"
+            fi
+            if grep -qE '/releases/download/' "$CURL_LOG"; then
+                case_fail "downloaded an asset despite a non-official asset origin"
+            fi
+            ;;
+        missing-digest)
+            if grep -qE '/releases/download/' "$CURL_LOG"; then
+                case_fail "downloaded an asset whose metadata lacks a digest"
             fi
             ;;
         no-preview)
@@ -516,6 +593,9 @@ run_case prefetched-success success_case prefetched-success prefetch
 run_case missing-arm64 refusal_case missing-arm64
 run_case digest-mismatch refusal_case digest-mismatch
 run_case wrong-arch refusal_case wrong-arch
+run_case size-mismatch refusal_case size-mismatch
+run_case bad-origin refusal_case bad-origin
+run_case missing-digest refusal_case missing-digest
 run_case no-preview refusal_case no-preview
 run_case prefetched-empty refusal_case prefetched-empty success prefetch-empty
 run_case prefetched-malformed refusal_case prefetched-malformed success prefetch-malformed

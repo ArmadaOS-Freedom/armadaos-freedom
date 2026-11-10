@@ -1,0 +1,11 @@
+[Unit]
+Description=Independent Steam updates page
+PartOf=gamescope-session-plus@steam.service graphical-session.target
+
+[Service]
+ExecStart=/usr/libexec/armada/armada-steam-updates
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

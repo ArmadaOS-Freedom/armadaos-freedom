@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=Armada Linux update trial confirmation
+ConditionPathExists=/sys/firmware/devicetree/base/chosen/armada,update-transaction
+After=local-fs.target dbus.service systemd-logind.service
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/
+Environment=PYTHONPATH=/usr/lib/armada
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m updates.trial_confirmation
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=2min
+
+[Install]
+WantedBy=graphical.target

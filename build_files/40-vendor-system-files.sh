@@ -146,12 +146,15 @@ systemctl enable armada-installer-visibility.service
 systemctl enable armada-steamapps.service
 systemctl enable armada-als-bridge.service
 systemctl enable armada-powerd.service
+systemctl enable armada-updates.service
+systemctl enable armada-update-confirm.service
 systemctl enable armada-control.service
 systemctl enable steamos-manager.service
 systemctl --global enable steamos-manager.service
 systemctl --global enable steamos-manager-session-cleanup.service
 systemctl --global enable armada-steam-default-session.service
 systemctl --global enable armada-steam-charging-eta.service
+systemctl --global enable armada-steam-updates.service
 systemctl --global enable armada-steam-pinyin.service
 systemctl enable armada-bootimg-sync.service
 systemctl enable armada-esp-rename.service

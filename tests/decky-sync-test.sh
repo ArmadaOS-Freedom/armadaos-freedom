@@ -22,6 +22,8 @@ sed \
     -e "s|loader_version_src=/usr/share/decky-loader/.loader.version|loader_version_src=$WORK/bundled/.loader.version|" \
     -e "s|src=/usr/share/decky-plugins|src=$WORK/plugins|" \
     -e "s|plugin_seed=/usr/lib/decky-loader/armada-plugin-seed.py|plugin_seed=$ROOT/system_files/usr/lib/decky-loader/armada-plugin-seed.py|" \
+    -e "s|update_lock=/run/lock/armada-update.lock|update_lock=$WORK/armada-update.lock|" \
+    -e "s|update_state=/var/lib/armada/updates/decky|update_state=$WORK/update-state|" \
     "$SYNC" > "$WORK/sync"
 chmod +x "$WORK/sync"
 
@@ -227,5 +229,54 @@ assert_content "$WORK/homebrew/services/.loader.version" 'v3.4.0'
 [[ "$before" == "$after" ]] || fail "newer installed x86-64 loader was rewritten"
 cmp -s "$WORK/homebrew/services/PluginLoader" "$WORK/preserved-x86-newer" ||
     fail "newer installed x86-64 loader was downgraded to bundled ARM64"
+
+# Managed/pending coordination and lock contention.
+reset_plugins
+mkdir -p "$WORK/update-state"
+printf '{"managed":true}\n' >"$WORK/update-state/managed.json"
+write_elf "$WORK/homebrew/services/PluginLoader" 183 managed-v3.2.8
+printf 'v3.2.8\n' >"$WORK/homebrew/services/.loader.version"
+cp "$WORK/homebrew/services/PluginLoader" "$WORK/preserved-managed"
+write_elf "$WORK/bundled/PluginLoader" 183 bundled-v3.5.0
+printf 'v3.5.0\n' >"$WORK/bundled/.loader.version"
+write_plugin "$WORK/plugins/managed-demo" managed-demo 0.1.0
+PATH="$WORK/bin:$PATH" "$WORK/sync"
+assert_content "$WORK/homebrew/services/.loader.version" 'v3.2.8'
+cmp -s "$WORK/homebrew/services/PluginLoader" "$WORK/preserved-managed" ||
+    fail "managed loader was overwritten by newer bundled loader"
+assert_exists "$WORK/homebrew/plugins/managed-demo/main.py"
+assert_exists "$WORK/update-state/managed.json"
+
+rm -f "$WORK/homebrew/services/PluginLoader" "$WORK/homebrew/services/.loader.version"
+PATH="$WORK/bin:$PATH" "$WORK/sync"
+[[ ! -e "$WORK/homebrew/services/PluginLoader" && ! -e "$WORK/homebrew/services/.loader.version" ]] ||
+    fail "missing managed loader was re-seeded instead of leaving repair to external updater"
+rm -f "$WORK/update-state/managed.json"
+
+ln -s "$WORK/update-state/nonexistent-pending" "$WORK/update-state/pending.json"
+PATH="$WORK/bin:$PATH" "$WORK/sync"
+[[ ! -e "$WORK/homebrew/services/PluginLoader" ]] ||
+    fail "pending transaction symlink did not prevent loader seeding"
+rm -f "$WORK/update-state/pending.json"
+
+reset_plugins
+printf 'sentinel\n' >"$WORK/homebrew/services/PluginLoader"
+printf 'v3.1.0\n' >"$WORK/homebrew/services/.loader.version"
+printf 'bundled v3.9.0\n' >"$WORK/bundled/PluginLoader"
+chmod +x "$WORK/bundled/PluginLoader"
+printf 'v3.9.0\n' >"$WORK/bundled/.loader.version"
+write_plugin "$WORK/plugins/locked-demo" locked-demo 0.1.0
+set +e
+(
+    exec 9>"$WORK/armada-update.lock"
+    flock -n 9 || exit 1
+    PATH="$WORK/bin:$PATH" "$WORK/sync" 2>"$WORK/lock.err"
+)
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] || fail "expected exit 75 when update lock busy, got $rc"
+assert_content "$WORK/homebrew/services/PluginLoader" 'sentinel'
+assert_content "$WORK/homebrew/services/.loader.version" 'v3.1.0'
+[[ ! -e "$WORK/homebrew/plugins/locked-demo" ]] || fail "plugins seeded while update lock was held"
 
 printf 'decky sync tests passed\n'

@@ -641,7 +641,7 @@ def prepare_args(expect="fingerprint", device="/dev/sda"):
 
 SEED_COMMIT = "f" * 64
 SEED_MANIFEST_DIGEST = "sha256:" + "a" * 64
-SEED_ORIGIN = "ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:testing"
+SEED_ORIGIN = "ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing"
 
 
 def deploy_args(**overrides):

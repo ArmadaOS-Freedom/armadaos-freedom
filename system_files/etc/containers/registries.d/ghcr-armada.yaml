@@ -1,4 +1,6 @@
 docker:
+  ghcr.io/armadaos-freedom/armadaos-freedom:
+    use-sigstore-attachments: true
   ghcr.io/mydanyi/armadaos-freedom:
     use-sigstore-attachments: true
   ghcr.io/virtudude/armada:

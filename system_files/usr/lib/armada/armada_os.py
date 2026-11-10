@@ -1,11 +1,15 @@
+import copy
 import json
+import re
 import subprocess
+
+from updates.client import UpdateClient
 
 UPDATE = "/usr/libexec/armada/armada-update"
 SELECT = "/usr/libexec/armada/armada-select-branch"
 CHANNELS = ("stable", "beta", "preview")
-FREEDOM = "ghcr.io/mydanyi/armadaos-freedom"
-REPOSITORIES = (FREEDOM,)
+FREEDOM = "ghcr.io/armadaos-freedom/armadaos-freedom"
+REPOSITORIES = (FREEDOM, "ghcr.io/mydanyi/armadaos-freedom")
 # Transport prefixes bootc may report on a staged image reference.
 TRANSPORTS = (
     "ostree-image-signed:docker://",
@@ -66,6 +70,20 @@ def deployment(value):
             "stateroot": ostree.get("stateroot"), "incompatible": bool(value.get("incompatible"))}
 
 
+def _rollback_binding(target):
+    if not isinstance(target, dict) or target.get("incompatible") is not False:
+        return None
+    checksum = target.get("checksum")
+    serial = target.get("serial")
+    stateroot = target.get("stateroot")
+    if (not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+            or type(serial) is not int or not 0 <= serial <= 0xffffffff
+            or not isinstance(stateroot, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", stateroot)):
+        return None
+    return f"{stateroot}/{checksum}.{serial}"
+
+
 def snapshot():
     raw = json.loads(command(["/usr/bin/bootc", "status", "--format", "json"]))
     status = raw.get("status") or {}
@@ -86,12 +104,94 @@ def snapshot():
     return state
 
 
+def _service_status(client=None):
+    if client is None:
+        client = UpdateClient()
+    try:
+        record = client.snapshot()["components"].get("system")
+        if (not isinstance(record, dict) or type(record.get("busy")) is not bool
+                or not isinstance(record.get("result"), dict)
+                or record["result"].get("component") != "system"):
+            raise RuntimeError("update service returned invalid system status")
+        if record["busy"]:
+            return copy.deepcopy(record["result"]), True
+        result = client.run("system", "status", timeout=120)
+        if not isinstance(result, dict) or result.get("component") != "system":
+            raise RuntimeError("update service returned invalid system result")
+        return result, False
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("cannot read update service status: %s" % exc) from exc
+
+
 def status():
     state = snapshot()
-    # A reboot is ready for an explicit rollback, or when the staged image is
-    # actually the Freedom channel this deployment now targets.
+    update, busy = _service_status()
+    result_state = update.get("state")
+    idle = not busy
+    state["update"] = update
+    state["update_busy"] = busy
+    state["update_allowed"] = bool(
+        idle and not state["rollback_queued"]
+        and state["repository"] in REPOSITORIES and state["channel"] in CHANNELS
+        and result_state in ("installed", "up_to_date", "update_available"))
+    trial = update.get("trial")
+    target = None
+    if result_state in ("awaiting_reboot", "awaiting_confirmation"):
+        target = update.get("targetVersion")
+        if not target and isinstance(trial, dict):
+            target = trial.get("newDeployment")
+        if not target:
+            target = update.get("newDeployment")
+    state["update_target"] = target
+    binding = _rollback_binding(state["rollback"])
+    state["rollback_allowed"] = bool(
+        idle and not state["staged"] and not state["rollback_queued"]
+        and state["repository"] in REPOSITORIES
+        and result_state in ("installed", "up_to_date", "update_available")
+        and update.get("model") in ("TB322FC", "TB323FU")
+        and isinstance(trial, dict) and trial.get("recordState") == "confirmed"
+        and trial.get("runningDeployment") == "new"
+        and update.get("lastUpdateState") == "confirmed"
+        and binding is not None and trial.get("oldDeployment") == binding)
     state["reboot_ready"] = bool(
-        state["rollback_queued"] or staged_matches_channel(state["staged"], state["channel"]))
+        idle and result_state == "awaiting_reboot" and update.get("requiresReboot") is True)
+    message = ""
+    if busy:
+        phase = update.get("phase")
+        message = "Update operation is running" + (f" ({phase})." if phase else ".")
+    elif result_state == "awaiting_reboot":
+        if update.get("requiresReboot") is True:
+            message = "Update installed. Restart to apply."
+        else:
+            message = "Update status is incomplete."
+    elif result_state == "awaiting_confirmation":
+        if update.get("lastUpdateState") == "finalizing" or update.get("phase") == "finalizing":
+            message = "Update is finalizing."
+        elif isinstance(trial, dict):
+            message = "Update trial is awaiting confirmation."
+        else:
+            message = "Update is awaiting confirmation."
+    elif result_state in ("pending_conflict", "failed", "check_failed", "not_configured",
+                          "unsupported", "uncertain"):
+        message = {
+            "pending_conflict": "Another update operation is pending.",
+            "failed": "Update failed.",
+            "check_failed": "Update check failed.",
+            "not_configured": "Updates are not configured.",
+            "unsupported": "This deployment does not support updates.",
+            "uncertain": "Update status is uncertain.",
+        }[result_state]
+        if update.get("error"):
+            message += " " + str(update["error"])
+    elif state["rollback_queued"]:
+        message = "Unverified legacy rollback is queued."
+    elif update.get("lastUpdateState") == "confirmed":
+        message = "Update confirmed."
+    elif update.get("lastUpdateState") == "rolled_back":
+        message = "Update rolled back."
+    state["update_message"] = message
     return state
 
 
@@ -100,7 +200,13 @@ def select_channel(channel):
         raise ValueError("Unknown update channel")
     if channel not in snapshot()["channels"]:
         raise RuntimeError("Channel selection is unavailable for this image")
-    command([SELECT, channel])
+    result = UpdateClient().run(
+        "system", "select_channel", "testing" if channel == "preview" else channel, timeout=120)
+    if (not isinstance(result, dict) or result.get("component") != "system"
+            or result.get("state") not in (
+                "installed", "up_to_date", "awaiting_reboot", "awaiting_confirmation")):
+        error = result.get("error") if isinstance(result, dict) else None
+        raise RuntimeError("Update channel selection failed" + (f": {error}" if error else ""))
     return {"ok": True}
 
 
@@ -112,31 +218,57 @@ def restart():
 
 
 def execute(operation, checksum=None):
-    state = snapshot()
     if operation == "update":
-        if not state["repository"] or not state["channel"]:
-            raise RuntimeError("This deployment has no supported update target")
+        state = status()
+        update = state["update"]
+        if state["update_busy"]:
+            raise RuntimeError("An update service operation is already running")
+        if update.get("state") == "awaiting_reboot" and update.get("requiresReboot") is True:
+            return {"message": "Update installed. Restart to apply."}
+        if not state["update_allowed"]:
+            raise RuntimeError(state["update_message"] or "No supported OS update is currently available")
         subprocess.run([UPDATE], check=True)
-        current = snapshot()
-        staged = current["staged"]
-        if not staged:
+        current = status()
+        update = current["update"]
+        if (not current["update_busy"] and update.get("state") == "awaiting_reboot"
+                and update.get("requiresReboot") is True):
+            return {"message": "Update installed. Restart to apply."}
+        if not current["update_busy"] and update.get("state") in ("installed", "up_to_date"):
             return {"message": "No new image was needed."}
-        if not staged_matches_channel(staged, current["channel"]):
-            raise RuntimeError(
-                f"An unsupported pending update is staged from {staged['image']}. "
-                "Refresh and confirm the update again.")
-        return {"message": "Update installed. Restart to apply."}
+        details = ": ".join(str(value) for value in (update.get("phase"), update.get("error")) if value)
+        raise RuntimeError("Update did not reach a ready state" + (f": {details}" if details else ""))
     if operation != "rollback":
         raise ValueError("Unknown OS operation")
+    state = status()
+    if state["update_busy"]:
+        raise RuntimeError("An update service operation is already running")
     target = state["rollback"]
     if not target or not target["checksum"] or target["incompatible"]:
         raise RuntimeError("No compatible previous deployment is available")
     if not checksum or checksum != target["checksum"]:
         raise RuntimeError("The rollback target changed. Refresh and confirm rollback again.")
-    if not state["rollback_queued"]:
-        print("Selecting the previous OS deployment", flush=True)
-        subprocess.run(["/usr/bin/bootc", "rollback"], check=True)
-    selected = snapshot()
-    if not selected["rollback_queued"] or not selected["rollback"] or selected["rollback"]["checksum"] != checksum:
-        raise RuntimeError("The expected rollback deployment was not selected")
-    return {"message": "Rollback ready. Restart to apply."}
+    binding = _rollback_binding(target)
+    update = state["update"]
+    if update.get("state") == "awaiting_reboot" and update.get("requiresReboot") is True:
+        trial = update.get("trial")
+        selected = trial.get("newDeployment") if isinstance(trial, dict) else None
+        if not selected:
+            selected = update.get("newDeployment")
+        if binding is not None and selected == binding:
+            return {"message": "Rollback ready. Restart to apply."}
+        raise RuntimeError("Another OS change is already awaiting restart")
+    if not state["rollback_allowed"]:
+        raise RuntimeError("The previous bound deployment is unavailable")
+    print("Selecting the previous OS deployment", flush=True)
+    result = UpdateClient().run("system", "rollback", checksum=checksum)
+    if (isinstance(result, dict) and result.get("component") == "system"
+            and result.get("state") == "awaiting_reboot"
+            and result.get("requiresReboot") is True
+            and result.get("bootWriteState") == "written"
+            and result.get("activationOutcome") == "activated"
+            and result.get("newDeployment") == binding):
+        return {"message": "Rollback ready. Restart to apply."}
+    raw_details = (result.get("phase"), result.get("error")) if isinstance(result, dict) else ()
+    details = ": ".join(str(value)[:300] for value in raw_details if value)
+    raise RuntimeError("Rollback did not reach a verified ready state"
+                       + (f": {details}" if details else ""))

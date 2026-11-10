@@ -92,7 +92,8 @@ class UpdatesGroup(Adw.PreferencesGroup):
                                     use_subtitle=True, subtitle_lines=0, sensitive=False)
         self.channel.connect("notify::selected", self.change_channel)
         self.update = Gtk.Button(label="Update", sensitive=False, valign=Gtk.Align.CENTER)
-        self.update.connect("clicked", lambda *_: self.confirm_update())
+        self.update.connect("clicked", lambda *_: self.confirm_restart()
+                            if self.state.get("reboot_ready") else self.confirm_update())
         self.update.set_tooltip_text("Install the latest OS version from the selected channel")
         self.channel.add_suffix(self.update)
         self.add(self.channel)
@@ -140,11 +141,11 @@ class UpdatesGroup(Adw.PreferencesGroup):
 
     def render(self, state):
         self.state = state
-        idle = not self.requesting and not self.loading
+        idle = not self.requesting and not self.loading and not state.get("update_busy", False)
         self.current.set_subtitle(state["booted"]["version"])
         previous = state["rollback"]
         self.previous.set_subtitle(previous["version"] if previous else "No previous version available")
-        self.rollback.set_sensitive(idle and bool(previous) and not previous["incompatible"] and not state["rollback_queued"])
+        self.rollback.set_sensitive(idle and state.get("rollback_allowed", False))
         if self.operation and not self.operation.running:
             self.operation.restart_button.set_visible(idle and self.operation.succeeded and state["reboot_ready"])
         self.updating = True
@@ -160,11 +161,24 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.channel.set_sensitive(idle)
         self.channel.set_activatable(idle and bool(self.channels))
         self.channel.set_enable_search(False)
-        self.update.set_sensitive(idle and bool(state["repository"]))
-        if self.result:
+        update_allowed = (state["update_allowed"] if "update_allowed" in state
+                          else bool(state["repository"]))
+        reboot_ready = state["reboot_ready"]
+        self.update.set_label("Restart" if reboot_ready else "Update")
+        self.update.set_tooltip_text("Restart to apply the queued OS changes" if reboot_ready
+                                     else "Install the latest OS version from the selected channel")
+        self.update.set_sensitive(idle and (reboot_ready or update_allowed))
+        if state.get("update_message"):
+            self.show_message(state["update_message"])
+        elif self.result:
             self.show_message(self.result)
         elif state["rollback_queued"]:
-            self.show_message("Rollback ready. Restart to apply.")
+            self.show_message("A rollback may be pending, but it is unverified. Repair or verify the OS state before restarting.")
+        elif state.get("update_target"):
+            if state["reboot_ready"]:
+                self.show_message("Update installed. Restart to apply.")
+            else:
+                self.show_message(f"Pending update to {state['update_target']}.")
         elif state["staged"]:
             if state["reboot_ready"]:
                 self.show_message("Update installed. Restart to apply.")
@@ -227,10 +241,9 @@ class UpdatesGroup(Adw.PreferencesGroup):
         target = self.state["rollback"]
         if not target:
             return
-        pending = " The pending update will be discarded." if self.state["staged"] else ""
-        self.confirm("Roll Back Armada?", f"Restore version {target['version']} and its system settings. "
-                     "Games and personal files are kept."
-                     f"{pending}\n\nA restart is required.", "Roll Back", "rollback-os", target["checksum"])
+        self.confirm("Roll Back Armada?", f"Restore version {target['version']}. "
+                     "Games and personal files are kept. A matching boot is prepared in the other slot."
+                     "\n\nA restart is required.", "Roll Back", "rollback-os", target["checksum"])
 
     def confirm_restart(self):
         self.confirm("Restart Now?", "Save your work and close any running games before restarting.", "Restart", "restart-os")

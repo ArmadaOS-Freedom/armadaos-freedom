@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+import sys
+
+if "/usr/lib/armada" not in sys.path:
+    sys.path.insert(0, "/usr/lib/armada")
+
+from updates.installer_authorization import main
+
+if __name__ == "__main__":
+    sys.exit(main())

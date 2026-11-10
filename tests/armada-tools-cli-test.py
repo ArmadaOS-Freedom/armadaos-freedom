@@ -104,7 +104,7 @@ except SystemExit as error:
                  "rollback": {"version": "20260907.previous", "checksum": "b" * 64, "incompatible": False},
                  "staged": None, "rollback_queued": False, "reboot_ready": False,
                  "channel": "stable", "channels": ["stable", "beta", "preview"],
-                 "repository": "ghcr.io/mydanyi/armadaos-freedom"}
+                 "repository": "ghcr.io/armadaos-freedom/armadaos-freedom"}
         state.update(overrides)
         return state
 
@@ -116,7 +116,7 @@ except SystemExit as error:
 
     def test_status_offers_after_restart_for_a_matching_freedom_pending_update(self):
         output = self.operating_system_status(self.operating_system_state(
-            staged={"version": "20260920.next", "image": "ghcr.io/mydanyi/armadaos-freedom:stable"},
+            staged={"version": "20260920.next", "image": "ghcr.io/armadaos-freedom/armadaos-freedom:stable"},
             reboot_ready=True))
         self.assertIn("After Restart: 20260920.next", output)
 

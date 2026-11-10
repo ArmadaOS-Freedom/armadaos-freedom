@@ -6,6 +6,15 @@
     ],
     "transports": {
         "docker": {
+            "ghcr.io/armadaos-freedom/armadaos-freedom": [
+                {
+                    "type": "sigstoreSigned",
+                    "keyPaths": ["/etc/pki/containers/armadaos-freedom.pub"],
+                    "signedIdentity": {
+                        "type": "matchRepository"
+                    }
+                }
+            ],
             "ghcr.io/mydanyi/armadaos-freedom": [
                 {
                     "type": "reject"

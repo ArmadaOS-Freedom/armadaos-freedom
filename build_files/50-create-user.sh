@@ -30,5 +30,6 @@ cat > /etc/sudoers.d/armada-user <<'EOF'
 %wheel ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff
 %wheel ALL=(ALL) NOPASSWD: /usr/bin/systemctl reboot
 %wheel ALL=(ALL) NOPASSWD: /usr/libexec/armada/armada-installer *
+%wheel ALL=(root) NOPASSWD: /usr/bin/python3 -I /usr/libexec/armada/armada-offline-update
 EOF
 chmod 0440 /etc/sudoers.d/armada-user

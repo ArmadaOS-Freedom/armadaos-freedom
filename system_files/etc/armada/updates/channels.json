@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "channels": {
+    "stable": {
+      "url": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/stable.json",
+      "signatureUrl": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/stable.json.sig"
+    },
+    "beta": {
+      "url": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/beta.json",
+      "signatureUrl": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/beta.json.sig"
+    },
+    "testing": {
+      "url": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/testing.json",
+      "signatureUrl": "https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/testing.json.sig"
+    }
+  }
+}
