@@ -952,6 +952,10 @@ int kshim_main(
                                                        : NULL);
                     }
                     if (status == 0) {
+                        handoff_stage = "boot-state";
+                        status = fdt_open_into(blob, blob, sizeof(HandoffDtb));
+                    }
+                    if (status == 0) {
                         status = kshim_boot_witness_export(blob, booted_slot);
                     }
                     if (status == 0) {
