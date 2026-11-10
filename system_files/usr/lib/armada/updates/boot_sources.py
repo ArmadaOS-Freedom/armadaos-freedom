@@ -171,23 +171,6 @@ def capture_boot_sources(expected_physical, output_dir, *, extra_labels=()):
         inspector=physical_slots.inspect_physical_slots, phase=_PHASE)
 
 
-def capture_recovery_boot_sources(expected_physical, output_dir, *, extra_labels=()):
-    """Snapshot current boot sources in RAM; these may include a temporary boot."""
-    if not isinstance(expected_physical, dict):
-        raise BootSourcesError('expected_physical must be a dict')
-    if type(expected_physical.get('schemaVersion')) is not int or \
-            expected_physical['schemaVersion'] != 1:
-        raise BootSourcesError('recovery report schemaVersion must be integer 1')
-    if expected_physical.get('phase') != 'recovery_slots_checked':
-        raise BootSourcesError('expected_physical is not a recovery slot report')
-    if 'deployment' in expected_physical or 'booted' in expected_physical:
-        raise BootSourcesError('recovery report must not contain deployment or booted')
-    return _capture_boot_sources(
-        expected_physical, output_dir, extra_labels,
-        inspector=physical_slots.inspect_recovery_slots,
-        phase='recovery_boot_sources_captured')
-
-
 def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,
                           inspector, phase):
     if not isinstance(expected_physical, dict):

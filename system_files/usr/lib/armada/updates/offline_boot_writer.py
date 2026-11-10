@@ -2,12 +2,11 @@
 
 import copy
 import hashlib
-import json
 import os
 import stat
 import uuid
 
-from . import boot_sources, physical_slots, recovery_authorization, recovery_boot_sources
+from . import boot_sources, physical_slots
 from .boot_candidate import _require_positive_int, _verify_claim
 from .boot_lock import read_boot_lock
 from .boot_sources import _load_locator, _locate, _rehash_region
@@ -78,62 +77,12 @@ def _validate_candidate_report(slot, report, trust_report, snapshot, initial, *,
     }
 
 
-def _resolve_recovery_sources(session_identity, sources, temporary_boot_sha256):
-    identity = recovery_authorization._session(json.dumps(session_identity).encode())
-    if type(identity.get('schemaVersion')) is not int or identity['schemaVersion'] != 2:
-        raise BootWriteError('recovery session identity must use schemaVersion 2')
-    required = {
-        'schemaVersion', 'phase', 'physical', 'slots', 'extraFiles',
-        'partitions', 'liveBoots', 'originalBoots', 'recoverySessionId',
-    }
-    if not isinstance(sources, dict) or set(sources) != required \
-            or type(sources.get('schemaVersion')) is not int \
-            or sources.get('schemaVersion') != 1 \
-            or sources.get('phase') != 'recovery_boot_sources_resolved' \
-            or sources.get('recoverySessionId') != identity['sessionId']:
-        raise BootWriteError('invalid or mismatched recovery boot sources')
-    live_snapshot = {
-        'schemaVersion': 1,
-        'phase': 'recovery_boot_sources_captured',
-        'physical': copy.deepcopy(sources['physical']),
-        'slots': copy.deepcopy(sources['slots']),
-        'extraFiles': copy.deepcopy(sources['extraFiles']),
-        'partitions': copy.deepcopy(sources['partitions']),
-    }
-    for slot in _SLOTS:
-        live_snapshot['slots'][slot]['boot'] = copy.deepcopy(sources['liveBoots'][slot])
-    original_boots = {slot: sources['slots'][slot]['boot'] for slot in _SLOTS}
-    resolved = recovery_boot_sources.resolve_session_recovery_boot_sources(
-        identity,
-        live_snapshot,
-        original_boots,
-        temporary_boot_sha256=temporary_boot_sha256,
-    )
-    if resolved != sources:
-        raise BootWriteError('resolved recovery boot sources differ from stored sources')
-    return resolved, identity
-
-
 def write_offline_boots(trust_report, candidates, *, progress=None):
     """Write inactive then current native boot extents; caller holds transaction/global lock."""
-    return _write_offline_boots(trust_report, candidates, recovery_session=None, progress=progress)
+    return _write_offline_boots(trust_report, candidates, progress=progress)
 
 
-def write_recovery_offline_boots(
-        trust_report, candidates, *, session_identity, temporary_boot_sha256, progress=None):
-    """Write both recovery A/B boots using an explicitly authorized recovery session."""
-    return _write_offline_boots(
-        trust_report,
-        candidates,
-        recovery_session={
-            'session_identity': session_identity,
-            'temporary_boot_sha256': temporary_boot_sha256,
-        },
-        progress=progress,
-    )
-
-
-def _write_offline_boots(trust_report, candidates, *, recovery_session, progress):
+def _write_offline_boots(trust_report, candidates, *, progress):
     ro_fds = []
     rw_fds = {}
     started_slots = []
@@ -144,8 +93,7 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
     try:
         if progress is not None and not callable(progress):
             raise BootWriteError('progress must be callable or None')
-        is_recovery = recovery_session is not None
-        expected_phase = 'recovery_boot_trust_checked' if is_recovery else 'boot_trust_checked'
+        expected_phase = 'boot_trust_checked'
         if not isinstance(trust_report, dict) \
                 or type(trust_report.get('schemaVersion')) is not int \
                 or trust_report.get('schemaVersion') != 1 \
@@ -154,10 +102,6 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
         if not isinstance(candidates, dict) or set(candidates.keys()) != {'a', 'b'}:
             raise BootWriteError('candidates must map exact keys a and b')
         initial = trust_report['physical']
-        if is_recovery and (
-                initial.get('phase') != 'recovery_slots_checked'
-                or 'deployment' in initial or 'booted' in initial):
-            raise BootWriteError('invalid recovery physical slot report')
         actual, inactive = initial['actualSlot'], initial['inactiveSlot']
         if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
             raise BootWriteError('invalid physical active/inactive slots')
@@ -166,19 +110,8 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
         extras = ['recovery_a', 'recovery_b', 'vbmeta_system_a', 'vbmeta_system_b']
         if initial['model'] == 'TB323FU':
             extras.append('efisp')
-        identity = None
-        if is_recovery:
-            snapshot, identity = _resolve_recovery_sources(
-                recovery_session['session_identity'],
-                trust_report['sources'],
-                recovery_session['temporary_boot_sha256'],
-            )
-            if set(snapshot['extraFiles']) != set(extras):
-                raise BootWriteError('recovery sources contain unexpected extra files')
-            current_binding = identity['installedDeployment']
-        else:
-            snapshot = _normalize_snapshot(trust_report['sources'], initial, extras)
-            current_binding = initial['deployment']
+        snapshot = _normalize_snapshot(trust_report['sources'], initial, extras)
+        current_binding = initial['deployment']
         if not isinstance(trust_report.get('trust'), dict) \
                 or not {'a', 'b'}.issubset(trust_report['trust'].keys()):
             raise BootWriteError('boot trust report missing slot trust entries')
@@ -187,10 +120,7 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
             plan[slot] = _validate_candidate_report(
                 slot, candidates[slot], trust_report, snapshot, initial,
                 current_binding=current_binding)
-            if is_recovery:
-                expected_boot_sha[slot] = snapshot['liveBoots'][slot]['sha256']
-            else:
-                expected_boot_sha[slot] = plan[slot]['originalClaim']['sha256']
+            expected_boot_sha[slot] = plan[slot]['originalClaim']['sha256']
             slot_results[slot] = {
                 'slot': slot,
                 'status': 'not_started',
@@ -207,8 +137,7 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
         deployment = plan['a']['deployment']
         slot_order = [inactive, actual]
 
-        fresh_physical = physical_slots.inspect_recovery_slots() if is_recovery \
-            else physical_slots.inspect_physical_slots()
+        fresh_physical = physical_slots.inspect_physical_slots()
         if fresh_physical != initial or read_boot_lock() != trust_report['lockState']:
             raise BootWriteError('physical slot or lock state changed since trust capture')
         recovery = physical_slots.locate_recovery_partition(require_edl=False)
@@ -219,14 +148,7 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
         _, found = _inventory(initial, recovery_rdev)
 
         def check_context():
-            if not is_recovery:
-                _check_context(initial, trust_report['lockState'], recovery)
-                return
-            if physical_slots.inspect_recovery_slots() != initial \
-                    or read_boot_lock() != trust_report['lockState'] \
-                    or physical_slots.locate_recovery_partition(require_edl=False) != recovery:
-                raise BootWriteError('recovery physical slot, lock, or partition state changed')
-            _inventory(initial, recovery_rdev)
+            _check_context(initial, trust_report['lockState'], recovery)
 
         luns = sorted(found)
         for lun in luns:
@@ -348,13 +270,6 @@ def _write_offline_boots(trust_report, candidates, *, recovery_session, progress
             'physical': initial,
             'writes': writes,
         }
-        if is_recovery:
-            result.update({
-                'runtime': 'recovery',
-                'recoverySessionId': identity['sessionId'],
-                'oldDeployment': current_binding,
-                'temporaryBootSha256': recovery_session['temporary_boot_sha256'],
-            })
         return result
     except Exception as error:
         if not started_slots:

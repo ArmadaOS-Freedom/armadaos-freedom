@@ -19,20 +19,14 @@ from .boot_candidate import (
     _write_new,
 )
 from .boot_lock import BootLockError, read_boot_lock
-from .boot_materials import BootMaterialsError, _copy_verified, _validate_output_dir
+from .boot_materials import BootMaterialsError, _validate_output_dir
 from .boot_sources import (
     BootSourcesError,
     capture_boot_sources,
-    capture_recovery_boot_sources,
 )
 from .physical_slots import (
     PhysicalSlotsError,
     inspect_physical_slots,
-    inspect_recovery_slots,
-)
-from .recovery_boot_sources import (
-    RecoveryBootSourcesError,
-    resolve_session_recovery_boot_sources,
 )
 
 
@@ -328,121 +322,6 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
         BootSourcesError,
         BootLockError,
         PhysicalSlotsError,
-        OSError,
-    ) as exc:
-        raise BootTrustError(str(exc)) from exc
-
-
-def _stage_original_boots(out, resolved):
-    """Copy authenticated original A/B boot bytes into the transaction.
-
-    The resolver has already authenticated the original claims and matched
-    live temporary vs original identity; this re-reads the exact original
-    bytes with a bounded, fstat-checked copy so the inspect-trust request
-    and later guards never depend on the ephemeral upload directory.
-    """
-    originals = out / "originals"
-    originals.mkdir(mode=0o700)
-    for slot in ("a", "b"):
-        claim = resolved["originalBoots"][slot]
-        src_fd = os.open(
-            claim["path"],
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-        )
-        try:
-            copied_sha = _copy_verified(
-                src_fd, originals / f"boot_{slot}.img", claim["bytes"]
-            )
-        finally:
-            os.close(src_fd)
-        if copied_sha != claim["sha256"].lower():
-            raise BootTrustError(
-                f"staged original boot {slot} digest does not match the "
-                "authenticated session claim"
-            )
-        staged = dict(claim)
-        staged["path"] = str(originals / f"boot_{slot}.img")
-        resolved["slots"][slot]["boot"] = staged
-        resolved["originalBoots"][slot] = staged
-    _fsync_directory(originals)
-
-
-def capture_recovery_boot_trust(
-    *,
-    output_dir,
-    original_boots,
-    session_identity,
-    temporary_boot_sha256,
-    boot_tool_path=_DEFAULT_BOOT_TOOL_PATH,
-):
-    """Capture current RAM boot sources and authenticate the original A/B boots.
-
-    The caller must hold the update lock and bind original_boots,
-    session_identity and temporary_boot_sha256 to an authenticated one-time
-    installer session. All recovery trust preparation is session-bound via
-    the schema 2 session resolver; no raw resolver bypass exists here. The
-    inspect-trust CLI request is built from the resolver's original boot
-    slots, never from the temporary recovery boot; liveBoots are preserved
-    for later write guards.
-    """
-    try:
-        out = _validate_output_dir(output_dir, [])
-        tool_path = _validate_boot_tool(boot_tool_path, [], out)
-
-        initial = inspect_recovery_slots()
-        if not isinstance(initial, dict) or initial.get("model") not in _NATIVE_MODELS:
-            raise BootTrustError("native A/B boot trust is supported only on TB322FC and TB323FU")
-        initial_lock = read_boot_lock()
-        if not isinstance(initial_lock, str) or initial_lock not in _LOCK_STATES:
-            raise BootTrustError(f"unsupported boot-lock state: {initial_lock!r}")
-
-        out.mkdir(mode=0o700)
-        tmp = out / "tmp"
-        tmp.mkdir(mode=0o700)
-
-        extra_labels = (
-            "recovery_a", "recovery_b", "vbmeta_system_a", "vbmeta_system_b"
-        )
-        if initial["model"] == "TB323FU":
-            extra_labels += ("efisp",)
-        snapshot = capture_recovery_boot_sources(
-            initial, out / "sources", extra_labels=extra_labels
-        )
-
-        resolved = resolve_session_recovery_boot_sources(
-            session_identity,
-            snapshot,
-            original_boots,
-            temporary_boot_sha256=temporary_boot_sha256,
-        )
-        resolved = deepcopy(resolved)
-        _stage_original_boots(out, resolved)
-
-        request = {
-            "schemaVersion": 1,
-            "model": initial["model"],
-            "lockState": initial_lock,
-            "a": _slot_request(resolved, "a"),
-            "b": _slot_request(resolved, "b"),
-            "efisp": (
-                _to_cli_claim(resolved["extraFiles"]["efisp"])
-                if initial["model"] == "TB323FU" else None
-            ),
-        }
-        return _finalize_trust(
-            tool_path, out, tmp, initial, initial_lock, request, resolved,
-            "recovery_boot_trust_checked",
-            lambda: inspect_recovery_slots() == initial,
-        )
-    except BootTrustError:
-        raise
-    except (
-        BootCandidateError,
-        BootMaterialsError,
-        BootSourcesError,
-        BootLockError,
-        PhysicalSlotsError,
-        RecoveryBootSourcesError,
         OSError,
     ) as exc:
         raise BootTrustError(str(exc)) from exc
