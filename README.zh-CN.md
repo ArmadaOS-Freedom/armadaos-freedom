@@ -37,7 +37,7 @@
 
 ## 关于 ArmadaOS Freedom
 
-ArmadaOS Freedom 是基于 [ArmadaOS](https://github.com/armada-os/armada)、由社区维护的平板适配分支。我们保留上游的游戏和桌面系统基础，针对平板硬件调整启动、显示、电源和外设，控制插件则采用 [Freedom Control](https://github.com/mydanyi/freedom-control)。
+ArmadaOS Freedom 是基于 [ArmadaOS](https://github.com/armada-os/armada)、由社区维护的平板适配分支。我们保留上游的游戏和桌面系统基础，针对平板硬件调整启动、显示、电源和外设，控制插件则采用 [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control)。
 
 目前已接入的功能：
 
@@ -47,7 +47,7 @@ ArmadaOS Freedom 是基于 [ArmadaOS](https://github.com/armada-os/armada)、由
 - 按设备型号匹配的显示档位、触屏、电源、音频与网络配置。
 - 双 USB 端口适配，以及电池和温度数据采集。
 - 平板触屏输入，以及 G9／G9 2026 手柄按键映射、RGB 控制和双击 Home 打开右侧快捷菜单。
-- 面向平板的 [Freedom Control](https://github.com/mydanyi/freedom-control) 适配，包括在无风扇设备上隐藏风扇控制。
+- 面向平板的 [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) 适配，包括在无风扇设备上隐藏风扇控制。
 
 各项功能的可用范围因设备而异，具体状态见下方设备文档。本仓库目前维护适配源码与补丁，平板安装镜像和 OTA 更新流程仍在完善中。
 
@@ -92,7 +92,7 @@ Linux 内核和设备树随 boot 镜像打包；内核启动后，根据所选�
 | 系统内使用哪些引导工具 | [kShimC 打包工具](packages/kshim-tools/README.md) |
 | 组件来源与固定版本 | [四代源码与来源](devices/lenovo-tb322fc/README.md#源码与来源) · [五代来源记录](devices/lenovo-tb323fu/docs/SOURCES.md) |
 | 上游系统如何使用 | [ArmadaOS 使用文档](https://armadaos.dev/using-armada/) |
-| 反馈本分支的问题 | [Freedom 问题反馈](https://github.com/mydanyi/armadaos-freedom/issues) |
+| 反馈本分支的问题 | [Freedom 问题反馈](https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues) |
 
 上游安装说明适用于上游支持的设备。平板的安装与启动方式请以本仓库对应机型的文档为准。
 
@@ -111,7 +111,7 @@ $ just --list    # 查看开发命令
 
 ### Freedom Control
 
-控制插件来自固定版本的 [Freedom Control](https://github.com/mydanyi/freedom-control) 依赖，位于 `decky/freedom-control`。本仓库不再维护插件源码副本，因此首次检出后需要获取固定版本：
+控制插件来自固定版本的 [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) 依赖，位于 `decky/freedom-control`。本仓库不再维护插件源码副本，因此首次检出后需要获取固定版本：
 
 ```console
 $ git submodule update --init --recursive
@@ -146,7 +146,7 @@ ArmadaOS Freedom 目前靠热爱和自费投入持续推进。从启动、显示
 
 - 系统基础：[ArmadaOS](https://github.com/armada-os/armada)，基于 [Fedora bootc](https://github.com/bootc-dev/bootc)。
 - 启动菜单：[kShimC](https://github.com/sunflower2333/kShimC/tree/feature/2610)。
-- 控制插件：[Freedom Control](https://github.com/mydanyi/freedom-control)。
+- 控制插件：[Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control)。
 - Armada 标志：[Rax](https://github.com/Raxcoms)。
 
 更多贡献者见[上游致谢](https://armadaos.dev/project/credits/)，设备适配的组件来源与固定版本见[对应设备文档](#设备支持)。各组件保留原有的来源署名和许可证。

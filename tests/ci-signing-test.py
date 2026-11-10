@@ -38,8 +38,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Approved configuration values.
-CANONICAL_IMAGE = "ghcr.io/mydanyi/armadaos-freedom"
-CANONICAL_OWNER = "mydanyi"
+CANONICAL_IMAGE = "ghcr.io/armadaos-freedom/armadaos-freedom"
+CANONICAL_OWNER = "ArmadaOS-Freedom"
 CANONICAL_REPO = "armadaos-freedom"
 SIGNING_PUBLIC_KEY = "system_files/etc/pki/containers/armadaos-freedom.pub"
 LEGACY_PUBLIC_KEY = "system_files/etc/pki/containers/armada.pub"
@@ -66,6 +66,7 @@ class UnrenderedExpression(Exception):
 def _expr_values():
     """Explicit, harmless substitution table for the known workflow expressions."""
     return {
+        "github.repository": f"{CANONICAL_OWNER}/{CANONICAL_REPO}",
         "github.repository_owner": CANONICAL_OWNER,
         "github.event.repository.name": CANONICAL_REPO,
         "github.event.repository.fork": "false",
@@ -76,9 +77,10 @@ def _expr_values():
         "runner.temp": "/tmp/fixture-runner-temp",
         "secrets.GITHUB_TOKEN": "fixture-token",
         "secrets.SIGNING_SECRET": PRIVATE_VALUE,
+        "secrets.SIGNING_PASSWORD": "fixture-password",
         "secrets.COSIGN_PRIVATE_KEY": PRIVATE_VALUE,
         "env.IMAGE_NAME": CANONICAL_REPO,
-        "env.IMAGE_REGISTRY": "ghcr.io/" + CANONICAL_OWNER,
+        "env.IMAGE_REGISTRY": "ghcr.io/" + CANONICAL_OWNER.lower(),
         "env.ARMADA_CANONICAL_IMAGE": CANONICAL_IMAGE,
         "env.ARMADA_SIGNING_PUBLIC_KEY": SIGNING_PUBLIC_KEY,
         "env.HAVE_SIGNING_SECRET": "true",
@@ -113,9 +115,12 @@ def render(text, overrides=None):
 
     def replace(match):
         key = match.group(1)
-        if key not in values:
-            raise UnrenderedExpression(key)
-        return values[key]
+        if key in values:
+            return values[key]
+        comparison = re.fullmatch(r"(.+?)\s*!=\s*''", key)
+        if comparison and comparison.group(1) in values:
+            return "false" if values[comparison.group(1)] == "" else "true"
+        raise UnrenderedExpression(key)
 
     return _EXPR_RE.sub(replace, text)
 
@@ -151,6 +156,34 @@ class Workflow:
 
     def step_offset(self, name):
         return self.text.index(f"      - name: {name}\n")
+
+    def step_env(self, name):
+        """Parse the step-level ``env:`` block of a named step into a dict.
+
+        Workflows pass ``${{ ... }}`` values through step ``env:`` instead of
+        interpolating them into the shell command, so the fixture must export
+        those values before running the step body, exactly like a runner does.
+        """
+        marker = f"      - name: {name}\n"
+        if marker not in self.text:
+            raise KeyError(f"workflow has no step named {name!r}")
+        step = self.text.split(marker, 1)[1]
+        lines = step.split("\n")
+        result = {}
+        for index, line in enumerate(lines):
+            if line.startswith("      - name:"):
+                break
+            if line != "        env:":
+                continue
+            for entry in lines[index + 1:]:
+                if not entry.startswith("          "):
+                    break
+                key, sep, value = entry.strip().partition(":")
+                if not sep:
+                    break
+                result[key.strip()] = value.strip().strip('"').strip("'")
+            break
+        return result
 
     def step_script(self, name):
         """Return the dedented body of the ``run: |`` block of a named step."""
@@ -352,6 +385,10 @@ class Harness(unittest.TestCase):
         for key, value in self.workflow.env().items():
             env[key] = render(value, overrides) if "${{" in value else value
 
+        # These step tests start after the runner has applied GITHUB_ENV.
+        env["IMAGE_REGISTRY"] = env["IMAGE_REGISTRY"].lower()
+        env["IMAGE_NAME"] = env["IMAGE_NAME"].lower()
+
         for name in ("github_output", "github_env", "summary"):
             (self.tmp / name).write_text("")
         (self.tmp / "home").mkdir(exist_ok=True)
@@ -361,6 +398,7 @@ class Harness(unittest.TestCase):
             "STUB_DIGEST": SHA256_DIGEST,
             "STUB_IDENTITY": CANONICAL_IMAGE,
             "STUB_VERIFY_FAIL": "0",
+            "COSIGN_PASSWORD": "fixture-password",
             "GITHUB_OUTPUT": str(self.tmp / "github_output"),
             "GITHUB_ENV": str(self.tmp / "github_env"),
             "GITHUB_STEP_SUMMARY": str(self.tmp / "summary"),
@@ -394,6 +432,14 @@ class Harness(unittest.TestCase):
         lines.append("set -eo pipefail")
         for name in names:
             lines.append(f"# ---- step: {name} ----")
+            for key, value in self.workflow.step_env(name).items():
+                rendered = shlex.quote(render(value, overrides))
+                # A variable already supplied by the fixture (a simulated
+                # secret, for instance) wins: those cases test a missing value,
+                # which a rendered step ``env:`` would otherwise restore.
+                lines.append(
+                    f'if [ -z "${{{key}+x}}" ]; then export {key}={rendered}; fi'
+                )
             lines.append(render(self.workflow.step_script(name), overrides))
         script = "\n".join(lines) + "\n"
         return subprocess.run(
@@ -431,7 +477,7 @@ class ConfigContractTest(unittest.TestCase):
         # canonical constant names, in both workflows.
         for workflow in (BUILD, PROMOTE):
             env = workflow.env()
-            derived = f"{render(env['IMAGE_REGISTRY'])}/{render(env['IMAGE_NAME'])}"
+            derived = f"{render(env['IMAGE_REGISTRY'])}/{render(env['IMAGE_NAME'])}".lower()
             self.assertEqual(derived, env.get("ARMADA_CANONICAL_IMAGE"))
             self.assertEqual(derived, CANONICAL_IMAGE)
 
@@ -475,6 +521,14 @@ class BuildSigningKeyTest(Harness):
 
     def test_missing_private_signing_value_fails(self):
         result = self.run_check(private="")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_signing_password_fails(self):
+        self.write_key(SIGNING_PUBLIC_KEY)
+        result = self.run_chain(
+            ["Check signing key"],
+            extra_env={"COSIGN_PRIVATE_KEY": PRIVATE_VALUE, "COSIGN_PASSWORD": ""},
+        )
         self.assertNotEqual(result.returncode, 0)
 
 
@@ -532,6 +586,17 @@ class BuildSigningFlowTest(Harness):
 
 class BuildRepositoryGuardTest(Harness):
     workflow = BUILD
+
+    def test_prepare_normalizes_organization_name_for_ghcr(self):
+        result = self.run_chain(
+            ["Prepare environment"],
+            extra_env={"IMAGE_REGISTRY": "ghcr.io/ArmadaOS-Freedom",
+                       "IMAGE_NAME": "armadaos-freedom"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = (self.tmp / "github_env").read_text().splitlines()
+        self.assertIn("IMAGE_REGISTRY=ghcr.io/armadaos-freedom", exported)
+        self.assertIn("IMAGE_NAME=armadaos-freedom", exported)
 
     def test_wrong_repository_fails_before_registry_use(self):
         self.write_key(SIGNING_PUBLIC_KEY)

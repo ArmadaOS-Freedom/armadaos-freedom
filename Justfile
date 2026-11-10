@@ -23,6 +23,16 @@ check: test
     just --unstable --fmt --check -f Justfile
 
 [group('Test')]
+test-update-deployment:
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-deployment-store-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-image-source-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-source-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-image-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-payload-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-deployment-options-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-boot-materials-test.py
+
+[group('Test')]
 test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -32,6 +42,10 @@ test:
         bash "${test_file}"
     done
     python3 -m unittest discover -s tests -p test_plugin_sources.py
+    python3 -m unittest discover -s tests -p 'test_decky_*.py'
+    python3 -m unittest discover -s tests -p 'test_update_*.py'
+    python3 tests/organization-migration-test.py
+    python3 tests/ci-signing-test.py
 
 # EDL filesystem tests; needs privileged containers, separate from `just test`
 [group('Test')]
@@ -121,7 +135,7 @@ sudoif command *args:
     sudoif {{ command }} {{ args }}
 
 # Registry holding published package images (override to use a fork's)
-export pkg_registry := env("ARMADA_PKG_REGISTRY", "ghcr.io/mydanyi/armada/pkg")
+export pkg_registry := env("ARMADA_PKG_REGISTRY", "ghcr.io/armadaos-freedom/armada/pkg")
 
 # Registry consulted when a package is absent from pkg_registry
 # (override to use another source)
@@ -190,14 +204,24 @@ build $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    REFS="$(mktemp)"
+    BOOT_TOOL_SOURCE="$(mktemp -d _build-boot-tool.XXXXXX)"
+    trap 'rm -f "${REFS}" && rm -rf -- "${BOOT_TOOL_SOURCE}"' EXIT
+
+    BOOT_TOOL_SOURCE_ARGS=()
+    if [[ -n "${ARMADA_BOOT_TOOL_LOCAL_SOURCE:-}" ]]; then
+        BOOT_TOOL_SOURCE_ARGS+=("--local-source" "${ARMADA_BOOT_TOOL_LOCAL_SOURCE}")
+    fi
+    python3 build_files/prepare-boot-tool-source.py \
+        --output "${BOOT_TOOL_SOURCE}" \
+        "${BOOT_TOOL_SOURCE_ARGS[@]}"
+
     # Resolve the latest bundled plugin sources before any package lookup or
     # image build, so the layers never come from a cached earlier resolution.
     python3 build_files/resolve-plugin-sources.py
 
     # Resolve every package to an image: one built locally if present, else
     # the published one for that content hash.
-    REFS="$(mktemp)"
-    trap 'rm -f "${REFS}"' EXIT
     for dir in packages/*/; do
         pkg="$(basename "${dir}")"
         [ -f "${dir}/build.sh" ] || continue
@@ -235,6 +259,7 @@ build $target_image=image_name $tag=default_tag:
     podman build \
         --build-arg "ARMADA_VERSION=${ARMADA_VERSION}" \
         --build-arg "ARMADA_REVISION=${ARMADA_REVISION}" \
+        --build-arg "BOOT_TOOL_SOURCE=${BOOT_TOOL_SOURCE}" \
         --build-arg-file "${REFS}" \
         "${SECRET_ARGS[@]}" \
         --platform linux/arm64 \
@@ -403,7 +428,7 @@ build-edl-package $image $digest $revision $version $origin="":
 
 # Build the 9008/EDL package from a locally built image (just build), using the
 # image's own version and revision labels. ORIGIN is the signed origin the
-# devices update from (ostree-image-signed:docker://ghcr.io/mydanyi/
+# devices update from (ostree-image-signed:docker://ghcr.io/armadaos-freedom/
 # armadaos-freedom:stable|beta|testing). Output: ./output/edl/<version>/
 [group('Armada')]
 build-edl-package-local $origin $target_image=("localhost/" + image_name) $tag=default_tag:

@@ -40,13 +40,6 @@ DEFAULT_ENTRY = "android"
 RUNTIME_BYTES = 4 * (1 << 20)
 ARM64_MAGIC = b"ARM\x64"
 
-DIAGNOSTIC_VERBOSE_TAIL = (
-    "loglevel=8",
-    "ignore_loglevel",
-    "printk.time=1",
-    "initcall_debug",
-    "rd.debug",
-)
 DEFAULT_DEVICES_CONFIG = Path(__file__).resolve().with_name("edl-devices.json")
 
 # Filesystem creation and deployment stay model-independent; only compatibility
@@ -683,45 +676,198 @@ def _requested_models(runtimes, requested=None, configuration=None):
     return models
 
 
+_BOOT_PAYLOAD_MANIFEST_REL = "usr/share/armada/update-boot/manifest.json"
+_MAX_BOOT_PAYLOAD_MANIFEST_BYTES = 1 << 20
+
+
+def _load_trusted_boot_payload_modules(source):
+    source = Path(source).resolve()
+    updates_dir = source / "system_files/usr/lib/armada/updates"
+    build_dir = source / "build_files"
+    init_path = updates_dir / "__init__.py"
+    verifier_path = updates_dir / "boot_payload.py"
+    config_helper_path = build_dir / "edl_device_config.py"
+    requirements_helper_path = build_dir / "edl_boot_requirements.py"
+    for required in (
+        init_path,
+        verifier_path,
+        config_helper_path,
+        requirements_helper_path,
+    ):
+        if not required.is_file():
+            raise ValueError(f"source file is missing: {required}")
+    package_name = f"_armada_trusted_updates_{uuid.uuid4().hex}"
+    package_spec = importlib.machinery.ModuleSpec(
+        package_name,
+        importlib.machinery.SourceFileLoader(package_name, str(init_path)),
+        is_package=True,
+    )
+    package_spec.submodule_search_locations = [str(updates_dir), str(build_dir)]
+    package_module = importlib.util.module_from_spec(package_spec)
+    try:
+        sys.modules[package_name] = package_module
+        package_spec.loader.exec_module(package_module)
+
+        verifier_name = f"{package_name}.boot_payload"
+        verifier_loader = importlib.machinery.SourceFileLoader(
+            verifier_name, str(verifier_path)
+        )
+        verifier_spec = importlib.util.spec_from_loader(verifier_name, verifier_loader)
+        verifier_module = importlib.util.module_from_spec(verifier_spec)
+        sys.modules[verifier_name] = verifier_module
+        verifier_loader.exec_module(verifier_module)
+    except BaseException:
+        for module_name in tuple(sys.modules):
+            if module_name == package_name or module_name.startswith(package_name + "."):
+                del sys.modules[module_name]
+        raise
+    return package_name, verifier_module
+
+
+def _match_boot_asset(path, record, label):
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"{label} is not a regular file: {candidate}")
+    size = candidate.stat().st_size
+    if size != record["bytes"]:
+        raise ValueError(
+            f"{label} length {size} does not match verified boot payload "
+            f"({record['bytes']} bytes): {candidate}"
+        )
+    digest = _sha256_file(candidate)
+    if digest != record["sha256"]:
+        raise ValueError(
+            f"{label} sha256 {digest} does not match verified boot payload "
+            f"({record['sha256']}): {candidate}"
+        )
+
+
+def _verified_deployment_runtimes(
+    source,
+    deployment,
+    configuration,
+    models,
+    external_runtimes,
+    kernel,
+    initramfs,
+    dtbs,
+):
+    models = tuple(models or ())
+    if not models:
+        raise ValueError("at least one model is required")
+    package_name = None
+    try:
+        package_name, verifier = _load_trusted_boot_payload_modules(source)
+        canonical_root, canonical_usr = verifier._resolve_root(deployment)
+        manifest_path, _ = verifier._resolve_regular_file(
+            canonical_root, canonical_usr, _BOOT_PAYLOAD_MANIFEST_REL
+        )
+        manifest_size = manifest_path.stat().st_size
+        if manifest_size <= 0 or manifest_size > _MAX_BOOT_PAYLOAD_MANIFEST_BYTES:
+            raise ValueError(
+                f"boot payload manifest size {manifest_size} is out of bounds: "
+                f"{manifest_path}"
+            )
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        verifier.verify_manifest(canonical_root, models[0], document)
+        edl_device_config, _ = verifier._load_helpers()
+        config_path, _ = verifier._resolve_regular_file(
+            canonical_root,
+            canonical_usr,
+            document["configuration"]["path"],
+        )
+        embedded_config = edl_device_config.load_configuration(config_path)
+        selected_embedded = tuple(
+            edl_device_config.select_models(embedded_config, models)
+        )
+        if selected_embedded != models:
+            raise ValueError(
+                "selected models do not match embedded device configuration order"
+            )
+        if verifier._canonical_json(embedded_config) != verifier._canonical_json(
+            configuration
+        ):
+            raise ValueError(
+                "embedded edl-devices.json does not match build device configuration"
+            )
+        _match_boot_asset(kernel, document["kernel"], "selected boot kernel")
+        _match_boot_asset(initramfs, document["initramfs"], "selected boot initramfs")
+        if set(dtbs) != set(models):
+            raise ValueError("DTB mapping keys do not match selected models")
+        manifest_models = document["models"]
+        verified = {}
+        for model in models:
+            if model not in manifest_models:
+                raise ValueError(
+                    f"selected model {model} is missing from boot payload manifest"
+                )
+            entry = manifest_models[model]
+            _match_boot_asset(
+                dtbs[model], entry["dtb"], f"selected {model} DTB"
+            )
+            runtime_record = entry["runtime"]
+            runtime_path, _ = verifier._resolve_regular_file(
+                canonical_root, canonical_usr, runtime_record["path"]
+            )
+            if runtime_record["bytes"] != RUNTIME_BYTES:
+                raise ValueError(
+                    f"embedded runtime for {model} must be {RUNTIME_BYTES} bytes"
+                )
+            verified[model] = {
+                "path": str(runtime_path),
+                "bytes": runtime_record["bytes"],
+                "sha256": runtime_record["sha256"],
+            }
+        if external_runtimes:
+            if set(external_runtimes) != set(models):
+                raise ValueError(
+                    "external runtime selection does not match selected models"
+                )
+            for model in models:
+                ext = external_runtimes[model]
+                ext_path = Path(ext["path"])
+                if ext_path.is_symlink() or not ext_path.is_file():
+                    raise ValueError(
+                        f"external runtime for {model} is not a regular file: "
+                        f"{ext_path}"
+                    )
+                ext_size = ext_path.stat().st_size
+                ext_sha256 = _sha256_file(ext_path)
+                if ext_size != ext["bytes"] or ext_sha256 != ext["sha256"]:
+                    raise ValueError(
+                        f"external runtime for {model} changed on disk: {ext_path}"
+                    )
+                embedded = verified[model]
+                if (
+                    ext_size != embedded["bytes"]
+                    or ext_sha256 != embedded["sha256"]
+                ):
+                    raise ValueError(
+                        f"external runtime for {model} does not match embedded "
+                        f"OCI boot payload runtime ({embedded['sha256']})"
+                    )
+        return verified
+    finally:
+        if package_name is not None:
+            prefix = f"{package_name}."
+            for module_name in list(sys.modules):
+                if module_name == package_name or module_name.startswith(prefix):
+                    sys.modules.pop(module_name, None)
+
+
+def _boot_recipe_module():
+    return _load_module(
+        "armada_update_boot_recipe",
+        Path(__file__).resolve().parents[1] / "system_files/usr/lib/armada/updates/boot_recipe.py",
+    )
+
+
 def _model_boot_args(normal, profile):
-    tokens = normal.split()
-    for extra in profile["extraArgs"]:
-        key = extra.split("=", 1)[0]
-        present = [token for token in tokens if token.split("=", 1)[0] == key]
-        if present:
-            if any(token != extra for token in present):
-                raise ValueError(f"deployment already passes a conflicting {key}= option")
-            continue
-        tokens.append(extra)
-    return " ".join(tokens)
+    return _boot_recipe_module().model_boot_args(normal, profile)
 
 
 def _diagnostic_boot_args(normal, profile):
-    """Return the diagnostic kernel command line for one profile mode.
-
-    rd-break simply appends the pre-mount break. verbose keeps every normal
-    token (including duplicates and original order) except the quiet switch and
-    all loglevel=/rd.break switches, then appends the missing verbose tail in
-    its fixed order.
-    """
-    mode = profile["diagnosticMode"]
-    if mode == "rd-break":
-        return normal + " rd.break=pre-mount"
-    if mode != "verbose":
-        raise ValueError(f"unsupported diagnosticMode {mode!r}")
-    tokens = []
-    for token in normal.split():
-        if token == "quiet":
-            continue
-        if token.startswith("loglevel="):
-            continue
-        if token == "rd.break" or token.startswith("rd.break="):
-            continue
-        tokens.append(token)
-    for token in DIAGNOSTIC_VERBOSE_TAIL:
-        if token not in tokens:
-            tokens.append(token)
-    return " ".join(tokens)
+    return _boot_recipe_module().diagnostic_boot_args(normal, profile)
 
 
 def _boot_compatibility(profile):
@@ -818,6 +964,67 @@ def _selected_deployment(target, commit):
     return matches[0]
 
 
+def _bind_deployment(target, deployment, parsed, commit):
+    _require_hex64(commit, "commit")
+    if not isinstance(parsed, dict):
+        raise ValueError("parsed deployment must be a mapping")
+    target_path = Path(target).resolve(strict=True)
+    if not target_path.is_dir():
+        raise ValueError(f"deployment target is not a directory: {target_path}")
+    deployment_path = Path(deployment)
+    if deployment_path.is_symlink() or not deployment_path.is_dir():
+        raise ValueError(f"selected deployment is not a nonsymlink directory: {deployment_path}")
+    name_match = re.fullmatch(re.escape(commit) + r"\.(0|[1-9][0-9]*)", deployment_path.name)
+    if name_match is None or len(name_match.group(1)) > 10 or int(name_match.group(1)) > 4294967295:
+        raise ValueError(f"selected deployment has a noncanonical name: {deployment_path.name}")
+    expected = target_path / "ostree/deploy/default/deploy" / deployment_path.name
+    canonical = deployment_path.resolve(strict=True)
+    if (
+        canonical != expected
+        or expected.is_symlink()
+        or expected.resolve(strict=True) != expected
+        or target_path not in canonical.parents
+    ):
+        raise ValueError(f"selected deployment is outside its canonical target path: {deployment_path}")
+
+    normal = parsed["normalBootArgs"]
+    diagnostic = parsed["diagnosticBootArgs"]
+    if not isinstance(normal, str) or not isinstance(diagnostic, str):
+        raise ValueError("parsed boot arguments must be strings")
+    normal_tokens = normal.split()
+    diagnostic_tokens = diagnostic.split()
+    pointers = [t for t in normal_tokens if t == "ostree" or t.startswith("ostree=")]
+    diag_pointers = [t for t in diagnostic_tokens if t == "ostree" or t.startswith("ostree=")]
+    if (
+        len(pointers) != 1
+        or diag_pointers != pointers
+        or _OSTREE_POINTER.fullmatch(pointers[0]) is None
+    ):
+        raise ValueError("boot arguments must contain the same single allowed ostree pointer")
+    for tokens in (normal_tokens, diagnostic_tokens):
+        if any(
+            token == "armada.deployment" or token.startswith("armada.deployment=")
+            for token in tokens
+        ):
+            raise ValueError("boot arguments already contain an armada.deployment binding")
+
+    pointer = target_path / pointers[0][len("ostree=/"):]
+    if not pointer.is_symlink():
+        raise ValueError(f"original ostree pointer is not a symlink: {pointer}")
+    try:
+        pointer_target = pointer.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"original ostree pointer does not resolve: {pointer}") from error
+    if pointer_target != canonical:
+        raise ValueError("original ostree pointer does not resolve to the selected deployment")
+
+    bound = dict(parsed)
+    binding = f"armada.deployment=default/{deployment_path.name}"
+    bound["normalBootArgs"] = normal + " " + binding
+    bound["diagnosticBootArgs"] = diagnostic + " " + binding
+    return bound
+
+
 def _verify_frozen_overlay(source, deployment):
     pairs = (
         ("usr/libexec/armada/armada-edl-grow-root", 0o755),
@@ -834,13 +1041,30 @@ def _verify_frozen_overlay(source, deployment):
             raise ValueError(f"deployed mode does not match the source overlay: {relative}")
 
 
+# Files the normal-Linux offline updater ships in the image. Images older than
+# the normal update path lack them, so this is the build-time evidence that lets
+# a package declare offline-upgrade; the RAM rescue path is tracked separately.
+_NORMAL_UPDATER_FILES = (
+    "usr/libexec/armada/armada-update",
+    "usr/libexec/armada/armada-offline-update",
+    "usr/lib/armada/updates/offline_prepare.py",
+)
+
+
+def _verify_normal_updater(deployment):
+    for relative in _NORMAL_UPDATER_FILES:
+        path = Path(deployment) / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"deployed image lacks the normal-Linux updater: {relative}")
+
+
 def _verify_plasma_packages(deployment):
     helper_path = Path(__file__).resolve().with_name('verify_plasma_runtime.py')
     module = _load_module('verify_plasma_runtime_sibling', helper_path)
     module.verify_packages(Path(deployment))
 
 
-def _verify_model_boot_requirements(deployment, initrd, configuration, models, work):
+def _verify_model_boot_requirements(source, deployment, initrd, configuration, models, work):
     helper_path = Path(__file__).resolve().with_name("edl_boot_requirements.py")
     module = _load_module('edl_boot_requirements_sibling', helper_path)
     modules_dir = Path(deployment) / "usr/lib/modules"
@@ -852,7 +1076,23 @@ def _verify_model_boot_requirements(deployment, initrd, configuration, models, w
     kver = kvers[0].name
     req = module.load_requirements(configuration, models)
     module.verify_tree(deployment, kver, req)
-    module.verify_initramfs(initrd, kver, req, work_parent=work)
+    expected_files = {
+        "usr/lib/systemd/system/ostree-prepare-root.service.d/armada-fallback.conf": (
+            b"[Service]\nExecStartPre=/usr/libexec/armada/armada-ostree-fallback\nExecStartPost=/usr/libexec/armada/armada-ostree-fallback --restore\n",
+            False,
+        )
+    }
+    for name in ("armada-bound-deployment", "armada-ostree-fallback"):
+        script = (
+            Path(source)
+            / f"system_files/usr/lib/dracut/modules.d/91armada-ostree-fallback/{name}.sh"
+        )
+        if not script.is_file():
+            raise ValueError(f"source file is missing: {script}")
+        expected_files[f"usr/libexec/armada/{name}"] = (script.read_bytes(), True)
+    module.verify_initramfs(
+        initrd, kver, req, work_parent=work, expected_files=expected_files
+    )
 
 
 def _write_deployment_markers(target, deployment, build):
@@ -969,8 +1209,11 @@ def _produce(args):
     configuration = _device_config_module().load_configuration(args.devices_config)
     models = tuple(_device_config_module().select_models(configuration, args.model))
     profiles = {name: configuration["profiles"][name] for name in models}
-    runtimes = _parse_runtimes(args.runtime, profiles)
-    models = _requested_models(runtimes, args.model, configuration)
+    if args.runtime:
+        external_runtimes = _parse_runtimes(args.runtime, profiles)
+        models = _requested_models(external_runtimes, args.model, configuration)
+    else:
+        external_runtimes = {}
     work = _fresh_directory(args.work)
     out = _fresh_directory(args.out)
     if work == out:
@@ -1048,14 +1291,34 @@ def _produce(args):
             result, bls_path.read_text(encoding="utf-8")
         )
         deployment = _selected_deployment(target, result["deployment_checksum"])
+        parsed = _bind_deployment(
+            target, deployment, parsed, result["deployment_checksum"]
+        )
         _verify_frozen_overlay(source, deployment)
+        if args.offline_upgrade:
+            _verify_normal_updater(deployment)
         _verify_plasma_packages(deployment)
         _verify_model_boot_requirements(
+            source,
             deployment,
             target / "boot" / result["initrd"],
             configuration,
             models,
             work,
+        )
+        fdtdir = target / "boot" / result["fdtdir"]
+        dtbs = {
+            name: _resolve_dtb(fdtdir, profiles[name], name) for name in models
+        }
+        runtimes = _verified_deployment_runtimes(
+            source,
+            deployment,
+            configuration,
+            models,
+            external_runtimes,
+            target / "boot" / result["image"],
+            target / "boot" / result["initrd"],
+            dtbs,
         )
         _write_deployment_markers(target, deployment, build)
         _copy_payload(
@@ -1067,13 +1330,12 @@ def _produce(args):
             target / "boot" / result["initrd"], staging / "common/boot/initramfs.img"
         )
         kshim = _prepare_dtb_module(source, work)
-        fdtdir = target / "boot" / result["fdtdir"]
         for name in models:
             profile = profiles[name]
             model_dir = staging / "models" / name
             (model_dir / "boot").mkdir(parents=True)
             (model_dir / "runtime").mkdir()
-            dtb = _resolve_dtb(fdtdir, profile, name)
+            dtb = dtbs[name]
             normal = _model_boot_args(parsed["normalBootArgs"], profile)
             diagnostic = _diagnostic_boot_args(normal, profile)
             kshim.REQUIRED_COMPATIBLE = profile["required"]
@@ -1215,6 +1477,7 @@ def _produce(args):
             "schemaVersion": 2,
             "bundleId": "armadaos-freedom",
             "version": args.version,
+            "offlineUpgrade": bool(args.offline_upgrade),
             "packages": [
                 {
                     "deviceModel": name,
@@ -1269,7 +1532,16 @@ def main(argv=None):
     parser.add_argument("--oci", required=True)
     parser.add_argument("--manifest-digest", required=True)
     parser.add_argument("--origin", required=True)
-    parser.add_argument("--runtime", action="append", required=True)
+    parser.add_argument(
+        "--runtime",
+        action="append",
+        default=[],
+        help=(
+            "Optional MODEL=PATH or PATH runtime file to cross-check for exact "
+            "match against the verified OCI deployment payload (never overrides "
+            "the embedded runtime)."
+        ),
+    )
     parser.add_argument("--boot-uuid", required=True)
     parser.add_argument("--root-uuid", required=True)
     parser.add_argument(
@@ -1279,6 +1551,16 @@ def main(argv=None):
         default=ROOT_IMAGE_GIB_CHOICES[0],
     )
     parser.add_argument("--version", required=True)
+    parser.add_argument(
+        "--offline-upgrade",
+        action="store_true",
+        default=False,
+        help=(
+            "declare normal-Linux preserve-data offline upgrade capability after "
+            "verifying the deployed image carries the normal updater; per-model "
+            "recovery manifests are not required"
+        ),
+    )
     parser.add_argument("--devices-config", default=str(DEFAULT_DEVICES_CONFIG))
     parser.add_argument("--work", required=True)
     parser.add_argument("--out", required=True)

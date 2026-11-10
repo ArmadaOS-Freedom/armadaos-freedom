@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  ARMADA_CANONICAL_IMAGE: "ghcr.io/mydanyi/armadaos-freedom"
+  ARMADA_CANONICAL_IMAGE: "ghcr.io/armadaos-freedom/armadaos-freedom"
   ARMADA_SIGNING_PUBLIC_KEY: "system_files/etc/pki/containers/armadaos-freedom.pub"
   BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
   IMAGE_DESC: "Armada: a gaming-focused, SteamOS-like Fedora bootc image for ARM64 handhelds"
@@ -39,6 +39,7 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
       revision: ${{ steps.version.outputs.revision }}
       version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.push.outputs.image }}
 
     permissions:
       contents: read
@@ -94,6 +95,75 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
+      - name: Check firmware boot slot witness
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libfdt-dev device-tree-compiler cpio dracut-core
+          kshim=devices/lenovo-tb323fu/boot/kshim-success-source
+          gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -I"$kshim/src/include" "$kshim/src/dt/boot_witness.c" "$kshim/tests/boot_witness_test.c" -lfdt -o "$RUNNER_TEMP/armada-boot-witness-test"
+          "$RUNNER_TEMP/armada-boot-witness-test"
+          bash tests/update-boot-runtime-test.sh
+      - name: Check update service D-Bus integration
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-glib-2.0 gir1.2-ostree-1.0 ostree dbus python3-websocket btrfs-progs e2fsprogs util-linux
+          /usr/bin/python3 -B tests/update-dbus-test.py
+          /usr/bin/python3 -B tests/armada-os-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-deployment-store-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-image-source-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-offline-source-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-deployment-options-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-deployment-test.py
+          sudo modprobe btrfs
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-mounts-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-context-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_recovery_channel.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_finalization_receipt.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_system_pending_status.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_system_transaction.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-boot-materials-test.py
+          /usr/bin/python3 -B tests/test_steam_update_bridge.py
+      - name: Check offline update command permissions
+        run: |
+          docker run --rm --cpus 2 --memory 1g -w /src -v "$GITHUB_WORKSPACE:/src:ro" -e ARMADA_DISPOSABLE_PRIVILEGE_TEST=1 -e PYTHONDONTWRITEBYTECODE=1 ubuntu:24.04 bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y &&
+            apt-get install -y --no-install-recommends python3 sudo passwd util-linux openssh-client openssh-server &&
+            python3 -B tests/update-offline-privileges-test.py build_files/50-create-user.sh allow &&
+            python3 -B tests/update-installer-authorization-test.py &&
+            ARMADA_DISPOSABLE_PRIVILEGE_TEST=1 python3 -B tests/update-installer-authorization-ssh-test.py
+          '
+      - name: Check offline image import
+        run: >
+          docker run --rm --cpus 2 --memory 2g
+          -v "${GITHUB_WORKSPACE}:/src:ro" -w /src
+          -e PYTHONDONTWRITEBYTECODE=1 fedora:44
+          bash -lc "dnf install -y --setopt=install_weak_deps=false python3-gobject ostree btrfs-progs openssl && python3 -B tests/update-offline-image-test.py && python3 -B tests/update-offline-payload-test.py"
+      - name: Check native Steam client update adapter
+        run: |
+          docker run --rm --network none --cpus 2 --memory 1g -v "$GITHUB_WORKSPACE":/src:ro -w /src node:22-bookworm-slim node --test tests/steam-update-native-test.cjs
+      - name: Check Steam updates browser page
+        run: |
+          docker run --rm --cpus 2 --memory 2g --shm-size 512m \
+            -v "$GITHUB_WORKSPACE":/src:ro -w /src \
+            -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+            mcr.microsoft.com/playwright:v1.58.2-noble bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends python3-websocket
+              npm install --prefix /tmp/armada-steam-ui --cache /tmp/armada-steam-ui-cache --no-save --no-audit --no-fund playwright@1.58.2
+              export NODE_PATH=/tmp/armada-steam-ui/node_modules
+              node --test tests/steam-update-page-test.cjs tests/steam-update-cdp-test.cjs
+            '
+      - name: Check desktop update interface
+        run: |
+          docker run --rm --cpus 2 --memory 2g \
+            -v "${GITHUB_WORKSPACE}:/src:ro" -w /src \
+            -e PYTHONDONTWRITEBYTECODE=1 -e GTK_A11Y=none -e GSK_RENDERER=cairo \
+            fedora:44 bash -euc '
+              dnf install -y python3-gobject gtk4 libadwaita xorg-x11-server-Xvfb xauth dbus-daemon dejavu-sans-fonts
+              xvfb-run -a -s "-screen 0 1600x1200x24" dbus-run-session -- /usr/bin/python3 -B tests/armada-tools-ui-test.py
+            '
       - name: Check Plasma runtime tests
         run: python3 -m unittest discover -s tests -p test_plasma_runtime.py
 
@@ -102,6 +172,8 @@ jobs:
           python3 -m unittest discover -s tests -p test_edl_boot_requirements.py
           python3 -m unittest discover -s tests -p test_tb322fc_bluetooth.py
           python3 -m unittest discover -s tests -p test_initramfs_requirement_failure.py
+          python3 -m unittest discover -s tests -p 'test_update_*.py'
+          TMPDIR="$RUNNER_TEMP" python3 tests/armada-reboot-edl-test.py
 
       # Resolve before the image build so the OCI layers bundle the latest
       # plugin sources instead of a cached earlier resolution.
@@ -119,6 +191,7 @@ jobs:
       - name: Check signing key
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
           set -euo pipefail
           IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
@@ -132,6 +205,10 @@ jobs:
           fi
           if [ ! -f "${ARMADA_SIGNING_PUBLIC_KEY}" ] || [ ! -s "${ARMADA_SIGNING_PUBLIC_KEY}" ]; then
             echo "::error::Freedom signing public key missing or empty: ${ARMADA_SIGNING_PUBLIC_KEY}"
+            exit 1
+          fi
+          if [ -z "${COSIGN_PASSWORD:-}" ]; then
+            echo "::error::SIGNING_PASSWORD is not configured."
             exit 1
           fi
 
@@ -217,6 +294,14 @@ jobs:
             'repos/SteamDeckHomebrew/decky-loader/releases?per_page=100' \
             >"$RUNNER_TEMP/decky-releases.json"
 
+      - name: Prepare BootTool sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$(mktemp -d _build-boot-tool.XXXXXX)"
+          python3 build_files/prepare-boot-tool-source.py --output "${source_dir}"
+          echo "ARMADA_BOOT_TOOL_SOURCE=${source_dir}" >> "${GITHUB_ENV}"
+
       - name: Build container image
         id: build_image
         uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
@@ -230,6 +315,7 @@ jobs:
             ARMADA_VERSION=${{ steps.version.outputs.version }}
             BASE_IMAGE=${{ steps.chunkah_config.outputs.base_image }}
             CHUNKAH_CONFIG_STR=${{ steps.chunkah_config.outputs.config }}
+            BOOT_TOOL_SOURCE=${{ env.ARMADA_BOOT_TOOL_SOURCE }}
           # armada-rootfs is consumed through RUN --mount, so retain otherwise-unused stages.
           extra-args: |
             --build-arg-file=${{ runner.temp }}/package-refs.env
@@ -301,6 +387,7 @@ jobs:
           done
           digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${BUILD_TAG}")
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "image=${IMAGE_FULL}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify anonymous image access
         env:
@@ -350,6 +437,7 @@ jobs:
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
 
       - name: Publish channel tags
         if: env.HAVE_SIGNING_SECRET == 'true'
@@ -381,6 +469,7 @@ jobs:
     name: Disk image
     needs: build_push
     if: >-
+      vars.ARMADA_PUBLISH_DISK == 'true' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') &&
       needs.build_push.outputs.channel != '' &&
       github.event.repository.fork == false
@@ -412,7 +501,10 @@ jobs:
       packages: read
     uses: ./.github/workflows/build-edl-package.yml
     with:
-      image: docker://ghcr.io/${{ github.repository }}:${{ needs.build_push.outputs.tag }}
+      image: docker://${{ needs.build_push.outputs.image }}:${{ needs.build_push.outputs.tag }}
       image_digest: ${{ needs.build_push.outputs.digest }}
       source_ref: ${{ needs.build_push.outputs.revision }}
       version: ${{ needs.build_push.outputs.version }}
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+      SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}

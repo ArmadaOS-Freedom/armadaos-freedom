@@ -7,7 +7,7 @@ on:
       image:
         description: >-
           OCI registry reference including the real channel, e.g.
-          docker://ghcr.io/mydanyi/armadaos-freedom:testing (the digest is
+          docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing (the digest is
           supplied separately)
         type: string
         required: true
@@ -41,6 +41,11 @@ on:
         description: "Exact org.opencontainers.image.version label value"
         type: string
         required: true
+    secrets:
+      SIGNING_SECRET:
+        required: true
+      SIGNING_PASSWORD:
+        required: true
 
 jobs:
   build:
@@ -67,6 +72,43 @@ jobs:
           ref: ${{ inputs.source_ref }}
           submodules: recursive
 
+      - name: Check firmware boot slot witness
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libfdt-dev device-tree-compiler cpio dracut-core
+          kshim=devices/lenovo-tb323fu/boot/kshim-success-source
+          gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -I"$kshim/src/include" "$kshim/src/dt/boot_witness.c" "$kshim/tests/boot_witness_test.c" -lfdt -o "$RUNNER_TEMP/armada-boot-witness-test"
+          "$RUNNER_TEMP/armada-boot-witness-test"
+          bash tests/update-boot-runtime-test.sh
+      - name: Check update service D-Bus integration
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-glib-2.0 gir1.2-ostree-1.0 ostree dbus
+          /usr/bin/python3 -B tests/update-dbus-test.py
+          /usr/bin/python3 -B tests/armada-os-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-deployment-store-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-image-source-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-offline-source-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-deployment-options-test.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_finalization_receipt.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_system_pending_status.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_system_transaction.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-boot-materials-test.py
+      - name: Check offline image import
+        run: >
+          docker run --rm --cpus 2 --memory 2g
+          -v "${GITHUB_WORKSPACE}:/src:ro" -w /src
+          -e PYTHONDONTWRITEBYTECODE=1 fedora:44
+          bash -lc "dnf install -y --setopt=install_weak_deps=false python3-gobject ostree btrfs-progs openssl && python3 -B tests/update-offline-image-test.py && python3 -B tests/update-offline-payload-test.py"
+      - name: Check desktop update interface
+        run: |
+          docker run --rm --cpus 2 --memory 2g \
+            -v "${GITHUB_WORKSPACE}:/src:ro" -w /src \
+            -e PYTHONDONTWRITEBYTECODE=1 -e GTK_A11Y=none -e GSK_RENDERER=cairo \
+            fedora:44 bash -euc '
+              dnf install -y python3-gobject gtk4 libadwaita xorg-x11-server-Xvfb xauth dbus-daemon dejavu-sans-fonts
+              xvfb-run -a -s "-screen 0 1600x1200x24" dbus-run-session -- /usr/bin/python3 -B tests/armada-tools-ui-test.py
+            '
       - name: Check Plasma runtime tests
         run: python3 -m unittest discover -s tests -p test_plasma_runtime.py
 
@@ -75,6 +117,36 @@ jobs:
           python3 -m unittest discover -s tests -p test_edl_boot_requirements.py
           python3 -m unittest discover -s tests -p test_tb322fc_bluetooth.py
           python3 -m unittest discover -s tests -p test_initramfs_requirement_failure.py
+          python3 -m unittest discover -s tests -p 'test_update_*.py'
+          TMPDIR="$RUNNER_TEMP" python3 tests/armada-reboot-edl-test.py
+
+      - name: Check signing key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TRUSTED_KEY="system_files/etc/pki/containers/armadaos-freedom.pub"
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "::error::SIGNING_SECRET is not set — refusing to build an unsigned EDL package."
+            exit 1
+          fi
+          if [ -z "${COSIGN_PASSWORD:-}" ]; then
+            echo "::error::SIGNING_PASSWORD is not configured."
+            exit 1
+          fi
+          if [ ! -f "${TRUSTED_KEY}" ] || [ ! -s "${TRUSTED_KEY}" ]; then
+            echo "::error::Freedom signing public key missing or empty: ${TRUSTED_KEY}"
+            exit 1
+          fi
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.3'
+
+      - name: Check detached package signature compatibility
+        run: bash tests/update-cosign-smoke.sh
 
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
@@ -82,8 +154,8 @@ jobs:
       - name: Require Docker host
         run: |
           set -euo pipefail
-          # The wrapper builds its own tools and runtime images, so the runner
-          # only has to be a working Docker host.
+          # The wrapper builds its own tools image and uses the runtimes embedded
+          # in the OCI input, so the runner only has to be a working Docker host.
           docker version >/dev/null
 
       - name: Resolve source revision
@@ -143,6 +215,28 @@ jobs:
           # agreement.
           just build-edl-package "${IMAGE}" "${IMAGE_DIGEST}" "${REVISION}" "${VERSION}"
 
+      - name: Sign and verify universal update descriptor
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t descriptors < <(find output/edl -type f -name '*.zip.update.json' -print0)
+          if [ "${#descriptors[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one *.zip.update.json under output/edl, found ${#descriptors[@]}."
+            exit 1
+          fi
+          descriptor="${descriptors[0]}"
+          cosign sign-blob \
+            --key env://COSIGN_PRIVATE_KEY \
+            --tlog-upload=false \
+            --output-signature "${descriptor}.sig" \
+            "${descriptor}"
+          python3 build_files/make-universal-update-descriptor.py verify \
+            --descriptor "${descriptor}" \
+            --signature "${descriptor}.sig" \
+            --trusted-key system_files/etc/pki/containers/armadaos-freedom.pub
+
       - name: Upload EDL package to GitHub artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -151,6 +245,8 @@ jobs:
           path: |
             output/edl/**/*.zip.[0-9][0-9][0-9]*
             output/edl/**/*.parts.json
+            output/edl/**/*.zip.update.json
+            output/edl/**/*.zip.update.json.sig
             output/edl/**/SHA256SUMS
             output/edl/**/README*
           if-no-files-found: error

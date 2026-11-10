@@ -50,7 +50,7 @@ ArmadaOS Freedom 为 Y700 五代提供 kShimC 多系统启动、Steam 游戏模�
 
 引导构建见[五代引导说明](boot/star-chart-build/README.md)，外置 initramfs 见[配套说明](boot/star-chart-build/EXTERNAL_INITRAMFS.md)。统一内核使用 `tb323fu_unified_defconfig` 启动器配置和五代专用启动载荷；**两代 boot 镜像不能互刷**。
 
-系统更新目标为 Freedom 的 `ghcr.io/mydanyi/armadaos-freedom`，支持 `stable`、`beta`、`testing` 渠道。现有 `armada-kshim-sync` 按四代 Elden 匹配，不能将它当作五代已完成的 OTA 支持。
+系统更新目标为 Freedom 的 `ghcr.io/armadaos-freedom/armadaos-freedom`，支持 `stable`、`beta`、`testing` 渠道。现有 `armada-kshim-sync` 按四代 Elden 匹配，不能将它当作五代已完成的 OTA 支持。
 
 ## 源码与来源
 

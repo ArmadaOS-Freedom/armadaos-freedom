@@ -27,7 +27,7 @@ are reused:
 
 1. local image `localhost/armada/pkg/<name>:<hash>`
 2. primary registry `ARMADA_PKG_REGISTRY` (default
-   `ghcr.io/mydanyi/armada/pkg`)
+   `ghcr.io/armadaos-freedom/armada/pkg`)
 3. fallback registry `ARMADA_PKG_FALLBACK_REGISTRY` (default
    `ghcr.io/armada-os/armada/pkg`); set it to an empty string to disable the
    fallback entirely

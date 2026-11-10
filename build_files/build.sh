@@ -20,6 +20,7 @@ run_step ./46-install-bundled-plugins.sh
 run_step ./50-create-user.sh
 run_step ./52-configure-os-release.sh
 run_step ./55-generate-initramfs.sh
+run_step bash ./56-install-update-boot.sh
 run_step ./60-set-default-target.sh
 run_step ./70-cleanup.sh
 run_step ./80-finalize-update-state.sh
