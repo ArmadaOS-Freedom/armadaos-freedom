@@ -831,5 +831,35 @@ class WorkflowConsistencyTest(unittest.TestCase):
             self.assertNotIn("force\": true", text)
 
 
+
+
+class RedirectAuthenticationTests(unittest.TestCase):
+    def test_same_origin_retains_auth_cross_origin_and_downgrade_remove_it(self):
+        source = "https://api.github.com/repos/example/assets/1"
+        handler = publication.AuthenticatedRedirectHandler()
+        for target, expected in (
+            ("https://api.github.com/redirected", "Bearer synthetic"),
+            ("https://api.github.com:443/redirected", "Bearer synthetic"),
+            ("https://objects.githubusercontent.com/asset", None),
+            ("https://example.invalid/asset", None),
+            ("http://api.github.com/asset", None),
+            ("https://api.github.com:444/asset", None),
+        ):
+            with self.subTest(target=target):
+                request = publication.urllib.request.Request(source)
+                request.add_header("Authorization", "Bearer synthetic")
+                redirected = handler.redirect_request(request, None, 302, "Found", {}, target)
+                self.assertEqual(redirected.get_header("Authorization"), expected)
+                self.assertEqual(request.get_header("Authorization"), "Bearer synthetic")
+
+    def test_redirect_chain_does_not_restore_dropped_auth(self):
+        handler = publication.AuthenticatedRedirectHandler()
+        request = publication.urllib.request.Request("https://api.github.com/assets/1")
+        request.add_header("Authorization", "Bearer synthetic")
+        first = handler.redirect_request(request, None, 302, "Found", {}, "https://objects.githubusercontent.com/asset")
+        second = handler.redirect_request(first, None, 302, "Found", {}, "https://api.github.com/another")
+        self.assertIsNone(second.get_header("Authorization"))
+
+
 if __name__ == "__main__":
     unittest.main()

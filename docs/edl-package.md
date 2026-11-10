@@ -303,7 +303,7 @@ The legacy SD card image and its manual installation flow remain available.
 
 Official images use `ghcr.io/armadaos-freedom/armadaos-freedom`. The
 `Build images` workflow publishes a signed `testing` image from `main`;
-`Promote channel` verifies the same digest before assigning `beta` or
+`Promote release` verifies the same digest before assigning `beta` or
 `stable`. Configure the encrypted Cosign key as `SIGNING_SECRET` and its
 password as `SIGNING_PASSWORD`. Its matching public key is shipped at
 `system_files/etc/pki/containers/armadaos-freedom.pub`. Keep private keys

@@ -64,6 +64,23 @@ def _is_github_host(url: str) -> bool:
     return host in _GITHUB_HOSTS
 
 
+class AuthenticatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            def origin(url):
+                parsed = urllib.parse.urlsplit(url)
+                return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+            if origin(req.full_url) != origin(newurl):
+                redirected.remove_header("Authorization")
+        return redirected
+
+
+def open_request(request):
+    return urllib.request.build_opener(AuthenticatedRedirectHandler()).open(
+        request, timeout=_NETWORK_TIMEOUT)
+
+
 class PublicationError(RuntimeError):
     """A publication precondition is not met; nothing may be published."""
 
@@ -494,7 +511,7 @@ class GitHub:
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=_NETWORK_TIMEOUT) as response:
+            with open_request(request) as response:
                 return response.status, response.read(MAX_REMOTE_BYTES)
         except urllib.error.HTTPError as exc:
             body = exc.read(64 * 1024)
@@ -596,7 +613,7 @@ class GitHub:
         hasher = hashlib.sha256()
         total = 0
         try:
-            with urllib.request.urlopen(request, timeout=_NETWORK_TIMEOUT) as response:
+            with open_request(request) as response:
                 status = getattr(response, "status", 200)
                 if status < 200 or status >= 300:
                     raise PublicationError(

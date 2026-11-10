@@ -158,7 +158,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 ## 发布配置
 
-正式镜像地址为 `ghcr.io/armadaos-freedom/armadaos-freedom`。`Build images` 从 `main` 发布签名后的 `testing` 镜像；`Promote channel` 核验同一镜像摘要后，再设置 `beta` 或 `stable` 标签。将加密的 Cosign 私钥配置为 `SIGNING_SECRET`，密码配置为 `SIGNING_PASSWORD`；对应公钥位于 `system_files/etc/pki/containers/armadaos-freedom.pub`。私钥不得放入源码。
+正式镜像地址为 `ghcr.io/armadaos-freedom/armadaos-freedom`。`Build images` 从 `main` 发布签名后的 `testing` 镜像；`Promote release` 核验同一镜像摘要后，再设置 `beta` 或 `stable` 标签。将加密的 Cosign 私钥配置为 `SIGNING_SECRET`，密码配置为 `SIGNING_PASSWORD`；对应公钥位于 `system_files/etc/pki/containers/armadaos-freedom.pub`。私钥不得放入源码。
 
 GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `edl-package-<run-id>` 产物中，由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
 
