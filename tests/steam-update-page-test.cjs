@@ -823,3 +823,23 @@ test('U367 - explicit read-only "Check for updates" recovers system status after
     assert.ok(readOnly.has(m), `expected read-only call, got ${m}`);
   }
 });
+
+
+test('poll transport errors recover automatically without clearing action failures', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+  await page.evaluate(() => { window.fixture.state.failedMethods.GetStatus = 'Temporary polling failure'; window.ArmadaUpdatesPage.refresh(); });
+  const error = page.locator('.armada-row[data-comp="system"] .armada-error-box');
+  await page.waitForFunction(() => document.querySelector('.armada-row[data-comp="system"] .armada-error-box').textContent.includes('Temporary polling failure'));
+  await page.evaluate(() => { delete window.fixture.state.failedMethods.GetStatus; window.ArmadaUpdatesPage.refresh(); });
+  await page.waitForFunction(() => !document.querySelector('.armada-row[data-comp="system"] .armada-error-box').textContent.includes('Temporary polling failure'));
+  assert.equal(await page.locator('.armada-row[data-comp="system"] .armada-btn-primary').isEnabled(), true);
+  await page.evaluate(() => { window.fixture.state.failedMethods['StartCheck:system'] = 'Action failure'; });
+  await page.click('.armada-header-row button');
+  await page.waitForFunction(() => document.querySelector('.armada-row[data-comp="system"] .armada-error-box').textContent.includes('Action failure'));
+  await page.evaluate(() => { window.fixture.state.failedMethods.GetStatus = 'Polling must not replace action'; window.ArmadaUpdatesPage.refresh(); });
+  await page.waitForTimeout(150);
+  await page.evaluate(() => { delete window.fixture.state.failedMethods.GetStatus; window.ArmadaUpdatesPage.refresh(); });
+  await page.waitForTimeout(150);
+  assert.match(await error.textContent(), /Action failure/);
+});

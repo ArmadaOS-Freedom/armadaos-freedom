@@ -34,6 +34,9 @@ COMPATIBLE_TB710FU = b"lenovo,tb710fu\x00"
 
 class SystemApplyWorkerTests(unittest.TestCase):
     def setUp(self):
+        root = patch.object(system_apply.os, "geteuid", return_value=0)
+        root.start()
+        self.addCleanup(root.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name).resolve()

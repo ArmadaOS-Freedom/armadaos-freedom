@@ -529,6 +529,14 @@
       render();
     }
 
+    function markPollError(comp, err) {
+      if (state[comp] && state[comp].localError) return;
+      var previous = state[comp] || { component: comp };
+      previous.state = 'failed';
+      previous.error = errorText(err);
+      state[comp] = previous;
+    }
+
     function syncClientSnapshot() {
       if (!adapter) return;
       var snap = adapter.snapshot();
@@ -755,14 +763,8 @@
         handleBackendComponent('decky', components.decky);
       }).catch(function(err) {
         if (disposed) return;
-        state.system = state.system || { component: 'system' };
-        state.decky = state.decky || { component: 'decky' };
-        state.system.error = (err.message || String(err)).slice(0, 2000);
-        state.decky.error = (err.message || String(err)).slice(0, 2000);
-        state.system.state = 'failed';
-        state.decky.state = 'failed';
-        state.system.localError = true;
-        state.decky.localError = true;
+        markPollError('system', err);
+        markPollError('decky', err);
       }).finally(function() {
         isPolling = false;
         if (disposed) return;
@@ -793,7 +795,7 @@
       try {
         validateComponent(comp, compData);
       } catch (err) {
-        markLocalError(comp, err);
+        markPollError(comp, err);
         return;
       }
       var expected = pendingJob[comp];
