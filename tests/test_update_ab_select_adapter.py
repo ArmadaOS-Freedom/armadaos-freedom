@@ -32,7 +32,7 @@ class UpdateAbSelectAdapterTest(unittest.TestCase):
             run = subprocess.run([str(exe)], check=False, timeout=60,
                                  env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            self.assertIn("PASS native A/B fd selection tests (12 cases)",
+            self.assertIn("PASS native A/B fd selection tests (13 cases)",
                           run.stdout)
             self.assertIn("PASS native A/B fd mark-success tests (12 cases)",
                           run.stdout)
