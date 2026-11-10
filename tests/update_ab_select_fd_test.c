@@ -367,9 +367,9 @@ int main(void)
     mark_rollback_case(FSYNC_ONCE);
     mark_rollback_case(FSYNC_ALWAYS);
     mark_post_inspect_case();
-    CHECK(cases_run == 12);
+    CHECK(cases_run == 13);
     CHECK(mark_cases == 12);
-    puts("PASS native A/B fd selection tests (12 cases)");
+    puts("PASS native A/B fd selection tests (13 cases)");
     puts("PASS native A/B fd mark-success tests (12 cases)");
     return 0;
 }
