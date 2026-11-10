@@ -90,6 +90,57 @@ class PendingStatusTests(unittest.TestCase):
         self.snap = sm_test.snapshot()
         self.boot = {"state": "available", "actualSlot": "a",
                      "inactiveSlot": "b", "deployment": None}
+        # Receipt validation requires the state root to be owned by uid 0.
+        # Report fixture paths owned by the invoking user as root owned while
+        # preserving every other stat field, so nonroot runs still exercise
+        # the receipt content checks instead of failing on ownership alone.
+        fixture_owner = os.getuid()
+        original_lstat = os.lstat
+        original_path_lstat = Path.lstat
+        original_fstat = os.fstat
+
+        def is_fixture_path(candidate):
+            try:
+                return Path(os.fsdecode(candidate)).is_relative_to(self.tmp)
+            except TypeError:
+                return False
+
+        def as_root_owned(info):
+            values = list(info)
+            values[4] = 0
+            return os.stat_result(values)
+
+        def fixture_lstat(candidate, *args, **kwargs):
+            info = original_lstat(candidate, *args, **kwargs)
+            if info.st_uid == fixture_owner and is_fixture_path(candidate):
+                return as_root_owned(info)
+            return info
+
+        def fixture_path_lstat(candidate):
+            info = original_path_lstat(candidate)
+            if info.st_uid == fixture_owner and is_fixture_path(candidate):
+                return as_root_owned(info)
+            return info
+
+        def fixture_fstat(fd):
+            info = original_fstat(fd)
+            if info.st_uid != fixture_owner:
+                return info
+            try:
+                target = os.readlink("/proc/self/fd/%d" % fd)
+            except OSError:
+                return info
+            if not is_fixture_path(target):
+                return info
+            return as_root_owned(info)
+
+        for patcher in (
+            patch.object(os, "lstat", new=fixture_lstat),
+            patch.object(Path, "lstat", new=fixture_path_lstat),
+            patch.object(os, "fstat", new=fixture_fstat),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def read(self, trial, op="status", fetch=None, configured=False):
         def boom(*args, **kwargs):
@@ -127,7 +178,6 @@ class PendingStatusTests(unittest.TestCase):
                            make_receipt(self.state_root / job_id, trial))
         return trial, job_id, work
 
-    @unittest.skipUnless(os.geteuid() == 0, "Receipt validation requires root ownership")
     def test_valid_receipt_reports_awaiting_reboot(self):
         trial, _, work = self.stage_valid()
         pointer = self.state_root / "current.json"
@@ -247,6 +297,24 @@ class PendingStatusTests(unittest.TestCase):
             self.assertFalse(res["requiresReboot"])
         finally:
             self.state_root.chmod(orig_mode)
+
+    def test_foreign_owned_receipt_root_is_rejected(self):
+        trial, _, _ = self.stage_valid()
+        real_lstat = os.lstat
+
+        def foreign_owner(candidate, *args, **kwargs):
+            info = real_lstat(candidate, *args, **kwargs)
+            if Path(os.fsdecode(candidate)) == self.state_root:
+                values = list(info)
+                values[4] = 12345
+                return os.stat_result(values)
+            return info
+
+        with patch.object(os, "lstat", new=foreign_owner):
+            for op in ("status", "check"):
+                res = self.read(trial, op)
+                self.assertEqual(res["state"], "pending_conflict", op)
+                self.assertFalse(res["requiresReboot"], op)
 
     def test_pending_new_and_old(self):
         for rec_state in ("prepared", "trial"):

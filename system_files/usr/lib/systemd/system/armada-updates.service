@@ -12,6 +12,7 @@ WorkingDirectory=/
 User=root
 Restart=on-failure
 RestartSec=3
+KillMode=mixed
 TimeoutStopSec=15min
 
 [Install]
