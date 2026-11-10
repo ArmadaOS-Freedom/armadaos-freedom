@@ -506,6 +506,44 @@ class PublicationTest(unittest.TestCase):
                 ]),
             )
 
+    def test_remote_assets_prefer_the_api_url_over_the_browser_url(self):
+        data = b"P" * 10
+        plan = {"assets": [
+            {"name": "pkg.zip.001", "bytes": len(data),
+             "sha256": sha256(data).hexdigest()},
+        ]}
+        api_url = "https://api.github.com/repos/x/releases/assets/1"
+        web_url = "https://github.com/x/releases/download/t/pkg.zip.001"
+        asset = {
+            "name": "pkg.zip.001", "size": len(data), "digest": None,
+            "url": api_url, "browser_download_url": web_url,
+        }
+
+        # Only the API URL resolves here: preferring the web URL would fail.
+        source = FakeReleaseAssets({api_url: data})
+        hashes = publication.verify_release_assets(
+            source, plan, self._release([asset]))
+        self.assertEqual(hashes["pkg.zip.001"], sha256(data).hexdigest())
+        self.assertEqual(source.streamed, ["pkg.zip.001"])
+
+        # A browser-only asset is still downloadable.
+        browser_only = FakeReleaseAssets({web_url: data})
+        hashes = publication.verify_release_assets(
+            browser_only, plan,
+            self._release([{"name": "pkg.zip.001", "size": len(data),
+                            "browser_download_url": web_url}]))
+        self.assertEqual(hashes["pkg.zip.001"], sha256(data).hexdigest())
+        self.assertEqual(browser_only.streamed, ["pkg.zip.001"])
+
+        # A present API digest is used as-is, even when both URLs are listed.
+        digested = FakeReleaseAssets({})
+        hashes = publication.verify_release_assets(
+            digested, plan,
+            self._release([
+                dict(asset, digest="sha256:" + sha256(data).hexdigest())]))
+        self.assertEqual(hashes["pkg.zip.001"], sha256(data).hexdigest())
+        self.assertEqual(digested.streamed, [])
+
     def test_run_identity_requires_a_successful_expected_build(self):
         run = {
             "id": 7,

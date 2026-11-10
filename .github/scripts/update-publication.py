@@ -482,7 +482,7 @@ def verify_release_assets(github, plan: dict, release: dict) -> dict:
         size, _expected = local[name]
         digest = _api_digest(asset)
         if digest is None:
-            url = asset.get("browser_download_url") or asset.get("url")
+            url = asset.get("url") or asset.get("browser_download_url")
             if not isinstance(url, str):
                 raise PublicationError(f"{name} has no downloadable location")
             digest = github.stream_sha256(url, expected_bytes=size, label=name)
