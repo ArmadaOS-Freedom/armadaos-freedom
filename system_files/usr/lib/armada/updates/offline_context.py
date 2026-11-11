@@ -140,6 +140,20 @@ def _origin_ref(deployment):
     return value if isinstance(value, str) and value else None
 
 
+def _deployment_identity(deployment, label):
+    """Return the validated ``(osname, checksum, deployserial)`` of a deployment."""
+    osname = deployment.get_osname()
+    checksum = deployment.get_csum()
+    serial = deployment.get_deployserial()
+    if not isinstance(osname, str) or _OSNAME.fullmatch(osname) is None:
+        raise OfflineContextError(f'{label} deployment osname is malformed')
+    if not isinstance(checksum, str) or _HEX64.fullmatch(checksum) is None:
+        raise OfflineContextError(f'{label} deployment checksum is malformed')
+    if type(serial) is not int or not 0 <= serial <= _UINT32_MAX:
+        raise OfflineContextError(f'{label} deployment serial is not a uint32 integer')
+    return osname, checksum, serial
+
+
 def _read_ostree_booted(sysroot_path=None):
     """Read the booted deployment with libostree without changing any sysroot.
 
@@ -147,7 +161,12 @@ def _read_ostree_booted(sysroot_path=None):
     pass nothing so the *default* runtime sysroot decides which deployment is
     booted; ``Sysroot.new('/sysroot')`` loads but reports no booted deployment
     in the composefs runtime, and a booted deployment is never inferred from
-    the deployment list.
+    the deployment list or the ostree pointer index.
+
+    A pending transaction never hides the running system: the booted identity
+    is returned with the staged deployment or queued rollback so read-only
+    queries can describe the device.  Only :func:`read_legacy_boot_state`
+    refuses a pending transaction, and only for its mutation callers.
     """
     try:
         Gio, _GLib, OSTree = _gi()
@@ -168,10 +187,8 @@ def _read_ostree_booted(sysroot_path=None):
             sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
         if not sysroot.load(None):
             raise OfflineContextError('cannot load the OSTree sysroot')
-        if sysroot.get_staged_deployment() is not None:
-            raise OfflineContextError(
-                'a staged OSTree deployment refuses a legacy offline upgrade')
         deployment = sysroot.get_booted_deployment()
+        staged_deployment = sysroot.get_staged_deployment()
     except OfflineContextError:
         raise
     except Exception as error:
@@ -179,17 +196,9 @@ def _read_ostree_booted(sysroot_path=None):
     if deployment is None:
         raise OfflineContextError('libostree reports no booted deployment')
 
-    osname = deployment.get_osname()
-    checksum = deployment.get_csum()
-    serial = deployment.get_deployserial()
+    osname, checksum, serial = _deployment_identity(deployment, 'booted')
     bootserial = deployment.get_bootserial()
     bootcsum = deployment.get_bootcsum()
-    if not isinstance(osname, str) or _OSNAME.fullmatch(osname) is None:
-        raise OfflineContextError('booted deployment osname is malformed')
-    if not isinstance(checksum, str) or _HEX64.fullmatch(checksum) is None:
-        raise OfflineContextError('booted deployment checksum is malformed')
-    if type(serial) is not int or not 0 <= serial <= _UINT32_MAX:
-        raise OfflineContextError('booted deployment serial is not a uint32 integer')
     if type(bootserial) is not int or not 0 <= bootserial <= _UINT32_MAX:
         raise OfflineContextError('booted deployment boot serial is not a uint32 integer')
     if not isinstance(bootcsum, str) or _HEX64.fullmatch(bootcsum) is None:
@@ -197,6 +206,27 @@ def _read_ostree_booted(sysroot_path=None):
     options = _boot_options(deployment)
     if not isinstance(options, str) or not options or len(options) > CMDLINE_MAX:
         raise OfflineContextError('booted deployment options are missing or oversized')
+
+    staged = None
+    if staged_deployment is not None:
+        staged_osname, staged_checksum, staged_serial = _deployment_identity(
+            staged_deployment, 'staged')
+        staged = {'stateroot': staged_osname, 'checksum': staged_checksum,
+                  'serial': staged_serial, 'incompatible': False}
+    # libostree reports the deployment that boots next first.  The pending
+    # default change is a comparison of that first deployment with the booted
+    # one; a pinned deployment appended by prepare stays behind the default, so
+    # it is never mistaken for a rollback.  Without a usable ordering the
+    # pending state is unknown and must not be reported as "nothing queued".
+    try:
+        default_identity = _deployment_identity(
+            sysroot.get_deployments()[0], 'default')
+    except OfflineContextError:
+        raise
+    except Exception as error:
+        raise OfflineContextError(
+            f'cannot establish the default deployment order: {error}') from error
+    rollback_queued = staged is None and default_identity != (osname, checksum, serial)
     return {
         'osname': osname,
         'checksum': checksum,
@@ -205,6 +235,8 @@ def _read_ostree_booted(sysroot_path=None):
         'bootcsum': bootcsum,
         'options': options,
         'originRef': _origin_ref(deployment),
+        'staged': staged,
+        'rollback_queued': rollback_queued,
         'booted': {
             'stateroot': osname,
             'checksum': checksum,
@@ -485,13 +517,27 @@ def read_boot_id(path=BOOT_ID_PATH):
 
 
 def read_legacy_boot_state(*, sysroot_path=None, cmdline_path=CMDLINE_PATH,
-                           os_release_path=OS_RELEASE_PATH, mount_lookup=read_mount_uuid):
+                           os_release_path=OS_RELEASE_PATH, mount_lookup=read_mount_uuid,
+                           reject_pending=True):
     """Return ``(booted, context)`` for a legacy system, or raise.
 
     The booted deployment comes from the default runtime sysroot; the
     ``/sysroot`` and ``/boot`` block mounts are bound separately by UUID.
+
+    ``reject_pending`` is the mutation gate.  Preflight, prepare, execute, the
+    boot writer and activation keep the default and refuse either a staged
+    deployment or a queued rollback; the read-only identity query passes
+    ``False`` so a connected system is still identified, with the pending
+    transaction reported as data.
     """
     evidence = _read_ostree_booted(sysroot_path)
+    if reject_pending:
+        if evidence.get('staged') is not None:
+            raise OfflineContextError(
+                'a pending OSTree transaction (staged) refuses a legacy offline upgrade')
+        if evidence.get('rollback_queued'):
+            raise OfflineContextError(
+                'a pending OSTree transaction (rollback) refuses a legacy offline upgrade')
     _armada_os_release(os_release_path)
     cmdline = _read_cmdline(cmdline_path)
     root_uuid = mount_lookup(ROOT_MOUNT)
@@ -516,7 +562,10 @@ def snapshot(*, sysroot_path=None):
     """Return the strict snapshot, or an explicit legacy snapshot when allowed.
 
     ``sysroot_path`` is a diagnostic/test override for the booted-deployment
-    read only; the authoritative value is the default runtime sysroot.
+    read only; the authoritative value is the default runtime sysroot.  The
+    legacy snapshot reports the staged deployment and a rollback queued by a
+    differing default deployment as data, so a read-only query can describe the
+    device while prepare still refuses either state.
     """
     try:
         return armada_os.snapshot()
@@ -530,12 +579,15 @@ def snapshot(*, sysroot_path=None):
         except Exception as exc:
             raise OfflineContextError(
                 f'cannot read the legacy deployment: {exc}') from exc
+    rollback_queued = evidence.get('rollback_queued')
+    if type(rollback_queued) is not bool:
+        raise OfflineContextError('legacy pending update state is unavailable')
     repository, channel, inferred = legacy_channel(evidence.get('originRef'))
     return {
         'booted': dict(evidence['booted']),
         'rollback': None,
-        'staged': None,
-        'rollback_queued': False,
+        'staged': evidence.get('staged'),
+        'rollback_queued': rollback_queued,
         'channel': channel,
         'repository': repository,
         'channels': list(_CANONICAL_CHANNELS) if repository in armada_os.REPOSITORIES else [],

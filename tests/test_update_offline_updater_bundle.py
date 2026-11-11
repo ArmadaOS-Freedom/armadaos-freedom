@@ -16,6 +16,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER_PATH = ROOT / 'build_files' / 'build-offline-updater-bundle.py'
+BOOTSTRAP_PATH = ROOT / 'system_files/usr/libexec/armada/armada-offline-bootstrap'
 SYSTEM = ROOT / 'system_files'
 UPDATES = 'usr/lib/armada/updates'
 TRUST_KEY_SOURCE = 'etc/pki/containers/armadaos-freedom.pub'
@@ -154,6 +155,20 @@ class BundleTest(unittest.TestCase):
             self.assertEqual(json.loads(
                 archive.extractfile('manifest.json').read())['format'], 'tar')
 
+    def test_bundle_satisfies_the_bootstrap_manifest_contract(self):
+        # The helper that installs the bundle, not just the builder, decides
+        # whether a bundle is acceptable.
+        helper = load_module('armada_offline_bootstrap', BOOTSTRAP_PATH)
+        _summary, output = self.build()
+        with output.open('rb') as stream:
+            manifest, members = helper._scan_archive(stream)
+            specs = helper._validate_manifest(manifest, members)
+        declared = {entry['path'] for entry in manifest['files']}
+        self.assertEqual(set(members) - {'manifest.json'}, declared)
+        self.assertEqual(set(specs), declared)
+        for name in ('offline_payload.py', 'offline_boot_writer.py'):
+            self.assertIn(UPDATES + '/' + name, declared)
+
     def test_output_is_byte_identical_for_identical_input(self):
         first = self.base / 'a.tar.gz'
         second = self.base / 'b.tar.gz'
@@ -201,6 +216,41 @@ class BundleTest(unittest.TestCase):
             self.assertNotIn(TRUST_KEY_SOURCE, declared)
             shipped = archive.extractfile(TRUST_KEY_DESTINATION).read()
         self.assertEqual(shipped, (SYSTEM / TRUST_KEY_SOURCE).read_bytes())
+
+    def test_missing_required_module_fails_outside_the_entry_closure(self):
+        # The bootstrap helper requires these files even when the entry stops
+        # importing them, so the builder must collect them as roots.
+        importers = {
+            'offline_boot_writer': ('offline_execute.py',),
+            'offline_payload': ('offline_prepare.py', 'offline_session.py'),
+        }
+        for name, importers_of in importers.items():
+            with self.subTest(module=name):
+                root = make_runtime_root(self.base / name)
+                for importer in importers_of:
+                    path = root / UPDATES / importer
+                    text = path.read_text()
+                    self.assertIn('    %s,\n' % name, text)
+                    path.write_text(text.replace('    %s,\n' % name, ''))
+                (root / UPDATES / (name + '.py')).unlink()
+                output = self.base / (name + '.tar.gz')
+                with self.assertRaises(self.builder.BundleError) as caught:
+                    self.builder.build(root, output)
+                self.assertIn(UPDATES + '/' + name + '.py', str(caught.exception))
+                self.assertFalse(output.exists())
+
+    def test_subpackage_module_is_rejected_before_writing_output(self):
+        write(self.root / UPDATES / 'vendor/__init__.py', b'')
+        write(self.root / UPDATES / 'vendor/extra.py', b'VALUE = 1\n')
+        session = self.root / UPDATES / 'offline_session.py'
+        session.write_text(session.read_text() + '\nfrom .vendor.extra import VALUE\n')
+        output = self.base / 'nested.tar.gz'
+        with self.assertRaises(self.builder.BundleError) as caught:
+            self.builder.build(self.root, output)
+        message = str(caught.exception)
+        self.assertIn('vendor', message)
+        self.assertIn(UPDATES, message)
+        self.assertFalse(output.exists())
 
     def test_missing_build_files_support_module_names_its_source(self):
         (self.root / UPDATES / 'edl_device_config.py').unlink()

@@ -72,6 +72,8 @@ def _evidence(**overrides):
         "bootcsum": BOOTSUM,
         "options": OPTIONS,
         "originRef": None,
+        "staged": None,
+        "rollback_queued": False,
         "booted": {"stateroot": OSNAME, "checksum": CHECKSUM, "serial": SERIAL,
                    "incompatible": False},
     }
@@ -100,24 +102,31 @@ class _FakeOrigin:
 
 
 class _FakeDeployment:
-    def __init__(self, *, options=OPTIONS, origin=None):
+    def __init__(self, *, options=OPTIONS, origin=None, osname=OSNAME,
+                 checksum=CHECKSUM, serial=SERIAL, bootserial=BOOT_SERIAL,
+                 bootcsum=BOOTSUM):
         self._options = options
         self._origin = origin
+        self._osname = osname
+        self._checksum = checksum
+        self._serial = serial
+        self._bootserial = bootserial
+        self._bootcsum = bootcsum
 
     def get_osname(self):
-        return OSNAME
+        return self._osname
 
     def get_csum(self):
-        return CHECKSUM
+        return self._checksum
 
     def get_deployserial(self):
-        return SERIAL
+        return self._serial
 
     def get_bootserial(self):
-        return BOOT_SERIAL
+        return self._bootserial
 
     def get_bootcsum(self):
-        return BOOTSUM
+        return self._bootcsum
 
     def get_bootconfig(self):
         return _FakeBootConfig(self._options)
@@ -193,11 +202,13 @@ class LegacyBootContextTests(unittest.TestCase):
         os_release_path = kwargs.pop("os_release_path", None)
         if os_release_path is None:
             os_release_path = self._os_release()
+        reject_pending = kwargs.pop("reject_pending", True)
         return offline_context.read_legacy_boot_state(
             sysroot_path=self.sysroot,
             cmdline_path=cmdline_path,
             os_release_path=os_release_path,
-            mount_lookup=lambda mount: mounts[mount])
+            mount_lookup=lambda mount: mounts[mount],
+            reject_pending=reject_pending)
 
     def test_missing_evidence_binds_libostree_without_an_actual_slot(self):
         with mock.patch.object(offline_context, "_read_ostree_booted",
@@ -242,7 +253,8 @@ class LegacyBootContextTests(unittest.TestCase):
             self.assertEqual(
                 offline_context._read_ostree_booted("/")["serial"], SERIAL)
             # An explicit /sysroot-style sysroot that reports no booted
-            # deployment is refused; its deployment list is never used.
+            # deployment is refused; no booted deployment is inferred from its
+            # deployment list.
             with self.assertRaisesRegex(offline_context.OfflineContextError,
                                         "no booted deployment"):
                 offline_context._read_ostree_booted(self.sysroot)
@@ -262,15 +274,50 @@ class LegacyBootContextTests(unittest.TestCase):
         self.assertEqual(after["serial"], SERIAL)
         self.assertEqual(after["bootserial"], BOOT_SERIAL)
 
-    def test_ostree_reader_refuses_a_staged_transaction(self):
-        sysroot = _FakeSysroot(_FakeDeployment(), staged=_FakeDeployment(
-            options="armada.deployment=x"))
+    def test_ostree_reader_reports_a_staged_deployment_with_its_identity(self):
+        # A staged deployment is a pending-update blocker, not an identity
+        # defect: the reader still returns the booted deployment and reports
+        # the staged one as data.
+        sysroot = _FakeSysroot(
+            _FakeDeployment(), staged=_FakeDeployment(checksum="c" * 64, serial=1))
+        with mock.patch.object(
+                offline_context, "_gi",
+                return_value=_fake_gi(sysroot)):
+            evidence = offline_context._read_ostree_booted()
+        self.assertEqual(evidence["serial"], SERIAL)
+        self.assertEqual(evidence["staged"], {
+            "stateroot": OSNAME, "checksum": "c" * 64, "serial": 1,
+            "incompatible": False})
+        self.assertFalse(evidence["rollback_queued"])
+
+    def test_staged_identity_binds_while_mutation_readers_refuse(self):
+        # The identity query tolerates staging; the strict reader used by
+        # preflight/prepare/execute/boot writer/activation still refuses it.
+        sysroot = _FakeSysroot(_FakeDeployment(), staged=_FakeDeployment())
         with mock.patch.object(
                 offline_context, "_gi",
                 return_value=_fake_gi(sysroot, explicit=sysroot)):
+            booted, context = self._state(reject_pending=False)
+            self.assertEqual(booted["serial"], SERIAL)
+            self.assertEqual(context["deployment"], LEGACY_DEPLOYMENT)
+            self.assertIsNone(context["actualSlot"])
             with self.assertRaisesRegex(offline_context.OfflineContextError,
                                         "staged"):
-                offline_context._read_ostree_booted(self.sysroot)
+                self._state()
+
+    def test_queued_rollback_binds_for_identity_but_refuses_mutations(self):
+        # A rollback queued after prepare is pending even though nothing is
+        # staged.  The identity query reports it; every mutation caller refuses
+        # it exactly like a staged deployment.
+        with mock.patch.object(offline_context, "_read_ostree_booted",
+                               return_value=_evidence(rollback_queued=True)):
+            booted, context = self._state(reject_pending=False)
+            self.assertEqual(booted["serial"], SERIAL)
+            self.assertEqual(context["deployment"], LEGACY_DEPLOYMENT)
+            self.assertIsNone(context["actualSlot"])
+            with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                        "rollback"):
+                self._state()
 
     def test_cmdline_index_binds_the_boot_serial_not_the_deploy_serial(self):
         # The fixture intentionally uses serial=2 (deployment) and bootserial=7
@@ -408,6 +455,69 @@ class LegacyBootContextTests(unittest.TestCase):
     def test_unknown_container_origin_is_not_guessed(self):
         with self.assertRaises(offline_context.OfflineContextError):
             offline_context.legacy_channel("docker://example.invalid/os:stable")
+
+    def _legacy_snapshot(self, sysroot):
+        with mock.patch.object(offline_context.armada_os, "snapshot",
+                               side_effect=RuntimeError("bootc status failed")), \
+                mock.patch.object(offline_context, "new_evidence_present",
+                                  return_value=False), \
+                mock.patch.object(offline_context, "_gi",
+                                  return_value=_fake_gi(sysroot)):
+            return offline_context.snapshot()
+
+    def test_legacy_snapshot_reports_the_booted_default_as_idle(self):
+        booted = _FakeDeployment()
+        snap = self._legacy_snapshot(
+            _FakeSysroot(booted, deployments=[booted]))
+        self.assertIsNone(snap["staged"])
+        self.assertFalse(snap["rollback_queued"])
+        self.assertEqual(snap["booted"]["checksum"], CHECKSUM)
+
+    def test_legacy_snapshot_derives_a_queued_rollback_from_the_default(self):
+        # No staged deployment, but the first (default) deployment is a
+        # different osname/checksum/serial: a rollback is queued for the next
+        # boot, so prepare may not start.
+        booted = _FakeDeployment()
+        default = _FakeDeployment(checksum="c" * 64, serial=1)
+        snap = self._legacy_snapshot(
+            _FakeSysroot(booted, deployments=[default, booted]))
+        self.assertIsNone(snap["staged"])
+        self.assertTrue(snap["rollback_queued"])
+
+    def test_legacy_snapshot_does_not_flag_a_prepared_append_target(self):
+        # Prepare appends its pinned target behind the default deployment.
+        # Only the first entry decides the next boot, so the appended target is
+        # never mistaken for a rollback.
+        booted = _FakeDeployment()
+        target = _FakeDeployment(checksum="d" * 64, serial=3)
+        snap = self._legacy_snapshot(
+            _FakeSysroot(booted, deployments=[booted, target]))
+        self.assertIsNone(snap["staged"])
+        self.assertFalse(snap["rollback_queued"])
+        self.assertEqual(snap["booted"]["checksum"], CHECKSUM)
+        self.assertEqual(snap["booted"]["serial"], SERIAL)
+
+    def test_legacy_snapshot_reports_staging_not_a_rollback(self):
+        # A pending staged deployment is reported as staged, never as a queued
+        # rollback, even when the first listed deployment differs from booted.
+        booted = _FakeDeployment()
+        staged = _FakeDeployment(checksum="e" * 64, serial=4)
+        snap = self._legacy_snapshot(
+            _FakeSysroot(booted, staged=staged, deployments=[staged, booted]))
+        self.assertEqual(snap["staged"], {
+            "stateroot": OSNAME, "checksum": "e" * 64, "serial": 4,
+            "incompatible": False})
+        self.assertFalse(snap["rollback_queued"])
+
+    def test_legacy_snapshot_refuses_a_missing_default_ordering(self):
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "default deployment order"):
+            self._legacy_snapshot(
+                _FakeSysroot(_FakeDeployment(), deployments=[]))
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "default deployment checksum"):
+            self._legacy_snapshot(_FakeSysroot(
+                _FakeDeployment(), deployments=[_FakeDeployment(checksum="z")]))
 
 
 class MountEvidenceTests(unittest.TestCase):
@@ -657,6 +767,72 @@ class SnapshotFailureFallbackTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class LegacyStagedMutationTests(unittest.TestCase):
+    """A pending transaction never hides the device but still blocks writes."""
+
+    STATE = ({"stateroot": OSNAME, "checksum": CHECKSUM, "serial": SERIAL,
+              "incompatible": False},
+             {"state": "available", "actualSlot": None, "inactiveSlot": None,
+              "bootContext": "legacy-controller", "deployment": LEGACY_DEPLOYMENT})
+
+    def test_identity_inspector_uses_the_pending_tolerant_reader(self):
+        calls = []
+
+        def fake_inspect(reader, phase, *, require_witness=True,
+                         require_bootable=True):
+            calls.append((reader, phase, require_witness, require_bootable))
+            reader()
+            return dict(LEGACY_REPORT)
+
+        with mock.patch.object(physical_slots, "_inspect_slots",
+                               side_effect=fake_inspect), \
+                mock.patch.object(physical_slots.offline_context,
+                                  "new_evidence_present", return_value=False), \
+                mock.patch.object(physical_slots, "_read_legacy_boot_state",
+                                  return_value=self.STATE) as legacy:
+            report = physical_slots.inspect_legacy_identity_slots()
+        self.assertEqual(report, LEGACY_REPORT)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0][2])
+        self.assertFalse(calls[0][3])
+        legacy.assert_called_once_with(reject_pending=False)
+
+    def test_mutation_reader_keeps_the_staged_rejection(self):
+        staged = offline_context.OfflineContextError(
+            "a staged OSTree deployment refuses a legacy offline upgrade")
+        with mock.patch.object(physical_slots.offline_context,
+                               "read_legacy_boot_state",
+                               side_effect=staged) as reader:
+            with self.assertRaisesRegex(physical_slots.PhysicalSlotsError,
+                                        "staged"):
+                physical_slots._read_legacy_boot_state()
+        reader.assert_called_once_with(reject_pending=True)
+
+    def test_mutation_reader_also_rejects_a_queued_rollback(self):
+        pending = offline_context.OfflineContextError(
+            "a pending OSTree transaction (rollback) refuses a legacy offline upgrade")
+        with mock.patch.object(physical_slots.offline_context,
+                               "read_legacy_boot_state",
+                               side_effect=pending) as reader:
+            with self.assertRaisesRegex(physical_slots.PhysicalSlotsError,
+                                        "rollback"):
+                physical_slots._read_legacy_boot_state()
+        reader.assert_called_once_with(reject_pending=True)
+
+    def test_mutation_fallback_never_passes_the_identity_only_flag(self):
+        # _read_offline_boot_state is a mutation fallback, so it must keep the
+        # strict default; only inspect_legacy_identity_slots may relax it.
+        error = physical_slots.PhysicalSlotsError("invalid boot context: no witness")
+        with mock.patch.object(physical_slots, "_read_boot_state",
+                               side_effect=error), \
+                mock.patch.object(physical_slots.offline_context,
+                                  "new_evidence_present", return_value=False), \
+                mock.patch.object(physical_slots, "_read_legacy_boot_state",
+                                  return_value=self.STATE) as legacy:
+            physical_slots._read_offline_boot_state()
+        legacy.assert_called_once_with()
+
+
 def _set_gpt_unbootable(image, block_size, entry):
     """Set GPT attribute bit 55 on one fixture entry and repair both CRCs.
 
@@ -823,6 +999,31 @@ class OfflineIdentityTests(unittest.TestCase):
                                     "actual slot"):
             offline_session._legacy_identity(dict(LEGACY_REPORT, actualSlot="a"))
 
+    def test_info_reports_a_staged_deployment_as_data(self):
+        # info must still identify the device; the staged deployment is the
+        # upgrade blocker and is exposed instead of failing the connection.
+        self._legacy_device(LEGACY_REPORT)
+        staged = {"stateroot": OSNAME, "checksum": "c" * 64, "serial": 1,
+                  "incompatible": False}
+        with mock.patch.object(offline_context, "_read_ostree_booted",
+                               return_value=_evidence(staged=staged)):
+            info = offline_session.OfflineSessionStore(base=self.base).info()
+        self.assertEqual(info["staged"], staged)
+        self.assertFalse(info["rollbackQueued"])
+        self.assertEqual(info["deployment"], LEGACY_DEPLOYMENT)
+        self.assertIsNone(info["actualSlot"])
+        self.assertFalse(self.base.exists())
+
+    def test_info_reports_a_queued_rollback_as_data(self):
+        self._legacy_device(LEGACY_REPORT)
+        with mock.patch.object(offline_context, "_read_ostree_booted",
+                               return_value=_evidence(rollback_queued=True)):
+            info = offline_session.OfflineSessionStore(base=self.base).info()
+        self.assertIsNone(info["staged"])
+        self.assertTrue(info["rollbackQueued"])
+        self.assertEqual(info["deployment"], LEGACY_DEPLOYMENT)
+        self.assertFalse(self.base.exists())
+
 
 def _signed_package(private_key, payload: bytes):
     package = release_fixture._upgrade_package_dict()
@@ -974,6 +1175,87 @@ class PreflightTests(unittest.TestCase):
         writes.assert_not_called()
         self.assertFalse(self.base.exists())
         self.assertFalse((self.sysroot / "ostree").exists())
+
+    def test_preflight_rejects_a_staged_deployment(self):
+        # info accepts this device, but preflight asks the strict mutation
+        # precheck, which keeps the staged-deployment rejection.
+        document, signature, _payload = _signed_package(
+            self.private, os.urandom(4096))
+        store = offline_session.OfflineSessionStore(
+            base=self.base, trusted_key=self.public, sysroot_path=self.sysroot)
+        staged = physical_slots.PhysicalSlotsError(
+            "invalid legacy boot context: a staged OSTree deployment refuses "
+            "a legacy offline upgrade")
+        with mock.patch.object(
+                physical_slots, "inspect_physical_slots",
+                side_effect=physical_slots.PhysicalSlotsError("no witness")), \
+                mock.patch.object(physical_slots.offline_context,
+                                  "new_evidence_present", return_value=False), \
+                mock.patch.object(physical_slots, "_inspect_slots",
+                                  side_effect=staged), \
+                mock.patch.object(
+                    offline_session.offline_prepare.offline_recovery.os,
+                    "pwrite") as writes:
+            with self.assertRaisesRegex(physical_slots.PhysicalSlotsError,
+                                        "staged"):
+                store.preflight(document, signature)
+        writes.assert_not_called()
+        self.assertFalse(self.base.exists())
+        self.assertFalse((self.sysroot / "ostree").exists())
+
+    def test_preflight_rejects_a_queued_rollback_before_any_work(self):
+        # The injected inspector cannot prove pending state, so preflight reads
+        # the snapshot: a rollback queued after prepare must fail before
+        # package, dependency or recovery work instead of reporting ready.
+        document, signature, _payload = _signed_package(
+            self.private, os.urandom(4096))
+        snapshot = {"channel": "stable", "staged": None, "rollback_queued": True}
+        with mock.patch.object(
+                offline_session.offline_context, "snapshot",
+                return_value=snapshot), \
+                mock.patch.object(
+                    offline_session.package_contract, "load_package") as load, \
+                mock.patch.object(
+                    offline_session.OfflineSessionStore,
+                    "_check_updater_dependencies") as dependencies, \
+                mock.patch.object(
+                    offline_session.offline_prepare, "_check_recovery") as recovery, \
+                mock.patch.object(
+                    offline_session.offline_prepare.offline_recovery.os,
+                    "pwrite") as writes:
+            with self.assertRaisesRegex(offline_session.OfflineSessionError,
+                                        "pending"):
+                self._store(lambda: dict(LEGACY_REPORT)).preflight(
+                    document, signature)
+        load.assert_not_called()
+        dependencies.assert_not_called()
+        recovery.assert_not_called()
+        writes.assert_not_called()
+        self.assertFalse(self.base.exists())
+        self.assertFalse((self.sysroot / "ostree").exists())
+
+    def test_preflight_rejects_a_pending_modern_snapshot(self):
+        # Modern systems keep the same strict policy: a staged deployment or
+        # queued rollback blocks preflight regardless of boot context.
+        document, signature, _payload = _signed_package(
+            self.private, os.urandom(4096))
+        self.board = 2
+        strict = {"model": "TB323FU", "actualSlot": "a", "inactiveSlot": "b",
+                  "selectedSlot": "a", "deployment": LEGACY_DEPLOYMENT,
+                  "recoveryPartUuid": PART_UUID}
+        snapshot = {"channel": "stable", "staged": {
+            "stateroot": OSNAME, "checksum": "c" * 64, "serial": 1},
+            "rollback_queued": False}
+        with mock.patch.object(
+                offline_session.offline_context, "snapshot",
+                return_value=snapshot), \
+                mock.patch.object(
+                    offline_session.package_contract, "load_package") as load:
+            with self.assertRaisesRegex(offline_session.OfflineSessionError,
+                                        "pending"):
+                self._store(lambda: dict(strict)).preflight(document, signature)
+        load.assert_not_called()
+        self.assertFalse(self.base.exists())
 
     def test_preflight_rejects_a_bad_signature_or_missing_dependency(self):
         document, signature, _payload = _signed_package(self.private, os.urandom(4096))

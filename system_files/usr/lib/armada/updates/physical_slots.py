@@ -260,10 +260,18 @@ def _read_boot_state():
     return dict(booted), dict(context)
 
 
-def _read_legacy_boot_state():
-    """Read-only libostree binding used only by the offline inspector."""
+def _read_legacy_boot_state(*, reject_pending=True):
+    """Read-only libostree binding used only by the offline inspector.
+
+    ``reject_pending`` stays True for every mutation caller (preflight,
+    prepare, execute, the boot writer and activation): a staged deployment or
+    a queued rollback refuses a legacy upgrade.  Only the identity-only
+    inventory passes False, and that permissive reader never reaches a
+    mutation path.
+    """
     try:
-        booted, context = offline_context.read_legacy_boot_state()
+        booted, context = offline_context.read_legacy_boot_state(
+            reject_pending=reject_pending)
     except Exception as error:
         raise PhysicalSlotsError(f'invalid legacy boot context: {error}') from error
     return dict(booted), dict(context)
@@ -410,17 +418,21 @@ def inspect_legacy_identity_slots():
     image the firmware has not authenticated) is still a healthy running
     system, and refusing to identify it would hide the reason a future upgrade
     cannot start.  The controller's genuine flags are reported unchanged and
-    the selected slot must itself be bootable; no actual slot is claimed.
+    the selected slot must itself be bootable; no actual slot is claimed.  A
+    staged OSTree deployment is likewise an upgrade blocker, not an identity
+    defect, so this inventory tolerates it while info reports it as data; the
+    same holds for a queued rollback.
 
     This path is never used by prepare, execute, preflight or any other caller
-    that can write; those keep the strict both-bootable precheck.
+    that can write; those keep the strict both-bootable precheck and the
+    explicit pending-transaction rejection.
     """
     if offline_context.new_evidence_present():
         raise PhysicalSlotsError(
             'witness evidence exists; the legacy identity inventory does not apply')
     return _inspect_slots(
-        _read_legacy_boot_state, 'physical_slots_checked',
-        require_witness=False, require_bootable=False)
+        lambda: _read_legacy_boot_state(reject_pending=False),
+        'physical_slots_checked', require_witness=False, require_bootable=False)
 
 
 def offline_slot_pair(physical):

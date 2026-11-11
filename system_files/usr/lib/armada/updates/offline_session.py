@@ -239,8 +239,9 @@ def read_offline_device_identity():
     selected slot is reported.  That inventory is read-only and permissive
     about the inactive slot: info must identify a running device even when the
     inactive slot is not bootable yet, because that is a future upgrade
-    blocker, not an identity defect.  Mutation callers keep the strict
-    both-bootable precheck.
+    blocker, not an identity defect.  It is also the only inspector that
+    tolerates a staged OSTree deployment; mutation callers keep the strict
+    both-bootable and staged-deployment precheck.
     """
     try:
         evidence = _strict_evidence()
@@ -330,19 +331,25 @@ class OfflineSessionStore:
 
     def info(self):
         physical = self._info_physical()
+        snapshot = self._snapshot_state()
         result = {
             'schemaVersion': 1,
             'updaterVersion': self.updater_version,
             'model': physical['model'],
             'deployment': physical['deployment'],
             'recoveryPartUuid': physical['recoveryPartUuid'],
-            'channel': self._channel_info(),
+            'channel': system_transaction._snapshot_channel(snapshot),
         }
         if physical.get('bootContext') == physical_slots.LEGACY_BOOT_CONTEXT:
+            # Pending OSTree state is reported as data instead of hiding the
+            # device: info must identify a connected legacy system even when a
+            # staged deployment or a queued rollback blocks a later upgrade.
             result.update(actualSlot=None, inactiveSlot=None,
                           selectedSlot=physical['selectedSlot'],
                           bootContext=physical['bootContext'],
-                          bootableSlots=dict(physical['bootableSlots']))
+                          bootableSlots=dict(physical['bootableSlots']),
+                          staged=snapshot.get('staged'),
+                          rollbackQueued=bool(snapshot.get('rollback_queued')))
         else:
             result.update(actualSlot=physical['actualSlot'],
                           inactiveSlot=physical['inactiveSlot'])
@@ -413,6 +420,15 @@ class OfflineSessionStore:
             raise ValueError('signature must be nonempty bytes of at most 16 KiB')
         physical = self._require_identity(self._physical_info())
         snapshot = self._snapshot_state()
+        # A pending OSTree transaction blocks prepare, execute, the boot
+        # writer and activation.  The injected/mocked inspector cannot prove
+        # the device is idle, and the modern snapshot carries the same fields,
+        # so preflight rejects the snapshot before package, dependency or
+        # recovery work instead of claiming readiness prepare would refuse.
+        if isinstance(snapshot, dict) and (
+                snapshot.get('staged') or snapshot.get('rollback_queued')):
+            raise OfflineSessionError(
+                'a pending OSTree transaction refuses an offline upgrade')
         channel = system_transaction._snapshot_channel(snapshot)
         package = package_contract.load_package(
             document, signature_b64, trusted_key=self.trusted_key)

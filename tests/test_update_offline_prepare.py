@@ -571,6 +571,44 @@ class OfflinePrepareTest(unittest.TestCase):
             env.capture.assert_not_called()
             env.assert_untouched()
 
+    def test_legacy_queued_rollback_is_refused_before_deployment_work(self) -> None:
+        # The legacy snapshot now derives rollback_queued from the libostree
+        # default/booted mismatch, so prepare sees the real pending state and
+        # refuses before importing, capturing trust or appending a deployment.
+        with self._case(legacy=True) as env:
+            env.snapshot.return_value = {
+                "repository": next(iter(armada_os.REPOSITORIES)),
+                "channel": "stable",
+                "staged": None,
+                "rollback_queued": True,
+            }
+            with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                env.run()
+            self.assertIn("transaction conflict", str(ctx.exception))
+            self.assertFalse(env.work.exists())
+            env.import_payload.assert_not_called()
+            env.capture.assert_not_called()
+            env.deploy.assert_not_called()
+            env.materials.assert_not_called()
+            env.assert_untouched()
+
+    def test_legacy_staged_deployment_is_refused_before_deployment_work(self) -> None:
+        with self._case(legacy=True) as env:
+            env.snapshot.return_value = {
+                "repository": next(iter(armada_os.REPOSITORIES)),
+                "channel": "stable",
+                "staged": {"checksum": NEW_COMMIT},
+                "rollback_queued": False,
+            }
+            with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                env.run()
+            self.assertIn("transaction conflict", str(ctx.exception))
+            self.assertFalse(env.work.exists())
+            env.import_payload.assert_not_called()
+            env.capture.assert_not_called()
+            env.deploy.assert_not_called()
+            env.assert_untouched()
+
 
 if __name__ == "__main__":
     unittest.main()

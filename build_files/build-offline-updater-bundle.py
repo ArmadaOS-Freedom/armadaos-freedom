@@ -60,6 +60,8 @@ CORE_MODULES = (
     'offline_prepare',
     'offline_execute',
     'offline_recovery',
+    'offline_payload',
+    'offline_boot_writer',
 )
 
 # Modules the assembled rootfs receives from build_files rather than from the
@@ -139,6 +141,23 @@ def _local_imports(path):
     return ({name for name in required if name and name != '*'}, optional)
 
 
+def _flat_modules(located, dotted):
+    """Return located modules, rejecting paths the bootstrap cannot install.
+
+    armada-offline-bootstrap only accepts direct ``updates/*.py`` files, so a
+    subpackage would be written into the archive and then rejected on install.
+    """
+    for archive_name, _path in located:
+        if archive_name == ARMADA_OS_PATH:
+            continue
+        directory, _sep, filename = archive_name.rpartition('/')
+        if directory != UPDATES_DIR or not filename.endswith('.py'):
+            raise BundleError(
+                'updater module %s maps to nested path %s; the offline bootstrap '
+                'only accepts flat modules in %s' % (dotted, archive_name, UPDATES_DIR))
+    return located
+
+
 def _locate_module(updates_root, dotted):
     """Return [(archive name, source path)] for a locally resolvable import."""
     parts = dotted.split('.')
@@ -158,11 +177,11 @@ def _locate_module(updates_root, dotted):
         if len(parts) > 1:
             directory += '/'.join(parts[:-1]) + '/'
         located.append((directory + parts[-1] + '.py', module))
-        return located
+        return _flat_modules(located, dotted)
     init = parent / parts[-1] / '__init__.py'
     if init.is_file():
         located.append((UPDATES_DIR + '/' + '/'.join(parts) + '/__init__.py', init))
-        return located
+        return _flat_modules(located, dotted)
     if parts == ['armada_os']:
         support = updates_root.parent / 'armada_os.py'
         if support.is_file():
@@ -186,8 +205,11 @@ def _module_closure(updates_root):
     names = set()
     # armada_os is imported by the updater and itself imports updates.client, so
     # it is traversed as a required support module even though it lives beside
-    # the package instead of inside it.
-    pending = [('offline_rpc', True), ('armada_os', True)]
+    # the package instead of inside it.  offline_payload and offline_boot_writer
+    # are the same kind of root: armada-offline-bootstrap rejects a bundle
+    # without them, so they are collected even if the entry stops importing them.
+    pending = [('offline_rpc', True), ('armada_os', True),
+               ('offline_payload', True), ('offline_boot_writer', True)]
     while pending:
         name, required = pending.pop()
         if name in names:
