@@ -15,6 +15,7 @@ SSH/sudo policy or remounts the root filesystem.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -854,6 +855,44 @@ def _restore(final, stage, backup):
             shutil.rmtree(stage, ignore_errors=True)
 
 
+@contextlib.contextmanager
+def _verified_bundle_snapshot(stream, expected_sha256):
+    """Copy the bundle to a private snapshot and verify exactly those bytes.
+
+    The bundle file belongs to the caller.  Hashing the named file and then
+    scanning it again would leave a window in which a writer could replace it
+    with a different, internally consistent archive after the digest check,
+    so the bytes that are hashed are the only bytes that get installed.  The
+    copy lives in an anonymous temporary file: another process has no name to
+    open or substitute.  A file that changes while it is copied simply yields
+    different snapshot bytes and therefore a digest mismatch.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        snapshot = tempfile.TemporaryFile()
+    except OSError as error:
+        raise BootstrapError('stage_failed',
+                             'cannot create a private bundle snapshot: %s' % error)
+    with snapshot:
+        while True:
+            chunk = stream.read(_CHUNK)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_BUNDLE_BYTES:
+                raise BootstrapError('bundle_too_large', 'bundle exceeds %d bytes'
+                                     % MAX_BUNDLE_BYTES)
+            digest.update(chunk)
+            snapshot.write(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+            raise BootstrapError('hash_mismatch',
+                                 'bundle SHA256 does not match the expected digest')
+        snapshot.flush()
+        snapshot.seek(0)
+        yield snapshot
+
+
 def install(bundle, expected_sha256, *, root='/', runner=None):
     """Deploy the verified bundle as a host extension and refresh systemd-sysext."""
     if not _is_root():
@@ -874,22 +913,8 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
     except OSError as error:
         raise BootstrapError('bundle_unreadable', 'cannot open bundle: %s' % error)
 
-    with stream:
-        digest = hashlib.sha256()
-        size = 0
-        while True:
-            chunk = stream.read(_CHUNK)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_BUNDLE_BYTES:
-                raise BootstrapError('bundle_too_large', 'bundle exceeds %d bytes'
-                                     % MAX_BUNDLE_BYTES)
-            digest.update(chunk)
-        if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
-            raise BootstrapError('hash_mismatch',
-                                 'bundle SHA256 does not match the expected digest')
-        manifest, members = _scan_archive(stream)
+    with stream, _verified_bundle_snapshot(stream, expected_sha256) as snapshot:
+        manifest, members = _scan_archive(snapshot)
         specs = _validate_manifest(manifest, members)
 
         version = manifest['version']
@@ -947,7 +972,7 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
         stage = _new_stage(extensions)
 
         try:
-            _extract(stream, stage, specs)
+            _extract(snapshot, stage, specs)
             if _missing_runtime(stage):
                 raise BootstrapError('manifest_mismatch',
                                      'staged extension is missing required runtime files')

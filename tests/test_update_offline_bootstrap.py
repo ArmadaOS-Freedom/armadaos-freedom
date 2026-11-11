@@ -315,9 +315,9 @@ class ProbeTest(unittest.TestCase):
         source = BOOTSTRAP_PATH.read_text(encoding='utf-8')
         tree = ast.parse(source, filename=str(BOOTSTRAP_PATH))
         allowed_imports = {
-            '__future__', 'hashlib', 'hmac', 'json', 'os', 'pathlib', 'platform',
-            're', 'shutil', 'stat', 'subprocess', 'sys', 'tarfile', 'tempfile',
-            'uuid',
+            '__future__', 'contextlib', 'hashlib', 'hmac', 'json', 'os',
+            'pathlib', 'platform', 're', 'shutil', 'stat', 'subprocess', 'sys',
+            'tarfile', 'tempfile', 'uuid',
         }
         forbidden_imports = {
             'updates', 'armada_os', 'boot_writer', 'slot_activation',
@@ -530,6 +530,29 @@ class InstallTest(unittest.TestCase):
         return sorted(path.name for path in
                       (self.root / 'run/extensions').glob('.%s.*' % EXTENSION))
 
+    def modified_bundle(self, name, relative, data):
+        """Build a second, fully valid bundle whose file ``relative`` differs."""
+        source = populate_runtime(self.base / (name + '-src'))
+        write(source / relative, data)
+        target = self.base / (name + '.tar.gz')
+        self.builder.build(source, target)
+        return target
+
+    def snapshots(self, action):
+        """Run ``action`` while recording every bundle snapshot it opens."""
+        created = []
+        real_temporary_file = self.bootstrap.tempfile.TemporaryFile
+
+        def factory(*args, **kwargs):
+            handle = real_temporary_file(*args, **kwargs)
+            created.append(handle)
+            return handle
+
+        with mock.patch.object(self.bootstrap.tempfile, 'TemporaryFile',
+                               side_effect=factory):
+            action()
+        return created
+
     def test_install_deploys_extension_without_touching_other_extensions(self):
         other = self.root / 'run/extensions/other.raw'
         write(other / 'keep.txt', b'other extension\n')
@@ -580,6 +603,76 @@ class InstallTest(unittest.TestCase):
             self.install(digest='0' * 64)
         self.assertEqual(caught.exception.code, 'hash_mismatch')
         self.assertFalse(self.final.exists())
+
+    def test_install_ignores_a_bundle_swapped_after_hashing(self):
+        # A writer replaces the bundle once the digest check has passed.  The
+        # replacement keeps every module and its imports intact - only extra
+        # bytes are appended - so the builder accepts it as a valid bundle and
+        # only reading the verified bytes prevents installing it.
+        original_rpc = self.base / 'bundle-src' / UPDATES / 'offline_rpc.py'
+        marker = b'\n# attacker marker: swapped after the digest check\n'
+        replacement = original_rpc.read_bytes() + marker
+        attacker = self.modified_bundle(
+            'attacker', UPDATES + '/offline_rpc.py', replacement)
+        real_scan = self.bootstrap._scan_archive
+
+        # The attacker archive is a genuine, buildable bundle that differs from
+        # the verified one exactly by the appended marker.
+        with tarfile.open(attacker) as archive:
+            self.assertEqual(
+                archive.extractfile(UPDATES + '/offline_rpc.py').read(), replacement)
+        self.assertNotEqual(replacement, original_rpc.read_bytes())
+
+        def swap_then_scan(stream):
+            shutil.copyfile(attacker, self.bundle)
+            return real_scan(stream)
+
+        with mock.patch.object(self.bootstrap, '_scan_archive',
+                               side_effect=swap_then_scan):
+            result = self.install()
+
+        # The swap really happened; hashing the named file again would have
+        # seen the attacker archive.
+        self.assertEqual(self.bundle.read_bytes(), attacker.read_bytes())
+        self.assertEqual(result['state'], 'installed')
+        self.assertEqual(result['sha256'], self.digest)
+        installed = (self.final / UPDATES / 'offline_rpc.py').read_bytes()
+        self.assertEqual(installed, original_rpc.read_bytes())
+        self.assertNotEqual(installed, replacement)
+        self.assertNotIn(marker, installed)
+
+    def test_install_extracts_only_from_the_verified_snapshot(self):
+        real_extract = self.bootstrap._extract
+
+        def corrupt_then_extract(stream, stage, specs):
+            self.bundle.write_bytes(b'this is no longer a tar archive')
+            return real_extract(stream, stage, specs)
+
+        with mock.patch.object(self.bootstrap, '_extract',
+                               side_effect=corrupt_then_extract):
+            result = self.install()
+
+        self.assertEqual(result['state'], 'installed')
+        self.assertEqual(
+            (self.final / UPDATES / 'offline_session.py').read_bytes(),
+            (self.base / 'bundle-src' / UPDATES / 'offline_session.py').read_bytes())
+
+    def test_install_closes_the_snapshot_after_success(self):
+        created = self.snapshots(self.install)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].closed)
+        with self.assertRaises(ValueError):
+            created[0].fileno()
+
+    def test_install_closes_the_snapshot_after_a_digest_mismatch(self):
+        def attempt():
+            with self.assertRaises(self.bootstrap.BootstrapError) as caught:
+                self.install(digest='0' * 64)
+            self.assertEqual(caught.exception.code, 'hash_mismatch')
+
+        created = self.snapshots(attempt)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].closed)
 
     def test_install_rejects_traversal_member(self):
         malicious = write_archive(self.base / 'bad.tar.gz',
