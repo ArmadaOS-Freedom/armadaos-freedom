@@ -42,6 +42,10 @@ _METHOD_PARAMS = {
 _METHOD_OPTIONAL_PARAMS = {
     'preflight': frozenset({'sessionId'}),
 }
+# Reported by this exact service, not inferred from a version string: a client
+# may gate the optional preflight session id on this only.  It is truthful
+# because the optional parameter and its forwarder above are already present.
+_CAPABILITIES = ('preflight-session-v1',)
 _NORMAL_METHODS = frozenset({
     'preflight', 'info', 'begin', 'status', 'upload', 'seal', 'prepare', 'execute',
     'export', 'restart_to_verify',
@@ -100,7 +104,12 @@ def _session_id(params):
 
 
 def _op_info(manager, _params):
-    return manager.store.info()
+    # Copy before adding: the store may hand back the mapping it keeps
+    # internally, and advertising this endpoint's capabilities must never
+    # rewrite the stored device info.
+    info = dict(manager.store.info())
+    info['capabilities'] = list(_CAPABILITIES)
+    return info
 
 
 def _op_preflight(manager, params):

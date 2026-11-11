@@ -20,6 +20,9 @@ from updates import offline_session  # noqa: E402
 from updates.package_contract import validate_package  # noqa: E402
 
 _MIB = 1024 * 1024
+# Captured before any test replaces it, so a multi-device fixture can still ask
+# the real filesystem about every path it does not overrule.
+_REAL_STAT = os.stat
 
 
 class OfflineSessionStoreTest(unittest.TestCase):
@@ -265,6 +268,15 @@ class OfflineSessionStoreTest(unittest.TestCase):
         sysroot.mkdir(exist_ok=True)
         return sysroot
 
+    @staticmethod
+    def _preflight_required(data, stored=0):
+        """Upload remainder plus the expansion, extraction and import allowances.
+
+        Each of the last three is planned with the authenticated expanded size;
+        the repository reserve is charged separately.
+        """
+        return (len(data) - stored) + 3 * (2 * len(data))
+
     def _preflight_identity(self, model="TB322FC"):
         """A realistic witness identity: strict slots and a canonical binding."""
         return lambda: {
@@ -280,12 +292,14 @@ class OfflineSessionStoreTest(unittest.TestCase):
                 "staged": None, "rollback_queued": False}
 
     def _preflight_store(self, base, free_bytes, model="TB322FC", sysroot_path=None,
-                         snapshot=None):
+                         snapshot=None, total_bytes=0):
         """A store whose read-only preflight sees the given free space.
 
         The inspector, snapshot and deployment binding are realistic; the
         updater dependencies and the recovery journal stay read-only fixtures
         so the only variable left is the storage accounting under test.
+        ``total_bytes`` sizes the filesystem for the OSTree repository reserve,
+        which stays unset here so the plain byte arithmetic is exact.
         """
         store = self._store(
             base, sysroot_path=sysroot_path or self._preflight_sysroot("default"),
@@ -301,7 +315,60 @@ class OfflineSessionStoreTest(unittest.TestCase):
                     layout=SimpleNamespace(descriptor_version=3))),
             mock.patch.object(
                 offline_session.os, "statvfs",
-                return_value=SimpleNamespace(f_bavail=free_bytes, f_frsize=1)),
+                return_value=SimpleNamespace(
+                    f_bavail=free_bytes, f_blocks=total_bytes, f_frsize=1)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return store
+
+    def _storage_store(self, base, sysroot, layout, snapshot=None):
+        """A preflight store whose paths report the filesystems in ``layout``.
+
+        ``layout`` is a sequence of ``(prefix, st_dev, free_bytes, total_bytes)``
+        in match order, so a test can place the session storage and the import
+        destination on different filesystems while every other read keeps
+        touching the real filesystem.
+        """
+        store = self._store(
+            base, sysroot_path=sysroot, inspect=self._preflight_identity(),
+            snapshot=self._preflight_snapshot() if snapshot is None else snapshot)
+        real_stat = _REAL_STAT
+
+        def owner(path):
+            text = str(Path(path))
+            for prefix, device, free, total in layout:
+                if text == prefix or text.startswith(prefix + os.sep):
+                    return device, free, total
+            return None
+
+        def fake_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            found = owner(path)
+            if found is None:
+                return result
+            # st_dev is index 2 of stat_result's first ten fields; index 0 is
+            # st_mode, so overwriting it would erase the file type.
+            values = list(result)
+            values[2] = found[0]
+            return os.stat_result(values)
+
+        def fake_statvfs(path):
+            found = owner(path)
+            if found is None:
+                raise AssertionError("unexpected statvfs: %s" % path)
+            return SimpleNamespace(f_bavail=found[1], f_blocks=found[2], f_frsize=1)
+
+        for patcher in (
+            mock.patch.object(
+                offline_session.OfflineSessionStore,
+                "_check_updater_dependencies"),
+            mock.patch.object(
+                offline_session.offline_prepare, "_check_recovery",
+                return_value=SimpleNamespace(
+                    layout=SimpleNamespace(descriptor_version=3))),
+            mock.patch.object(offline_session.os, "stat", side_effect=fake_stat),
+            mock.patch.object(offline_session.os, "statvfs", side_effect=fake_statvfs),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -363,10 +430,12 @@ class OfflineSessionStoreTest(unittest.TestCase):
             store.preflight(doc, sig)
         self.assertFalse(base.exists())
 
-        # The 4 KiB compressed payload plus its 8 KiB expansion must fit.
+        # The 4 KiB compressed payload, its 8 KiB expansion, the 8 KiB
+        # repository extraction and the 8 KiB import must all fit.
+        required = self._preflight_required(data)
+        self.assertEqual(required, 7 * len(data))
         self.assertEqual(
-            self._preflight_store(base, len(data) + 2 * len(data))
-            .preflight(doc, sig)["phase"],
+            self._preflight_store(base, required).preflight(doc, sig)["phase"],
             "preflight_passed")
         self.assertFalse(base.exists())
 
@@ -374,11 +443,12 @@ class OfflineSessionStoreTest(unittest.TestCase):
         doc, sig, data = self._signed_package()
         self.assertEqual(len(data), 4 * 1024)
         base = self.tmp / "preflight-space" / "offline"
+        required = self._preflight_required(data)
         with self.assertRaisesRegex(
                 offline_session.OfflineSessionError, "free space"):
-            self._preflight_store(base, 6 * 1024).preflight(doc, sig)
+            self._preflight_store(base, required - 1).preflight(doc, sig)
         self.assertEqual(
-            self._preflight_store(base, 12 * 1024).preflight(doc, sig)["phase"],
+            self._preflight_store(base, required).preflight(doc, sig)["phase"],
             "preflight_passed")
         self.assertFalse(base.exists())
 
@@ -461,12 +531,12 @@ class OfflineSessionStoreTest(unittest.TestCase):
             base, sid, doc, sig, 0, "prepared")
 
         # The same read-only guarantee on a session that has no lock yet: the
-        # full compressed payload plus expansion is still required and no lock
-        # may appear as a side effect.
+        # full compressed payload plus expansion, extraction and import is
+        # still required and no lock may appear as a side effect.
         self.assertFalse((unlocked / unlocked_sid / ".lock").exists())
         self._assert_preflight_is_read_only(
             unlocked, unlocked_sid, unlocked_doc, unlocked_sig,
-            3 * len(unlocked_data), "unlocked")
+            self._preflight_required(unlocked_data), "unlocked")
 
     def test_preflight_does_not_credit_expansion_without_bound_proof(self):
         for label, proof in (
@@ -482,7 +552,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
                     self._write_completed_expansion(
                         base, sid, doc, 2 * len(data), **proof)
                 store = self._preflight_store(
-                    base, 2 * len(data) - 1,
+                    base, 3 * (2 * len(data)) - 1,
                     sysroot_path=self._preflight_sysroot("proof"))
                 with self.assertRaisesRegex(
                         offline_session.OfflineSessionError, "free space"):
@@ -498,8 +568,8 @@ class OfflineSessionStoreTest(unittest.TestCase):
         self._store(base).upload(other["sessionId"], 0, other_data[:-16])
 
         # A partial upload only reduces the compressed part it already stored;
-        # the full expansion is still required.
-        required = (len(data) - 1000) + 2 * len(data)
+        # the full expansion, extraction and import are still required.
+        required = self._preflight_required(data, stored=1000)
         sysroot = self._preflight_sysroot("partial")
         self.assertEqual(
             self._preflight_store(base, required, sysroot_path=sysroot)
@@ -596,39 +666,168 @@ class OfflineSessionStoreTest(unittest.TestCase):
             store.preflight(doc, sig)
         self.assertFalse(base.exists())
 
-    def test_preflight_measures_the_storage_that_receives_data(self):
-        base = self.tmp / "preflight-mounts" / "offline"
-        sid, doc, sig, data = self._session_for_preflight(
-            base, state="uploading", received=1000)
-        sysroot = self._preflight_sysroot("mounts")
-        required = (len(data) - 1000) + 2 * len(data)
+    def _preflight_work(self, name):
+        """A resolved working directory holding both the session and sysroot."""
+        work = (self.tmp / name).resolve()
+        work.mkdir(exist_ok=True)
+        sysroot = work / "image"
+        sysroot.mkdir(exist_ok=True)
+        return work, work / "offline", sysroot
 
-        def free_space(by_path):
-            def statvfs(path):
-                for prefix, value in by_path:
-                    if str(path) == prefix or str(path).startswith(prefix + os.sep):
-                        return SimpleNamespace(f_bavail=value, f_frsize=1)
-                raise AssertionError("unexpected statvfs: %s" % path)
-            return statvfs
+    def test_preflight_rejects_a_destination_without_room_despite_an_ample_session(self):
+        # The session tree and the import destination are different
+        # filesystems: room for the session never covers the pull-local target.
+        _work, base, sysroot = self._preflight_work("preflight-destination")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        import_allowance = 2 * len(data)
+        short = [(str(sysroot), 2, import_allowance - 1, 0),
+                 (str(base), 1, 1 << 30, 0)]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(base, sysroot, short).preflight(doc, sig, sid)
+        room = [(str(sysroot), 2, import_allowance, 0),
+                (str(base), 1, 1 << 30, 0)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, room).preflight(doc, sig, sid)["sessionId"],
+            sid)
 
-        # The unrelated image sysroot has ample room, but the session storage
-        # that receives the upload and the expansion does not.
-        store = self._preflight_store(base, 0, sysroot_path=sysroot)
-        with mock.patch.object(
-                offline_session.os, "statvfs",
-                side_effect=free_space([(str(sysroot), 1 << 30),
-                                        (str(base), required - 1)])):
-            with self.assertRaisesRegex(
-                    offline_session.OfflineSessionError, "free space"):
-                store.preflight(doc, sig, sid)
+    def test_preflight_rejects_missing_repository_extraction_space(self):
+        # The session filesystem has room for the expanded image but not for
+        # the repository tree btrfs restore extracts beside it.
+        _work, base, sysroot = self._preflight_work("preflight-extraction")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        expanded = 2 * len(data)
+        short = [(str(sysroot), 2, 1 << 30, 0),
+                 (str(base), 1, expanded + 1, 0)]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(base, sysroot, short).preflight(doc, sig, sid)
+        room = [(str(sysroot), 2, 1 << 30, 0),
+                (str(base), 1, 2 * expanded, 0)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, room).preflight(doc, sig, sid)["sessionId"],
+            sid)
 
-        # Conversely a full image sysroot never gates a session whose own
-        # filesystem has the room the upload and expansion actually need.
-        with mock.patch.object(
-                offline_session.os, "statvfs",
-                side_effect=free_space([(str(sysroot), 0),
-                                        (str(base), required)])):
+    def test_preflight_sums_a_shared_filesystem_and_keeps_the_repository_reserve(self):
+        # One filesystem holds the expansion, the extraction and the import, so
+        # the three allowances are summed and the repository's default reserve
+        # (3 percent, no config present) is charged once more on top.
+        work, base, sysroot = self._preflight_work("preflight-shared")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        total = 1_000_000
+        reserve = total * 3 // 100
+        required = 3 * (2 * len(data)) + reserve
+        short = [(str(work), 1, required - 1, total)]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(base, sysroot, short).preflight(doc, sig, sid)
+        room = [(str(work), 1, required, total)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, room).preflight(doc, sig, sid)["sessionId"],
+            sid)
+
+    def test_preflight_honours_the_repository_reserve_config(self):
+        work, base, sysroot = self._preflight_work("preflight-reserve")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        repository = sysroot / "ostree" / "repo"
+        repository.mkdir(parents=True)
+        config = repository / "config"
+        config.write_text("[core]\nmin-free-space-percent=10\n"
+                          "min-free-space-size=1MB\n")
+        total = 1_000_000
+        allowances = 3 * (2 * len(data))
+        # min-free-space-size wins over min-free-space-percent the way older
+        # libostree resolves them: 1 MiB, not 10 percent of this filesystem.
+        # Newer releases take the lesser of the two, so this deliberate
+        # older-compatible precedence only ever overstates the reserve.
+        percent_only = allowances + total * 10 // 100
+        size_reserve = 1024 * 1024
+        short = [(str(work), 1, percent_only, total)]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(base, sysroot, short).preflight(doc, sig, sid)
+        room = [(str(work), 1, allowances + size_reserve, total)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, room).preflight(doc, sig, sid)["sessionId"],
+            sid)
+
+        # A reserve this module cannot honour is refused, never ignored.
+        config.write_text("[core]\nmin-free-space-size=3XB\n")
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "reserve size"):
+            self._storage_store(base, sysroot, room).preflight(doc, sig, sid)
+
+        # A zero size disables only the absolute form: the percent reserve the
+        # same config still names keeps applying, rather than the reserve
+        # collapsing to nothing.
+        config.write_text("[core]\nmin-free-space-size=0\n"
+                          "min-free-space-percent=10\n")
+        percent_reserve = total * 10 // 100
+        percent_short = [(str(work), 1, allowances + percent_reserve - 1, total)]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(base, sysroot, percent_short).preflight(doc, sig, sid)
+        percent_room = [(str(work), 1, allowances + percent_reserve, total)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, percent_room).preflight(doc, sig, sid)["sessionId"],
+            sid)
+
+        # The percent form is bounded to 0..99, so 100 is refused, not clamped.
+        config.write_text("[core]\nmin-free-space-percent=100\n")
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "reserve percent"):
+            self._storage_store(base, sysroot, percent_room).preflight(
+                doc, sig, sid)
+
+    def test_preflight_does_not_recharge_a_prepared_sessions_completed_work(self):
+        work, base, sysroot = self._preflight_work("preflight-prepared-storage")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        self._write_completed_expansion(base, sid, doc, 2 * len(data))
+        unproven = work / "offline-unproven"
+        other_sid, other_doc, other_sig, _other = self._session_for_preflight(unproven)
+
+        # The bound transaction proves the upload, the expansion, the
+        # extraction and the import are done, so no free space is required
+        # again and the repository reserve is not recharged either.
+        empty = [(str(work), 1, 0, 1_000_000)]
+        self.assertEqual(
+            self._storage_store(base, sysroot, empty).preflight(doc, sig, sid)["sessionId"],
+            sid)
+        # The same empty filesystem still refuses a session without that proof.
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            self._storage_store(unproven, sysroot, empty).preflight(
+                other_doc, other_sig, other_sid)
+
+    def test_preflight_reads_the_repository_config_without_touching_it(self):
+        work, base, sysroot = self._preflight_work("preflight-read-only")
+        sid, doc, sig, data = self._session_without_lock(base)
+        repository = sysroot / "ostree" / "repo"
+        repository.mkdir(parents=True)
+        config = repository / "config"
+        config.write_text("[core]\nmin-free-space-percent=1\n")
+        before = (self._tree(work), config.read_bytes())
+        opens = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+            opens.append((Path(path), flags))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        store = self._preflight_store(
+            base, self._preflight_required(data), sysroot_path=sysroot)
+        with mock.patch.object(offline_session.os, "open", recording_open):
             self.assertEqual(store.preflight(doc, sig, sid)["sessionId"], sid)
+        # The canonical config is only read: no file, no lock and no directory
+        # appears, and no open carries a write flag.
+        self.assertEqual((self._tree(work), config.read_bytes()), before)
+        self.assertFalse((base / sid / ".lock").exists())
+        self.assertTrue(opens)
+        for path, flags in opens:
+            self.assertEqual(
+                flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC |
+                         os.O_APPEND), 0,
+                "preflight opened %s with write flags %#x" % (path, flags))
 
     def test_export_length_and_state_handling(self):
         store, sid, blob, tx = self._export_session()

@@ -556,7 +556,6 @@ class LegacyBootContextTests(unittest.TestCase):
         with self.assertRaises(offline_context.OfflineContextError):
             offline_context.legacy_channel(
                 "docker://example.invalid/os:stable", state_path=self.state)
-
     def _legacy_snapshot(self, sysroot):
         with mock.patch.object(offline_context.armada_os, "snapshot",
                                side_effect=RuntimeError("bootc status failed")), \
@@ -626,6 +625,10 @@ class LegacyChannelStateTests(unittest.TestCase):
 
     ORIGIN_STABLE = ("ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
                      "armadaos-freedom:stable@sha256:" + "d" * 64)
+    ORIGIN_DIGEST_ONLY = ("ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+                          "armadaos-freedom@sha256:" + "d" * 64)
+    ORIGIN_UNTRUSTED_DIGEST = ("ostree-image-signed:docker://ghcr.io/example/"
+                               "armadaos-freedom@sha256:" + "d" * 64)
     RAW_ORIGIN = "armada/stable"
 
     def setUp(self):
@@ -738,6 +741,63 @@ class LegacyChannelStateTests(unittest.TestCase):
         self.assertTrue(inferred["channelInferred"])
         self.assertFalse(self.state.exists())
 
+    def test_supported_digest_only_origin_uses_the_persisted_channel(self):
+        # A digest-only container reference still names its repository, so the
+        # validated persisted selection decides the channel.
+        self._write_state(b"beta\n")
+        snap = self._snapshot(self.ORIGIN_DIGEST_ONLY)
+        self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
+        self.assertEqual(snap["channel"], "beta")
+        self.assertFalse(snap["channelInferred"])
+
+    def test_supported_digest_only_origin_without_state_is_rejected(self):
+        # A digest-only container origin carries no channel.  Without a
+        # persisted selection it is refused, never inferred as stable.
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "channel state"):
+            self._snapshot(self.ORIGIN_DIGEST_ONLY)
+        self.assertFalse(self.state.exists())
+
+    def test_unsupported_container_origin_is_rejected_with_or_without_digest(self):
+        # A valid persisted selection never rescues an untrusted repository.
+        self._write_state(b"beta\n")
+        for origin in (
+                self.ORIGIN_UNTRUSTED_DIGEST,
+                "ostree-image-signed:docker://ghcr.io/example/os:stable",
+                "docker://ghcr.io/example/os@sha256:" + "d" * 64):
+            with self.subTest(origin=origin):
+                with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                            "not a supported"):
+                    self._snapshot(origin)
+
+    def test_malformed_container_origin_is_rejected(self):
+        self._write_state(b"beta\n")
+        for origin in (
+                "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+                "armadaos-freedom@sha256:nothex",
+                "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+                "armadaos-freedom:",
+                "ostree-image-signed:docker:///armadaos-freedom",
+                "unknown-transport://ghcr.io/armadaos-freedom/"
+                "armadaos-freedom:stable"):
+            with self.subTest(origin=origin):
+                with self.assertRaises(offline_context.OfflineContextError):
+                    self._snapshot(origin)
+
+    def test_a_genuine_raw_local_origin_keeps_the_legacy_inference(self):
+        # A raw OSTree ref and a bare commit name no container channel, so the
+        # established stable inference still applies.
+        for origin in (self.RAW_ORIGIN, "a" * 64):
+            with self.subTest(origin=origin):
+                snap = self._snapshot(origin)
+                self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
+                self.assertEqual(snap["channel"], "stable")
+                self.assertTrue(snap["channelInferred"])
+        self._write_state(b"testing\n")
+        snap = self._snapshot("a" * 64)
+        self.assertEqual(snap["channel"], "preview")
+        self.assertFalse(snap["channelInferred"])
+
     def test_invalid_or_unsafe_state_is_never_ignored(self):
         self._write_state(b"feature\n")
         with self.assertRaisesRegex(offline_context.OfflineContextError,
@@ -758,6 +818,7 @@ class LegacyChannelStateTests(unittest.TestCase):
         with self.assertRaisesRegex(offline_context.OfflineContextError,
                                     "channel state"):
             self._snapshot(self.ORIGIN_STABLE)
+
 
 
 class MountEvidenceTests(unittest.TestCase):

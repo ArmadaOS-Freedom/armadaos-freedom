@@ -58,6 +58,9 @@ _OSTREE = re.compile(
 _UUID = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 _HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+# A container digest; only used to recognise a digest-pinned reference, never
+# to decide the repository, which is parsed before the tag is considered.
+_DIGEST = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[-+._][A-Za-z0-9]+)*:[0-9a-fA-F]{32,128}\Z')
 _ZERO_UUID = '00000000-0000-0000-0000-000000000000'
 _UINT32_MAX = 0xFFFFFFFF
 _CHANNEL_TAGS = {'stable': 'stable', 'beta': 'beta', 'testing': 'preview'}
@@ -638,30 +641,98 @@ def _read_channel_state(state_path):
     return _installed_channel(state_path, f'{armada_os.FREEDOM}:stable')
 
 
+def _container_reference(origin_ref):
+    """Return the container reference of ``origin_ref``, or ``None`` for a local one.
+
+    A legacy origin is a raw OSTree commit or ref (``armada/stable``, a 64-hex
+    checksum) unless it carries a known transport prefix or names a registry in
+    its first path component.  The digest is stripped only afterwards, in
+    :func:`_container_repository`, so a digest-only container reference is
+    never mistaken for a local commit.
+    """
+    if origin_ref is None:
+        return None
+    if not isinstance(origin_ref, str):
+        raise OfflineContextError('legacy image origin is not text')
+    if not origin_ref:
+        return None
+    if any(ord(character) < 33 or ord(character) == 127 for character in origin_ref):
+        raise OfflineContextError('legacy image origin is malformed')
+    for prefix in armada_os.TRANSPORTS:
+        if origin_ref.startswith(prefix):
+            reference = origin_ref[len(prefix):]
+            if not reference:
+                raise OfflineContextError('legacy image origin is malformed')
+            return reference
+    if '://' in origin_ref:
+        raise OfflineContextError('legacy image origin uses an unsupported transport')
+    head = origin_ref.split('/', 1)[0]
+    if '@' in origin_ref or '.' in head or ':' in head:
+        # Registry-qualified or digest-pinned: a container reference even
+        # without a transport prefix, which is how libostree can report it.
+        return origin_ref
+    return None
+
+
+def _container_repository(reference):
+    """Return the repository of a container reference, independent of its tag.
+
+    The digest and the tag are optional and are removed in that order, so a
+    digest-only reference still names its repository.  A reference that cannot
+    be split into a repository, an optional tag and an optional digest is
+    refused instead of being guessed.
+    """
+    name, at, digest = reference.partition('@')
+    if at and (not name or _DIGEST.fullmatch(digest) is None):
+        raise OfflineContextError('legacy image origin has a malformed digest')
+    separator = name.rfind(':')
+    if separator > name.rfind('/'):
+        repository, tag = name[:separator], name[separator + 1:]
+        if not tag or '/' in tag:
+            raise OfflineContextError('legacy image origin has a malformed tag')
+    else:
+        repository = name
+    if not repository or repository.startswith('/') or '/' not in repository:
+        raise OfflineContextError('legacy image origin has a malformed repository')
+    return repository
+
+
 def legacy_channel(origin_ref, *, state_path=None):
     """Return ``(repository, channel, inferred)`` for a legacy origin.
 
     The validated persisted selection in ``/var/lib/armada/update-channel``
     wins over the image origin, so a channel selected after installation is
     what the snapshot and the submission identity checks report.  The origin
-    tag (or the explicit stable inference for a raw local commit origin) is a
-    fallback only while that state file is absent.  Invalid or unsafe state is
-    never ignored.
+    tag is a fallback only while that state file is absent, and only the
+    established stable inference for a genuine raw local commit/ref remains.
+
+    A container origin is classified by its repository, not by its tag: an
+    unsupported or malformed repository is refused with or without a digest,
+    and a digest-only origin of a supported repository needs the persisted
+    selection instead of being inferred as stable.
     """
     if state_path is None:
         from . import channel_selection
         state_path = channel_selection.DEFAULT_STATE_PATH
-    repository, _tag = armada_os.ref_repository_tag(origin_ref or '')
-    if repository is None:
+    reference = _container_reference(origin_ref)
+    if reference is None:
+        # A raw local OSTree commit/ref names no container channel, so it is
+        # never handed to the strict origin parser.  The validated state file
+        # decides the channel; only a missing selection is inferred as stable
+        # and explicitly recorded as such.
         channel = _read_channel_state(state_path)
         if channel is None:
-            # No selection exists, so the migration channel is inferred and
-            # explicitly recorded as such.
             return armada_os.FREEDOM, 'stable', True
         return armada_os.FREEDOM, _CHANNEL_TAGS[channel], False
+    repository = _container_repository(reference)
     if repository not in armada_os.REPOSITORIES:
-        raise OfflineContextError('legacy image origin is not a supported Freedom channel')
-    return repository, _CHANNEL_TAGS[_installed_channel(state_path, origin_ref)], False
+        raise OfflineContextError(
+            'legacy image origin is not a supported Freedom channel')
+    # The source is trusted only after that check; the persisted selection then
+    # still wins, and a digest-only origin without it is refused by the same
+    # strict reader instead of being inferred as stable.
+    return repository, _CHANNEL_TAGS[
+        _installed_channel(state_path, origin_ref)], False
 
 
 def snapshot(*, sysroot_path=None, state_path=None):

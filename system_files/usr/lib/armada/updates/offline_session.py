@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import configparser
 import fcntl
 import hashlib
 import json
@@ -35,9 +36,17 @@ _UPDATER_VERSION = '0.8.0'
 _DOCUMENT_MAX = 2 * 1024 * 1024
 _SIGNATURE_MAX = 16 * 1024
 _JSON_MAX = 2 * 1024 * 1024
+_REPOSITORY_CONFIG_MAX = 64 * 1024
 _CHUNK_MAX = 1024 * 1024
 _SESSION_ID = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
 _MODELS = frozenset({'TB322FC', 'TB323FU'})
+# The OSTree repository keeps free space for itself before a pull-local writes
+# into it.  libostree's configured minimum wins; without one this conservative
+# share covers releases that keep no reserve of their own.
+_REPOSITORY_RESERVE_DEFAULT_PERCENT = 3
+# ``min-free-space-size`` is expressed in power-of-two units.
+_REPOSITORY_RESERVE_UNITS = (('TB', 1024 ** 4), ('GB', 1024 ** 3),
+                             ('MB', 1024 ** 2), ('KB', 1024))
 _EXPORT_STATES = frozenset({
     'awaiting_recovery_export', 'executing', 'awaiting_reboot', 'failed',
     'recovery_required',
@@ -115,6 +124,90 @@ def _regular(fd, label):
     if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
         raise OfflineSessionError('%s is not a safe root-owned regular file' % label)
     return st
+
+
+def _repository_config(path):
+    """Return the canonical OSTree repository config text, or ``None`` if absent.
+
+    Strictly read-only: the file is inspected without following links and read
+    through the same bounded helper the protected session documents use.  A
+    repository without a config keeps libostree's default reserve.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise OfflineSessionError(
+            'cannot inspect the OSTree repository config: %s' % exc) from exc
+    try:
+        return offline_execute._read_bounded(
+            path, _REPOSITORY_CONFIG_MAX,
+            'OSTree repository config').decode('ascii')
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise OfflineSessionError(
+            'cannot read the OSTree repository config: %s' % exc) from exc
+
+
+def _reserve_size_bytes(value):
+    """Return the bytes named by a libostree ``min-free-space-size`` value."""
+    text = value.strip().upper()
+    for suffix, factor in _REPOSITORY_RESERVE_UNITS:
+        if text.endswith(suffix):
+            digits = text[:-len(suffix)]
+            break
+    else:
+        digits, factor = text, 1
+    if not digits.isdigit():
+        raise OfflineSessionError(
+            'OSTree repository reserve size is malformed: %r' % value)
+    return int(digits) * factor
+
+
+def _repository_reserve_minimum(text):
+    """Return ``('size', bytes)`` or ``('percent', n)`` for the repository config.
+
+    ``min-free-space-size`` takes precedence over ``min-free-space-percent``,
+    the way older libostree resolves them.  Newer releases instead take the
+    lesser of the two, so this precedence can overstate the reserve but never
+    understate it: the budget stays deliberately conservative rather than an
+    exact model of current libostree.  A zero size disables only the absolute
+    form, leaving the percent or the conservative default in force.  Neither
+    key being present keeps that default.  A value this module cannot honour is
+    refused rather than ignored, because ignoring it would understate the
+    requirement.
+    """
+    if text is None:
+        return ('percent', _REPOSITORY_RESERVE_DEFAULT_PERCENT)
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise OfflineSessionError(
+            'OSTree repository config is malformed: %s' % exc) from exc
+    if not parser.has_section('core'):
+        return ('percent', _REPOSITORY_RESERVE_DEFAULT_PERCENT)
+    size = parser.get('core', 'min-free-space-size', fallback=None)
+    if size is not None:
+        reserve = _reserve_size_bytes(size)
+        if reserve:
+            return ('size', reserve)
+    percent = parser.get('core', 'min-free-space-percent', fallback=None)
+    if percent is not None:
+        digits = percent.strip()
+        if not digits.isdigit() or int(digits) > 99:
+            raise OfflineSessionError(
+                'OSTree repository reserve percent is malformed: %r' % percent)
+        return ('percent', int(digits))
+    return ('percent', _REPOSITORY_RESERVE_DEFAULT_PERCENT)
+
+
+def _reserve_bytes(minimum, vfs):
+    """Return the reserve in bytes for the filesystem described by ``vfs``."""
+    kind, value = minimum
+    if kind == 'size':
+        return value
+    return value * vfs.f_blocks * vfs.f_frsize // 100
 
 
 def _strict_evidence():
@@ -461,13 +554,17 @@ class OfflineSessionStore:
         return self._received(session, receipt)
 
     def _prepared_expansion_evidence(self, session, document, expanded_bytes):
-        """Return True only when this session proved the gzip was expanded.
+        """Return True only when this session proved its prepare completed.
 
         The session receipt is never enough: the protected transaction's own
         ``prepared.json`` and ``status.json`` must bind the completed prepare to
         exactly these signed bytes, and the expanded image must still be a
-        regular file of the declared size.  Anything missing or foreign stays
-        charged in full, so a retry cannot understate its space requirement.
+        regular file of the declared size.  ``awaiting_recovery_export`` is only
+        written once the expansion, the ``btrfs restore`` extraction and the
+        ``ostree pull-local`` import all succeeded, so those allocations are
+        already paid for.  Anything missing or foreign stays charged in full,
+        and the current device binding comes from the receipt checked before
+        this call, never from the receipt alone.
         """
         transaction = session / 'transaction'
         if transaction.is_symlink() or not transaction.is_dir():
@@ -544,14 +641,19 @@ class OfflineSessionStore:
         return current
 
     @staticmethod
-    def _require_free_space(destinations):
+    def _require_free_space(destinations, reserve=None):
         """Check each write destination's own filesystem, never a proxy.
 
         ``destinations`` are ``(directory, bytes, label)`` triples for the
         storage this preflight is about to consume.  Requirements that land on
         the same device are summed once, so a shared filesystem is never
-        double-charged, while a split upload/expansion pair is checked
+        double-charged, while a split session/destination pair is checked
         independently against the device that actually holds each part.
+
+        ``reserve`` is an optional ``(directory, minimum)`` pair describing the
+        space the OSTree repository at ``directory`` keeps for itself.  It is
+        charged once, on that directory's own filesystem, so a reserve is never
+        multiplied by the allocations sharing the device.
         """
         devices = {}
         for directory, required, label in destinations:
@@ -564,16 +666,29 @@ class OfflineSessionStore:
                     'cannot inspect %s storage: %s' % (label, exc)) from exc
             total = devices.setdefault(entry.st_dev, [directory, 0])
             total[1] += required
-        for directory, required in devices.values():
+        reserve_device = None
+        if reserve is not None:
+            directory, minimum = reserve
+            try:
+                reserve_device = os.stat(directory).st_dev
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'cannot inspect the repository reserve storage: %s'
+                    % exc) from exc
+            devices.setdefault(reserve_device, [directory, 0])
+        for device, (directory, required) in devices.items():
             try:
                 vfs = os.statvfs(directory)
             except OSError as exc:
                 raise OfflineSessionError(
                     'cannot check free space on %s: %s' % (directory, exc)) from exc
+            if reserve is not None and device == reserve_device:
+                required += _reserve_bytes(minimum, vfs)
             free = vfs.f_bavail * vfs.f_frsize
             if free < required:
                 raise OfflineSessionError(
-                    'insufficient free space for compressed payload and expansion')
+                    'insufficient free space for the payload, its expansion '
+                    'and the repository import')
 
     def preflight(self, document: bytes, signature_b64: bytes, sessionId=None):
         """Read-only readiness check: no session, no staging, no device write.
@@ -591,15 +706,21 @@ class OfflineSessionStore:
         authenticated package and the current device, and only those validated
         bytes are credited against the free-space requirement.  Nothing is
         created, written, locked or started; the first upgrade of a device
-        keeps the full compressed plus expanded requirement.
+        keeps the full compressed, expanded and repository requirement.
 
-        Space is checked on the filesystems that actually receive data: the
-        session's own protected directory for uploads, and the transaction
-        storage where the gzip payload is expanded.  The image sysroot is only
-        validated as canonical, never charged.  A resumed session that proves a
-        completed expansion through its bound transaction documents no longer
-        pays for that expansion; an upload without that proof pays the
-        remaining compressed bytes plus the full expansion.
+        Space is checked on every filesystem that actually receives data: the
+        session's protected directory for uploads, the transaction storage that
+        holds the expanded image, the staging tree ``btrfs restore`` extracts
+        the package repository into, and the ``sysroot/ostree/repo`` that
+        ``ostree pull-local`` fills.  Allocations sharing a device are summed
+        once, the repository destination also keeps the repository's own
+        free-space reserve, and distinct filesystems are checked independently.
+        The authenticated ``expandedBytes`` is the planning allowance for the
+        expansion, the extraction and the import; it is an estimate rather than
+        a guarantee, because a compressed Btrfs image can hold more logical data
+        than its expanded size.  A session whose protected transaction
+        documents prove a completed preparation pays nothing again for the
+        expansion, extraction or import it already finished.
 
         A controller-only legacy system reports ``actualSlot: null`` plus its
         selected slot; no slot is ever inferred from the controller's
@@ -641,34 +762,49 @@ class OfflineSessionStore:
         parts, size, digest, expanded_size, _expanded_sha = \
             offline_payload._select_payload_entry(package)
         stored_bytes = 0
-        expansion_done = False
+        prepared = False
         if sessionId is not None:
             session = self.resolve_session(sessionId)
             stored_bytes = self._preflight_session_bytes(
                 session, document, signature_b64, physical, channel,
                 '/'.join(parts), size, digest)
-            expansion_done = self._prepared_expansion_evidence(
+            prepared = self._prepared_expansion_evidence(
                 session, document, expanded_size)
             # An existing session keeps its bytes and its expansion in its own
             # protected directory, so that is the storage a resume consumes.
             upload_dir = self._allocation_dir(session, 'session storage')
-            expansion_dir = self._allocation_dir(
-                session / 'transaction', 'transaction storage')
+            transaction = session / 'transaction'
         else:
-            # The session does not exist yet: attribute both the upload and the
-            # expansion to the nearest existing ancestor of the base and never
-            # create it from a read-only preflight.
+            # The session does not exist yet: attribute every allocation to the
+            # nearest existing ancestor of the base and never create it from a
+            # read-only preflight.
             upload_dir = self._allocation_dir(self.base, 'session base')
-            expansion_dir = upload_dir
-        # The image sysroot is validated with the same canonical rules, but the
-        # upload and expansion are never written there, so its free space must
-        # not gate a session stored on another filesystem.
-        self._canonical_sysroot()
-        self._require_free_space([
-            (upload_dir, size - stored_bytes, 'payload upload'),
-            (expansion_dir, 0 if expansion_done else expanded_size,
-             'payload expansion'),
-        ])
+            transaction = self.base
+        root = self._canonical_sysroot()
+        # btrfs restore writes the extracted package repository below
+        # ``transaction/import/import/content`` and ostree pull-local then
+        # copies it into ``sysroot/ostree/repo``, so both trees need their own
+        # capacity.  The authenticated expandedBytes is the planning allowance
+        # for each; it is an estimate, not a guarantee, because a compressed
+        # Btrfs image can hold more logical data than its expanded size.
+        expansion_dir = self._allocation_dir(transaction, 'transaction storage')
+        extraction_dir = self._allocation_dir(
+            transaction / 'import' / 'import', 'repository staging storage')
+        repository_dir = self._allocation_dir(
+            root / 'ostree' / 'repo', 'repository destination')
+        allocations = [(upload_dir, size - stored_bytes, 'payload upload')]
+        reserve = None
+        if not prepared:
+            allocations += [
+                (expansion_dir, expanded_size, 'payload expansion'),
+                (extraction_dir, expanded_size, 'repository extraction'),
+                (repository_dir, expanded_size, 'repository import'),
+            ]
+            # The reserve is the repository's own; it is read from the
+            # canonical config and never written back.
+            reserve = (repository_dir, _repository_reserve_minimum(
+                _repository_config(root / 'ostree' / 'repo' / 'config')))
+        self._require_free_space(allocations, reserve=reserve)
         self._check_updater_dependencies()
         # Read the journal and its descriptor version with the same read-only
         # check prepare uses.  Reporting readiness before this would claim a

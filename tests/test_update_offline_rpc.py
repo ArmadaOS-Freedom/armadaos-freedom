@@ -88,6 +88,23 @@ class OfflineRpcTests(unittest.TestCase):
         mgr.submit_execute.assert_called_once_with(SID, ack)
         mgr.store.export.assert_called_once_with(SID, 'recovery.tar', 0, 14)
 
+    def test_info_advertises_the_preflight_session_capability_and_keeps_every_field(self):
+        mgr = _manager()
+        stored = {'schemaVersion': 1, 'updaterVersion': '0.8.0',
+                  'model': 'TB323FU', 'capabilities': ['something-else']}
+        mgr.store.info.return_value = stored
+        request = {'protocolVersion': 1, 'id': 1, 'method': 'info', 'params': {}}
+        rc, out = _run_lines(mgr, (json.dumps(request) + '\n').encode('utf-8'))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0]['ok'])
+        self.assertEqual(out[0]['result'], {
+            'schemaVersion': 1, 'updaterVersion': '0.8.0', 'model': 'TB323FU',
+            'capabilities': ['preflight-session-v1']})
+        # The store's own mapping is not rewritten by serving info.
+        self.assertEqual(stored, {'schemaVersion': 1, 'updaterVersion': '0.8.0',
+                                  'model': 'TB323FU',
+                                  'capabilities': ['something-else']})
+
     def test_preflight_keeps_the_document_only_shape_and_accepts_a_session(self):
         mgr = _manager()
         requests = [
