@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Offline SHA-256 ECDSA P-256 detached DER-in-base64 signature verification.
-Uses /etc/pki/containers/armadaos-freedom.pub via system OpenSSL; payload never supplies trust."""
+
+Trust comes from the host, never from the payload: the /etc policy key is used
+when it exists, otherwise the key shipped inside the updater extension under
+/usr, because systemd-sysext merges /usr and /opt but never /etc.  Verification
+runs through the system OpenSSL binary.
+"""
 
 import base64
 import binascii
@@ -10,7 +15,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-DEFAULT_TRUSTED_KEY = Path('/etc/pki/containers/armadaos-freedom.pub')
+ETC_TRUSTED_KEY = Path('/etc/pki/containers/armadaos-freedom.pub')
+PACKAGED_TRUSTED_KEY = Path('/usr/share/armada/updates/armadaos-freedom.pub')
+DEFAULT_TRUSTED_KEY = ETC_TRUSTED_KEY
 OPENSSL = '/usr/bin/openssl'
 OPENSSL_TIMEOUT_SECONDS = 15
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -19,6 +26,20 @@ MAX_SIGNATURE_BYTES = 4096
 
 class SignatureError(ValueError):
     """Raised when signature verification fails or input is malformed."""
+
+
+def trusted_key_path(trusted_key=DEFAULT_TRUSTED_KEY):
+    """Return the key to verify with.
+
+    The default keeps an existing /etc policy key and otherwise uses the key
+    packaged in the extension.  A caller-supplied path is honoured as given so
+    an explicit trust choice is never silently replaced.
+    """
+    if trusted_key is not None and Path(trusted_key) != DEFAULT_TRUSTED_KEY:
+        return Path(trusted_key)
+    if ETC_TRUSTED_KEY.is_file():
+        return ETC_TRUSTED_KEY
+    return PACKAGED_TRUSTED_KEY
 
 
 def _reject_pairs(pairs):
@@ -70,7 +91,7 @@ def verify_document(document, signature_b64, *, trusted_key=DEFAULT_TRUSTED_KEY)
     if len(signature_der) > MAX_SIGNATURE_BYTES:
         raise SignatureError('decoded signature exceeds %d bytes' % MAX_SIGNATURE_BYTES)
 
-    key_path = Path(trusted_key)
+    key_path = trusted_key_path(trusted_key)
     with tempfile.TemporaryDirectory(prefix='armada-signature-') as tmpdir:
         sig_path = Path(tmpdir) / 'signature.bin'
         try:

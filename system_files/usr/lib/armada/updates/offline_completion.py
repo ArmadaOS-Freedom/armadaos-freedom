@@ -33,6 +33,21 @@ CONFIRMED = 'confirmed'
 ROLLED_BACK = 'rolled_back'
 FAILED = 'failed'
 
+LEGACY_BOOT_CONTEXT = 'legacy-controller'
+LEGACY_PRE_REBOOT = 'legacy-pre-reboot'
+LEGACY_EVIDENCE_SCHEMA = 1
+# Explicit payload shape of the root-only, read-only legacy pre-reboot
+# evidence document produced by offline_jobs.  Every key is required; the
+# document never carries an actual/inactive slot.
+LEGACY_EVIDENCE_KEYS = frozenset({
+    'schemaVersion', 'state', 'bootContext', 'bootId', 'deployment',
+    'status', 'journal', 'plan', 'writeReport', 'activationReport',
+})
+_WRITE_EVIDENCE_KEYS = frozenset({
+    'candidate', 'sourceBootSha256', 'bytesWritten', 'readbackSha256',
+})
+_CANDIDATE_KEYS = frozenset({'path', 'bytes', 'sha256'})
+
 
 def _canonical_uuid(value):
     if type(value) is not str:
@@ -263,5 +278,246 @@ def evaluate(receipt, trial, identity=None):
             'restartState': None,
         }
     result = _classify(receipt, trial, identity)
+    result['restartState'] = _restart_state(receipt, identity['transactionId'])
+    return result
+
+
+def _legacy_claim(entry):
+    """Validate one write-report candidate claim without trusting its path."""
+    if not isinstance(entry, dict) or set(entry) != _CANDIDATE_KEYS:
+        return None
+    if type(entry.get('bytes')) is not int or entry['bytes'] <= 0:
+        return None
+    digest = _sha(entry.get('sha256'))
+    if digest is None or digest == '0' * 64:
+        return None
+    return digest
+
+
+def _legacy_boot_hashes(plan, key):
+    value = plan.get(key) if isinstance(plan, dict) else None
+    if not isinstance(value, dict) or set(value) != set(_SLOTS):
+        return None
+    hashes = {}
+    for slot in _SLOTS:
+        hashes[slot] = _sha(value[slot])
+        if hashes[slot] is None or hashes[slot] == '0' * 64:
+            return None
+    return hashes
+
+
+def _legacy_write_evidence(write, identity, physical, plan):
+    """Return True only for a complete, plan-verified dual write report."""
+    if not isinstance(write, dict) or write.get('phase') != 'dual_boots_written':
+        return False
+    if (write.get('transactionUuid') != identity['transactionId'] or
+            write.get('deployment') != identity['newDeployment'] or
+            write.get('fromSlot') != identity['fromSlot'] or
+            write.get('slotOrder') != [identity['targetSlot'], identity['fromSlot']] or
+            write.get('physical') != physical):
+        return False
+    original = _legacy_boot_hashes(plan, 'originalBootSha256')
+    new = _legacy_boot_hashes(plan, 'newBootSha256')
+    if original is None or new is None:
+        return False
+    writes = write.get('writes')
+    if not isinstance(writes, dict) or set(writes) != set(_SLOTS):
+        return False
+    for slot in _SLOTS:
+        evidence = writes[slot]
+        if not isinstance(evidence, dict) or set(evidence) != _WRITE_EVIDENCE_KEYS:
+            return False
+        if evidence.get('sourceBootSha256') != original[slot]:
+            return False
+        candidate = evidence.get('candidate')
+        digest = _legacy_claim(candidate)
+        if digest is None or digest != new[slot]:
+            return False
+        if evidence.get('bytesWritten') != candidate['bytes']:
+            return False
+        if evidence.get('readbackSha256') != digest:
+            return False
+    return True
+
+
+def _legacy_activation_evidence(activation, write, identity, plan):
+    """Return True only for a complete, plan-verified activation report."""
+    if not isinstance(activation, dict):
+        return False
+    if activation.get('phase') != 'offline_slots_activated':
+        return False
+    if (activation.get('transactionUuid') != identity['transactionId'] or
+            activation.get('deployment') != identity['newDeployment'] or
+            activation.get('fromSlot') != identity['fromSlot'] or
+            activation.get('targetSlot') != identity['targetSlot'] or
+            activation.get('selectedSlot') != identity['targetSlot']):
+        return False
+    sequence = activation.get('recordSequence')
+    if type(sequence) is not int or sequence < 1:
+        return False
+    new = _legacy_boot_hashes(plan, 'newBootSha256')
+    if new is None:
+        return False
+    writes = write['writes']
+    return (
+        activation.get('currentReadbackSha256') == new[identity['fromSlot']] and
+        activation.get('targetReadbackSha256') == new[identity['targetSlot']] and
+        writes[identity['fromSlot']]['readbackSha256'] ==
+        new[identity['fromSlot']] and
+        writes[identity['targetSlot']]['readbackSha256'] ==
+        new[identity['targetSlot']]
+    )
+
+
+def _classify_legacy_pre_reboot(receipt, evidence, identity):
+    outcome = _outcome(receipt)
+    if outcome in _TERMINAL_FAILURE_STATES:
+        return _result(FAILED, identity, reason=outcome)
+
+    if evidence.get('bootContext') != LEGACY_BOOT_CONTEXT:
+        return _unverified(identity, 'legacy_evidence_malformed')
+    boot_id = _canonical_uuid(evidence.get('bootId'))
+    if boot_id is None:
+        return _unverified(identity, 'legacy_boot_id_missing')
+
+    status = evidence.get('status')
+    if not isinstance(status, dict):
+        return _unverified(identity, 'legacy_status_missing')
+    if (status.get('transactionId') != identity['transactionId'] or
+            status.get('oldDeployment') != identity['oldDeployment'] or
+            status.get('newDeployment') != identity['newDeployment'] or
+            status.get('planSha256') != identity['planSha256']):
+        return _mismatch(
+            identity, 'legacy_status_mismatch',
+            'the durable execute status does not describe this session')
+    if status.get('state') != 'awaiting_reboot':
+        return _unverified(identity, 'legacy_status_mismatch')
+    recorded_boot = _canonical_uuid(status.get('bootId'))
+    if recorded_boot is None:
+        return _unverified(identity, 'legacy_boot_id_missing')
+    if recorded_boot != boot_id:
+        # The activation happened in an earlier boot; only the post-reboot
+        # witness/finalization path may judge this transaction now.
+        return _unverified(identity, 'boot_changed')
+
+    journal = evidence.get('journal')
+    if not isinstance(journal, dict) or journal.get('state') != 'available':
+        error = journal.get('error') if isinstance(journal, dict) else None
+        return _unverified(identity, 'trial_unavailable', error)
+    if (journal.get('bootContext') != LEGACY_BOOT_CONTEXT or
+            journal.get('policy') != 'offline-dual' or
+            journal.get('actualSlot') is not None or
+            journal.get('inactiveSlot') is not None):
+        return _unverified(identity, 'legacy_journal_malformed')
+    if (journal.get('transactionId') != identity['transactionId'] or
+            journal.get('oldDeployment') != identity['oldDeployment'] or
+            journal.get('newDeployment') != identity['newDeployment'] or
+            journal.get('fromSlot') != identity['fromSlot'] or
+            journal.get('targetSlot') != identity['targetSlot']):
+        return _mismatch(
+            identity, 'transaction_mismatch',
+            'the legacy journal does not describe this session')
+    if journal.get('planSha256') != identity['planSha256']:
+        return _mismatch(
+            identity, 'plan_mismatch',
+            'the legacy journal plan digest does not match this session')
+
+    record_state = journal.get('recordState')
+    if record_state == CONFIRMED:
+        # A controller-only boot cannot provide the new witness; never label a
+        # transaction confirmed from the pre-reboot journal alone.
+        return _unverified(identity, 'legacy_confirmation_requires_witness')
+    if record_state != 'prepared':
+        # TRIAL/ROLLED_BACK mean a boot attempt was already consumed; only the
+        # post-reboot strict path may judge those.
+        return _unverified(
+            identity, 'legacy_pre_reboot_requires_prepared_journal')
+
+    deployment = evidence.get('deployment')
+    running = journal.get('runningDeployment')
+    if deployment == identity['newDeployment']:
+        if running != 'new':
+            return _mismatch(
+                identity, 'running_deployment_mismatch',
+                'the legacy journal does not place the new deployment')
+        evidence_fields = {
+            'evidenceKind': LEGACY_PRE_REBOOT,
+            'bootContext': LEGACY_BOOT_CONTEXT,
+            'actualSlot': None,
+            'bootId': boot_id,
+            'recordState': record_state,
+            'runningDeployment': 'new',
+        }
+        return _result(AWAITING_CONFIRMATION, identity, **evidence_fields)
+    if deployment != identity['oldDeployment']:
+        return _unverified(identity, 'boot_evidence_missing')
+    if running != 'old':
+        return _mismatch(
+            identity, 'running_deployment_mismatch',
+            'the legacy journal does not place the old deployment')
+
+    plan = evidence.get('plan')
+    if not isinstance(plan, dict):
+        return _unverified(identity, 'legacy_plan_missing')
+    if (plan.get('transactionId') != identity['transactionId'] or
+            plan.get('oldDeployment') != identity['oldDeployment'] or
+            plan.get('newDeployment') != identity['newDeployment'] or
+            plan.get('fromSlot') != identity['fromSlot'] or
+            plan.get('targetSlot') != identity['targetSlot']):
+        return _mismatch(
+            identity, 'legacy_plan_mismatch',
+            'the durable plan does not describe this session')
+    write = evidence.get('writeReport')
+    activation = evidence.get('activationReport')
+    if (status.get('bootWriteState') != 'written' or
+            status.get('activationOutcome') != 'activated'):
+        return _unverified(identity, 'legacy_write_evidence_missing')
+    if not _legacy_write_evidence(write, identity, receipt.get('physical'), plan):
+        return _unverified(identity, 'legacy_write_evidence_missing')
+    if not _legacy_activation_evidence(activation, write, identity, plan):
+        return _unverified(identity, 'legacy_activation_evidence_missing')
+
+    return _result(
+        AWAITING_REBOOT, identity,
+        evidenceKind=LEGACY_PRE_REBOOT,
+        bootContext=LEGACY_BOOT_CONTEXT,
+        actualSlot=None,
+        bootId=boot_id,
+        recordState=record_state,
+        runningDeployment='old',
+    )
+
+
+def evaluate_legacy_pre_reboot(receipt, evidence, identity=None):
+    """Evaluate a legacy session before its reboot without inventing a slot.
+
+    ``evidence`` is the explicit :data:`LEGACY_EVIDENCE_KEYS` document read by
+    offline_jobs.  Restart eligibility requires the *same* kernel boot that
+    performed the activation, the exact old booted deployment, a durable
+    PREPARED journal bound to this transaction, and complete verified write and
+    activation reports.  It never returns ``confirmed``: that needs the new
+    witness and finalization evidence after the reboot.
+    """
+    identity = identity if identity is not None else session_identity(receipt)
+    if identity is None:
+        return {
+            'schemaVersion': 1,
+            'state': UNVERIFIED,
+            'transactionId': None,
+            'reason': 'session_identity_missing',
+            'restartEligible': False,
+            'restartState': None,
+        }
+    outcome = _outcome(receipt)
+    if outcome in _TERMINAL_FAILURE_STATES:
+        result = _result(FAILED, identity, reason=outcome)
+    elif not isinstance(evidence, dict) or evidence.get('state') != 'available':
+        error = evidence.get('error') if isinstance(evidence, dict) else None
+        result = _unverified(identity, 'legacy_evidence_unavailable', error)
+    elif (evidence.get('schemaVersion') != LEGACY_EVIDENCE_SCHEMA or
+            frozenset(evidence) != LEGACY_EVIDENCE_KEYS):
+        result = _unverified(identity, 'legacy_evidence_malformed')
+    else:
+        result = _classify_legacy_pre_reboot(receipt, evidence, identity)
     result['restartState'] = _restart_state(receipt, identity['transactionId'])
     return result

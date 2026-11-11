@@ -1,0 +1,1053 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-only
+"""Deploy the offline-updater runtime on installations that do not ship it.
+
+This helper is standalone: it imports only the Python standard library so it
+can run before /usr/lib/armada/updates exists.  Invoke it isolated, e.g.
+
+    python3 -I /path/to/armada-offline-bootstrap probe
+    python3 -I /path/to/armada-offline-bootstrap install --bundle FILE --sha256 HEX
+
+Exactly one JSON object is written to stdout; diagnostics go to stderr.
+Nothing here runs the updater, writes boot state, touches partitions, changes
+SSH/sudo policy or remounts the root filesystem.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+COMMAND_PROBE = 'probe'
+COMMAND_INSTALL = 'install'
+
+BUNDLE_NAME = 'armada-offline-updater'
+EXTENSION_NAME = 'zzzzzz-armada-offline-updater'
+EXTENSION_RELEASE = ('usr/lib/extension-release.d/extension-release.'
+                     + EXTENSION_NAME)
+
+ENTRY_PATH = 'usr/libexec/armada/armada-offline-update'
+BOOT_TOOL_DIR = 'usr/libexec/armada/boot-tool'
+BOOT_TOOL_PATH = BOOT_TOOL_DIR + '/armada-boot-tool'
+AB_LIBRARY_PATH = 'usr/libexec/armada/libarmada-update-ab.so'
+DTB_HELPER_PATH = 'usr/libexec/armada/kshim-build-boot.py'
+ARMADA_OS_PATH = 'usr/lib/armada/armada_os.py'
+UPDATE_LIB_PATH = 'usr/lib/armada/update-lib'
+UPDATES_DIR = 'usr/lib/armada/updates'
+# systemd-sysext merges /usr and /opt only, never /etc.  The bundle therefore
+# carries the trusted key at a /usr path and the host /etc policy, when one
+# exists, wins over it.  The bundle never writes /etc.
+TRUST_KEY_PATH = 'usr/share/armada/updates/armadaos-freedom.pub'
+HOST_TRUST_KEY_PATH = 'etc/pki/containers/armadaos-freedom.pub'
+RUN_EXTENSIONS = 'run/extensions'
+UPDATE_SERVICE_PATH = 'usr/share/dbus-1/system-services/org.armada.Updates.service'
+
+CORE_MODULES = (
+    # armada_os imports updates.client at module load time.
+    'client.py',
+    'offline_rpc.py',
+    'offline_jobs.py',
+    'offline_session.py',
+    'offline_prepare.py',
+    'offline_execute.py',
+    'offline_recovery.py',
+    'offline_payload.py',
+    'offline_boot_writer.py',
+    # Executed as a script by runtime_health during trial confirmation.
+    'wayland_probe.py',
+)
+REQUIRED_FILES = (
+    ENTRY_PATH,
+    BOOT_TOOL_PATH,
+    AB_LIBRARY_PATH,
+    DTB_HELPER_PATH,
+    ARMADA_OS_PATH,
+    UPDATE_LIB_PATH,
+    TRUST_KEY_PATH,
+) + tuple(UPDATES_DIR + '/' + name for name in CORE_MODULES)
+
+ALLOWED_EXACT = frozenset(REQUIRED_FILES)
+ALLOWED_PREFIXES = (
+    UPDATES_DIR + '/',
+    BOOT_TOOL_DIR + '/',
+)
+
+# Model rules are copied from the boot payload device configuration; only the
+# required tokens are needed to name the running model.
+MODEL_RULES = (
+    ('TB322FC', frozenset({'lenovo,elden', 'qcom,sm8750'})),
+    ('TB323FU', frozenset({'lenovo,baldur', 'qcom,kaanapali'})),
+)
+SUPPORTED_ARCHITECTURES = frozenset({'aarch64', 'arm64'})
+DEPENDENCIES = (
+    ('openssl', ('/usr/bin/openssl',)),
+    ('bootc', ('/usr/bin/bootc',)),
+    ('ostree', ('/usr/bin/ostree',)),
+    ('rpmOstree', ('/usr/bin/rpm-ostree',)),
+    ('fdtget', ('/usr/bin/fdtget',)),
+    ('fdtput', ('/usr/bin/fdtput',)),
+    ('dtc', ('/usr/bin/dtc',)),
+)
+SYSEXT_PATHS = ('/usr/bin/systemd-sysext', '/bin/systemd-sysext')
+OS_RELEASE_PATHS = ('usr/lib/os-release', 'etc/os-release')
+SYSEXT_TIMEOUT_SECONDS = 180
+
+MAX_BUNDLE_BYTES = 512 * 1024 * 1024
+MAX_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_MEMBERS = 4096
+MAX_TEXT_BYTES = 256 * 1024
+_CHUNK = 1024 * 1024
+_HEX64 = re.compile(r'[0-9a-f]{64}\Z', re.ASCII)
+_VERSION = re.compile(r'(\d+(?:\.\d+)*)(?:[-+][0-9A-Za-z.+-]+)?\Z', re.ASCII)
+_MANIFEST_KEYS = frozenset({'schemaVersion', 'bundle', 'version', 'format',
+                            'entry', 'files'})
+_FILE_KEYS = frozenset({'path', 'bytes', 'sha256', 'mode'})
+_MODES = frozenset({'0644', '0755'})
+# extension-release is a shell-like key=value file.  Host os-release values are
+# root-owned but still untrusted input here: only bare tokens are serialised,
+# never quoted or escaped text that could carry a newline or extra assignment.
+_OS_RELEASE_VALUE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+~:-]*\Z', re.ASCII)
+
+
+class BootstrapError(RuntimeError):
+    """A bootstrap request cannot be completed safely."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _p(base, relative):
+    # Join under an explicit root without letting an absolute input escape it.
+    return Path(base) / str(relative).lstrip('/')
+
+
+def _is_root():
+    return os.name == 'posix' and os.geteuid() == 0
+
+
+def _architecture():
+    import platform
+    return platform.machine().strip().lower()
+
+
+def _find(base, candidates):
+    for relative in candidates:
+        path = _p(base, relative)
+        if path.is_symlink() or not path.is_file():
+            continue
+        if not os.access(path, os.X_OK):
+            continue
+        return path
+    return None
+
+
+def _read_text(base, relative, limit=MAX_TEXT_BYTES):
+    path = _p(base, relative)
+    if path.is_symlink():
+        return None
+    try:
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        chunks = []
+        total = 0
+        while total < info.st_size:
+            chunk = os.read(fd, min(_CHUNK, info.st_size - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b''.join(chunks).decode('utf-8', 'replace')
+    finally:
+        os.close(fd)
+
+
+def _read_os_release(base):
+    for relative in OS_RELEASE_PATHS:
+        text = _read_text(base, relative)
+        if text is None:
+            continue
+        values = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+                value = value[1:-1]
+            if key and value:
+                values[key] = value
+        if values.get('ID'):
+            values['_path'] = relative
+            return values
+    return {}
+
+
+def _read_compatible(base):
+    text = _read_text(base, 'sys/firmware/devicetree/base/compatible')
+    if text is None:
+        return []
+    tokens = []
+    for raw in text.split('\x00'):
+        token = raw.strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _select_model(compatible):
+    present = set(compatible)
+    matches = [model for model, required in MODEL_RULES if required <= present]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _read_updater_version(base):
+    text = _read_text(base, UPDATES_DIR + '/offline_session.py')
+    if text is None:
+        return None
+    for line in text.splitlines():
+        if line.startswith("_UPDATER_VERSION = '") and line.endswith("'"):
+            return line[len("_UPDATER_VERSION = '"):-1]
+    return None
+
+
+def _version_tuple(value):
+    if not isinstance(value, str):
+        return None
+    match = _VERSION.match(value.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split('.'))
+
+
+def _version_compare(left, right):
+    left_parts = _version_tuple(left)
+    right_parts = _version_tuple(right)
+    if left_parts is None or right_parts is None:
+        return None
+    width = max(len(left_parts), len(right_parts))
+    left_parts += (0,) * (width - len(left_parts))
+    right_parts += (0,) * (width - len(right_parts))
+    return (left_parts > right_parts) - (left_parts < right_parts)
+
+
+def _missing_runtime(base):
+    """Required runtime paths absent below base.
+
+    A host that still carries the /etc policy key does not need the key the
+    extension ships, because the runtime prefers the /etc one.
+    """
+    missing = [relative for relative in REQUIRED_FILES
+               if not _is_regular(_p(base, relative))]
+    if TRUST_KEY_PATH in missing and _is_regular(_p(base, HOST_TRUST_KEY_PATH)):
+        missing.remove(TRUST_KEY_PATH)
+    return missing
+
+
+def _is_regular(path):
+    if path.is_symlink():
+        return False
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def _extension_active(base):
+    return _is_regular(_p(base, EXTENSION_RELEASE))
+
+
+def _extension_dir(base):
+    return _p(base, RUN_EXTENSIONS + '/' + EXTENSION_NAME)
+
+
+def _runtime_root(base):
+    """Root that actually holds the updater runtime for reading its files."""
+    extension = _extension_dir(base)
+    if _extension_active(base) and extension.is_dir() and not extension.is_symlink():
+        return extension
+    return Path(base)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while True:
+            chunk = stream.read(_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_runtime(base, specs):
+    """Return the manifest paths whose installed file does not match its claim.
+
+    Reusing a runtime because its version string matches is not proof that the
+    shipped files are the ones the bundle describes.
+    """
+    problems = []
+    host_key = _is_regular(_p(base, HOST_TRUST_KEY_PATH))
+    for relative in sorted(specs):
+        spec = specs[relative]
+        if relative == TRUST_KEY_PATH and host_key:
+            # An existing /etc policy key is the anchor in effect.
+            continue
+        path = _p(base, relative)
+        if not _is_regular(path):
+            problems.append(relative)
+            continue
+        try:
+            info = path.stat()
+            if info.st_size != spec['bytes']:
+                problems.append(relative)
+                continue
+            if stat.S_IMODE(info.st_mode) != int(spec['mode'], 8):
+                problems.append(relative)
+                continue
+            if _sha256_file(path) != spec['sha256']:
+                problems.append(relative)
+        except OSError:
+            problems.append(relative)
+    return problems
+
+
+def _read_bytes(path, limit):
+    if not _is_regular(path):
+        return None
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _trust_anchor(base):
+    """Return (relative path, source) for the trusted key in effect.
+
+    The host /etc policy wins whenever it exists; the key shipped inside the
+    extension is only a fallback for hosts that never had one.
+    """
+    if _is_regular(_p(base, HOST_TRUST_KEY_PATH)):
+        return HOST_TRUST_KEY_PATH, 'etc'
+    if _is_regular(_p(base, TRUST_KEY_PATH)):
+        return TRUST_KEY_PATH, 'packaged'
+    return (HOST_TRUST_KEY_PATH, None)
+
+
+def _trust_files_differ(host_root, bundled_root):
+    """True when both key files exist and hold different bytes."""
+    host = _p(host_root, HOST_TRUST_KEY_PATH)
+    bundled = _p(bundled_root, TRUST_KEY_PATH)
+    if not _is_regular(host) or not _is_regular(bundled):
+        return False
+    host_pem = _read_bytes(host, MAX_TEXT_BYTES)
+    bundled_pem = _read_bytes(bundled, MAX_TEXT_BYTES)
+    if host_pem is None or bundled_pem is None:
+        return False
+    return host_pem != bundled_pem
+
+
+def _host_key_mismatch(base, specs):
+    """True when the host /etc key differs from the key the bundle ships."""
+    spec = specs.get(TRUST_KEY_PATH)
+    host = _p(base, HOST_TRUST_KEY_PATH)
+    if spec is None or not _is_regular(host):
+        return False
+    try:
+        if host.stat().st_size != spec['bytes']:
+            return True
+        return _sha256_file(host) != spec['sha256']
+    except OSError:
+        return False
+
+
+def _extension_usable(directory):
+    if directory.is_symlink():
+        return False
+    if directory.is_dir():
+        return os.access(directory, os.W_OK | os.X_OK)
+    return not directory.exists() and os.access(directory.parent, os.W_OK | os.X_OK)
+
+
+# --------------------------------------------------------------------------
+# probe
+
+
+def probe(*, root='/', runner=None):
+    """Report platform, dependency and updater state without changing anything."""
+    base = Path(root)
+    os_release = _read_os_release(base)
+    compatible = _read_compatible(base)
+    model = _select_model(compatible)
+    architecture = _architecture()
+
+    connection_reasons = []
+    if not _is_root():
+        connection_reasons.append('not-root')
+    if not os_release:
+        connection_reasons.append('missing-os-release')
+    sysext = _find(base, SYSEXT_PATHS)
+    if sysext is None:
+        connection_reasons.append('missing-systemd-sysext')
+    extensions = _p(base, 'run/extensions')
+    if not _extension_usable(extensions):
+        connection_reasons.append('extensions-dir-unusable')
+
+    upgrade_reasons = []
+    if not compatible:
+        upgrade_reasons.append('missing-devicetree-compatible')
+    elif model is None:
+        upgrade_reasons.append('unsupported-model')
+    if architecture not in SUPPORTED_ARCHITECTURES:
+        upgrade_reasons.append('unsupported-architecture')
+    trust_path, trust_source = _trust_anchor(base)
+
+    missing = _missing_runtime(base)
+    version = _read_updater_version(base)
+    release_file = _read_text(base, 'usr/lib/armada/version')
+    release_version = release_file.strip()[:64] if release_file else None
+    if _extension_active(base):
+        source = 'extension'
+    elif _is_regular(_p(base, ENTRY_PATH)):
+        source = 'native'
+    else:
+        source = None
+    # The current update service is reported on its own: its absence is not a
+    # platform limitation and must not hide an unsupported model or dependency.
+    service_present = _is_regular(_p(base, UPDATE_SERVICE_PATH))
+
+    dependencies = {
+        'python3': {'present': True, 'version': '%d.%d.%d' % sys.version_info[:3]},
+        'systemdSysext': {'present': sysext is not None,
+                          'path': str(sysext) if sysext is not None else None},
+    }
+    for name, candidates in DEPENDENCIES:
+        found = _find(base, candidates)
+        dependencies[name] = {'present': found is not None,
+                              'path': str(found) if found is not None else None}
+
+    existing = []
+    if extensions.is_dir() and not extensions.is_symlink():
+        for child in sorted(extensions.iterdir()):
+            if child.name == EXTENSION_NAME or child.name.startswith('.' + EXTENSION_NAME):
+                continue
+            existing.append(child.name)
+
+    return {
+        'schemaVersion': SCHEMA_VERSION,
+        'ok': True,
+        'command': COMMAND_PROBE,
+        'connection': {
+            'ready': not connection_reasons,
+            'reasons': connection_reasons,
+        },
+        'upgrade': {
+            # Eligibility is a platform property; connection.ready says whether
+            # this particular session can deploy.  Keep the two separate so a
+            # non-root probe cannot be mistaken for an unsupported device.
+            'eligible': not upgrade_reasons,
+            'reasons': upgrade_reasons,
+            'tokensEvaluated': False,
+        },
+        'system': {
+            'model': model,
+            'compatible': compatible,
+            'architecture': architecture,
+            'version': (release_version or os_release.get('IMAGE_VERSION')
+                        or os_release.get('VERSION')),
+            'osId': os_release.get('ID'),
+            'osVersionId': os_release.get('VERSION_ID'),
+            'osReleasePath': os_release.get('_path'),
+        },
+        'dependencies': dependencies,
+        'extensions': {
+            'directory': str(extensions),
+            'target': EXTENSION_NAME,
+            'targetInstalled': _extension_active(base),
+            'others': existing,
+        },
+        'updater': {
+            'entryPresent': _is_regular(_p(base, ENTRY_PATH)),
+            'version': version,
+            'source': source,
+            'capable': not missing and _version_tuple(version) is not None,
+            'missing': missing,
+        },
+        'service': {
+            # Whether the host already runs the current update service.  Kept
+            # apart from upgrade.eligible and from dependency presence.
+            'present': service_present,
+            'path': str(_p(base, UPDATE_SERVICE_PATH)),
+            'reasons': [] if service_present else ['missing-update-service'],
+        },
+        'trust': {
+            'keyPath': str(_p(base, trust_path)),
+            'present': trust_source is not None,
+            'source': trust_source,
+            # Both keys present but different: /etc policy is kept as-is and the
+            # packaged key is ignored.  Reported, never switched silently.
+            'conflict': _trust_files_differ(base, base),
+            # A missing key is not a platform limitation: the bundle ships one
+            # under /usr for hosts that never had a /etc policy key.
+            'reasons': [] if trust_source is not None else ['missing-trust-anchor'],
+        },
+        'notes': [
+            'legacy boot witness and deployment tokens are not evaluated by this helper',
+        ],
+    }
+
+
+# --------------------------------------------------------------------------
+# install
+
+
+def _check_member_name(name):
+    if not isinstance(name, str) or not name or len(name) > 255:
+        raise BootstrapError('archive_path_rejected', 'invalid archive member name')
+    if name.startswith('/') or '\\' in name or ':' in name:
+        raise BootstrapError('archive_path_rejected',
+                             'archive member is not a safe relative path: %r' % name)
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise BootstrapError('archive_path_rejected',
+                             'archive member has control characters: %r' % name)
+    if any(part in ('', '.', '..') for part in name.split('/')):
+        raise BootstrapError('archive_path_rejected',
+                             'archive member traverses outside the extension: %r' % name)
+
+
+def _allowed_member(name):
+    if name in ALLOWED_EXACT:
+        return True
+    for prefix in ALLOWED_PREFIXES:
+        if name.startswith(prefix) and len(name) > len(prefix):
+            if prefix == UPDATES_DIR + '/':
+                directory, _sep, filename = name.rpartition('/')
+                return directory == UPDATES_DIR and filename.endswith('.py')
+            return True
+    return False
+
+
+def _parse_manifest(raw):
+    try:
+        document = json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise BootstrapError('manifest_invalid', 'manifest is not valid JSON: %s' % error)
+    if not isinstance(document, dict) or set(document) != _MANIFEST_KEYS:
+        raise BootstrapError('manifest_invalid', 'manifest has an unexpected key set')
+    if document.get('schemaVersion') != SCHEMA_VERSION:
+        raise BootstrapError('manifest_invalid', 'manifest schemaVersion must be %d'
+                             % SCHEMA_VERSION)
+    if document.get('bundle') != BUNDLE_NAME:
+        raise BootstrapError('manifest_invalid', 'manifest bundle name mismatch')
+    if _version_tuple(document.get('version')) is None:
+        raise BootstrapError('manifest_invalid', 'manifest version is not a version string')
+    if document.get('format') not in ('tar', 'tar.gz'):
+        raise BootstrapError('manifest_invalid', 'manifest format is unsupported')
+    if document.get('entry') != ENTRY_PATH:
+        raise BootstrapError('manifest_invalid', 'manifest entry point mismatch')
+    if not isinstance(document.get('files'), list) or not document['files']:
+        raise BootstrapError('manifest_invalid', 'manifest files must be a non-empty list')
+    return document
+
+
+def _scan_archive(stream):
+    stream.seek(0)
+    members = {}
+    manifest = None
+    with tarfile.open(fileobj=stream, mode='r:*') as archive:
+        for member in archive:
+            name = member.name
+            _check_member_name(name)
+            if name in members:
+                raise BootstrapError('archive_member_rejected',
+                                     'duplicate archive member: %s' % name)
+            if not member.isreg():
+                raise BootstrapError('archive_member_rejected',
+                                     'only regular files are allowed: %s' % name)
+            if name == 'manifest.json':
+                if manifest is not None:
+                    raise BootstrapError('archive_member_rejected',
+                                         'duplicate manifest.json')
+                if not 0 < member.size <= MAX_MANIFEST_BYTES:
+                    raise BootstrapError('manifest_invalid', 'manifest size is out of bounds')
+                manifest = _parse_manifest(archive.extractfile(member).read())
+            else:
+                if not _allowed_member(name):
+                    raise BootstrapError('archive_path_rejected',
+                                         'archive member is not allowlisted: %s' % name)
+                if not 0 <= member.size <= MAX_MEMBER_BYTES:
+                    raise BootstrapError('archive_member_rejected',
+                                         'archive member size is out of bounds: %s' % name)
+            members[name] = member.size
+            if len(members) > MAX_MEMBERS:
+                raise BootstrapError('archive_member_rejected', 'archive has too many members')
+    if manifest is None:
+        raise BootstrapError('manifest_invalid', 'archive has no manifest.json')
+    return manifest, members
+
+
+def _validate_manifest(manifest, members):
+    files = manifest['files']
+    specs = {}
+    previous = None
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != _FILE_KEYS:
+            raise BootstrapError('manifest_invalid', 'manifest file entry has an invalid key set')
+        path = entry.get('path')
+        _check_member_name(path)
+        if path == 'manifest.json':
+            raise BootstrapError('manifest_invalid', 'manifest must not list itself')
+        if not _allowed_member(path):
+            raise BootstrapError('archive_path_rejected',
+                                 'manifest path is not allowlisted: %s' % path)
+        if previous is not None and path <= previous:
+            raise BootstrapError('manifest_invalid', 'manifest paths must be sorted and unique')
+        previous = path
+        if type(entry.get('bytes')) is not int or not 0 <= entry['bytes'] <= MAX_MEMBER_BYTES:
+            raise BootstrapError('manifest_invalid',
+                                 'manifest byte count is out of bounds: %s' % path)
+        if not isinstance(entry.get('sha256'), str) or not _HEX64.fullmatch(entry['sha256']):
+            raise BootstrapError('manifest_invalid',
+                                 'manifest digest is malformed: %s' % path)
+        if entry.get('mode') not in _MODES:
+            raise BootstrapError('manifest_invalid', 'manifest mode is unsupported: %s' % path)
+        specs[path] = entry
+
+    payload = set(members) - {'manifest.json'}
+    if set(specs) != payload:
+        raise BootstrapError('manifest_mismatch',
+                             'manifest does not describe exactly the archived files')
+    for entry in specs.values():
+        if members[entry['path']] != entry['bytes']:
+            raise BootstrapError('manifest_mismatch',
+                                 'manifest size differs from archive member: %s' % entry['path'])
+    if sum(entry['bytes'] for entry in specs.values()) > MAX_BUNDLE_BYTES:
+        raise BootstrapError('archive_member_rejected', 'bundle payload is too large')
+    for relative in REQUIRED_FILES:
+        if relative not in specs:
+            raise BootstrapError('manifest_mismatch',
+                                 'bundle is missing required runtime path: %s' % relative)
+    return specs
+
+
+def _mkdirs(directory):
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+
+
+def _extract(stream, stage, specs):
+    stream.seek(0)
+    required = set(specs)
+    written = set()
+    with tarfile.open(fileobj=stream, mode='r:*') as archive:
+        for member in archive:
+            name = member.name
+            if name == 'manifest.json':
+                continue
+            spec = specs.get(name)
+            if spec is None or member.size != spec['bytes']:
+                raise BootstrapError('manifest_mismatch',
+                                     'archive member changed after manifest validation: %s' % name)
+            target = stage / name
+            if target.exists() or target.is_symlink():
+                raise BootstrapError('archive_path_rejected',
+                                     'duplicate extraction target: %s' % name)
+            _mkdirs(target.parent)
+            source = archive.extractfile(member)
+            digest = hashlib.sha256()
+            total = 0
+            flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+            fd = os.open(target, flags, 0o600)
+            try:
+                while True:
+                    chunk = source.read(_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > spec['bytes']:
+                        raise BootstrapError('manifest_mismatch',
+                                             'archive member exceeds its declared size: %s' % name)
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        count = os.write(fd, view)
+                        if count <= 0:
+                            raise BootstrapError('stage_failed', 'short write: %s' % name)
+                        view = view[count:]
+                if total != spec['bytes'] or digest.hexdigest() != spec['sha256']:
+                    raise BootstrapError('manifest_mismatch',
+                                         'archive member digest mismatch: %s' % name)
+                os.fchmod(fd, int(spec['mode'], 8))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            written.add(name)
+            if written == required:
+                break
+    if written != required:
+        raise BootstrapError('manifest_mismatch',
+                             'archive is missing files declared by the manifest')
+
+
+def _extension_release(os_release):
+    """Serialise the host identity into an extension-release file.
+
+    Only bare key tokens are emitted.  A host value carrying a newline, quote,
+    backslash or assignment is rejected instead of being interpolated.
+    """
+    identifier = os_release.get('ID')
+    if not identifier:
+        raise BootstrapError('input_missing', 'host os-release has no ID')
+    if not _OS_RELEASE_VALUE.fullmatch(identifier):
+        raise BootstrapError('input_invalid',
+                             'host os-release ID is not a safe extension-release value: %r'
+                             % identifier)
+    lines = ['# managed by armada-offline-bootstrap', 'ID=' + identifier]
+    for key in ('VERSION_ID', 'SYSEXT_LEVEL'):
+        value = os_release.get(key)
+        if not value:
+            continue
+        if not _OS_RELEASE_VALUE.fullmatch(value):
+            raise BootstrapError('input_invalid',
+                                 'host os-release %s is not a safe extension-release value: %r'
+                                 % (key, value))
+        lines.append('%s=%s' % (key, value))
+    return ('\n'.join(lines) + '\n').encode('utf-8')
+
+
+def _write_file(path, data, mode):
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise BootstrapError('stage_failed', 'short write: %s' % path)
+            view = view[count:]
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _refresh(runner, sysext):
+    completed = runner([str(sysext), 'refresh'], capture_output=True, check=False,
+                       timeout=SYSEXT_TIMEOUT_SECONDS)
+    return getattr(completed, 'returncode', 1) == 0
+
+
+def _new_stage(extensions):
+    """Create a stage directory that belongs to this invocation only."""
+    try:
+        path = tempfile.mkdtemp(prefix='.' + EXTENSION_NAME + '.stage.', dir=str(extensions))
+    except OSError as error:
+        raise BootstrapError('stage_failed', 'cannot create a staging directory: %s' % error)
+    return Path(path)
+
+
+def _new_backup(extensions):
+    """Return an unused backup name; never reuse a directory found on disk."""
+    for _attempt in range(16):
+        candidate = extensions / ('.' + EXTENSION_NAME + '.old.' + uuid.uuid4().hex[:12])
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise BootstrapError('stage_failed', 'cannot reserve a backup path')
+
+
+def _install_extension(stage, final):
+    """Move the staged tree into place, keeping the old extension on failure."""
+    backup = None
+    replaced = final.exists() or final.is_symlink()
+    if replaced:
+        if final.is_symlink() or not final.is_dir():
+            raise BootstrapError('extension_conflict',
+                                 'extension path is not a plain directory: %s' % final)
+        backup = _new_backup(final.parent)
+        os.rename(final, backup)
+    try:
+        os.rename(stage, final)
+    except OSError:
+        if backup is not None:
+            os.rename(backup, final)
+        raise
+    return backup, replaced
+
+
+def _restore(final, stage, backup):
+    """Roll back only the extension this invocation replaced."""
+    try:
+        if final.exists() or final.is_symlink():
+            shutil.rmtree(final, ignore_errors=True)
+        if backup is not None and (backup.exists() or backup.is_symlink()):
+            os.rename(backup, final)
+    finally:
+        if stage.exists() or stage.is_symlink():
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def install(bundle, expected_sha256, *, root='/', runner=None):
+    """Deploy the verified bundle as a host extension and refresh systemd-sysext."""
+    if not _is_root():
+        raise BootstrapError('not_root', 'installing the updater runtime requires root')
+    if not isinstance(expected_sha256, str) or not _HEX64.fullmatch(expected_sha256.strip().lower()):
+        raise BootstrapError('hash_invalid', 'expected SHA256 must be 64 hexadecimal characters')
+    expected_sha256 = expected_sha256.strip().lower()
+    runner = subprocess.run if runner is None else runner
+
+    base = Path(root)
+    bundle_path = Path(bundle)
+    if bundle_path.is_symlink():
+        raise BootstrapError('bundle_unreadable', 'bundle path must not be a symlink')
+    try:
+        if not stat.S_ISREG(bundle_path.stat().st_mode):
+            raise BootstrapError('bundle_unreadable', 'bundle is not a regular file')
+        stream = bundle_path.open('rb')
+    except OSError as error:
+        raise BootstrapError('bundle_unreadable', 'cannot open bundle: %s' % error)
+
+    with stream:
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = stream.read(_CHUNK)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_BUNDLE_BYTES:
+                raise BootstrapError('bundle_too_large', 'bundle exceeds %d bytes'
+                                     % MAX_BUNDLE_BYTES)
+            digest.update(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+            raise BootstrapError('hash_mismatch',
+                                 'bundle SHA256 does not match the expected digest')
+        manifest, members = _scan_archive(stream)
+        specs = _validate_manifest(manifest, members)
+
+        version = manifest['version']
+        runtime = _runtime_root(base)
+        current = _read_updater_version(runtime)
+        comparison = _version_compare(current, version)
+        if comparison is not None and comparison > 0:
+            raise BootstrapError('newer_runtime_present',
+                                 'installed updater %s is newer than bundle %s; '
+                                 'the existing runtime is left untouched'
+                                 % (current, version))
+        if _host_key_mismatch(base, specs):
+            raise BootstrapError('trust_conflict',
+                                 'the host trust anchor %s differs from the bundled key '
+                                 '%s; existing trust policy is kept and nothing is installed'
+                                 % (HOST_TRUST_KEY_PATH, TRUST_KEY_PATH))
+        if comparison == 0:
+            # The same version string is not proof of the same runtime: only
+            # reuse an installation whose files still match the manifest.
+            problems = _verify_runtime(runtime, specs)
+            if not problems:
+                return {
+                    'schemaVersion': SCHEMA_VERSION,
+                    'ok': True,
+                    'command': COMMAND_INSTALL,
+                    'state': 'reused',
+                    'bundle': BUNDLE_NAME,
+                    'version': current,
+                    'extension': EXTENSION_NAME,
+                    'path': None,
+                    'replaced': False,
+                    'previousVersion': current,
+                    'files': len(specs),
+                    'sha256': expected_sha256,
+                    'verified': True,
+                    'sysextRefreshed': False,
+                    'entry': str(_p(base, ENTRY_PATH)),
+                }
+
+        sysext = _find(base, SYSEXT_PATHS)
+        if sysext is None:
+            raise BootstrapError('missing-systemd-sysext',
+                                 'systemd-sysext is required to deploy the updater')
+        os_release = _read_os_release(base)
+        release = _extension_release(os_release)
+        extensions = _p(base, RUN_EXTENSIONS)
+        _mkdirs(extensions)
+        if extensions.is_symlink() or not extensions.is_dir():
+            raise BootstrapError('extensions_dir_unusable',
+                                 '/run/extensions is not a plain directory')
+        final = _extension_dir(base)
+        if final.is_symlink():
+            raise BootstrapError('extension_conflict',
+                                 'extension path must not be a symlink: %s' % final)
+        stage = _new_stage(extensions)
+
+        try:
+            _extract(stream, stage, specs)
+            if _missing_runtime(stage):
+                raise BootstrapError('manifest_mismatch',
+                                     'staged extension is missing required runtime files')
+            staged_version = _read_updater_version(stage)
+            if staged_version != version:
+                raise BootstrapError('manifest_mismatch',
+                                     'staged updater version does not match the manifest')
+            release_path = stage / EXTENSION_RELEASE
+            _mkdirs(release_path.parent)
+            _write_file(release_path, release, 0o644)
+            _fsync_dir(release_path.parent)
+            _fsync_dir(stage)
+        except BaseException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+        try:
+            backup, replaced = _install_extension(stage, final)
+        except OSError as error:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise BootstrapError('stage_failed',
+                                 'cannot activate the staged extension: %s' % error)
+        except BaseException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        previous = current if replaced else None
+        try:
+            if not _refresh(runner, sysext):
+                raise BootstrapError('sysext_failed', 'systemd-sysext refresh failed')
+            if base == Path('/') and not _extension_active(base):
+                raise BootstrapError('verify_failed',
+                                     'systemd-sysext did not merge the updater extension')
+            merged_version = _read_updater_version(final)
+            if merged_version != version:
+                raise BootstrapError('verify_failed',
+                                     'merged updater version is %r, expected %r'
+                                     % (merged_version, version))
+            if _missing_runtime(final):
+                raise BootstrapError('verify_failed',
+                                     'merged updater runtime is incomplete')
+        except BaseException:
+            _restore(final, stage, backup)
+            _refresh(runner, sysext)
+            raise
+
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
+        _fsync_dir(extensions)
+        return {
+            'schemaVersion': SCHEMA_VERSION,
+            'ok': True,
+            'command': COMMAND_INSTALL,
+            'state': 'installed',
+            'bundle': BUNDLE_NAME,
+            'version': version,
+            'extension': EXTENSION_NAME,
+            'path': str(final),
+            'replaced': replaced,
+            'previousVersion': previous,
+            'files': len(specs),
+            'sha256': expected_sha256,
+            'sysextRefreshed': True,
+            'entry': str(_p(base, ENTRY_PATH)),
+        }
+
+
+# --------------------------------------------------------------------------
+# command line
+
+
+def _parse_install(argv):
+    options = {}
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if '=' in argument and argument.startswith('--'):
+            key, _, value = argument.partition('=')
+            index += 1
+        else:
+            key = argument
+            if index + 1 >= len(argv):
+                raise BootstrapError('usage', 'missing value for %s' % key)
+            value = argv[index + 1]
+            index += 2
+        if key not in ('--bundle', '--sha256'):
+            raise BootstrapError('usage', 'unknown option: %s' % key)
+        if key in options:
+            raise BootstrapError('usage', 'duplicate option: %s' % key)
+        options[key] = value
+    if set(options) != {'--bundle', '--sha256'}:
+        raise BootstrapError('usage', 'install requires --bundle and --sha256')
+    return options['--bundle'], options['--sha256']
+
+
+def _emit(document):
+    sys.stdout.write(json.dumps(document, sort_keys=True, separators=(',', ':')) + '\n')
+    sys.stdout.flush()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+    command = argv[0] if argv else None
+    try:
+        if command == COMMAND_PROBE:
+            if len(argv) != 1:
+                raise BootstrapError('usage', 'probe takes no arguments')
+            result = probe()
+        elif command == COMMAND_INSTALL:
+            bundle, digest = _parse_install(argv[1:])
+            result = install(bundle, digest)
+        else:
+            raise BootstrapError(
+                'usage',
+                'usage: armada-offline-bootstrap probe | install --bundle FILE --sha256 HEX')
+    except BootstrapError as error:
+        _emit({
+            'schemaVersion': SCHEMA_VERSION,
+            'ok': False,
+            'command': command,
+            'error': {'code': error.code, 'message': str(error)},
+        })
+        return 2 if error.code == 'usage' else 1
+    except Exception as error:  # pragma: no cover - unexpected environment failure
+        print('armada-offline-bootstrap: %s' % error, file=sys.stderr)
+        _emit({
+            'schemaVersion': SCHEMA_VERSION,
+            'ok': False,
+            'command': command,
+            'error': {'code': 'internal', 'message': type(error).__name__},
+        })
+        return 1
+    _emit(result)
+    return 0 if result.get('ok') else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

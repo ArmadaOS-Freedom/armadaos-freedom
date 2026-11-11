@@ -65,6 +65,39 @@ class OfflineSessionStoreTest(unittest.TestCase):
     def _payload_file(self, session, receipt):
         return session.joinpath("incoming", *receipt["payload"]["path"].split("/"))
 
+    def test_info_reports_genuine_legacy_bootable_slots(self):
+        for target, attribute, value in (
+            (offline_session.os, "geteuid", mock.Mock(return_value=0)),
+            (offline_session.armada_os, "snapshot",
+             mock.Mock(return_value={"channel": "stable"})),
+        ):
+            patcher = mock.patch.object(target, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The live legacy device: selected A bootable, inactive B unbootable.
+        report = {
+            "model": "TB322FC", "actualSlot": None, "inactiveSlot": None,
+            "selectedSlot": "a", "bootContext": "legacy-controller",
+            "deployment": "stable", "recoveryPartUuid": "00000000-0000",
+            "bootableSlots": {"a": True, "b": False},
+        }
+        base = self.tmp / "legacy-info" / "offline"
+        info = offline_session.OfflineSessionStore(
+            base=base, trusted_key=self.pub_key,
+            info_reader=lambda: dict(report)).info()
+        self.assertEqual(info["bootableSlots"], {"a": True, "b": False})
+        self.assertEqual(info["selectedSlot"], "a")
+        self.assertIsNone(info["actualSlot"])
+        self.assertIsNone(info["inactiveSlot"])
+        self.assertFalse(base.exists())
+
+        invented = dict(report)
+        del invented["bootableSlots"]
+        with self.assertRaises(offline_session.OfflineSessionError):
+            offline_session.OfflineSessionStore(
+                base=base, trusted_key=self.pub_key,
+                info_reader=lambda: dict(invented)).info()
+
     def test_upload_roundtrip_and_seal(self):
         for model in ("TB322FC", "TB323FU"):
             with self.subTest(model=model):

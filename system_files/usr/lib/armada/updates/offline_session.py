@@ -15,17 +15,22 @@ from contextlib import contextmanager
 
 import armada_os
 from . import (
+    boot_candidate,
     boot_context,
+    offline_context,
     offline_execute,
     offline_payload,
+    offline_prepare,
     package_contract,
     physical_slots,
     recovery_device,
     signature,
     system_transaction,
+    trial_record,
 )
 
 _DEFAULT_BASE = Path('/var/lib/armada-updates/offline')
+_DEFAULT_SYSROOT = Path('/sysroot')
 _UPDATER_VERSION = '0.8.0'
 _DOCUMENT_MAX = 2 * 1024 * 1024
 _SIGNATURE_MAX = 16 * 1024
@@ -37,12 +42,26 @@ _EXPORT_STATES = frozenset({
     'awaiting_recovery_export', 'executing', 'awaiting_reboot', 'failed',
     'recovery_required',
 })
+# Read-only dependencies every offline worker needs before a session starts.
+_REQUIRED_UPDATER_FILES = (
+    Path('/usr/libexec/armada/kshim-build-boot.py'),
+    physical_slots.LIBRARY_PATH,
+)
+_REQUIRED_UPDATER_EXECUTABLES = (
+    Path('/usr/bin/python3'),
+    Path('/usr/libexec/armada/armada-offline-update'),
+    boot_candidate._DEFAULT_BOOT_TOOL_PATH,
+)
 # info() treats exactly this inspector as "not injected" and reads the device.
-_DEFAULT_INSPECT = physical_slots.inspect_physical_slots
+_DEFAULT_INSPECT = physical_slots.inspect_offline_physical_slots
 
 
 class OfflineSessionError(RuntimeError):
     """An offline session cannot safely perform the requested operation."""
+
+
+class _WitnessEvidenceError(OfflineSessionError):
+    """Firmware witness evidence could not be read at all."""
 
 
 def _fsync_dir(path):
@@ -91,28 +110,21 @@ def _regular(fd, label):
     return st
 
 
-def read_device_identity():
-    """Read the running system's identity for read-only queries.
-
-    ``inspect_physical_slots`` deliberately fails while the controller's selected
-    slot differs from the slot the machine booted from.  That is the expected
-    state between a successful activation of the inactive slot and the reboot, so
-    queries made in that window must not reuse the strict mutation precheck.  The
-    identity here comes from the same verified evidence the boot precheck trusts:
-    the booted deployment record, the firmware witness and cmdline binding, and
-    the located internal recovery partition.  Nothing is cached from a previous
-    session and no slot is inferred from the controller's selection.
-    """
-    snapshot = armada_os.snapshot()
+def _strict_evidence():
+    """Read and bind the firmware witness evidence; the strict rules are unchanged."""
+    try:
+        snapshot = armada_os.snapshot()
+    except Exception as exc:
+        raise _WitnessEvidenceError('cannot verify the booted slot: %s' % exc) from exc
     if not isinstance(snapshot, dict):
-        raise OfflineSessionError('device snapshot is not an object')
+        raise _WitnessEvidenceError('device snapshot is not an object')
     booted = snapshot.get('booted')
     if not isinstance(booted, dict):
-        raise OfflineSessionError('device snapshot has no booted deployment')
+        raise _WitnessEvidenceError('device snapshot has no booted deployment')
     try:
         context = boot_context.read_boot_context(booted)
     except Exception as exc:
-        raise OfflineSessionError('cannot verify the booted slot: %s' % exc) from exc
+        raise _WitnessEvidenceError('cannot verify the booted slot: %s' % exc) from exc
     if not isinstance(context, dict):
         raise OfflineSessionError('boot context is not an object')
     stateroot = booted.get('stateroot')
@@ -129,6 +141,10 @@ def read_device_identity():
     inactive = context.get('inactiveSlot')
     if actual not in ('a', 'b') or inactive != ('b' if actual == 'a' else 'a'):
         raise OfflineSessionError('boot context reports invalid slots')
+    return deployment, actual, inactive
+
+
+def _recovery_identity(deployment, actual, inactive):
     try:
         _dev, part_uuid, board, _rdev = recovery_device.locate_recovery_partition(
             require_edl=False)
@@ -150,11 +166,101 @@ def read_device_identity():
     }
 
 
+def _legacy_bootable_slots(physical):
+    """Validate the controller flags a legacy identity may report.
+
+    Only ``info`` uses the permissive legacy inventory, so an inactive slot may
+    be unbootable here.  The flags are never rewritten: an absent or
+    non-boolean value is a defect, not "both bootable".
+    """
+    bootable = physical.get('bootableSlots')
+    if not isinstance(bootable, dict) or set(bootable) != {'a', 'b'}:
+        raise OfflineSessionError('legacy device identity has no verified bootableSlots')
+    if any(type(bootable[slot]) is not bool for slot in ('a', 'b')):
+        raise OfflineSessionError('legacy device identity reports non-boolean bootableSlots')
+    if not bootable[physical['selectedSlot']]:
+        raise OfflineSessionError(
+            'legacy device identity reports the selected slot as not bootable')
+    return {'a': bootable['a'], 'b': bootable['b']}
+
+
+def _legacy_identity(physical):
+    """Describe a controller-only legacy device without inventing an actual slot."""
+    if not isinstance(physical, dict):
+        raise OfflineSessionError('legacy physical report is not an object')
+    if physical.get('bootContext') != physical_slots.LEGACY_BOOT_CONTEXT:
+        raise OfflineSessionError('legacy physical report is not controller-only')
+    if physical.get('actualSlot') is not None or physical.get('inactiveSlot') is not None:
+        raise OfflineSessionError('legacy physical report must not claim an actual slot')
+    if physical.get('model') not in _MODELS:
+        raise OfflineSessionError('physical offline upgrades support only TB322FC/TB323FU')
+    selected = physical.get('selectedSlot')
+    if selected not in ('a', 'b'):
+        raise OfflineSessionError('legacy physical report has no selected slot')
+    deployment = physical.get('deployment')
+    if not isinstance(deployment, str) or not deployment:
+        raise OfflineSessionError('legacy device identity has no verified deployment')
+    part_uuid = physical.get('recoveryPartUuid')
+    if not isinstance(part_uuid, str) or not part_uuid:
+        raise OfflineSessionError('recovery partition has no verified PARTUUID')
+    return {
+        'model': physical['model'],
+        'actualSlot': None,
+        'inactiveSlot': None,
+        'selectedSlot': selected,
+        'bootContext': physical_slots.LEGACY_BOOT_CONTEXT,
+        'deployment': deployment,
+        'recoveryPartUuid': part_uuid,
+        'bootableSlots': _legacy_bootable_slots(physical),
+    }
+
+
+def read_device_identity():
+    """Read the running system's identity for read-only queries.
+
+    ``inspect_physical_slots`` deliberately fails while the controller's selected
+    slot differs from the slot the machine booted from.  That is the expected
+    state between a successful activation of the inactive slot and the reboot, so
+    queries made in that window must not reuse the strict mutation precheck.  The
+    identity here comes from the same verified evidence the boot precheck trusts:
+    the booted deployment record, the firmware witness and cmdline binding, and
+    the located internal recovery partition.  Nothing is cached from a previous
+    session and no slot is inferred from the controller's selection.
+    """
+    return _recovery_identity(*_strict_evidence())
+
+
+def read_offline_device_identity():
+    """Identity used by the offline service.
+
+    A system with witness evidence keeps the strict identity above.  A legacy
+    0.7 system is inspected only when neither the witness nor an
+    ``armada.deployment`` argument exists, and then only the controller's
+    selected slot is reported.  That inventory is read-only and permissive
+    about the inactive slot: info must identify a running device even when the
+    inactive slot is not bootable yet, because that is a future upgrade
+    blocker, not an identity defect.  Mutation callers keep the strict
+    both-bootable precheck.
+    """
+    try:
+        evidence = _strict_evidence()
+    except _WitnessEvidenceError:
+        if offline_context.new_evidence_present():
+            raise
+        try:
+            physical = physical_slots.inspect_legacy_identity_slots()
+        except Exception as exc:
+            raise OfflineSessionError('cannot verify the booted slot: %s' % exc) from exc
+        return _legacy_identity(physical)
+    return _recovery_identity(*evidence)
+
+
 class OfflineSessionStore:
     """Transport-independent storage; authorization belongs to the stdio helper."""
 
     def __init__(self, base=_DEFAULT_BASE, trusted_key=signature.DEFAULT_TRUSTED_KEY,
-                 inspect=physical_slots.inspect_physical_slots, info_reader=None):
+                 inspect=_DEFAULT_INSPECT, info_reader=None, snapshot=None,
+                 sysroot_path=_DEFAULT_SYSROOT):
         if os.geteuid() != 0:
             raise PermissionError('offline session storage requires euid 0')
         self.base = Path(base)
@@ -163,7 +269,17 @@ class OfflineSessionStore:
         self.trusted_key = Path(trusted_key)
         self._inspect = inspect
         self._info_reader = info_reader
+        self._snapshot = snapshot
+        self.sysroot_path = Path(sysroot_path)
         self.updater_version = _UPDATER_VERSION
+
+    def _snapshot_state(self):
+        if self._snapshot is not None:
+            return self._snapshot()
+        # The booted deployment lives in the default runtime sysroot; the
+        # configured /sysroot path is only a mount for image work, not the
+        # libostree sysroot that owns the booted deployment.
+        return offline_context.snapshot()
 
     def _physical_info(self):
         physical = self._inspect()
@@ -174,6 +290,17 @@ class OfflineSessionStore:
     def _require_identity(self, physical):
         if not isinstance(physical, dict) or physical.get('model') not in _MODELS:
             raise OfflineSessionError('physical offline upgrades support only TB322FC/TB323FU')
+        if physical.get('bootContext') == physical_slots.LEGACY_BOOT_CONTEXT:
+            if physical.get('actualSlot') is not None or physical.get('inactiveSlot') is not None:
+                raise OfflineSessionError('legacy device identity must not claim an actual slot')
+            for field in ('model', 'deployment', 'recoveryPartUuid', 'selectedSlot'):
+                value = physical.get(field)
+                if not isinstance(value, str) or not value:
+                    raise OfflineSessionError('device identity has no verified %s' % field)
+            if physical['selectedSlot'] not in ('a', 'b'):
+                raise OfflineSessionError('device identity reports an invalid selected slot')
+            _legacy_bootable_slots(physical)
+            return physical
         for field in ('model', 'actualSlot', 'inactiveSlot', 'deployment',
                       'recoveryPartUuid'):
             value = physical.get(field)
@@ -190,29 +317,141 @@ class OfflineSessionStore:
         if self._info_reader is not None:
             return self._require_identity(self._info_reader())
         if self._inspect is _DEFAULT_INSPECT:
-            return self._require_identity(read_device_identity())
+            return self._require_identity(read_offline_device_identity())
         # A caller that supplied its own inspector is describing the device for
         # this store, so info keeps reading that fixture instead of the host.
         return self._require_identity(self._inspect())
 
     def _channel_info(self):
-        return system_transaction._snapshot_channel(armada_os.snapshot())
+        return system_transaction._snapshot_channel(self._snapshot_state())
 
     def _new_session_id(self):
         return uuid.uuid4().hex
 
     def info(self):
         physical = self._info_physical()
-        return {
+        result = {
             'schemaVersion': 1,
             'updaterVersion': self.updater_version,
             'model': physical['model'],
-            'actualSlot': physical['actualSlot'],
-            'inactiveSlot': physical['inactiveSlot'],
             'deployment': physical['deployment'],
             'recoveryPartUuid': physical['recoveryPartUuid'],
             'channel': self._channel_info(),
         }
+        if physical.get('bootContext') == physical_slots.LEGACY_BOOT_CONTEXT:
+            result.update(actualSlot=None, inactiveSlot=None,
+                          selectedSlot=physical['selectedSlot'],
+                          bootContext=physical['bootContext'],
+                          bootableSlots=dict(physical['bootableSlots']))
+        else:
+            result.update(actualSlot=physical['actualSlot'],
+                          inactiveSlot=physical['inactiveSlot'])
+        return result
+
+    def _canonical_sysroot(self):
+        path = Path(self.sysroot_path)
+        if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+            raise OfflineSessionError('sysroot must be an absolute non-symlink directory')
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise OfflineSessionError('cannot resolve the sysroot: %s' % exc) from exc
+        if resolved != path:
+            raise OfflineSessionError('sysroot path is not canonical')
+        return path
+
+    @staticmethod
+    def _check_updater_dependencies():
+        required = [(Path(path), False) for path in _REQUIRED_UPDATER_FILES]
+        required += [(Path(path), True) for path in _REQUIRED_UPDATER_EXECUTABLES]
+        for path, executable in required:
+            try:
+                entry = os.lstat(path)
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'missing updater dependency: %s' % path) from exc
+            if stat.S_ISLNK(entry.st_mode):
+                # /usr/bin/python3 is a normal root-owned distro symlink on
+                # Fedora.  Resolve trusted executable symlinks to their regular
+                # target instead of rejecting Python; a dangling or non-regular
+                # target still fails.  Uploaded payload and archive-member
+                # symlinks keep their own strict O_NOFOLLOW protections.
+                try:
+                    checked = path.resolve(strict=True)
+                    target = os.stat(checked)
+                except OSError as exc:
+                    raise OfflineSessionError(
+                        'missing updater dependency: %s' % path) from exc
+                if not stat.S_ISREG(target.st_mode):
+                    raise OfflineSessionError(
+                        'missing updater dependency: %s' % path)
+            elif stat.S_ISREG(entry.st_mode):
+                checked = path
+            else:
+                raise OfflineSessionError('missing updater dependency: %s' % path)
+            if executable and not os.access(checked, os.X_OK):
+                raise OfflineSessionError(
+                    'missing executable updater dependency: %s' % path)
+
+    def preflight(self, document: bytes, signature_b64: bytes):
+        """Read-only readiness check: no session, no staging, no device write.
+
+        The result shape is fixed: ``schemaVersion``, ``phase``,
+        ``bootWriteState``, ``model``, ``bootContext``, ``actualSlot``,
+        ``selectedSlot``, ``currentDeployment``, ``recoveryPartUuid``,
+        ``recoveryDescriptorVersion``, ``recoveryMigrationRequired``,
+        ``channel`` and optional ``channelInferred``.  A controller-only
+        legacy system reports ``actualSlot: null`` plus its selected slot; no
+        slot is ever inferred from the controller's selection.  The bound
+        recovery journal is read with the same rules prepare and execute use,
+        so a legacy v1/v2 descriptor is reported as needing migration rather
+        than being ignored; nothing is written here.
+        """
+        if type(document) is not bytes or not 0 < len(document) <= _DOCUMENT_MAX:
+            raise ValueError('document must be nonempty bytes of at most 2 MiB')
+        if type(signature_b64) is not bytes or not 0 < len(signature_b64) <= _SIGNATURE_MAX:
+            raise ValueError('signature must be nonempty bytes of at most 16 KiB')
+        physical = self._require_identity(self._physical_info())
+        snapshot = self._snapshot_state()
+        channel = system_transaction._snapshot_channel(snapshot)
+        package = package_contract.load_package(
+            document, signature_b64, trusted_key=self.trusted_key)
+        package_contract.require_operation(
+            package, physical['model'], 'offline-upgrade',
+            updater_version=self.updater_version)
+        _parts, size, _digest, _expanded_size, _expanded_sha = \
+            offline_payload._select_payload_entry(package)
+        sysroot = self._canonical_sysroot()
+        statvfs = os.statvfs(sysroot)
+        free = statvfs.f_bavail * statvfs.f_frsize
+        if free < size:
+            raise OfflineSessionError('insufficient free space for compressed payload')
+        self._check_updater_dependencies()
+        # Read the journal and its descriptor version with the same read-only
+        # check prepare uses.  Reporting readiness before this would claim a
+        # legacy upgrade can start when the descriptor still blocks it.
+        journal = offline_prepare._check_recovery(
+            physical, system_transaction._binding(physical['deployment']))
+        descriptor_version = journal.layout.descriptor_version
+        result = {
+            'schemaVersion': 1,
+            'phase': 'preflight_passed',
+            'bootWriteState': 'not_started',
+            'model': physical['model'],
+            'bootContext': physical.get('bootContext',
+                                        offline_context.WITNESS_BOOT_CONTEXT),
+            'actualSlot': physical.get('actualSlot'),
+            'selectedSlot': physical.get('selectedSlot', physical.get('actualSlot')),
+            'currentDeployment': physical['deployment'],
+            'recoveryPartUuid': physical['recoveryPartUuid'],
+            'recoveryDescriptorVersion': descriptor_version,
+            'recoveryMigrationRequired': (
+                descriptor_version != trial_record.DESCRIPTOR_MIN_VERSION),
+            'channel': channel,
+        }
+        if isinstance(snapshot, dict) and snapshot.get('channelInferred'):
+            result['channelInferred'] = True
+        return result
 
     def _ensure_base(self):
         if self.base.exists() or self.base.is_symlink():

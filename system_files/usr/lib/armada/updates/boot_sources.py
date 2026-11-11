@@ -160,15 +160,17 @@ def _rehash_region(fd, offset, size):
     return digest.hexdigest()
 
 
-def capture_boot_sources(expected_physical, output_dir, *, extra_labels=()):
+def capture_boot_sources(expected_physical, output_dir, *, extra_labels=(), inspector=None):
     """Snapshot all boot source partitions read-only into output_dir.
 
     Caller must hold /run/lock/armada-update.lock for the full transaction.
+    The optional inspector defaults to the strict online precheck; offline
+    callers pass the legacy-aware offline inspector.
     Returns the manifest dict; raises BootSourcesError on any failure.
     """
     return _capture_boot_sources(
         expected_physical, output_dir, extra_labels,
-        inspector=physical_slots.inspect_physical_slots, phase=_PHASE)
+        inspector=inspector or physical_slots.inspect_physical_slots, phase=_PHASE)
 
 
 def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,

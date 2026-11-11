@@ -14,7 +14,9 @@ from . import (
     boot_candidate,
     deployment_options,
     offline_boot_writer,
+    offline_context,
     offline_prepare,
+    offline_recovery,
     package_contract,
     physical_slots,
     recovery_device,
@@ -208,7 +210,7 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
 
     package = package_contract.load_package(
         package_doc, signature_b64, trusted_key=trusted_key)
-    initial = (physical_slots.inspect_physical_slots())
+    initial = (physical_slots.inspect_offline_physical_slots())
     if initial['model'] not in ('TB322FC', 'TB323FU'):
         raise ValueError('unsupported physical model')
     package_contract.require_operation(
@@ -242,17 +244,22 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
             materials.get('rootUuid') != dep_opts['rootUuid'] or
             materials.get('bootUuid') != dep_opts['bootUuid']):
         raise ValueError('prepared deployment or boot materials binding mismatch')
-    actual, inactive = initial['actualSlot'], initial['inactiveSlot']
-    if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
+    actual, inactive = initial.get('actualSlot'), initial.get('inactiveSlot')
+    if actual is not None and (
+            actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a')):
         raise ValueError('physical active/inactive slots invalid')
-    if (plan.get('fromSlot') != actual or plan.get('targetSlot') != inactive or
+    reference, other = physical_slots.offline_slot_pair(initial)
+    if (plan.get('fromSlot') != reference or plan.get('targetSlot') != other or
+            plan.get('selectedSlot') != reference or
+            plan.get('bootContext') != initial.get('bootContext') or
             plan.get('model') != initial['model']):
         raise ValueError('plan slot/model bindings mismatch physical state')
 
     if (not _is_schema_one(trust.get('schemaVersion')) or
             trust.get('physical') != initial or
             trust.get('sources', {}).get('physical') != initial or
-            manifest.get('physical') != initial or manifest.get('model') != initial['model']):
+            manifest.get('physical') != initial or manifest.get('model') != initial['model'] or
+            manifest.get('bootContext') != initial.get('bootContext')):
         raise ValueError('boot trust physical report mismatch')
     sources = trust['sources']
     candidates = {}
@@ -276,13 +283,13 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
             raise ValueError('plan new boot digest mismatch for slot %s' % slot)
         candidates[slot] = candidate
 
-    journal = system_transaction._check_recovery(initial, old)
+    journal = offline_prepare._check_recovery(initial, old)
     layout = journal.layout
     if (manifest.get('installationUuid') != str(uuid.UUID(bytes=layout.installation_uuid)) or
             manifest.get('recoveryPartUuid') != str(uuid.UUID(bytes=layout.partition_uuid)) or
             manifest.get('recoveryPartUuid') != initial['recoveryPartUuid'] or
             manifest.get('board') != layout.board or
-            manifest.get('fromSlot') != actual or
+            manifest.get('fromSlot') != reference or
             manifest.get('oldDeployment') != current_binding or
             manifest.get('partitions') != sources.get('partitions')):
         raise ValueError('recovery manifest identity mismatch')
@@ -334,20 +341,20 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
 def _build_record(ctx, plan_sha):
     journal, initial = ctx['journal'], ctx['initial']
     old, new = ctx['old'], ctx['new']
-    actual, inactive = initial['actualSlot'], initial['inactiveSlot']
+    reference, other = physical_slots.offline_slot_pair(initial)
     sequence = 1 if journal.record is None else journal.record.sequence + 1
     record = trial_record.TrialRecord(
         sequence=sequence, partition_uuid=journal.layout.partition_uuid,
         installation_uuid=journal.layout.installation_uuid,
         transaction_uuid=uuid.UUID(ctx['tx']).bytes, state=trial_record.PREPARED,
-        from_slot=0 if actual == 'a' else 1, target_slot=0 if inactive == 'a' else 1,
+        from_slot=0 if reference == 'a' else 1, target_slot=0 if other == 'a' else 1,
         remaining=3, attempt_limit=3, old_serial=old[2], new_serial=new[2],
         os_name=old[0], old_commit=bytes.fromhex(old[1]),
         new_commit=bytes.fromhex(new[1]),
-        old_boot_sha256=bytes.fromhex(ctx['plan']['originalBootSha256'][actual]),
-        new_boot_sha256=bytes.fromhex(ctx['plan']['newBootSha256'][inactive]),
+        old_boot_sha256=bytes.fromhex(ctx['plan']['originalBootSha256'][reference]),
+        new_boot_sha256=bytes.fromhex(ctx['plan']['newBootSha256'][other]),
         plan_sha256=bytes.fromhex(plan_sha), policy=trial_record.OFFLINE_DUAL,
-        other_boot_sha256=bytes.fromhex(ctx['plan']['newBootSha256'][actual]))
+        other_boot_sha256=bytes.fromhex(ctx['plan']['newBootSha256'][reference]))
     trial_record.encode_record(record)
     return record
 
@@ -375,8 +382,11 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
         try:
             ctx = _preflight(work, recovery_ack, updater_version, trusted_key)
             status = dict(ctx['saved_status'])
+            # Durable pre-reboot binding: completion may only offer a restart
+            # inside the original boot that performed the activation.
+            status['bootId'] = offline_context.read_boot_id()
             initial, plan = ctx['initial'], ctx['plan']
-            actual, inactive = initial['actualSlot'], initial['inactiveSlot']
+            reference, other = physical_slots.offline_slot_pair(initial)
             record = _build_record(ctx, ctx['saved_status']['planSha256'])
             started = True
             system_transaction._save_json(work, 'recovery-ack.json', recovery_ack)
@@ -399,8 +409,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                     report.get('physical') != initial or
                     report.get('transactionUuid') != ctx['tx'] or
                     report.get('deployment') != plan['newDeployment'] or
-                    report.get('fromSlot') != actual or
-                    report.get('slotOrder') != [inactive, actual] or
+                    report.get('fromSlot') != reference or
+                    report.get('slotOrder') != [other, reference] or
                     set(report.get('writes', {})) != {'a', 'b'}):
                 raise ValueError('offline dual boot write report mismatch')
             for slot in _SLOTS:
@@ -417,7 +427,7 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             system_transaction._save_json(work, 'write-report.json', report)
             system_transaction._save_json(work, 'status.json', status)
 
-            after_write = (physical_slots.inspect_physical_slots())
+            after_write = (physical_slots.inspect_offline_physical_slots())
             if after_write != initial:
                 raise ValueError('physical slots changed after boot writes')
             status['phase'] = 'preparing_trial'
@@ -428,7 +438,14 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 if (partuuid != initial['recoveryPartUuid'] or
                         physical_slots._MODEL.get(board) != initial['model']):
                     raise ValueError('recovery identity changed before journal write')
-                if trial_store.load(fd, partuuid, board) != journal:
+                # The captured export rolled back is the pre-migration image.
+                # Only a validated v1/v2 descriptor is converted here, after
+                # both boot writes and their readback, and before the record
+                # write.  Version 3 keeps the existing compare-and-swap path.
+                if (journal.layout.descriptor_version !=
+                        trial_record.DESCRIPTOR_MIN_VERSION):
+                    journal = offline_recovery.migrate_descriptor(fd, journal)
+                elif trial_store.load(fd, partuuid, board) != journal:
                     raise ValueError('recovery journal compare-and-swap failed')
                 trial_store.save(fd, journal, record)
                 if trial_store.load(fd, partuuid, board).record != record:
@@ -442,14 +459,14 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             activated = slot_activation.activate_offline_slots(report)
             if (activated.get('phase') != 'offline_slots_activated' or
                     activated.get('model') != initial['model'] or
-                    activated.get('fromSlot') != actual or
-                    activated.get('targetSlot') != inactive or
-                    activated.get('selectedSlot') != inactive or
+                    activated.get('fromSlot') != reference or
+                    activated.get('targetSlot') != other or
+                    activated.get('selectedSlot') != other or
                     activated.get('transactionUuid') != ctx['tx'] or
                     activated.get('deployment') != plan['newDeployment'] or
                     activated.get('recordSequence') != record.sequence or
-                    activated.get('currentReadbackSha256') != plan['newBootSha256'][actual] or
-                    activated.get('targetReadbackSha256') != plan['newBootSha256'][inactive]):
+                    activated.get('currentReadbackSha256') != plan['newBootSha256'][reference] or
+                    activated.get('targetReadbackSha256') != plan['newBootSha256'][other]):
                 raise ValueError('offline slot activation report mismatch')
             status.update(state='awaiting_reboot', phase='awaiting_reboot',
                           requiresReboot=True, activationOutcome='activated',

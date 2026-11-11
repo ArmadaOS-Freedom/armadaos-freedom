@@ -10,6 +10,7 @@ import armada_os
 from . import (
     boot_context,
     offline_completion,
+    offline_context,
     offline_execute,
     offline_session,
     system_transaction,
@@ -46,6 +47,45 @@ def _read_trial_evidence():
                 'error': str(error) or type(error).__name__}
 
 
+def _legacy_evidence_unavailable(error):
+    return {'schemaVersion': offline_completion.LEGACY_EVIDENCE_SCHEMA,
+            'state': 'unavailable',
+            'error': (str(error) or type(error).__name__)[:200]}
+
+
+def _read_legacy_completion_evidence(session):
+    """Read the explicit pre-reboot legacy evidence document, read-only.
+
+    This never writes, stages, selects, or synthesizes a slot.  The exact
+    booted deployment comes from libostree; the journal and both execute
+    reports are the durable documents written by this transaction.
+    """
+    try:
+        transaction = session / 'transaction'
+        status, _raw = offline_execute._load_json(transaction, 'status.json')
+        plan, _raw = offline_execute._load_json(transaction, 'plan.json')
+        write_report, _raw = offline_execute._load_json(
+            transaction, 'write-report.json')
+        activation_report, _raw = offline_execute._load_json(
+            transaction, 'activation-report.json')
+        _booted, context = offline_context.read_legacy_boot_state()
+        journal = trial_status.read_legacy_trial_status(context)
+        return {
+            'schemaVersion': offline_completion.LEGACY_EVIDENCE_SCHEMA,
+            'state': 'available',
+            'bootContext': context.get('bootContext'),
+            'bootId': offline_context.read_boot_id(),
+            'deployment': context.get('deployment'),
+            'status': status,
+            'journal': journal,
+            'plan': plan,
+            'writeReport': write_report,
+            'activationReport': activation_report,
+        }
+    except Exception as error:
+        return _legacy_evidence_unavailable(error)
+
+
 class OfflineJobManager:
     """Submit authorized session operations without accepting client commands."""
 
@@ -64,7 +104,7 @@ class OfflineJobManager:
         if self.store._physical_info() != receipt.get('physical'):
             raise offline_session.OfflineSessionError(
                 'physical identity changed since session submission')
-        channel = system_transaction._snapshot_channel(armada_os.snapshot())
+        channel = system_transaction._snapshot_channel(self.store._snapshot_state())
         if channel != receipt.get('channel'):
             raise offline_session.OfflineSessionError(
                 'configured channel changed since session submission')
@@ -240,12 +280,41 @@ class OfflineJobManager:
         return offline_completion.document_identity(
             prepared, plan, hashlib.sha256(plan_raw).hexdigest())
 
+    @staticmethod
+    def _completion(session, receipt, identity):
+        """Evaluate this session with the strict or the legacy reader.
+
+        A legacy controller-only receipt has no witness and no actual slot, so
+        it is judged by the narrow pre-reboot evidence document.  Every other
+        receipt keeps the unchanged strict trial/witness path.
+        """
+        physical = receipt.get('physical')
+        if (isinstance(physical, dict) and
+                physical.get('bootContext') == offline_completion.LEGACY_BOOT_CONTEXT):
+            verdict = offline_completion.evaluate_legacy_pre_reboot(
+                receipt, _read_legacy_completion_evidence(session), identity)
+            # The narrow verdict only covers the boot that performed the
+            # activation.  After a reboot (or when the legacy reader is no
+            # longer applicable) the strict witness/finalization path decides;
+            # a confirmed result can never come from the legacy document.
+            if verdict.get('reason') in ('boot_changed',
+                                         'legacy_evidence_unavailable'):
+                strict = offline_completion.evaluate(
+                    receipt, _read_trial_evidence(), identity)
+                if (strict.get('state') != offline_completion.UNVERIFIED or
+                        strict.get('reason') != 'trial_unavailable'):
+                    return strict
+            return verdict
+        return offline_completion.evaluate(
+            receipt, _read_trial_evidence(), identity)
+
     def _attach_completion(self, session_id, receipt):
         """Attach the read-only completion verdict for an executed session."""
         if receipt.get('state') not in _COMPLETION_STATES:
             return receipt
         try:
-            identity = self._session_identity(self.store.resolve_session(session_id))
+            session = self.store.resolve_session(session_id)
+            identity = self._session_identity(session)
         except (OSError, ValueError, RuntimeError) as error:
             receipt['completion'] = {
                 'schemaVersion': 1,
@@ -257,8 +326,7 @@ class OfflineJobManager:
                 'restartState': None,
             }
             return receipt
-        receipt['completion'] = offline_completion.evaluate(
-            receipt, _read_trial_evidence(), identity)
+        receipt['completion'] = self._completion(session, receipt, identity)
         return receipt
 
     @staticmethod
@@ -306,8 +374,7 @@ class OfflineJobManager:
                 return self._restart_result(sessionId, identity, saved)
             # Only a request the system explicitly rejected may be retried, and
             # that retry still has to pass the eligibility check below.
-            completion = offline_completion.evaluate(
-                receipt, _read_trial_evidence(), identity)
+            completion = self._completion(session, receipt, identity)
             if (completion.get('state') != offline_completion.AWAITING_REBOOT or
                     completion.get('restartEligible') is not True):
                 raise offline_session.OfflineSessionError(

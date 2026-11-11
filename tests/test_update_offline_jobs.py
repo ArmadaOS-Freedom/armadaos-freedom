@@ -23,6 +23,14 @@ PHYSICAL = {
     'deployment': 'armada/' + ('a' * 64) + '.0',
     'recoveryPartUuid': '12345678-1234-5678-9abc-123456789abc',
 }
+LEGACY_PHYSICAL = {
+    'model': 'TB322FC', 'actualSlot': None, 'inactiveSlot': None,
+    'selectedSlot': 'a', 'bootContext': 'legacy-controller',
+    'deployment': PHYSICAL['deployment'],
+    'recoveryPartUuid': PHYSICAL['recoveryPartUuid'],
+}
+LEGACY_BOOT_ID = '0e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b'
+OTHER_BOOT_ID = '11111111-2222-4333-8444-555555555555'
 PAYLOAD = b'data'
 TX = '11111111-2222-4333-8444-555555555555'
 OTHER_TX = '99999999-8888-4777-8666-555555555555'
@@ -163,6 +171,142 @@ class OfflineJobTests(unittest.TestCase):
     def receipt_bytes(self, sid):
         with self.store.session_lock(sid) as session:
             return (session / 'receipt.json').read_bytes()
+
+    def legacy_executed_session(self):
+        """Executed session on a controller-only (legacy) system."""
+        self.inspect.return_value = dict(LEGACY_PHYSICAL)
+        return self.executed_session()
+
+    def legacy_evidence(self, sid, **overrides):
+        """Explicit pre-reboot evidence document for a legacy transaction."""
+        with self.store.session_lock(sid) as session:
+            prepared = json.loads(
+                (session / 'transaction/prepared.json').read_text())
+        original_boot = {'a': '3' * 64, 'b': '4' * 64}
+        new_boot = {'a': '5' * 64, 'b': '6' * 64}
+        writes = {}
+        for index, slot in enumerate(('a', 'b')):
+            digest = new_boot[slot]
+            writes[slot] = {
+                'candidate': {'path': '/tx/boot-%s.img' % slot,
+                              'bytes': 16 + index, 'sha256': digest},
+                'sourceBootSha256': original_boot[slot],
+                'bytesWritten': 16 + index,
+                'readbackSha256': digest,
+            }
+        body = {
+            'schemaVersion': 1, 'state': 'available',
+            'bootContext': 'legacy-controller', 'bootId': LEGACY_BOOT_ID,
+            'deployment': PHYSICAL['deployment'],
+            'status': {
+                'transactionId': TX, 'oldDeployment': PHYSICAL['deployment'],
+                'newDeployment': NEW_DEPLOYMENT,
+                'planSha256': prepared['planSha256'],
+                'state': 'awaiting_reboot', 'bootWriteState': 'written',
+                'activationOutcome': 'activated', 'bootId': LEGACY_BOOT_ID,
+            },
+            'journal': {
+                'state': 'available', 'bootContext': 'legacy-controller',
+                'actualSlot': None, 'inactiveSlot': None,
+                'recordState': 'prepared', 'policy': 'offline-dual',
+                'transactionId': TX,
+                'oldDeployment': PHYSICAL['deployment'],
+                'newDeployment': NEW_DEPLOYMENT, 'fromSlot': 'a',
+                'targetSlot': 'b', 'planSha256': prepared['planSha256'],
+                'runningDeployment': 'old', 'bootConfirmed': False,
+            },
+            'plan': {
+                'transactionId': TX,
+                'oldDeployment': PHYSICAL['deployment'],
+                'newDeployment': NEW_DEPLOYMENT, 'fromSlot': 'a',
+                'targetSlot': 'b',
+                'originalBootSha256': original_boot,
+                'newBootSha256': new_boot,
+            },
+            'writeReport': {
+                'phase': 'dual_boots_written', 'transactionUuid': TX,
+                'deployment': NEW_DEPLOYMENT, 'fromSlot': 'a',
+                'slotOrder': ['b', 'a'], 'physical': dict(LEGACY_PHYSICAL),
+                'writes': writes,
+            },
+            'activationReport': {
+                'phase': 'offline_slots_activated', 'transactionUuid': TX,
+                'deployment': NEW_DEPLOYMENT, 'fromSlot': 'a',
+                'targetSlot': 'b', 'selectedSlot': 'b', 'recordSequence': 1,
+                'currentReadbackSha256': writes['a']['readbackSha256'],
+                'targetReadbackSha256': writes['b']['readbackSha256'],
+            },
+        }
+        body.update(overrides)
+        return body
+
+    def test_legacy_status_uses_the_pre_reboot_evidence_not_the_witness(self):
+        sid = self.legacy_executed_session()
+        self.trial.side_effect = AssertionError(
+            'legacy completion must not read the strict witness')
+        before = self.receipt_bytes(sid)
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=self.legacy_evidence(sid)) as reader:
+            result = self.manager().status(sid)
+            again = self.manager().status(sid)
+        self.assertEqual(reader.call_count, 2)
+        for value in (result, again):
+            self.assertEqual(value['state'], 'awaiting_reboot')
+            completion = value['completion']
+            self.assertEqual(completion['state'], 'awaiting_reboot')
+            self.assertTrue(completion['restartEligible'])
+            self.assertEqual(completion['evidenceKind'], 'legacy-pre-reboot')
+            self.assertEqual(completion['bootContext'], 'legacy-controller')
+            self.assertIsNone(completion['actualSlot'])
+            self.assertEqual(completion['bootId'], LEGACY_BOOT_ID)
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.reboot.assert_not_called()
+
+    def test_legacy_after_reboot_defers_to_the_strict_witness_path(self):
+        sid = self.legacy_executed_session()
+        self.trial.return_value = self.evidence(
+            sid, recordState='confirmed', runningDeployment='new',
+            bootConfirmed=True, finalization={'state': 'complete'})
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=self.legacy_evidence(
+                            sid, bootId=OTHER_BOOT_ID)):
+            completion = self.manager().status(sid)['completion']
+        # The pre-reboot document is gone, so confirmation still needs the new
+        # witness/finalization; it is never synthesized from the legacy verdict.
+        self.assertEqual(completion['state'], 'confirmed')
+        self.assertFalse(completion['restartEligible'])
+
+    def test_legacy_wrong_transaction_never_becomes_restart_eligible(self):
+        sid = self.legacy_executed_session()
+        evidence = self.legacy_evidence(sid)
+        evidence['journal']['transactionId'] = OTHER_TX
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=evidence):
+            completion = self.manager().status(sid)['completion']
+        self.assertEqual(completion['state'], 'mismatch')
+        self.assertEqual(completion['reason'], 'transaction_mismatch')
+        self.assertFalse(completion['restartEligible'])
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=evidence):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                self.manager().request_restart(sid)
+        self.reboot.assert_not_called()
+
+    def test_legacy_request_restart_needs_the_original_boot(self):
+        sid = self.legacy_executed_session()
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=self.legacy_evidence(
+                            sid, bootId=OTHER_BOOT_ID)):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                self.manager().request_restart(sid)
+        self.reboot.assert_not_called()
+
+        with mock.patch('updates.offline_jobs._read_legacy_completion_evidence',
+                        return_value=self.legacy_evidence(sid)):
+            result = self.manager().request_restart(sid)
+        self.assertEqual(result['restart']['state'], 'dispatched')
+        self.assertEqual(result['transactionId'], TX)
+        self.assertEqual(self.reboot.call_count, 1)
 
     def test_status_binds_completion_without_writing_or_rebooting(self):
         sid = self.executed_session()

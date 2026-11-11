@@ -71,7 +71,7 @@ class OfflinePrepareTest(unittest.TestCase):
     @contextmanager
     def _case(self, model: str = "TB322FC", actual: str = "a",
               document: bytes | None = None, signature_b64: bytes | None = None,
-              commit: str = NEW_COMMIT):
+              commit: str = NEW_COMMIT, legacy: bool = False):
         with tempfile.TemporaryDirectory() as tmp_str, ExitStack() as stack:
             temp = Path(tmp_str).resolve()
             sysroot = temp / "sysroot"
@@ -108,21 +108,36 @@ class OfflinePrepareTest(unittest.TestCase):
                 "deployment": OLD_DEPLOYMENT,
                 "recoveryPartUuid": str(RECOVERY_UUID),
             }
+            if legacy:
+                # Controller-only system: the selected slot is the reference and
+                # no actual/inactive slot is known.
+                physical = {
+                    "model": model,
+                    "actualSlot": None,
+                    "inactiveSlot": None,
+                    "selectedSlot": actual,
+                    "bootContext": "legacy-controller",
+                    "deployment": OLD_DEPLOYMENT,
+                    "recoveryPartUuid": str(RECOVERY_UUID),
+                }
             header_bytes = b"H" * 65536
             region_bytes = b"R" * 65536
             journal = SimpleNamespace(
                 layout=SimpleNamespace(
+                    descriptor_version=1 if legacy else 3,
                     partition_uuid=RECOVERY_UUID.bytes,
                     installation_uuid=INSTALL_UUID.bytes,
                     board=board,
                 ),
                 header=header_bytes,
                 region=region_bytes,
+                record=None,
             )
             captured_originals: dict[str, bytes] = {}
             extra_override: dict[str, dict] = {}
 
-            def _capture_side_effect(*, output_dir: Path, boot_tool_path: Path) -> dict:
+            def _capture_side_effect(*, output_dir: Path, boot_tool_path: Path,
+                                     **_kwargs) -> dict:
                 slots = {"a": {}, "b": {}}
                 for s in ("a", "b"):
                     for key in SLOT_KEYS:
@@ -224,6 +239,23 @@ class OfflinePrepareTest(unittest.TestCase):
                 offline_prepare.boot_candidate, "prepare_boot_candidate",
                 side_effect=_candidate_side_effect))
 
+            if legacy:
+                # The legacy journal precheck reads the recovery partition
+                # directly instead of the strict online reader.  A version
+                # 1/2 descriptor is accepted read-only; execute is the only
+                # place that migrates it.
+                @contextmanager
+                def _legacy_recovery(*, writable):
+                    self.assertFalse(writable)
+                    yield 71, str(RECOVERY_UUID), board
+
+                stack.enter_context(mock.patch.object(
+                    offline_prepare.recovery_device, "open_recovery",
+                    _legacy_recovery))
+                stack.enter_context(mock.patch.object(
+                    offline_prepare.offline_recovery, "load",
+                    side_effect=lambda fd, partuuid, board_id: journal))
+
             spies = {
                 "write_offline_boots": stack.enter_context(mock.patch.object(
                     updates.offline_boot_writer, "write_offline_boots")),
@@ -261,7 +293,7 @@ class OfflinePrepareTest(unittest.TestCase):
             yield SimpleNamespace(
                 temp=temp, sysroot=sysroot, payload=payload, work=work,
                 document=document, signature_b64=signature_b64,
-                physical=physical, journal=journal,
+                physical=physical, journal=journal, legacy=legacy, selected=actual,
                 captured_originals=captured_originals, extra_override=extra_override,
                 inspect=m_inspect, snapshot=m_snapshot, recovery=m_recovery,
                 import_payload=m_import, capture=m_capture, deploy=m_deploy,
@@ -329,6 +361,9 @@ class OfflinePrepareTest(unittest.TestCase):
                         self.assertEqual(plan["originalBootSha256"][s], orig_sha)
                         self.assertEqual(plan["newBootSha256"][s], cand_json["candidate"]["sha256"])
                         self.assertNotEqual(plan["originalBootSha256"][s], plan["newBootSha256"][s])
+                    # Strict systems keep the strict inspector: no offline
+                    # fallback is propagated into boot_trust/boot_sources.
+                    self.assertNotIn("inspector", env.capture.call_args.kwargs)
                     env.assert_untouched()
 
     def test_package_authentication_and_up_to_date_gates(self) -> None:
@@ -485,6 +520,55 @@ class OfflinePrepareTest(unittest.TestCase):
             self.assertEqual(res["failedPhase"], "preparing_candidates")
             self.assertEqual(res["state"], "failed")
             self.assertIn("disk full", res["persistenceError"])
+            env.assert_untouched()
+
+
+    def test_legacy_reference_slot_is_not_reported_as_an_actual_slot(self) -> None:
+        for model in ("TB322FC", "TB323FU"):
+            for selected in ("a", "b"):
+                with self.subTest(model=model, selected=selected), \
+                        self._case(model=model, actual=selected, legacy=True) as env:
+                    status = env.run()
+                    self.assertEqual(status["phase"], "awaiting_recovery_export")
+                    self.assertEqual(status["bootContext"], "legacy-controller")
+                    self.assertEqual(status["selectedSlot"], selected)
+                    self.assertEqual(status["fromSlot"], selected)
+                    self.assertEqual(status["targetSlot"],
+                                     "b" if selected == "a" else "a")
+                    plan = json.loads((env.work / "plan.json").read_text("utf-8"))
+                    manifest = json.loads(
+                        (env.work / "recovery-manifest.json").read_text("utf-8"))
+                    self.assertEqual(plan["fromSlot"], selected)
+                    self.assertEqual(plan["targetSlot"], status["targetSlot"])
+                    self.assertEqual(plan["selectedSlot"], selected)
+                    self.assertEqual(plan["bootContext"], "legacy-controller")
+                    self.assertEqual(manifest["fromSlot"], selected)
+                    self.assertEqual(manifest["bootContext"], "legacy-controller")
+                    self.assertIsNone(manifest["physical"]["actualSlot"])
+                    self.assertIsNone(manifest["physical"]["inactiveSlot"])
+                    self.assertEqual(manifest["physical"]["selectedSlot"], selected)
+                    # Both slots still receive a prepared candidate.
+                    self.assertEqual(
+                        [c.kwargs["slot"] for c in env.candidate.call_args_list],
+                        ["a", "b"])
+                    # The legacy-aware inspector is propagated into boot_trust
+                    # (and from there into boot_sources); the strict default is
+                    # never used on a controller-only system.
+                    self.assertIs(
+                        env.capture.call_args.kwargs["inspector"],
+                        offline_prepare.physical_slots.inspect_offline_physical_slots)
+                    env.assert_untouched()
+
+    def test_legacy_nonempty_journal_is_refused(self) -> None:
+        with self._case(legacy=True) as env:
+            env.journal.record = SimpleNamespace(state=3)
+            with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                env.run()
+            self.assertIn("cannot bind the existing trial record",
+                          str(ctx.exception))
+            self.assertFalse(env.work.exists())
+            env.import_payload.assert_not_called()
+            env.capture.assert_not_called()
             env.assert_untouched()
 
 

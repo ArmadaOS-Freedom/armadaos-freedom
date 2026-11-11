@@ -15,7 +15,6 @@ from .boot_writer import (
     BootWriteError,
     _MODES,
     _SLOT_KEYS,
-    _check_context,
     _inventory,
     _pwrite_all,
     _read_private,
@@ -78,7 +77,13 @@ def _validate_candidate_report(slot, report, trust_report, snapshot, initial, *,
 
 
 def write_offline_boots(trust_report, candidates, *, progress=None):
-    """Write inactive then current native boot extents; caller holds transaction/global lock."""
+    """Write the non-reference boot extent, then the reference one.
+
+    For a strict witness report the reference is the booted slot (inactive then
+    current).  For a legacy controller-only report the reference is the
+    controller's selected slot and the other slot is written first.  The caller
+    holds the transaction/global lock.
+    """
     return _write_offline_boots(trust_report, candidates, progress=progress)
 
 
@@ -102,9 +107,10 @@ def _write_offline_boots(trust_report, candidates, *, progress):
         if not isinstance(candidates, dict) or set(candidates.keys()) != {'a', 'b'}:
             raise BootWriteError('candidates must map exact keys a and b')
         initial = trust_report['physical']
-        actual, inactive = initial['actualSlot'], initial['inactiveSlot']
-        if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
-            raise BootWriteError('invalid physical active/inactive slots')
+        try:
+            reference, other = physical_slots.offline_slot_pair(initial)
+        except physical_slots.PhysicalSlotsError as error:
+            raise BootWriteError(f'invalid physical slot pair: {error}') from error
         if initial['model'] not in ('TB322FC', 'TB323FU'):
             raise BootWriteError('unsupported physical model for offline dual-boot write')
         extras = ['recovery_a', 'recovery_b', 'vbmeta_system_a', 'vbmeta_system_b']
@@ -135,9 +141,9 @@ def _write_offline_boots(trust_report, candidates, *, progress):
             raise BootWriteError('candidate reports disagree on mode, transactionUuid, or deployment')
         transaction = plan['a']['transactionUuid']
         deployment = plan['a']['deployment']
-        slot_order = [inactive, actual]
+        slot_order = [other, reference]
 
-        fresh_physical = physical_slots.inspect_physical_slots()
+        fresh_physical = physical_slots.inspect_offline_physical_slots()
         if fresh_physical != initial or read_boot_lock() != trust_report['lockState']:
             raise BootWriteError('physical slot or lock state changed since trust capture')
         recovery = physical_slots.locate_recovery_partition(require_edl=False)
@@ -148,7 +154,13 @@ def _write_offline_boots(trust_report, candidates, *, progress):
         _, found = _inventory(initial, recovery_rdev)
 
         def check_context():
-            _check_context(initial, trust_report['lockState'], recovery)
+            if physical_slots.inspect_offline_physical_slots() != initial:
+                raise BootWriteError('physical slot report drifted')
+            if read_boot_lock() != trust_report['lockState']:
+                raise BootWriteError('boot-lock state drifted')
+            if physical_slots.locate_recovery_partition(require_edl=False) != recovery:
+                raise BootWriteError('recovery partition identity drifted')
+            _inventory(initial, recovery_rdev)
 
         luns = sorted(found)
         for lun in luns:
@@ -263,7 +275,7 @@ def _write_offline_boots(trust_report, candidates, *, progress):
             'schemaVersion': 1,
             'phase': 'dual_boots_written',
             'model': initial['model'],
-            'fromSlot': actual,
+            'fromSlot': reference,
             'slotOrder': slot_order,
             'transactionUuid': transaction,
             'deployment': deployment,

@@ -14,9 +14,12 @@ from . import (
     boot_trust,
     deployment_store,
     image_source,
+    offline_context,
     offline_payload,
+    offline_recovery,
     package_contract,
     physical_slots,
+    recovery_device,
     signature,
     system_transaction,
     trial_confirmation,
@@ -28,6 +31,34 @@ _JOURNAL_BYTES = 64 * 1024
 
 def _sha256(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _check_recovery(initial, old):
+    """Journal precheck for OFFLINE-DUAL.
+
+    Strict systems keep the online rules untouched.  A legacy system may
+    only start from a validated v1/v2 descriptor with an empty journal; the
+    descriptor itself is migrated later, in execute, immediately before the
+    record write.  An existing 0.8 record names slot proof that a
+    controller-only boot cannot supply, so it is refused instead of guessed.
+    """
+    if initial.get('bootContext') != physical_slots.LEGACY_BOOT_CONTEXT:
+        return system_transaction._check_recovery(initial, old)
+    try:
+        with recovery_device.open_recovery(writable=False) as (fd, part_uuid, board):
+            if part_uuid != initial['recoveryPartUuid']:
+                raise ValueError('recovery partition changed')
+            if physical_slots._MODEL.get(board) != initial['model']:
+                raise ValueError('recovery board changed')
+            snapshot = offline_recovery.load(fd, part_uuid, board)
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(f'cannot read the legacy recovery journal: {error}') from error
+    if snapshot.record is not None:
+        raise ValueError(
+            'legacy boot context cannot bind the existing trial record to an actual slot')
+    return snapshot
 
 
 def _check_candidate(candidate, *, slot, tx, deployment, model, mode, source_sha):
@@ -115,29 +146,42 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 raise ValueError('sysroot_path and work_dir must be absolute')
             if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
                 raise ValueError('sysroot path must be canonical, symlinks rejected')
-            inspect_slots = physical_slots.inspect_physical_slots
+            inspect_slots = physical_slots.inspect_offline_physical_slots
 
             initial = inspect_slots()
             if initial['model'] not in ('TB322FC', 'TB323FU'):
                 raise ValueError('unsupported physical model')
-            snapshot = armada_os.snapshot()
+            # Booted identity comes from the default runtime sysroot; `root`
+            # is the image sysroot this transaction writes, not the libostree
+            # sysroot that reports the booted deployment.
+            snapshot = offline_context.snapshot()
             if (snapshot['repository'] not in armada_os.REPOSITORIES or
                     snapshot['staged'] or snapshot['rollback_queued']):
                 raise ValueError('legacy OSTree transaction conflict')
             if system_transaction._snapshot_channel(snapshot) != expected_channel:
                 raise ValueError('requested channel differs from configured channel')
+            # OFFLINE-DUAL reference/other pair: the controller's selected slot is
+            # the reference and the other slot is written first.  A legacy report
+            # never claims an actual/inactive slot, so the pair is recorded
+            # explicitly rather than reusing witness names.
+            reference_slot, other_slot = physical_slots.offline_slot_pair(initial)
             current_binding = initial['deployment']
             old = system_transaction._binding(current_binding)
-            journal = system_transaction._check_recovery(initial, old)
+            journal = _check_recovery(initial, old)
 
             package = package_contract.load_package(
                 document, signature_b64, trusted_key=trusted_key)
             package_contract.require_operation(
                 package, initial['model'], 'offline-upgrade',
                 updater_version=updater_version)
-            status.update(model=initial['model'], fromSlot=initial['actualSlot'],
-                          targetSlot=initial['inactiveSlot'],
+            status.update(model=initial['model'], fromSlot=reference_slot,
+                          targetSlot=other_slot,
                           oldDeployment=current_binding)
+            if initial.get('bootContext') == physical_slots.LEGACY_BOOT_CONTEXT:
+                status.update(bootContext=initial['bootContext'],
+                              selectedSlot=initial['selectedSlot'])
+            if snapshot.get('channelInferred'):
+                status['channelInferred'] = True
             if package['ostreeCommit'] == old[1]:
                 status.update(state='up_to_date', phase='complete')
                 return status
@@ -167,8 +211,14 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             status['phase'] = 'capturing_boot_trust'
             system_transaction._save_json(work, 'status.json', status)
+            capture_kwargs = {}
+            if initial.get('bootContext') == physical_slots.LEGACY_BOOT_CONTEXT:
+                # Only the offline path may inspect a controller-only system;
+                # the online default inspector stays strict.
+                capture_kwargs['inspector'] = inspect_slots
             trust = boot_trust.capture_boot_trust(
-                output_dir=work / 'trust', boot_tool_path=boot_tool_path)
+                output_dir=work / 'trust', boot_tool_path=boot_tool_path,
+                **capture_kwargs)
             if (trust['physical'] != initial or
                     trust['sources']['physical'] != initial):
                 raise ValueError('boot trust physical report mismatch')
@@ -236,7 +286,8 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'recoveryPartUuid': str(uuid.UUID(bytes=journal.layout.partition_uuid)),
                 'board': journal.layout.board,
                 'oldDeployment': current_binding,
-                'fromSlot': initial['actualSlot'], 'physical': initial,
+                'fromSlot': reference_slot, 'physical': initial,
+                'bootContext': initial.get('bootContext'),
                 'partitions': sources['partitions'],
                 'files': _recovery_files(work, sources, journal),
             }
@@ -254,13 +305,17 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'releaseId': package['releaseId'], 'version': package['version'],
                 'sourceRevision': package['sourceRevision'],
                 'ociDigest': package['ociDigest'], 'ostreeCommit': imported['commit'],
-                'fromSlot': initial['actualSlot'], 'targetSlot': initial['inactiveSlot'],
+                'fromSlot': reference_slot, 'targetSlot': other_slot,
+                'selectedSlot': reference_slot,
+                'bootContext': initial.get('bootContext'),
                 'oldDeployment': current_binding,
                 'newDeployment': target_deployment,
                 'originalBootSha256': old_sha, 'newBootSha256': new_sha,
                 'recoveryManifestSha256': manifest_sha,
                 'packageDescriptorSha256': document_sha,
             }
+            if snapshot.get('channelInferred'):
+                plan['channelInferred'] = True
             plan_sha = _sha256(system_transaction._save_json(work, 'plan.json', plan))
             prepared = {
                 'schemaVersion': 1, 'operation': 'offline-upgrade',
@@ -277,7 +332,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             if inspect_slots() != initial:
                 raise ValueError('physical slots changed before preparation completed')
-            final_journal = system_transaction._check_recovery(initial, old)
+            final_journal = _check_recovery(initial, old)
             if (final_journal.header != journal.header or
                     final_journal.region != journal.region):
                 raise ValueError('recovery journal changed during preparation')

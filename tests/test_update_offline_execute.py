@@ -84,7 +84,9 @@ class OfflineExecuteTest(unittest.TestCase):
 
         @contextmanager
         def open_recovery(*, writable):
-            self.assertTrue(writable)
+            # The legacy journal precheck reads without writable intent.
+            if not env.legacy:
+                self.assertTrue(writable)
             yield 73, env.physical["recoveryPartUuid"], env.journal.layout.board
 
         def load(fd, partuuid, board):
@@ -104,6 +106,12 @@ class OfflineExecuteTest(unittest.TestCase):
                     offline_execute.recovery_device, "open_recovery", open_recovery)),
                 load=stack.enter_context(mock.patch.object(
                     offline_execute.trial_store, "load", side_effect=load)),
+                # The real conversion needs a block device; ordering and the
+                # conversion rules themselves are covered by the dedicated
+                # offline_recovery tests.
+                migrate=stack.enter_context(mock.patch.object(
+                    offline_execute.offline_recovery, "migrate_descriptor",
+                    side_effect=lambda fd, snapshot: snapshot)),
             )
             yield mocks
 
@@ -388,6 +396,139 @@ class OfflineExecuteTest(unittest.TestCase):
                 if case == "final_save":
                     self.assertIn("final status disk full", result["error"])
                     self.assertNotIn("persistenceError", result)
+
+
+    def test_legacy_reference_ordering_and_both_payloads(self) -> None:
+        for model in ("TB322FC", "TB323FU"):
+            for selected in ("a", "b"):
+                other = "b" if selected == "a" else "a"
+                with self.subTest(model=model, selected=selected), self.fixture._case(
+                        model=model, actual=selected, legacy=True) as env:
+                    initial, _, ack = self._ready(env)
+                    self._install_success_spies(env)
+                    plan = self._json(env.work, "plan.json")
+                    self.assertEqual(plan["fromSlot"], selected)
+                    self.assertEqual(plan["targetSlot"], other)
+                    self.assertEqual(plan["selectedSlot"], selected)
+                    self.assertEqual(plan["bootContext"], "legacy-controller")
+                    with self._execution(env):
+                        result = offline_execute.execute_offline_update(
+                            work_dir=env.work, recovery_ack=ack,
+                            trusted_key=self.fixture.pub_key)
+                    self.assertEqual((result["state"], result["phase"]),
+                                     ("awaiting_reboot", "awaiting_reboot"))
+                    trust_arg = env.spies["write_offline_boots"].call_args.args[0]
+                    self.assertEqual(trust_arg["physical"]["bootContext"],
+                                     "legacy-controller")
+                    self.assertIsNone(trust_arg["physical"]["actualSlot"])
+                    self.assertEqual(trust_arg["physical"]["selectedSlot"], selected)
+
+                    report = self._json(env.work, "write-report.json")
+                    self.assertEqual(report["slotOrder"], [other, selected])
+                    self.assertEqual(set(report["writes"]), {"a", "b"})
+                    for slot in ("a", "b"):
+                        self.assertEqual(report["writes"][slot]["readbackSha256"],
+                                         plan["newBootSha256"][slot])
+
+                    record = env.journal.record
+                    self.assertEqual(record.from_slot, 0 if selected == "a" else 1)
+                    self.assertEqual(record.target_slot, 0 if other == "a" else 1)
+                    self.assertEqual(record.old_boot_sha256.hex(),
+                                     plan["originalBootSha256"][selected])
+                    self.assertEqual(record.new_boot_sha256.hex(),
+                                     plan["newBootSha256"][other])
+                    self.assertEqual(record.other_boot_sha256.hex(),
+                                     plan["newBootSha256"][selected])
+                    self._assert_sources_untouched(env)
+
+    def test_legacy_descriptor_migration_runs_after_writes_before_journal(self) -> None:
+        # The migration is bounded to the point between the verified dual boot
+        # writes and the trial record write.  Nothing may activate before the
+        # journal is durable, and a v3 descriptor must never reach the writer.
+        with self.fixture._case(model="TB322FC", actual="a", legacy=True) as env:
+            self._ready(env)
+            ack = self._ack(env)
+            order = []
+
+            def write(*args, **kwargs):
+                order.append("boot-write")
+                return self._writer_report(env, *args, **kwargs)
+
+            def save(fd, journal, record):
+                order.append("journal-save")
+                env.journal.record = record
+
+            def activate(report):
+                order.append("activate")
+                return self._activate(env, report)
+
+            env.spies["write_offline_boots"].side_effect = write
+            env.spies["activate_offline_slots"].side_effect = activate
+            with self._execution(env) as mocks:
+                # _execution replaces the journal-save spy for its own
+                # readback bookkeeping; wrap that again with the recorder.
+                env.spies["trial_save"].side_effect = save
+
+                def migrate(fd, snapshot):
+                    order.append("descriptor-migrate")
+                    return snapshot
+
+                mocks.migrate.side_effect = migrate
+                result = offline_execute.execute_offline_update(
+                    work_dir=env.work, recovery_ack=ack,
+                    trusted_key=self.fixture.pub_key)
+            self.assertEqual(result["state"], "awaiting_reboot")
+            self.assertEqual(order, ["boot-write", "descriptor-migrate",
+                                     "journal-save", "activate"])
+            self.assertEqual(env.spies["write_offline_boots"].call_count, 1)
+            self.assertEqual(env.spies["activate_offline_slots"].call_count, 1)
+
+    def test_legacy_migration_failure_requires_recovery_without_save(self) -> None:
+        with self.fixture._case(legacy=True) as env:
+            self._ready(env)
+            ack = self._ack(env)
+            self._install_success_spies(env)
+            with self._execution(env) as mocks:
+                mocks.migrate.side_effect = (
+                    offline_execute.offline_recovery.OfflineRecoveryError(
+                        "recovery descriptor readback mismatch"))
+                with self.assertRaises(
+                        system_transaction.SystemTransactionError) as raised:
+                    offline_execute.execute_offline_update(
+                        work_dir=env.work, recovery_ack=ack,
+                        trusted_key=self.fixture.pub_key)
+            result = raised.exception.result
+            self.assertEqual(result["state"], "recovery_required")
+            self.assertEqual(result["bootWriteState"], "written")
+            self.assertFalse(result["requiresReboot"])
+            env.spies["trial_save"].assert_not_called()
+            env.spies["activate_offline_slots"].assert_not_called()
+
+    def test_legacy_existing_record_and_selected_drift_are_refused(self) -> None:
+        with self.fixture._case(legacy=True) as env:
+            _, initial_bytes, ack = self._ready(env)
+            env.journal.record = SimpleNamespace(state=3)
+            with self._execution(env):
+                with self.assertRaises(system_transaction.SystemTransactionError) as raised:
+                    offline_execute.execute_offline_update(
+                        work_dir=env.work, recovery_ack=ack,
+                        trusted_key=self.fixture.pub_key)
+            self.assertIn("cannot bind the existing trial record",
+                          str(raised.exception))
+            self._assert_no_execution(env, initial_bytes)
+
+        with self.fixture._case(legacy=True) as env:
+            _, initial_bytes, ack = self._ready(env)
+            env.inspect.side_effect = lambda: dict(
+                env.physical, selectedSlot="b")
+            with self._execution(env):
+                with self.assertRaises(system_transaction.SystemTransactionError) as raised:
+                    offline_execute.execute_offline_update(
+                        work_dir=env.work, recovery_ack=ack,
+                        trusted_key=self.fixture.pub_key)
+            self.assertIn("plan slot/model bindings mismatch physical state",
+                          str(raised.exception))
+            self._assert_no_execution(env, initial_bytes)
 
 
 if __name__ == "__main__":

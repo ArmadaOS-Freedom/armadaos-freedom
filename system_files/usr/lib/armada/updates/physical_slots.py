@@ -7,13 +7,17 @@ import stat
 from pathlib import Path
 
 import armada_os
-from . import boot_context
+from . import boot_context, offline_context
 from .boot_health import BootHealthError, _sysfs_block_node, _ufs_controller
 from .recovery_device import locate_recovery_partition
 
 SYS_CLASS_BLOCK = Path('/sys/class/block')
 DEV_BLOCK = Path('/dev/block')
 LIBRARY_PATH = Path('/usr/libexec/armada/libarmada-update-ab.so')
+
+# Report marker for a legacy controller-only observation.  A legacy report never
+# names an actual/inactive slot: only the controller's selected slot is known.
+LEGACY_BOOT_CONTEXT = offline_context.LEGACY_BOOT_CONTEXT
 
 _MODEL = {1: 'TB322FC', 2: 'TB323FU'}
 _LUN_IDS = frozenset(range(6))
@@ -226,6 +230,7 @@ def _read_slot_flags(fds, found):
 
 
 def _run_inspection(fds, found):
+    """Strict inspection: both slots must be bootable, returns the slot index."""
     current, bootable = _read_slot_flags(fds, found)
     if not bootable['a'] or not bootable['b']:
         raise PhysicalSlotsError(
@@ -235,7 +240,14 @@ def _run_inspection(fds, found):
 
 
 def _read_boot_state():
-    snap = armada_os.snapshot()
+    try:
+        snap = armada_os.snapshot()
+    except Exception as error:
+        # The strict snapshot is the one strict read whose failure type lives
+        # outside this module (bootc/libostree raise RuntimeError).  Normalize it
+        # here so callers can tell "no witness evidence" apart from an
+        # inspection defect; the original failure stays attached as the cause.
+        raise PhysicalSlotsError(f'cannot read the boot snapshot: {error}') from error
     if not isinstance(snap, dict):
         raise PhysicalSlotsError('armada_os.snapshot() did not return a dict')
     booted = snap.get('booted')
@@ -248,7 +260,26 @@ def _read_boot_state():
     return dict(booted), dict(context)
 
 
-def _inspect_slots(reader, phase):
+def _read_legacy_boot_state():
+    """Read-only libostree binding used only by the offline inspector."""
+    try:
+        booted, context = offline_context.read_legacy_boot_state()
+    except Exception as error:
+        raise PhysicalSlotsError(f'invalid legacy boot context: {error}') from error
+    return dict(booted), dict(context)
+
+
+def _read_offline_boot_state():
+    """Strict booted state when witness evidence exists, else the legacy binding."""
+    try:
+        return _read_boot_state()
+    except PhysicalSlotsError:
+        if offline_context.new_evidence_present():
+            raise
+    return _read_legacy_boot_state()
+
+
+def _inspect_slots(reader, phase, *, require_witness=True, require_bootable=True):
     saved_booted, context = reader()
     saved_context = dict(context)
     try:
@@ -263,14 +294,23 @@ def _inspect_slots(reader, phase):
         for lun in sorted(found):
             item = found[lun]
             fds.append(_device_fd(item['path'], item['rdev']))
-        current = _run_inspection(fds, found)
+
+        def read_state():
+            if require_bootable:
+                # The strict inspection only returns when both flags are true.
+                return _run_inspection(fds, found), {'a': True, 'b': True}
+            return _read_slot_flags(fds, found)
+
+        current, bootable_slots = read_state()
         selected_slot = 'ab'[current]
-        if selected_slot != context['actualSlot']:
+        if not bootable_slots[selected_slot]:
+            raise PhysicalSlotsError(
+                f'selected slot {selected_slot} is not bootable; repair required')
+        if require_witness and selected_slot != context['actualSlot']:
             raise PhysicalSlotsError(
                 'actual boot != next selected slot; restart or repair required '
                 f'(witness={context["actualSlot"]}, controller reports slot index {current})'
             )
-        bootable_slots = {'a': True, 'b': True}
         for lun, fd in zip(sorted(found), fds):
             info = os.fstat(fd)
             if not stat.S_ISBLK(info.st_mode) or info.st_rdev != found[lun]['rdev']:
@@ -284,6 +324,8 @@ def _inspect_slots(reader, phase):
             raise PhysicalSlotsError(f'cannot re-verify recovery partition: {error}') from error
         if re_recovery != (dev, part_uuid, board, recovery_rdev):
             raise PhysicalSlotsError('recovery partition identity drifted during check')
+        if not require_witness and read_state() != (current, bootable_slots):
+            raise PhysicalSlotsError('controller A/B slot state drifted during check')
         re_booted, re_context = reader()
         if re_booted != saved_booted or re_context != saved_context:
             raise PhysicalSlotsError('boot context drifted during check')
@@ -298,15 +340,31 @@ def _inspect_slots(reader, phase):
             }
             for l in sorted(found)
         ]
-        report = {
-            'schemaVersion': 1,
-            'phase': phase,
-            'model': _MODEL[board],
-            'actualSlot': context['actualSlot'],
-            'inactiveSlot': context['inactiveSlot'],
-        }
-        report['deployment'] = context['deployment']
-        report['selectedSlot'] = selected_slot
+        if require_witness:
+            report = {
+                'schemaVersion': 1,
+                'phase': phase,
+                'model': _MODEL[board],
+                'actualSlot': context['actualSlot'],
+                'inactiveSlot': context['inactiveSlot'],
+            }
+            report['deployment'] = context['deployment']
+            report['selectedSlot'] = selected_slot
+        else:
+            if context.get('actualSlot') is not None or context.get('inactiveSlot') is not None:
+                raise PhysicalSlotsError('legacy boot context must not claim an actual slot')
+            if not isinstance(context.get('deployment'), str) or not context['deployment']:
+                raise PhysicalSlotsError('legacy boot context has no deployment binding')
+            report = {
+                'schemaVersion': 1,
+                'phase': phase,
+                'model': _MODEL[board],
+                'actualSlot': None,
+                'inactiveSlot': None,
+                'selectedSlot': selected_slot,
+                'bootContext': LEGACY_BOOT_CONTEXT,
+                'deployment': context.get('deployment'),
+            }
         report['bootableSlots'] = dict(bootable_slots)
         report['recoveryPartUuid'] = part_uuid
         report['ufsController'] = str(anchor)
@@ -323,3 +381,70 @@ def _inspect_slots(reader, phase):
 def inspect_physical_slots():
     """Perform the read-only physical A/B slot precheck and return its report."""
     return _inspect_slots(_read_boot_state, 'physical_slots_checked')
+
+
+def inspect_offline_physical_slots():
+    """Physical precheck for offline dual-slot work.
+
+    Systems with firmware witness evidence get exactly the strict report.  A
+    legacy controller-only system is inspected only when the witness and the
+    ``armada.deployment`` argument are both provably absent, and then the report
+    exposes the controller's selected slot without claiming an actual slot.
+    """
+    try:
+        return inspect_physical_slots()
+    except PhysicalSlotsError:
+        if offline_context.new_evidence_present():
+            raise
+    return _inspect_slots(
+        _read_legacy_boot_state, 'physical_slots_checked', require_witness=False)
+
+
+def inspect_legacy_identity_slots():
+    """Read-only controller-only inventory used to identify a legacy device.
+
+    ``inspect_offline_physical_slots`` answers whether this device may start a
+    slot mutation, so it requires both slots to be bootable.  An authenticated
+    identity query only needs to know which system is running: a legacy device
+    whose inactive slot is not bootable yet (GPT attribute UNBOOTABLE, or an
+    image the firmware has not authenticated) is still a healthy running
+    system, and refusing to identify it would hide the reason a future upgrade
+    cannot start.  The controller's genuine flags are reported unchanged and
+    the selected slot must itself be bootable; no actual slot is claimed.
+
+    This path is never used by prepare, execute, preflight or any other caller
+    that can write; those keep the strict both-bootable precheck.
+    """
+    if offline_context.new_evidence_present():
+        raise PhysicalSlotsError(
+            'witness evidence exists; the legacy identity inventory does not apply')
+    return _inspect_slots(
+        _read_legacy_boot_state, 'physical_slots_checked',
+        require_witness=False, require_bootable=False)
+
+
+def offline_slot_pair(physical):
+    """Return ``(reference, other)`` for an OFFLINE-DUAL write.
+
+    The reference slot is the controller's selected slot; the other slot is
+    written first.  A legacy report never turns the selected slot into an actual
+    slot, and a strict report must agree with the booted slot.
+    """
+    if not isinstance(physical, dict):
+        raise PhysicalSlotsError('physical report must be a dict')
+    legacy = physical.get('bootContext') == LEGACY_BOOT_CONTEXT
+    if legacy:
+        reference = physical.get('selectedSlot')
+        if physical.get('actualSlot') is not None or physical.get('inactiveSlot') is not None:
+            raise PhysicalSlotsError('legacy physical report must not claim an actual slot')
+    else:
+        reference = physical.get('selectedSlot', physical.get('actualSlot'))
+        if reference != physical.get('actualSlot'):
+            raise PhysicalSlotsError(
+                'strict physical report selected slot disagrees with the booted slot')
+    if reference not in ('a', 'b'):
+        raise PhysicalSlotsError('physical report has no valid selected slot')
+    other = 'b' if reference == 'a' else 'a'
+    if not legacy and physical.get('inactiveSlot') not in (None, other):
+        raise PhysicalSlotsError('strict physical report inactive slot disagrees')
+    return reference, other

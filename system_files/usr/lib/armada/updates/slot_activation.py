@@ -178,13 +178,26 @@ def _activate_prepared_slots(write_report, offline):
         initial = write_report.get('physical')
         if not isinstance(initial, dict):
             raise ActivationError('write_report.physical must be a dict')
-        inspect_slots = physical_slots.inspect_physical_slots
-        read_boot_state = physical_slots._read_boot_state
+        if offline:
+            inspect_slots = physical_slots.inspect_offline_physical_slots
+            read_boot_state = physical_slots._read_offline_boot_state
+        else:
+            inspect_slots = physical_slots.inspect_physical_slots
+            read_boot_state = physical_slots._read_boot_state
         if inspect_slots() != initial:
             raise ActivationError('live physical slots report does not match initial report')
-        if (
-            initial.get('model') != model
-            or initial.get('actualSlot') != from_slot
+        if initial.get('model') != model:
+            raise ActivationError('write_report slot/model metadata disagrees with physical report')
+        if offline:
+            try:
+                reference, other = physical_slots.offline_slot_pair(initial)
+            except physical_slots.PhysicalSlotsError as error:
+                raise ActivationError(f'offline physical slot pair is invalid: {error}') from error
+            if reference != from_slot or other != target_slot:
+                raise ActivationError(
+                    'write_report slot pair disagrees with the physical report')
+        elif (
+            initial.get('actualSlot') != from_slot
             or initial.get('inactiveSlot') != target_slot
             or initial.get('selectedSlot') != from_slot
         ):

@@ -204,5 +204,37 @@ class TestUpdateSignature(unittest.TestCase):
                 verify_document(doc, sig, trusted_key=self.pub1)
 
 
+class TestDefaultTrustedKeySelection(unittest.TestCase):
+    """The default trust chain keeps /etc policy and falls back to the packaged key."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory(prefix="test-update-trust-")
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name)
+        self.etc_key = root / "etc.pub"
+        self.packaged_key = root / "usr.pub"
+        self.etc_key.write_bytes(b"etc key\n")
+        self.packaged_key.write_bytes(b"packaged key\n")
+        for name, value in (("ETC_TRUSTED_KEY", self.etc_key),
+                            ("PACKAGED_TRUSTED_KEY", self.packaged_key)):
+            patcher = mock.patch.object(signature, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_existing_etc_policy_wins(self):
+        self.assertEqual(signature.trusted_key_path(), self.etc_key)
+        self.assertEqual(signature.trusted_key_path(signature.DEFAULT_TRUSTED_KEY),
+                         self.etc_key)
+
+    def test_packaged_key_is_used_when_no_etc_policy_exists(self):
+        self.etc_key.unlink()
+        self.assertEqual(signature.trusted_key_path(), self.packaged_key)
+        self.assertEqual(signature.trusted_key_path(None), self.packaged_key)
+
+    def test_explicit_key_is_never_replaced(self):
+        missing = self.etc_key.parent / "explicit.pub"
+        self.assertEqual(signature.trusted_key_path(missing), missing)
+
+
 if __name__ == "__main__":
     unittest.main()

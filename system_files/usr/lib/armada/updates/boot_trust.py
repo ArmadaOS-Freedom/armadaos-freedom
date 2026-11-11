@@ -271,13 +271,18 @@ def _finalize_trust(
     return report
 
 
-def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
-    """Capture and authenticate current physical boot sources without writing them."""
+def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH, inspector=None):
+    """Capture and authenticate current physical boot sources without writing them.
+
+    ``inspector`` defaults to the strict online physical precheck; the offline
+    dual-slot path passes the legacy-aware offline inspector instead.
+    """
+    check_physical = inspector or inspect_physical_slots
     try:
         out = _validate_output_dir(output_dir, [])
         tool_path = _validate_boot_tool(boot_tool_path, [], out)
 
-        initial = inspect_physical_slots()
+        initial = check_physical()
         if not isinstance(initial, dict) or initial.get("model") not in _NATIVE_MODELS:
             raise BootTrustError("native A/B boot trust is supported only on TB322FC and TB323FU")
         initial_lock = read_boot_lock()
@@ -294,7 +299,7 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
         if initial["model"] == "TB323FU":
             extra_labels += ("efisp",)
         snapshot = capture_boot_sources(
-            initial, out / "sources", extra_labels=extra_labels
+            initial, out / "sources", extra_labels=extra_labels, inspector=check_physical
         )
         snapshot = _normalize_snapshot(snapshot, initial, extra_labels)
 
@@ -312,7 +317,7 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
         return _finalize_trust(
             tool_path, out, tmp, initial, initial_lock, request, snapshot,
             "boot_trust_checked",
-            lambda: inspect_physical_slots() == initial,
+            lambda: check_physical() == initial,
         )
     except BootTrustError:
         raise

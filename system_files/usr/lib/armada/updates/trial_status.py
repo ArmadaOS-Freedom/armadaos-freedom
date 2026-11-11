@@ -7,6 +7,7 @@ from pathlib import Path
 from . import (
     boot_context,
     finalization_receipt,
+    offline_context,
     recovery_device,
     trial_record,
     trial_store,
@@ -118,6 +119,76 @@ def read_trial_status(
         ):
             result["finalization"] = finalization_receipt.read(record)
         return result
+    except (RuntimeError, ValueError, OSError,
+            subprocess.SubprocessError) as error:
+        return _unavailable(error)
+
+
+def read_legacy_trial_status(context):
+    """Read the durable journal for a controller-only legacy boot.
+
+    This is a pre-reboot reader.  It identifies the running side of the
+    transaction from the exact booted deployment, never from a slot: a legacy
+    system has no witness, so ``actualSlot``/``inactiveSlot`` stay null and
+    ``bootConfirmed`` is always false.  Confirmation requires the new witness
+    and finalization evidence after the reboot.
+    """
+    if (
+        not isinstance(context, dict)
+        or context.get("bootContext") != offline_context.LEGACY_BOOT_CONTEXT
+        or context.get("actualSlot") is not None
+        or context.get("inactiveSlot") is not None
+        or not isinstance(context.get("deployment"), str)
+        or not context.get("deployment")
+    ):
+        return _unavailable("Legacy boot context is malformed")
+
+    deployment = context["deployment"]
+    try:
+        with recovery_device.open_recovery(writable=False) as opened:
+            fd, part_uuid, board = opened
+            snapshot = trial_store.load(fd, part_uuid, board)
+        record = snapshot.record
+        if record is None:
+            return {"state": "empty",
+                    "bootContext": offline_context.LEGACY_BOOT_CONTEXT}
+
+        record_state = _RECORD_STATES.get(record.state)
+        if record_state is None:
+            raise ValueError(f"Unsupported trial record state: {record.state}")
+
+        old_deployment = _canonical_deployment(
+            record.os_name, record.old_commit, record.old_serial)
+        new_deployment = _canonical_deployment(
+            record.os_name, record.new_commit, record.new_serial)
+        if deployment == old_deployment:
+            running = "old"
+        elif deployment == new_deployment:
+            running = "new"
+        else:
+            running = None
+        return {
+            "state": "available",
+            "bootContext": offline_context.LEGACY_BOOT_CONTEXT,
+            "actualSlot": None,
+            "inactiveSlot": None,
+            "recordState": record_state,
+            "policy": (
+                "offline-dual" if record.policy == trial_record.OFFLINE_DUAL
+                else "online-single"
+            ),
+            "transactionId": str(uuid.UUID(bytes=record.transaction_uuid)),
+            "sequence": record.sequence,
+            "fromSlot": "ab"[record.from_slot],
+            "targetSlot": "ab"[record.target_slot],
+            "remainingAttempts": record.remaining,
+            "attemptLimit": record.attempt_limit,
+            "oldDeployment": old_deployment,
+            "newDeployment": new_deployment,
+            "planSha256": record.plan_sha256.hex(),
+            "runningDeployment": running,
+            "bootConfirmed": False,
+        }
     except (RuntimeError, ValueError, OSError,
             subprocess.SubprocessError) as error:
         return _unavailable(error)

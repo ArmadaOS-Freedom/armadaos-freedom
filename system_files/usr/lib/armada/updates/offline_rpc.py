@@ -22,6 +22,7 @@ _WORKER_OK = frozenset({'prepared', 'up_to_date', 'awaiting_reboot'})
 _REQUEST_KEYS = frozenset({'protocolVersion', 'id', 'method', 'params'})
 _SESSION_HEX = frozenset('0123456789abcdef')
 _METHOD_PARAMS = {
+    'preflight': frozenset({'document', 'signature'}),
     'info': frozenset(),
     'begin': frozenset({'document', 'signature'}),
     'status': frozenset({'sessionId'}),
@@ -37,8 +38,8 @@ _METHOD_PARAMS = {
     'recovery_boot_seal': frozenset({'sessionId'}),
 }
 _NORMAL_METHODS = frozenset({
-    'info', 'begin', 'status', 'upload', 'seal', 'prepare', 'execute', 'export',
-    'restart_to_verify',
+    'preflight', 'info', 'begin', 'status', 'upload', 'seal', 'prepare', 'execute',
+    'export', 'restart_to_verify',
 })
 
 
@@ -95,6 +96,12 @@ def _session_id(params):
 
 def _op_info(manager, _params):
     return manager.store.info()
+
+
+def _op_preflight(manager, params):
+    document = _b64(params['document'], _DOCUMENT_MAX, 'document')
+    signature = _b64(params['signature'], _SIGNATURE_MAX, 'signature')
+    return manager.store.preflight(document, signature)
 
 
 def _op_begin(manager, params):
@@ -180,6 +187,7 @@ def _op_export(manager, params):
 
 
 _OPERATIONS = {
+    'preflight': _op_preflight,
     'info': _op_info,
     'begin': _op_begin,
     'status': _op_status,

@@ -239,5 +239,191 @@ class VerdictTests(unittest.TestCase):
                 self.assertEqual(verdict['reason'], 'trial_unavailable')
 
 
+BOOT_ID = '0e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b'
+PHYSICAL = {
+    'model': 'TB322FC', 'actualSlot': None, 'inactiveSlot': None,
+    'selectedSlot': 'a', 'bootContext': 'legacy-controller',
+    'deployment': OLD, 'recoveryPartUuid':
+    '12345678-1234-5678-9abc-123456789abc',
+}
+
+
+def legacy_receipt(**overrides):
+    body = {
+        'state': 'awaiting_reboot',
+        'transactionId': TX,
+        'oldDeployment': OLD,
+        'newDeployment': NEW,
+        'fromSlot': 'a',
+        'targetSlot': 'b',
+        'planSha256': SHA,
+    }
+    body.update(overrides)
+    return {'state': 'awaiting_reboot', 'physical': dict(PHYSICAL), 'result': body}
+
+
+ORIGINAL_BOOT = {'a': '3' * 64, 'b': '4' * 64}
+NEW_BOOT = {'a': '5' * 64, 'b': '6' * 64}
+
+
+def _writes():
+    result = {}
+    for index, slot in enumerate(('a', 'b')):
+        digest = NEW_BOOT[slot]
+        result[slot] = {
+            'candidate': {'path': '/tx/boot-%s.img' % slot, 'bytes': 16 + index,
+                          'sha256': digest},
+            'sourceBootSha256': ORIGINAL_BOOT[slot],
+            'bytesWritten': 16 + index,
+            'readbackSha256': digest,
+        }
+    return result
+
+
+def legacy_evidence(**overrides):
+    body = {
+        'schemaVersion': 1,
+        'state': 'available',
+        'bootContext': 'legacy-controller',
+        'bootId': BOOT_ID,
+        'deployment': OLD,
+        'status': {
+            'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
+            'planSha256': SHA, 'state': 'awaiting_reboot',
+            'bootWriteState': 'written', 'activationOutcome': 'activated',
+            'bootId': BOOT_ID,
+        },
+        'journal': {
+            'state': 'available', 'bootContext': 'legacy-controller',
+            'actualSlot': None, 'inactiveSlot': None, 'recordState': 'prepared',
+            'policy': 'offline-dual',
+            'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
+            'fromSlot': 'a', 'targetSlot': 'b', 'planSha256': SHA,
+            'runningDeployment': 'old', 'bootConfirmed': False,
+        },
+        'plan': {
+            'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
+            'fromSlot': 'a', 'targetSlot': 'b',
+            'originalBootSha256': dict(ORIGINAL_BOOT),
+            'newBootSha256': dict(NEW_BOOT),
+        },
+        'writeReport': {
+            'phase': 'dual_boots_written', 'transactionUuid': TX,
+            'deployment': NEW, 'fromSlot': 'a', 'slotOrder': ['b', 'a'],
+            'physical': dict(PHYSICAL), 'writes': _writes(),
+        },
+        'activationReport': {
+            'phase': 'offline_slots_activated', 'transactionUuid': TX,
+            'deployment': NEW, 'fromSlot': 'a', 'targetSlot': 'b',
+            'selectedSlot': 'b', 'recordSequence': 1,
+            'currentReadbackSha256': _writes()['a']['readbackSha256'],
+            'targetReadbackSha256': _writes()['b']['readbackSha256'],
+        },
+    }
+    body.update(overrides)
+    return body
+
+
+class LegacyPreRebootVerdictTests(unittest.TestCase):
+    """A controller-only boot may only reach awaiting_reboot, never confirmed."""
+
+    def test_eligible_only_in_the_original_boot_with_complete_evidence(self):
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), legacy_evidence())
+        self.assertEqual(verdict['state'], 'awaiting_reboot')
+        self.assertTrue(verdict['restartEligible'])
+        self.assertEqual(verdict['evidenceKind'], 'legacy-pre-reboot')
+        self.assertEqual(verdict['bootContext'], 'legacy-controller')
+        self.assertIsNone(verdict['actualSlot'])
+        self.assertEqual(verdict['bootId'], BOOT_ID)
+        self.assertEqual(verdict['recordState'], 'prepared')
+        self.assertNotEqual(verdict['state'], 'confirmed')
+        self.assertNotIn('bootConfirmed', verdict)
+
+    def test_a_changed_boot_is_never_restart_eligible(self):
+        evidence = legacy_evidence(bootId='11111111-2222-4333-8444-555555555555')
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'unverified')
+        self.assertEqual(verdict['reason'], 'boot_changed')
+        self.assertFalse(verdict['restartEligible'])
+
+    def test_wrong_transaction_or_plan_is_a_mismatch(self):
+        for field, value in (('transactionId', OTHER_TX),
+                             ('planSha256', OTHER_SHA)):
+            with self.subTest(field=field):
+                evidence = legacy_evidence()
+                evidence['journal'][field] = value
+                verdict = offline_completion.evaluate_legacy_pre_reboot(
+                    legacy_receipt(), evidence)
+                self.assertEqual(verdict['state'], 'mismatch')
+                self.assertFalse(verdict['restartEligible'])
+
+    def test_confirmed_journal_without_the_new_witness_stays_unverified(self):
+        evidence = legacy_evidence()
+        evidence['journal']['recordState'] = 'confirmed'
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'unverified')
+        self.assertEqual(verdict['reason'],
+                         'legacy_confirmation_requires_witness')
+        self.assertFalse(verdict['restartEligible'])
+
+    def test_running_the_new_deployment_waits_for_confirmation(self):
+        evidence = legacy_evidence(deployment=NEW)
+        evidence['journal']['runningDeployment'] = 'new'
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'awaiting_confirmation')
+        self.assertFalse(verdict['restartEligible'])
+
+    def test_missing_or_tampered_write_records_are_not_eligible(self):
+        evidence = legacy_evidence()
+        evidence['writeReport']['writes']['b']['readbackSha256'] = 'f' * 64
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'unverified')
+        self.assertEqual(verdict['reason'], 'legacy_write_evidence_missing')
+        self.assertFalse(verdict['restartEligible'])
+
+        evidence = legacy_evidence()
+        evidence['plan']['newBootSha256']['b'] = '9' * 64
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'unverified')
+        self.assertEqual(verdict['reason'], 'legacy_write_evidence_missing')
+
+        evidence = legacy_evidence()
+        evidence['activationReport']['selectedSlot'] = 'a'
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), evidence)
+        self.assertEqual(verdict['state'], 'unverified')
+        self.assertEqual(verdict['reason'], 'legacy_activation_evidence_missing')
+
+    def test_unavailable_or_malformed_evidence_fails_closed(self):
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), {'schemaVersion': 1, 'state': 'unavailable',
+                               'error': 'no journal'})
+        self.assertEqual(verdict['reason'], 'legacy_evidence_unavailable')
+        extra = legacy_evidence()
+        extra['actualSlot'] = 'b'
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(), extra)
+        self.assertEqual(verdict['reason'], 'legacy_evidence_malformed')
+
+    def test_terminal_failure_and_restart_state(self):
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            legacy_receipt(state='recovery_required'), legacy_evidence())
+        self.assertEqual(verdict['state'], 'failed')
+        self.assertFalse(verdict['restartEligible'])
+
+        verdict = offline_completion.evaluate_legacy_pre_reboot(
+            dict(legacy_receipt(), restart={'schemaVersion': 1,
+                                            'state': 'dispatched',
+                                            'transactionId': TX}),
+            legacy_evidence())
+        self.assertEqual(verdict['restartState'], 'dispatched')
+
+
 if __name__ == '__main__':
     unittest.main()
