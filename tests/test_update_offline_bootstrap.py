@@ -167,6 +167,38 @@ def write_archive(path, extra, manifest=None):
     return path
 
 
+def base_manifest(**overrides):
+    document = {
+        'schemaVersion': 1,
+        'bundle': 'armada-offline-updater',
+        'version': '0.8.0',
+        'format': 'tar.gz',
+        'entry': 'usr/libexec/armada/armada-offline-update',
+        'files': [{'path': 'usr/libexec/armada/armada-offline-update',
+                   'bytes': 1, 'sha256': '0' * 64, 'mode': '0755'}],
+    }
+    document.update(overrides)
+    return document
+
+
+def rewrite_manifest(source, target, mutate):
+    """Copy a bundle, replacing manifest.json after ``mutate(document)``."""
+    with tarfile.open(source) as archive:
+        members = [(member, archive.extractfile(member).read())
+                   for member in archive]
+    with tarfile.open(target, 'w:gz') as archive:
+        for member, data in members:
+            if member.name == 'manifest.json':
+                document = json.loads(data.decode('utf-8'))
+                mutate(document)
+                data = json.dumps(document).encode('utf-8')
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            info.mode = member.mode
+            archive.addfile(info, io.BytesIO(data))
+    return target
+
+
 class ProbeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -359,6 +391,77 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(result['updater']['missing'], [])
 
 
+class ManifestCapabilityTest(unittest.TestCase):
+    """The helper accepts old bundles and rejects malformed capability claims."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = load_module('armada_offline_bootstrap_capabilities',
+                                    BOOTSTRAP_PATH)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name).resolve()
+
+    def scan(self, manifest, extra=()):
+        path = write_archive(self.base / 'bundle.tar.gz', list(extra), manifest)
+        with path.open('rb') as stream:
+            return self.bootstrap._scan_archive(stream)
+
+    def test_bundle_without_capabilities_is_still_accepted(self):
+        manifest, _members = self.scan(base_manifest())
+        self.assertNotIn('capabilities', manifest)
+
+    def test_declared_capabilities_are_accepted_including_unknown_ones(self):
+        manifest, _members = self.scan(base_manifest(
+            capabilities=['preflight-session-v1', 'some-future-capability']))
+        self.assertEqual(manifest['capabilities'],
+                         ['preflight-session-v1', 'some-future-capability'])
+
+    def test_malformed_capabilities_are_rejected(self):
+        cases = (
+            'preflight-session-v1',
+            None,
+            [1],
+            ['Preflight Session'],
+            ['preflight-session-v1', 'preflight-session-v1'],
+            ['a' * (self.bootstrap.MAX_CAPABILITY_LENGTH + 1)],
+            ['cap-%d' % index
+             for index in range(self.bootstrap.MAX_CAPABILITIES + 1)],
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(self.bootstrap.BootstrapError) as caught:
+                    self.scan(base_manifest(capabilities=value))
+                self.assertEqual(caught.exception.code, 'manifest_invalid')
+
+    def test_oversized_manifest_is_rejected(self):
+        path = self.base / 'oversized.tar.gz'
+        data = b' ' * (self.bootstrap.MAX_MANIFEST_BYTES + 1)
+        with tarfile.open(path, 'w:gz') as archive:
+            info = tarfile.TarInfo('manifest.json')
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        with path.open('rb') as stream:
+            with self.assertRaises(self.bootstrap.BootstrapError) as caught:
+                self.bootstrap._scan_archive(stream)
+        self.assertEqual(caught.exception.code, 'manifest_invalid')
+
+    def test_duplicate_manifest_is_rejected(self):
+        data = json.dumps(base_manifest()).encode()
+        path = self.base / 'duplicate.tar.gz'
+        with tarfile.open(path, 'w:gz') as archive:
+            for _index in range(2):
+                info = tarfile.TarInfo('manifest.json')
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        with path.open('rb') as stream:
+            with self.assertRaises(self.bootstrap.BootstrapError) as caught:
+                self.bootstrap._scan_archive(stream)
+        self.assertEqual(caught.exception.code, 'archive_member_rejected')
+
+
 class ExtensionReleaseTest(unittest.TestCase):
     """extension-release values are serialised, never interpolated blindly."""
 
@@ -461,6 +564,16 @@ class InstallTest(unittest.TestCase):
 
         sysext = str(self.root / 'usr/bin/systemd-sysext')
         self.assertEqual(self.runner.calls, [[sysext, 'refresh']])
+
+    def test_install_accepts_a_bundle_without_capabilities(self):
+        # The helper stays compatible with bundles built before the capability
+        # list existed; the installer is the side that enforces the contract.
+        legacy = rewrite_manifest(
+            self.bundle, self.base / 'legacy.tar.gz',
+            lambda document: document.pop('capabilities'))
+        digest = hashlib.sha256(legacy.read_bytes()).hexdigest()
+        result = self.install(bundle=legacy, digest=digest)
+        self.assertEqual(result['state'], 'installed')
 
     def test_install_rejects_wrong_bundle_digest(self):
         with self.assertRaises(self.bootstrap.BootstrapError) as caught:

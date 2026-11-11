@@ -30,6 +30,13 @@ BUNDLE_NAME = 'armada-offline-updater'
 BUNDLE_VERSION = '0.8.0'
 MANIFEST_NAME = 'manifest.json'
 
+# Bundle capabilities are explicit claims about the runtime the bundle ships.
+# A claim is only emitted after the source in the bundle has been checked to
+# provide it, so an installer can require the contract without executing any
+# bundle code.
+PREFLIGHT_SESSION_CAPABILITY = 'preflight-session-v1'
+MANIFEST_CAPABILITIES = (PREFLIGHT_SESSION_CAPABILITY,)
+
 UPDATES_DIR = 'usr/lib/armada/updates'
 ENTRY_PATH = 'usr/libexec/armada/armada-offline-update'
 BOOT_TOOL_DIR = 'usr/libexec/armada/boot-tool'
@@ -237,6 +244,66 @@ def _module_closure(updates_root):
     return files
 
 
+def _string_collection(node):
+    """Return the string constants of a set/list/tuple/frozenset literal."""
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        elements = node.elts
+    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+          and node.func.id in ('frozenset', 'set', 'tuple', 'list')
+          and len(node.args) == 1 and not node.keywords
+          and isinstance(node.args[0], (ast.Set, ast.List, ast.Tuple))):
+        elements = node.args[0].elts
+    else:
+        return None
+    values = set()
+    for element in elements:
+        if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+            return None
+        values.add(element.value)
+    return values
+
+
+def _provides_session_preflight(updates_root):
+    """True when the shipped RPC accepts and forwards preflight ``sessionId``.
+
+    The installer never executes bundle code, so the contract is read from the
+    source the bundle ships: the optional-parameter table names ``sessionId``
+    for preflight and the handler passes a third argument to the store.
+    """
+    module = _parse_module(updates_root / 'offline_rpc.py')
+    optional = None
+    forwarded = False
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id != '_METHOD_OPTIONAL_PARAMS' or not isinstance(node.value, ast.Dict):
+                    continue
+                for key, value in zip(node.value.keys, node.value.values):
+                    if isinstance(key, ast.Constant) and key.value == 'preflight':
+                        optional = _string_collection(value)
+        elif isinstance(node, ast.FunctionDef) and node.name == '_op_preflight':
+            for call in ast.walk(node):
+                if (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == 'preflight'
+                        and isinstance(call.func.value, ast.Attribute)
+                        and call.func.value.attr == 'store'
+                        and len(call.args) >= 3):
+                    forwarded = True
+    return optional is not None and 'sessionId' in optional and forwarded
+
+
+def _capabilities(root):
+    """Capabilities the bundle can honestly declare, or a build error."""
+    if _provides_session_preflight(root / UPDATES_DIR):
+        return MANIFEST_CAPABILITIES
+    raise BundleError(
+        'updater runtime does not provide session-aware preflight; cannot '
+        'declare the %s capability' % PREFLIGHT_SESSION_CAPABILITY)
+
+
 def _boot_tool_files(root):
     """Collect the shipped boot tool directory without following links."""
     directory = root / BOOT_TOOL_DIR
@@ -315,7 +382,7 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _manifest_bytes(entries, fmt):
+def _manifest_bytes(entries, fmt, capabilities):
     files = [
         {'path': name, 'bytes': path.stat().st_size, 'sha256': _sha256(path),
          'mode': _mode_text(path)}
@@ -327,6 +394,7 @@ def _manifest_bytes(entries, fmt):
         'version': BUNDLE_VERSION,
         'format': fmt,
         'entry': ENTRY_PATH,
+        'capabilities': list(capabilities),
         'files': files,
     }
     return (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + '\n').encode('utf-8')
@@ -398,8 +466,9 @@ def build(root, output):
                           % BUNDLE_VERSION)
 
     entries = _collect(root)
+    capabilities = _capabilities(root)
     fmt = 'tar' if output.name.endswith('.tar') else 'tar.gz'
-    manifest = _manifest_bytes(entries, fmt)
+    manifest = _manifest_bytes(entries, fmt, capabilities)
     payload = _archive_bytes(entries, manifest)
     written = _write_output(output, payload, gzipped=fmt == 'tar.gz')
     return {

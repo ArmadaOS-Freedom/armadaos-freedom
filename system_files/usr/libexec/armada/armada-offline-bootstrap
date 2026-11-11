@@ -109,11 +109,17 @@ MAX_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_MEMBERS = 4096
 MAX_TEXT_BYTES = 256 * 1024
+MAX_CAPABILITIES = 16
+MAX_CAPABILITY_LENGTH = 64
 _CHUNK = 1024 * 1024
 _HEX64 = re.compile(r'[0-9a-f]{64}\Z', re.ASCII)
 _VERSION = re.compile(r'(\d+(?:\.\d+)*)(?:[-+][0-9A-Za-z.+-]+)?\Z', re.ASCII)
+_CAPABILITY = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z', re.ASCII)
 _MANIFEST_KEYS = frozenset({'schemaVersion', 'bundle', 'version', 'format',
                             'entry', 'files'})
+# Optional keys stay backward compatible: a bundle built before capabilities
+# existed still installs, a bundle that declares them must do so cleanly.
+_MANIFEST_OPTIONAL_KEYS = frozenset({'capabilities'})
 _FILE_KEYS = frozenset({'path', 'bytes', 'sha256', 'mode'})
 _MODES = frozenset({'0644', '0755'})
 # extension-release is a shell-like key=value file.  Host os-release values are
@@ -549,12 +555,39 @@ def _allowed_member(name):
     return False
 
 
+def _validate_capabilities(document):
+    """Validate an optional capability list without requiring any of them.
+
+    The helper is the install side, not the policy side: it accepts bundles
+    that predate capabilities and bundles that declare new ones, but it never
+    guesses at a malformed claim.
+    """
+    if 'capabilities' not in document:
+        return
+    value = document['capabilities']
+    if type(value) is not list or len(value) > MAX_CAPABILITIES:
+        raise BootstrapError('manifest_invalid',
+                             'manifest capabilities must be a bounded list')
+    seen = set()
+    for capability in value:
+        if (type(capability) is not str or not capability
+                or len(capability) > MAX_CAPABILITY_LENGTH
+                or not _CAPABILITY.fullmatch(capability)):
+            raise BootstrapError('manifest_invalid',
+                                 'manifest capability is not a valid token')
+        if capability in seen:
+            raise BootstrapError('manifest_invalid',
+                                 'manifest capabilities must be unique')
+        seen.add(capability)
+
+
 def _parse_manifest(raw):
     try:
         document = json.loads(raw.decode('utf-8'))
     except (UnicodeDecodeError, ValueError) as error:
         raise BootstrapError('manifest_invalid', 'manifest is not valid JSON: %s' % error)
-    if not isinstance(document, dict) or set(document) != _MANIFEST_KEYS:
+    if (not isinstance(document, dict) or not _MANIFEST_KEYS <= set(document)
+            or set(document) - _MANIFEST_KEYS - _MANIFEST_OPTIONAL_KEYS):
         raise BootstrapError('manifest_invalid', 'manifest has an unexpected key set')
     if document.get('schemaVersion') != SCHEMA_VERSION:
         raise BootstrapError('manifest_invalid', 'manifest schemaVersion must be %d'
@@ -569,6 +602,7 @@ def _parse_manifest(raw):
         raise BootstrapError('manifest_invalid', 'manifest entry point mismatch')
     if not isinstance(document.get('files'), list) or not document['files']:
         raise BootstrapError('manifest_invalid', 'manifest files must be a non-empty list')
+    _validate_capabilities(document)
     return document
 
 

@@ -22,6 +22,45 @@ UPDATES = 'usr/lib/armada/updates'
 TRUST_KEY_SOURCE = 'etc/pki/containers/armadaos-freedom.pub'
 TRUST_KEY_DESTINATION = 'usr/share/armada/updates/armadaos-freedom.pub'
 
+# Runs in an isolated interpreter against the runtime extracted from a real
+# bundle.  The real offline_rpc handler is driven with a dummy store, so the
+# assertion is about the shipped dispatch path, not a reimplementation.
+RPC_PROBE = '''\
+import base64
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from updates import offline_rpc
+
+DOCUMENT = b'{"offline": true}'
+SIGNATURE = b'signature-bytes'
+SESSION = 'a1' * 16
+
+
+class Store:
+    def __init__(self):
+        self.calls = []
+
+    def preflight(self, document, signature, session_id=None):
+        self.calls.append([
+            document.decode('utf-8'),
+            signature.decode('utf-8'),
+            session_id,
+        ])
+        return {'phase': 'preflight_passed'}
+
+
+manager = type('Manager', (), {'store': Store()})()
+params = {
+    'document': base64.b64encode(DOCUMENT).decode('ascii'),
+    'signature': base64.b64encode(SIGNATURE).decode('ascii'),
+}
+offline_rpc._dispatch(manager, 'preflight', dict(params))
+offline_rpc._dispatch(manager, 'preflight', dict(params, sessionId=SESSION))
+print(json.dumps(manager.store.calls))
+'''
+
 
 def load_module(name, path):
     """Load by explicit source loader; extensionless helpers have no suffix."""
@@ -168,6 +207,53 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(set(specs), declared)
         for name in ('offline_payload.py', 'offline_boot_writer.py'):
             self.assertIn(UPDATES + '/' + name, declared)
+
+    def test_manifest_declares_the_preflight_session_capability(self):
+        _summary, output = self.build()
+        with tarfile.open(output) as archive:
+            manifest = json.loads(archive.extractfile('manifest.json').read())
+        self.assertEqual(manifest['capabilities'], ['preflight-session-v1'])
+
+    def test_capability_is_withheld_when_preflight_ignores_the_session(self):
+        rpc = self.root / UPDATES / 'offline_rpc.py'
+        text = rpc.read_text()
+        call = 'manager.store.preflight(document, signature, _session_id(params))'
+        self.assertEqual(text.count(call), 1)
+        rpc.write_text(text.replace(call, 'manager.store.preflight(document, signature)'))
+        output = self.base / 'no-capability.tar.gz'
+        with self.assertRaises(self.builder.BundleError) as caught:
+            self.builder.build(self.root, output)
+        self.assertIn('preflight-session-v1', str(caught.exception))
+        self.assertFalse(output.exists())
+
+    def test_capability_is_withheld_when_the_session_parameter_is_not_accepted(self):
+        rpc = self.root / UPDATES / 'offline_rpc.py'
+        text = rpc.read_text()
+        optional = "    'preflight': frozenset({'sessionId'}),\n"
+        self.assertEqual(text.count(optional), 1)
+        rpc.write_text(text.replace(optional, ''))
+        output = self.base / 'no-session-parameter.tar.gz'
+        with self.assertRaises(self.builder.BundleError) as caught:
+            self.builder.build(self.root, output)
+        self.assertIn('preflight-session-v1', str(caught.exception))
+        self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'the shipped runtime imports fcntl')
+    def test_bundled_handler_forwards_preflight_arguments_to_the_store(self):
+        _summary, output = self.build()
+        extracted = self.base / 'rpc-runtime'
+        with tarfile.open(output) as archive:
+            archive.extractall(extracted)
+        probe = write(self.base / 'rpc_probe.py', RPC_PROBE.encode('utf-8'))
+        library = extracted / 'usr/lib/armada'
+        completed = subprocess.run(
+            [sys.executable, '-I', str(probe), str(library)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), [
+            ['{"offline": true}', 'signature-bytes', None],
+            ['{"offline": true}', 'signature-bytes', 'a1' * 16],
+        ])
 
     def test_output_is_byte_identical_for_identical_input(self):
         first = self.base / 'a.tar.gz'
