@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import configparser
+import errno
 import fcntl
 import hashlib
 import json
@@ -40,6 +41,13 @@ _REPOSITORY_CONFIG_MAX = 64 * 1024
 _CHUNK_MAX = 1024 * 1024
 _SESSION_ID = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
 _MODELS = frozenset({'TB322FC', 'TB323FU'})
+# BTRFS_IOC_FS_INFO is _IOR(0x94, 31, struct btrfs_ioctl_fs_info_args): the
+# filesystem-wide FSID starts at byte 16 of its 1024-byte argument, unlike
+# statfs whose f_fsid is XORed with the subvolume root id.
+_BTRFS_IOCTL_FS_INFO = 0x8400941F
+_BTRFS_FS_INFO_SIZE = 1024
+_BTRFS_FSID_OFFSET = 16
+_BTRFS_FSID_SIZE = 16
 # The OSTree repository keeps free space for itself before a pull-local writes
 # into it.  libostree's configured minimum wins; without one this conservative
 # share covers releases that keep no reserve of their own.
@@ -641,51 +649,99 @@ class OfflineSessionStore:
         return current
 
     @staticmethod
+    def _filesystem_identity(directory, label):
+        """Return a grouping key for the filesystem that holds *directory*.
+
+        Every Btrfs subvolume reports its own ``st_dev`` although all of them
+        draw on one pool, and ``statfs`` XORs the subvolume root id into
+        ``f_fsid``.  Only BTRFS_IOC_FS_INFO exposes the filesystem-wide FSID, so
+        it is read through a read-only directory descriptor.  A non-Btrfs
+        filesystem answers ENOTTY and keeps its block-device identity; any
+        other failure is refused instead of being treated as a separate
+        filesystem.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(directory, flags)
+        except OSError as exc:
+            raise OfflineSessionError(
+                'cannot open %s storage: %s' % (label, exc)) from exc
+        try:
+            info = bytearray(_BTRFS_FS_INFO_SIZE)
+            try:
+                fcntl.ioctl(fd, _BTRFS_IOCTL_FS_INFO, info)
+            except OSError as exc:
+                if exc.errno != errno.ENOTTY:
+                    raise OfflineSessionError(
+                        'cannot identify the %s filesystem: %s'
+                        % (label, exc)) from exc
+                try:
+                    return ('device', os.stat(directory).st_dev)
+                except OSError as stat_exc:
+                    raise OfflineSessionError(
+                        'cannot inspect %s storage: %s'
+                        % (label, stat_exc)) from stat_exc
+            fsid = bytes(info[_BTRFS_FSID_OFFSET:
+                              _BTRFS_FSID_OFFSET + _BTRFS_FSID_SIZE])
+            if not any(fsid):
+                raise OfflineSessionError(
+                    '%s storage reports an empty filesystem FSID' % label)
+            return ('btrfs', fsid)
+        finally:
+            os.close(fd)
+
+    @staticmethod
     def _require_free_space(destinations, reserve=None):
         """Check each write destination's own filesystem, never a proxy.
 
         ``destinations`` are ``(directory, bytes, label)`` triples for the
         storage this preflight is about to consume.  Requirements that land on
-        the same device are summed once, so a shared filesystem is never
-        double-charged, while a split session/destination pair is checked
-        independently against the device that actually holds each part.
+        one filesystem are summed once, so a shared pool is never
+        double-charged, while distinct filesystems are checked independently.
+        Each path in a group must also report enough of its own available space
+        for the summed requirement, so a subvolume quota is never overruled by
+        the pool total.
 
         ``reserve`` is an optional ``(directory, minimum)`` pair describing the
         space the OSTree repository at ``directory`` keeps for itself.  It is
-        charged once, on that directory's own filesystem, so a reserve is never
-        multiplied by the allocations sharing the device.
+        charged once, on that directory's own filesystem.
         """
-        devices = {}
+        groups = {}
         for directory, required, label in destinations:
             if required <= 0:
                 continue
-            try:
-                entry = os.stat(directory)
-            except OSError as exc:
-                raise OfflineSessionError(
-                    'cannot inspect %s storage: %s' % (label, exc)) from exc
-            total = devices.setdefault(entry.st_dev, [directory, 0])
-            total[1] += required
-        reserve_device = None
+            identity = OfflineSessionStore._filesystem_identity(directory, label)
+            group = groups.setdefault(identity, [[], 0])
+            group[0].append(directory)
+            group[1] += required
+        reserve_identity = None
+        reserve_bytes = 0
         if reserve is not None:
             directory, minimum = reserve
-            try:
-                reserve_device = os.stat(directory).st_dev
-            except OSError as exc:
-                raise OfflineSessionError(
-                    'cannot inspect the repository reserve storage: %s'
-                    % exc) from exc
-            devices.setdefault(reserve_device, [directory, 0])
-        for device, (directory, required) in devices.items():
+            reserve_identity = OfflineSessionStore._filesystem_identity(
+                directory, 'repository reserve')
             try:
                 vfs = os.statvfs(directory)
             except OSError as exc:
                 raise OfflineSessionError(
-                    'cannot check free space on %s: %s' % (directory, exc)) from exc
-            if reserve is not None and device == reserve_device:
-                required += _reserve_bytes(minimum, vfs)
-            free = vfs.f_bavail * vfs.f_frsize
-            if free < required:
+                    'cannot check free space on %s: %s'
+                    % (directory, exc)) from exc
+            reserve_bytes = _reserve_bytes(minimum, vfs)
+            group = groups.setdefault(reserve_identity, [[], 0])
+            group[0].append(directory)
+        for identity, (paths, required) in groups.items():
+            if identity == reserve_identity:
+                required += reserve_bytes
+            available = []
+            for directory in paths:
+                try:
+                    vfs = os.statvfs(directory)
+                except OSError as exc:
+                    raise OfflineSessionError(
+                        'cannot check free space on %s: %s'
+                        % (directory, exc)) from exc
+                available.append(vfs.f_bavail * vfs.f_frsize)
+            if required and (not available or min(available) < required):
                 raise OfflineSessionError(
                     'insufficient free space for the payload, its expansion '
                     'and the repository import')
@@ -712,9 +768,13 @@ class OfflineSessionStore:
         session's protected directory for uploads, the transaction storage that
         holds the expanded image, the staging tree ``btrfs restore`` extracts
         the package repository into, and the ``sysroot/ostree/repo`` that
-        ``ostree pull-local`` fills.  Allocations sharing a device are summed
-        once, the repository destination also keeps the repository's own
-        free-space reserve, and distinct filesystems are checked independently.
+        ``ostree pull-local`` fills.  The repository must already exist;
+        preflight never creates it.  Allocations on one filesystem are summed
+        once, keyed by the Btrfs pool FSID so subvolumes with different
+        ``st_dev`` are not split, and each path must still report enough of its
+        own available space.  The repository destination also keeps the
+        repository's own reserve, charged once, and distinct filesystems are
+        checked independently.
         The authenticated ``expandedBytes`` is the planning allowance for the
         expansion, the extraction and the import; it is an estimate rather than
         a guarantee, because a compressed Btrfs image can hold more logical data
@@ -753,6 +813,18 @@ class OfflineSessionStore:
             if snapshot.get('repository') not in armada_os.REPOSITORIES:
                 raise OfflineSessionError(
                     'configured OSTree repository is not supported')
+        # ``ostree pull-local`` writes into the canonical repository that
+        # already exists; the nearest existing ancestor is only an allocation
+        # target for a planned session or transaction, never for the
+        # repository.  Rejecting it here keeps preflight read-only and stops a
+        # missing repository from being charged to the sysroot instead.
+        root = self._canonical_sysroot()
+        repository = root / 'ostree' / 'repo'
+        repository_dir = self._allocation_dir(
+            repository, 'repository destination')
+        if repository_dir != repository:
+            raise OfflineSessionError(
+                'repository destination does not exist: %s' % repository)
         channel = system_transaction._snapshot_channel(snapshot)
         package = package_contract.load_package(
             document, signature_b64, trusted_key=self.trusted_key)
@@ -780,7 +852,6 @@ class OfflineSessionStore:
             # read-only preflight.
             upload_dir = self._allocation_dir(self.base, 'session base')
             transaction = self.base
-        root = self._canonical_sysroot()
         # btrfs restore writes the extracted package repository below
         # ``transaction/import/import/content`` and ostree pull-local then
         # copies it into ``sysroot/ostree/repo``, so both trees need their own
@@ -790,8 +861,6 @@ class OfflineSessionStore:
         expansion_dir = self._allocation_dir(transaction, 'transaction storage')
         extraction_dir = self._allocation_dir(
             transaction / 'import' / 'import', 'repository staging storage')
-        repository_dir = self._allocation_dir(
-            root / 'ostree' / 'repo', 'repository destination')
         allocations = [(upload_dir, size - stored_bytes, 'payload upload')]
         reserve = None
         if not prepared:

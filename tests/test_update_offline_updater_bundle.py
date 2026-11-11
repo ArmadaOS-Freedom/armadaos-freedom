@@ -226,6 +226,27 @@ class BundleTest(unittest.TestCase):
         self.assertIn('preflight-session-v1', str(caught.exception))
         self.assertFalse(output.exists())
 
+    def test_capability_is_withheld_when_preflight_forwards_no_valid_session(self):
+        call = 'manager.store.preflight(document, signature, _session_id(params))'
+        # The shipped handler is the positive fixture for the same check.
+        self.assertTrue(self.builder._provides_session_preflight(self.root / UPDATES))
+        for label, replacement in (('none', 'None'),
+                                   ('constant', repr('a1' * 16))):
+            with self.subTest(value=label):
+                root = make_runtime_root(self.base / label)
+                rpc = root / UPDATES / 'offline_rpc.py'
+                text = rpc.read_text()
+                self.assertEqual(text.count(call), 1)
+                rpc.write_text(text.replace(
+                    call,
+                    'manager.store.preflight(document, signature, %s)'
+                    % replacement))
+                output = self.base / (label + '.tar.gz')
+                with self.assertRaises(self.builder.BundleError) as caught:
+                    self.builder.build(root, output)
+                self.assertIn('preflight-session-v1', str(caught.exception))
+                self.assertFalse(output.exists())
+
     def test_capability_is_withheld_when_the_session_parameter_is_not_accepted(self):
         rpc = self.root / UPDATES / 'offline_rpc.py'
         text = rpc.read_text()

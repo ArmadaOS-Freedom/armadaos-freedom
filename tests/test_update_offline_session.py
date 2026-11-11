@@ -1,11 +1,14 @@
 """Real-filesystem tests for private offline session storage."""
 
+import base64
+import errno
 import json
 import os
 import sys
 import tempfile
 import unittest
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -16,7 +19,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import test_update_channel_release as release  # noqa: E402
 import test_update_package_contract as fixture  # noqa: E402
-from updates import offline_session  # noqa: E402
+from updates import offline_rpc, offline_session  # noqa: E402
 from updates.package_contract import validate_package  # noqa: E402
 
 _MIB = 1024 * 1024
@@ -265,7 +268,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
 
     def _preflight_sysroot(self, name):
         sysroot = (self.tmp / ("sysroot-" + name)).resolve()
-        sysroot.mkdir(exist_ok=True)
+        (sysroot / "ostree" / "repo").mkdir(parents=True, exist_ok=True)
         return sysroot
 
     @staticmethod
@@ -367,6 +370,11 @@ class OfflineSessionStoreTest(unittest.TestCase):
                 offline_session.offline_prepare, "_check_recovery",
                 return_value=SimpleNamespace(
                     layout=SimpleNamespace(descriptor_version=3))),
+            # These fixtures model non-Btrfs filesystems: the block-device
+            # fallback must key the layout below, on any host filesystem.
+            mock.patch.object(
+                offline_session.fcntl, "ioctl",
+                side_effect=OSError(errno.ENOTTY, "not a btrfs filesystem")),
             mock.patch.object(offline_session.os, "stat", side_effect=fake_stat),
             mock.patch.object(offline_session.os, "statvfs", side_effect=fake_statvfs),
         ):
@@ -671,7 +679,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
         work = (self.tmp / name).resolve()
         work.mkdir(exist_ok=True)
         sysroot = work / "image"
-        sysroot.mkdir(exist_ok=True)
+        (sysroot / "ostree" / "repo").mkdir(parents=True, exist_ok=True)
         return work, work / "offline", sysroot
 
     def test_preflight_rejects_a_destination_without_room_despite_an_ample_session(self):
@@ -730,7 +738,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
         work, base, sysroot = self._preflight_work("preflight-reserve")
         sid, doc, sig, data = self._session_for_preflight(base)
         repository = sysroot / "ostree" / "repo"
-        repository.mkdir(parents=True)
+        repository.mkdir(parents=True, exist_ok=True)
         config = repository / "config"
         config.write_text("[core]\nmin-free-space-percent=10\n"
                           "min-free-space-size=1MB\n")
@@ -799,11 +807,55 @@ class OfflineSessionStoreTest(unittest.TestCase):
             self._storage_store(unproven, sysroot, empty).preflight(
                 other_doc, other_sig, other_sid)
 
+    def test_rpc_forwards_the_named_session_and_credits_its_space(self):
+        # The endpoint must forward a named session to the store's own
+        # read-only preflight.  With a completed prepare and no free space, the
+        # bound request passes only because the real store credited it, while
+        # the same store refuses the unbound request for capacity.
+        work, base, sysroot = self._preflight_work("preflight-rpc")
+        sid, doc, sig, data = self._session_for_preflight(base)
+        self._write_completed_expansion(base, sid, doc, 2 * len(data))
+
+        store = self._preflight_store(base, 0, sysroot_path=sysroot)
+        before_tree = self._tree(work)
+        before_lock = self._lock_snapshot(base / sid / ".lock")
+        signed = {"document": base64.b64encode(doc).decode("ascii"),
+                  "signature": base64.b64encode(sig).decode("ascii")}
+        requests = [{"protocolVersion": 1, "id": index, "method": "preflight",
+                     "params": dict(signed, **extra)}
+                    for index, extra in ((1, {"sessionId": sid}), (2, {}))]
+        reader = BytesIO(b"".join(
+            json.dumps(request, separators=(",", ":")).encode() + b"\n"
+            for request in requests))
+        writer = BytesIO()
+        # Only the store is real; the endpoint adds nothing but forwarding.
+        manager = SimpleNamespace(store=store)
+        self.assertEqual(offline_rpc.serve(reader, writer, manager), 0)
+
+        bound, unbound = [
+            json.loads(line) for line in writer.getvalue().splitlines()]
+        self.assertTrue(bound["ok"], bound)
+        self.assertEqual(bound["id"], 1)
+        self.assertEqual(bound["result"]["phase"], "preflight_passed")
+        self.assertEqual(bound["result"]["sessionId"], sid)
+        self.assertFalse(unbound["ok"], unbound)
+        self.assertEqual(unbound["id"], 2)
+        self.assertEqual(unbound["error"]["code"], "operation_failed")
+        self.assertIn("free space", unbound["error"]["message"])
+
+        # Purely read-only: no file, no lock and no receipt change appears, and
+        # no prepare or execute job was queued for either answer.
+        self.assertEqual(self._tree(work), before_tree)
+        self.assertEqual(self._lock_snapshot(base / sid / ".lock"), before_lock)
+        receipt = store.read_receipt(base / sid)
+        self.assertEqual(receipt["state"], "prepared")
+        self.assertNotIn("jobOperation", receipt)
+
     def test_preflight_reads_the_repository_config_without_touching_it(self):
         work, base, sysroot = self._preflight_work("preflight-read-only")
         sid, doc, sig, data = self._session_without_lock(base)
         repository = sysroot / "ostree" / "repo"
-        repository.mkdir(parents=True)
+        repository.mkdir(parents=True, exist_ok=True)
         config = repository / "config"
         config.write_text("[core]\nmin-free-space-percent=1\n")
         before = (self._tree(work), config.read_bytes())
@@ -828,6 +880,198 @@ class OfflineSessionStoreTest(unittest.TestCase):
                 flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC |
                          os.O_APPEND), 0,
                 "preflight opened %s with write flags %#x" % (path, flags))
+
+    def test_preflight_rejects_a_missing_repository_destination(self):
+        work = (self.tmp / "preflight-no-repo").resolve()
+        work.mkdir()
+        sysroot = work / "image"
+        sysroot.mkdir()
+        base = work / "offline"
+        sid, doc, sig, _data = self._session_for_preflight(base)
+        store = self._preflight_store(base, 1 << 30, sysroot_path=sysroot)
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "repository destination"):
+            store.preflight(doc, sig, sid)
+        self.assertFalse((sysroot / "ostree").exists())
+
+    @unittest.skipUnless(os.name == "posix", "symlinks are POSIX only")
+    def test_preflight_rejects_a_symlinked_repository_destination(self):
+        work = (self.tmp / "preflight-repo-link").resolve()
+        work.mkdir()
+        sysroot = work / "image"
+        (sysroot / "ostree").mkdir(parents=True)
+        outside = work / "outside"
+        outside.mkdir()
+        os.symlink(outside, sysroot / "ostree" / "repo")
+        base = work / "offline"
+        sid, doc, sig, _data = self._session_for_preflight(base)
+        store = self._preflight_store(base, 1 << 30, sysroot_path=sysroot)
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "symlinked path segment"):
+            store.preflight(doc, sig, sid)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def _space_dirs(self, name, count):
+        root = (self.tmp / name).resolve()
+        paths = []
+        for index in range(count):
+            path = root / ("d%d" % index)
+            path.mkdir(parents=True)
+            paths.append(path)
+        return paths
+
+    def _filesystem_doubles(self, fsids, free, total, devices=None):
+        """Model filesystem identity and capacity for direct space checks.
+
+        ``fsids`` maps a path to its 16-byte Btrfs FSID, or to ``None`` for a
+        filesystem that answers ENOTTY and must fall back to ``st_dev``
+        (overridden by ``devices``).  ``free`` maps each path to its own
+        available bytes and ``total`` sizes the percent reserve.  The ioctl
+        double mutates the buffer in place, the way the kernel does.
+        """
+        opened = []
+        closed = []
+        current = {}
+        real_open = os.open
+        real_close = os.close
+        real_stat = _REAL_STAT
+        devices = {} if devices is None else devices
+
+        def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            current[fd] = str(Path(path))
+            opened.append((Path(path), flags, fd))
+            return fd
+
+        def fake_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        def fake_ioctl(fd, request, arg):
+            self.assertEqual(request, 0x8400941F)
+            self.assertEqual(len(arg), 1024)
+            fsid = fsids[current[fd]]
+            if fsid is None:
+                raise OSError(errno.ENOTTY, "not a btrfs filesystem")
+            arg[16:32] = fsid
+            return bytes(arg)
+
+        def fake_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            text = str(Path(path))
+            if text not in devices:
+                return result
+            values = list(result)
+            values[2] = devices[text]
+            return os.stat_result(values)
+
+        def fake_statvfs(path):
+            text = str(Path(path))
+            if text not in free:
+                raise AssertionError("unexpected statvfs: %s" % path)
+            return SimpleNamespace(f_bavail=free[text], f_blocks=total,
+                                   f_frsize=1)
+
+        for patcher in (
+            mock.patch.object(offline_session.os, "open", side_effect=fake_open),
+            mock.patch.object(offline_session.os, "close", side_effect=fake_close),
+            mock.patch.object(offline_session.fcntl, "ioctl", side_effect=fake_ioctl),
+            mock.patch.object(offline_session.os, "stat", side_effect=fake_stat),
+            mock.patch.object(offline_session.os, "statvfs", side_effect=fake_statvfs),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return opened, closed
+
+    def test_free_space_joins_btrfs_subvolumes_by_filesystem_fsid(self):
+        # Two subvolumes report different st_dev but one pool FSID: their
+        # allowances are summed and the repository reserve is charged once.
+        first, second = self._space_dirs("btrfs-shared", 2)
+        fsid = bytes(range(16))
+        free = {str(first): 249, str(second): 1 << 30}
+        opened, closed = self._filesystem_doubles(
+            {str(first): fsid, str(second): fsid}, free, 1000,
+            {str(first): 101, str(second): 202})
+        destinations = [(first, 100, "payload"), (second, 100, "import")]
+        reserve = (second, ("size", 50))
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            offline_session.OfflineSessionStore._require_free_space(
+                destinations, reserve=reserve)
+        # The smaller subvolume must still fit the shared pool requirement.
+        free[str(first)] = 250
+        offline_session.OfflineSessionStore._require_free_space(
+            destinations, reserve=reserve)
+        self.assertEqual(len(opened), len(closed))
+
+    def test_free_space_keeps_distinct_btrfs_filesystems_independent(self):
+        first, second = self._space_dirs("btrfs-split", 2)
+        free = {str(first): 150, str(second): 99}
+        self._filesystem_doubles(
+            {str(first): b"A" * 16, str(second): b"B" * 16}, free, 1000)
+        destinations = [(first, 100, "payload"), (second, 100, "import")]
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            offline_session.OfflineSessionStore._require_free_space(destinations)
+        free[str(second)] = 100
+        offline_session.OfflineSessionStore._require_free_space(destinations)
+
+    def test_free_space_falls_back_to_st_dev_without_btrfs_ioctl(self):
+        first, second = self._space_dirs("non-btrfs", 2)
+        free = {str(first): 100, str(second): 100}
+        devices = {str(first): 7, str(second): 7}
+        opened, closed = self._filesystem_doubles(
+            {str(first): None, str(second): None}, free, 1000, devices)
+        destinations = [(first, 100, "payload"), (second, 100, "import")]
+        # One block device: both allowances are summed against one capacity.
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "free space"):
+            offline_session.OfflineSessionStore._require_free_space(destinations)
+        # A different st_dev keeps its own capacity and its own requirement.
+        devices[str(second)] = 8
+        offline_session.OfflineSessionStore._require_free_space(destinations)
+        self.assertEqual(len(opened), len(closed))
+
+    def test_free_space_refuses_an_ioctl_error_and_closes_the_descriptor(self):
+        (path,) = self._space_dirs("btrfs-error", 1)
+        opened = []
+        closed = []
+        real_open = os.open
+        real_close = os.close
+
+        def fake_open(name, flags, mode=0o777, *, dir_fd=None):
+            fd = real_open(name, flags, mode, dir_fd=dir_fd)
+            opened.append((Path(name), flags, fd))
+            return fd
+
+        def fake_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with mock.patch.object(offline_session.os, "open", side_effect=fake_open), \
+                mock.patch.object(offline_session.os, "close", side_effect=fake_close), \
+                mock.patch.object(
+                    offline_session.fcntl, "ioctl",
+                    side_effect=OSError(errno.EACCES, "permission denied")):
+            with self.assertRaisesRegex(
+                    offline_session.OfflineSessionError, "filesystem"):
+                offline_session.OfflineSessionStore._require_free_space(
+                    [(path, 1, "payload")])
+        _name, flags, fd = opened[0]
+        self.assertEqual(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT), 0)
+        self.assertTrue(flags & os.O_DIRECTORY)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_CLOEXEC)
+        self.assertEqual(closed, [fd])
+
+    def test_free_space_rejects_an_empty_btrfs_fsid(self):
+        (path,) = self._space_dirs("btrfs-empty-fsid", 1)
+        self._filesystem_doubles(
+            {str(path): b"\0" * 16}, {str(path): 1 << 30}, 1000)
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError, "empty"):
+            offline_session.OfflineSessionStore._require_free_space(
+                [(path, 100, "payload")])
 
     def test_export_length_and_state_handling(self):
         store, sid, blob, tx = self._export_session()

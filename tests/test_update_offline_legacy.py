@@ -1429,8 +1429,14 @@ class PreflightTests(unittest.TestCase):
             base=self.base, trusted_key=self.public, inspect=inspector,
             sysroot_path=self.sysroot)
 
+    def _repository(self):
+        repository = self.sysroot / "ostree" / "repo"
+        repository.mkdir(parents=True, exist_ok=True)
+        return repository
+
     def test_preflight_is_read_only_and_reports_no_slot_claim(self):
         document, signature, payload = _signed_package(self.private, os.urandom(4096))
+        repository = self._repository()
         store = self._store(lambda: dict(LEGACY_REPORT))
         with mock.patch.object(
                 offline_session.offline_prepare.offline_recovery.os, "pwrite") as writes:
@@ -1446,12 +1452,13 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result["recoveryMigrationRequired"])
         self.assertEqual(result["model"], "TB322FC")
         self.assertFalse(self.base.exists())
-        self.assertFalse((self.sysroot / "ostree").exists())
+        self.assertEqual(list(repository.iterdir()), [])
         writes.assert_not_called()
 
     def test_preflight_keeps_the_strict_identity(self):
         document, signature, _payload = _signed_package(self.private, os.urandom(4096))
         self.board = 2
+        self._repository()
         strict = {"model": "TB323FU", "actualSlot": "a", "inactiveSlot": "b",
                   "selectedSlot": "a", "deployment": LEGACY_DEPLOYMENT,
                   "recoveryPartUuid": PART_UUID}
@@ -1563,6 +1570,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_a_bad_signature_or_missing_dependency(self):
         document, signature, _payload = _signed_package(self.private, os.urandom(4096))
+        self._repository()
         store = self._store(lambda: dict(LEGACY_REPORT))
         with self.assertRaises(ValueError):
             store.preflight(document, b"not-a-signature")

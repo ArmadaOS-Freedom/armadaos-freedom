@@ -263,12 +263,24 @@ def _string_collection(node):
     return values
 
 
+def _is_session_argument(node):
+    """True for the exact ``_session_id(params)`` argument the RPC forwards."""
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_session_id'
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == 'params')
+
+
 def _provides_session_preflight(updates_root):
     """True when the shipped RPC accepts and forwards preflight ``sessionId``.
 
     The installer never executes bundle code, so the contract is read from the
     source the bundle ships: the optional-parameter table names ``sessionId``
-    for preflight and the handler passes a third argument to the store.
+    for preflight and the handler forwards the validated ``_session_id(params)``
+    as the store's third argument.
     """
     module = _parse_module(updates_root / 'offline_rpc.py')
     optional = None
@@ -290,7 +302,8 @@ def _provides_session_preflight(updates_root):
                         and call.func.attr == 'preflight'
                         and isinstance(call.func.value, ast.Attribute)
                         and call.func.value.attr == 'store'
-                        and len(call.args) >= 3):
+                        and len(call.args) >= 3
+                        and _is_session_argument(call.args[2])):
                     forwarded = True
     return optional is not None and 'sessionId' in optional and forwarded
 
