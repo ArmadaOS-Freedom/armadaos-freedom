@@ -31,6 +31,9 @@ STATE_FILE = Path("/var/lib/armada/powerd.state")
 FACTORY_CONFIG_FILE = Path("/usr/share/armada/power-profiles.conf")
 CONFIG_FILE = Path("/etc/armada/power-profiles.conf")
 FAN_SAFE_PWM = 128
+# Bounds live download-mode leases: each costs a pipe plus a main-loop watch,
+# and all bus calls are serialized, so one global cap suffices.
+MAX_DOWNLOAD_HANDLES = 64
 
 
 def normalize_profile(profile):
@@ -1060,9 +1063,30 @@ class ArmadaPower:
 
     def enter_download_mode(self, identifier, invocation):
         # Steam holds the write end; HUP on ours means every copy is closed.
-        rfd, wfd = os.pipe()
-        fds = Gio.UnixFDList.new()
-        fds.append(wfd)
+        if sum(self.download_handles.values()) >= MAX_DOWNLOAD_HANDLES:
+            # Reject before os.pipe(): nothing is allocated, no count changes.
+            print(f"armada-powerd: download mode handle limit reached "
+                  f"({MAX_DOWNLOAD_HANDLES})", file=sys.stderr)
+            invocation.return_dbus_error(
+                f"{BUS_NAME}.Error.DownloadModeLimitReached",
+                f"download mode handle limit {MAX_DOWNLOAD_HANDLES} reached",
+            )
+            return
+        rfd = wfd = -1
+        try:
+            rfd, wfd = os.pipe()
+            fds = Gio.UnixFDList.new()
+            fds.append(wfd)
+        except Exception as exc:
+            for fd in (rfd, wfd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            invocation.return_dbus_error(
+                f"{BUS_NAME}.Error.DownloadModeFailed", str(exc))
+            return
         os.close(wfd)
         self.download_handles[identifier] = self.download_handles.get(identifier, 0) + 1
         GLib.unix_fd_add_full(

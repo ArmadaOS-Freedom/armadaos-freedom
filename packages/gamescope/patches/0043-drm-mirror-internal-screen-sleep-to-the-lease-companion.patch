@@ -5,45 +5,80 @@ Steam sleeps the screen through gamescope_control, which only reaches the
 broker, so a lease companion's panel stays lit during low-power downloads
 and suspend. Forward the broker's internal sleep state over the lease
 socket, including to a companion that connects while it is asleep.
+
+The companion keeps that state in its own atomic mirror instead of the
+per-connector sleep ConVar, so an externally leased connector is not driven
+by the broker's internal setting. A failed send shuts the socket down and
+leaves the cached state for the reconnect replay; the socket thread still
+owns the fd.
 ---
 diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
-index 21dbfc3..b4f4cd9 100644
 --- a/src/Backends/DRMBackend.cpp
 +++ b/src/Backends/DRMBackend.cpp
-@@ -1662,6 +1662,8 @@ static bool g_bLeaseClientSuspendPending = false;
+@@ -1662,6 +1662,14 @@ static bool g_bLeaseClientSuspendPending = false;
  static bool g_bLeaseClientSuspended = false;
  static uint64_t g_uLeaseClientGeneration = 0;
++// ConVar's value is not atomic, so the socket thread must never read it; this
++// mirror is only touched with g_leaseClientMutex held.
++static bool g_bLeaseClientPanelSleep = false;
++
++// Companion-only: the broker's screen sleep, kept apart from this process's
++// own per-connector cv_drm_sleep_screens settings.
++static std::atomic<bool> g_bDrmLeasePanelSleep{ false };
  
 +extern gamescope::ConVar<bool> cv_drm_sleep_screens[];
-+
+ 
  static bool lease_send_fd( int nClientFd, int nLeaseFd )
- {
- 	union {
-@@ -1778,6 +1780,14 @@ bool drm_lease_companion_suspend( int nTimeoutMs )
+ 
+@@ -1778,6 +1786,33 @@ bool drm_lease_companion_suspend( int nTimeoutMs )
  	return true;
  }
  
++// Caller holds g_leaseClientMutex.
++static void lease_send_panel_sleep_locked( bool bSleep )
++{
++	if ( g_nLeaseClientFd < 0 )
++		return;
++	if ( !lease_send_control( bSleep ? DrmLeaseEventType::Sleep : DrmLeaseEventType::Wake ) )
++		shutdown( g_nLeaseClientFd, SHUT_RDWR );
++}
++
 +// Steam only sleeps the broker's screen, so the companion's panel would stay lit.
++// The cached state is kept while no companion is connected; a companion that
++// connects later is told about it.
 +static void drm_lease_send_sleep( bool bSleep )
 +{
 +	std::lock_guard lock( g_leaseClientMutex );
-+	if ( g_nLeaseClientFd >= 0 )
-+		lease_send_control( bSleep ? DrmLeaseEventType::Sleep : DrmLeaseEventType::Wake );
++	g_bLeaseClientPanelSleep = bSleep;
++	lease_send_panel_sleep_locked( bSleep );
++}
++
++// Companion side: the broker mirrors its sleep here instead of touching this
++// process's own per-connector settings.
++void drm_lease_client_set_panel_sleep( bool bSleep )
++{
++	if ( g_bDrmLeasePanelSleep.exchange( bSleep ) != bSleep )
++		force_repaint();
 +}
 +
  void drm_lease_companion_resume()
  {
  	std::lock_guard lock( g_leaseClientMutex );
-@@ -1884,6 +1894,8 @@ static void lease_socket_thread_run( struct drm_t *drm )
+@@ -1884,6 +1919,13 @@ static void lease_socket_thread_run( struct drm_t *drm )
  		g_nActiveLeaseClients.fetch_add( 1 );
  		grantLock.unlock();
  		drm_log.infof( "lease-connector: sent lease fd to companion app" );
-+		if ( cv_drm_sleep_screens[ gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL ] )
-+			drm_lease_send_sleep( true );
++		{
++			// A companion that connects while the panel sleeps would
++			// otherwise keep its own panel lit.
++			std::lock_guard lock( g_leaseClientMutex );
++			if ( g_nLeaseClientFd >= 0 )
++				lease_send_panel_sleep_locked( g_bLeaseClientPanelSleep );
++		}
  	}
  
  	lease_disconnect_client( nClientFd );
-@@ -2345,8 +2357,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+@@ -2345,8 +2387,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
  	return true;
  }
  
@@ -55,8 +90,17 @@ index 21dbfc3..b4f4cd9 100644
  	force_repaint();
  }
  
+@@ -4135,7 +4179,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
+ 	// A sleeping screen holds no output LUTs, so its desired state is "not applied";
+ 	// otherwise every repaint while asleep would see a mismatch and ask for a modeset.
+-	const bool bSleep = drm->pConnector && ( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ] ||
+-		( g_sDrmLeaseClientSocket && frameInfo->layers.count() == 0 ) );
++	const bool bSleep = drm->pConnector && ( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ] ||
++		( g_sDrmLeaseClientSocket && ( frameInfo->layers.count() == 0 || g_bDrmLeasePanelSleep.load() ) ) );
+ 
+ 	// The output LUTs change on this request when they go on or off (which changes
+ 	// the display blocks the CRTC owns and needs a modeset) or when their contents do;
 diff --git a/src/main.hpp b/src/main.hpp
-index 9b750d2..afec230 100644
 --- a/src/main.hpp
 +++ b/src/main.hpp
 @@ -75,6 +75,9 @@ enum class DrmLeaseEventType : uint32_t
@@ -69,18 +113,27 @@ index 9b750d2..afec230 100644
  };
  
  struct DrmLeaseEvent
+@@ -89,6 +92,10 @@
+ 
+ void drm_lease_send_touch( DrmLeaseEventType type, double x, double y, int touchId, uint32_t time );
+ 
++// Companion side (--drm-lease-client): mirror the broker's screen sleep without
++// touching this process's own per-connector settings.
++void drm_lease_client_set_panel_sleep( bool bSleep );
++
+ // Suspends a yielding companion for a protocol client; true only once it
+ // acknowledged that nothing of its can commit; false leaves it the holder.
+ bool drm_lease_companion_suspend( int nTimeoutMs );
 diff --git a/src/wlserver.cpp b/src/wlserver.cpp
-index 484c5c0..81de422 100644
 --- a/src/wlserver.cpp
 +++ b/src/wlserver.cpp
-@@ -2092,6 +2092,11 @@ static void drm_lease_client_dispatch_event()
+@@ -2092,6 +2092,10 @@ static void drm_lease_client_dispatch_event()
  			GetBackend()->DirtyState( true, true );
  			wl_log.infof( "DRM lease resumed by the broker" );
  			break;
 +		case DrmLeaseEventType::Sleep:
 +		case DrmLeaseEventType::Wake:
-+			drm_sleep_screen( gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL,
-+				g_drmLeaseEvent.type == DrmLeaseEventType::Sleep );
++			drm_lease_client_set_panel_sleep( g_drmLeaseEvent.type == DrmLeaseEventType::Sleep );
 +			break;
  	}
  }
