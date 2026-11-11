@@ -3,6 +3,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -54,6 +55,33 @@ class InstalledChannelTests(unittest.TestCase):
         self.state.parent.mkdir(parents=True, exist_ok=True)
         self.state.write_bytes(content)
         self.state.chmod(0o644)
+
+    DISTRO_UID = 4321
+
+    @contextmanager
+    def owner(self, uid):
+        """Report a fixed file owner without depending on a real chown."""
+        original = os.fstat
+
+        def owned(fd):
+            values = list(original(fd))
+            values[4] = uid
+            return os.stat_result(values)
+
+        with mock.patch.object(selection.os, "fstat", side_effect=owned):
+            yield
+
+    @contextmanager
+    def account(self, uid):
+        """Emulate the distro account lookup (``None`` means no such account)."""
+        if uid is None:
+            patcher = mock.patch.object(
+                selection.pwd, "getpwnam", side_effect=KeyError("armada"))
+        else:
+            patcher = mock.patch.object(
+                selection.pwd, "getpwnam", return_value=mock.Mock(pw_uid=uid))
+        with patcher as lookup:
+            yield lookup
 
     @unittest.skipUnless(os.geteuid() == 0, "channel writer requires root")
     def test_all_channels_written_by_set_channel_override_origin(self):
@@ -183,6 +211,53 @@ class InstalledChannelTests(unittest.TestCase):
                     selection.os, "fstat", return_value=os.stat_result(values)):
                 with self.assertRaises(ValueError):
                     self.read(origin())
+
+    def test_distro_account_owned_state_is_accepted(self):
+        # The install's tmpfiles stamp declares the channel file for the
+        # distro account, so the unprivileged writer's file must be read.
+        self.write_state(b"beta\n")
+        with self.account(self.DISTRO_UID) as lookup, \
+                self.owner(self.DISTRO_UID):
+            self.assertEqual("beta", self.read(origin(channel="stable")))
+            self.assertEqual(
+                "beta", self.read(FREEDOM + "@sha256:" + DIGEST))
+        lookup.assert_called_with("armada")
+
+    def test_root_owned_state_is_accepted_without_the_distro_account(self):
+        self.write_state(b"beta\n")
+        with self.account(None), self.owner(0):
+            self.assertEqual("beta", self.read(origin(channel="stable")))
+
+    def test_unknown_owner_is_still_rejected(self):
+        self.write_state(b"beta\n")
+        with self.account(self.DISTRO_UID), self.owner(self.DISTRO_UID + 1):
+            with self.assertRaises(ValueError):
+                self.read(origin(channel="stable"))
+
+    def test_missing_distro_account_allows_root_only(self):
+        self.write_state(b"beta\n")
+        with self.account(None):
+            with self.owner(self.DISTRO_UID):
+                with self.assertRaises(ValueError):
+                    self.read(origin(channel="stable"))
+            with self.owner(0):
+                self.assertEqual("beta", self.read(origin(channel="stable")))
+
+    def test_distro_account_owned_state_keeps_the_other_checks(self):
+        self.write_state(b"beta\n")
+        self.state.chmod(0o666)
+        with self.account(self.DISTRO_UID), self.owner(self.DISTRO_UID):
+            with self.assertRaises(ValueError):
+                self.read(origin(channel="stable"))
+
+        self.state.chmod(0o644)
+        self.state.unlink()
+        target = self.root / "target"
+        target.write_text("beta\n")
+        self.state.symlink_to(target)
+        with self.account(self.DISTRO_UID), self.owner(self.DISTRO_UID):
+            with self.assertRaises(ValueError):
+                self.read(origin(channel="stable"))
 
     def test_read_does_not_change_file_or_directory_inventory(self):
         self.write_state(b"beta\n")

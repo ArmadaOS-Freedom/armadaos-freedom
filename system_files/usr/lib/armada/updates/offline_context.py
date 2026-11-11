@@ -402,6 +402,45 @@ def _ostree_pointer(tokens, label):
     return bootver, name, bootcsum, int(index)
 
 
+def _boot_pointer(bootver, name, bootcsum, index):
+    """Return the kernel ostree pointer for one BLS boot entry."""
+    return f'/ostree/boot.{bootver}/{name}/{bootcsum}/{index}'
+
+
+def _resolve_boot_pointer(pointer, osname, checksum, serial, sysroot_path=None):
+    """Confirm ``pointer`` resolves to the booted deployment in the sysroot.
+
+    A rewritten BLS entry is trusted only when its symlink resolves to the
+    exact deployment directory libostree reports as booted.  The boot serial,
+    the running cmdline and the deployment list are never used to infer that
+    target; a pointer that resolves anywhere else is refused.
+    """
+    if sysroot_path is None:
+        root = DEFAULT_SYSROOT
+    else:
+        root = Path(sysroot_path)
+        if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+            raise OfflineContextError('sysroot must be an absolute non-symlink directory')
+    expected = root.joinpath(
+        'ostree', 'deploy', osname, 'deploy', f'{checksum}.{serial}')
+    link = root.joinpath(*pointer.lstrip('/').split('/'))
+    try:
+        if not link.is_symlink():
+            raise OfflineContextError(
+                f'the current {pointer} ostree pointer is not a symlink')
+        resolved = link.resolve(strict=True)
+    except OfflineContextError:
+        raise
+    except OSError as error:
+        raise OfflineContextError(
+            f'cannot resolve the current {pointer} ostree pointer: {error}') from error
+    if resolved != expected:
+        raise OfflineContextError(
+            f'the current ostree pointer resolves to {resolved}, '
+            f'not the booted deployment {expected}')
+    return resolved
+
+
 def _uuid_token(tokens, key, label):
     prefix = f'{key}='
     values = []
@@ -428,11 +467,21 @@ def _reject_new_tokens(tokens, label):
                 f'{label} carries new deployment evidence; legacy binding refused')
 
 
-def bind_legacy_evidence(evidence, cmdline, root_uuid, boot_uuid):
+def bind_legacy_evidence(evidence, cmdline, root_uuid, boot_uuid, *, sysroot_path=None):
     """Validate legacy boot evidence and return the bound boot context.
 
     ``root_uuid``/``boot_uuid`` are the UUIDs of the internal partitions the
-    running /sysroot and /boot are mounted from.
+    running /sysroot and /boot are mounted from.  ``sysroot_path`` overrides
+    the runtime sysroot used to resolve a rewritten BLS pointer in tests.
+
+    libostree's booted deployment stays authoritative: the running cmdline
+    must still name its osname and boot checksum, and the *current* BLS
+    pointer must name its osname, boot checksum and boot serial.  A prepare
+    that appended a deployment may have rewritten the boot version and/or the
+    entry index while /proc/cmdline kept the original pointer, so those two
+    cmdline fields are not required to match; a divergent pointer is instead
+    resolved in the runtime sysroot and must land exactly on the booted
+    deployment.
     """
     if not isinstance(evidence, dict):
         raise OfflineContextError('legacy evidence must be a mapping')
@@ -461,10 +510,6 @@ def bind_legacy_evidence(evidence, cmdline, root_uuid, boot_uuid):
         raise OfflineContextError('cmdline ostree osname differs from the booted deployment')
     if cmd_bootcsum != bootcsum:
         raise OfflineContextError('cmdline ostree checksum differs from the booted deployment')
-    # The final ostree pointer index is the boot serial.  The deployment is
-    # still identified by its deploy serial in the deployment string.
-    if index != bootserial:
-        raise OfflineContextError('cmdline ostree index differs from the boot serial')
 
     option_tokens = _tokens(evidence.get('options') if isinstance(
         evidence.get('options'), str) else '')
@@ -473,10 +518,26 @@ def bind_legacy_evidence(evidence, cmdline, root_uuid, boot_uuid):
     _reject_new_tokens(option_tokens, 'booted deployment options')
     opt_bootver, opt_name, opt_bootcsum, opt_index = _ostree_pointer(
         option_tokens, 'booted deployment options')
+    if opt_name != osname:
+        raise OfflineContextError(
+            'booted deployment options ostree osname differs from the booted deployment')
+    if opt_bootcsum != bootcsum:
+        raise OfflineContextError(
+            'booted deployment options ostree checksum differs from the booted deployment')
+    # The final ostree pointer index is the boot serial.  The deployment is
+    # still identified by its deploy serial in the deployment string.
+    if opt_index != bootserial:
+        raise OfflineContextError(
+            'booted deployment options ostree index differs from the boot serial')
     if (opt_bootver, opt_name, opt_bootcsum, opt_index) != (
             bootver, name, cmd_bootcsum, index):
-        raise OfflineContextError(
-            'booted deployment options do not describe the running ostree pointer')
+        # append_verified_deployment/write_deployments may rewrite the BLS
+        # entry (boot version and/or index) while the running cmdline keeps the
+        # pointer this boot used.  The rewritten pointer is accepted only when
+        # it resolves to the deployment libostree reports as booted.
+        _resolve_boot_pointer(
+            _boot_pointer(opt_bootver, opt_name, opt_bootcsum, opt_index),
+            osname, checksum, serial, sysroot_path=sysroot_path)
 
     option_root = _uuid_token(option_tokens, 'root', 'booted deployment options')
     option_boot = _uuid_token(option_tokens, 'boot', 'booted deployment options')
@@ -523,6 +584,8 @@ def read_legacy_boot_state(*, sysroot_path=None, cmdline_path=CMDLINE_PATH,
 
     The booted deployment comes from the default runtime sysroot; the
     ``/sysroot`` and ``/boot`` block mounts are bound separately by UUID.
+    ``sysroot_path`` is a diagnostic/test override for that read and for
+    resolving a rewritten BLS pointer; production passes nothing.
 
     ``reject_pending`` is the mutation gate.  Preflight, prepare, execute, the
     boot writer and activation keep the default and refuse either a staged
@@ -542,30 +605,74 @@ def read_legacy_boot_state(*, sysroot_path=None, cmdline_path=CMDLINE_PATH,
     cmdline = _read_cmdline(cmdline_path)
     root_uuid = mount_lookup(ROOT_MOUNT)
     boot_uuid = mount_lookup(BOOT_MOUNT)
-    context = bind_legacy_evidence(evidence, cmdline, root_uuid, boot_uuid)
+    context = bind_legacy_evidence(
+        evidence, cmdline, root_uuid, boot_uuid, sysroot_path=sysroot_path)
     return dict(evidence['booted']), context
 
 
-def legacy_channel(origin_ref):
-    """Return ``(repository, channel, inferred)`` for a legacy origin."""
-    repository, tag = armada_os.ref_repository_tag(origin_ref or '')
+def _installed_channel(state_path, origin_ref):
+    """Read the validated installed channel with the shared selection policy."""
+    # Imported lazily: channel_selection pulls in the trial/activation stack,
+    # which imports this module, so a module-level import would be cyclic.
+    from . import channel_selection
+    try:
+        return channel_selection.read_installed_channel(
+            state_path=state_path, origin_ref=origin_ref)
+    except (OSError, ValueError) as error:
+        raise OfflineContextError(
+            f'installed update channel state is invalid: {error}') from error
+
+
+def _read_channel_state(state_path):
+    """Return the validated persisted channel, or ``None`` when none exists."""
+    try:
+        os.lstat(state_path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise OfflineContextError(
+            f'cannot inspect the installed update channel: {error}') from error
+    # A raw local OSTree origin names a commit, not a container channel, so it
+    # cannot be handed to the strict origin parser.  The supported reference
+    # only satisfies that parser; the validated state file decides the channel.
+    return _installed_channel(state_path, f'{armada_os.FREEDOM}:stable')
+
+
+def legacy_channel(origin_ref, *, state_path=None):
+    """Return ``(repository, channel, inferred)`` for a legacy origin.
+
+    The validated persisted selection in ``/var/lib/armada/update-channel``
+    wins over the image origin, so a channel selected after installation is
+    what the snapshot and the submission identity checks report.  The origin
+    tag (or the explicit stable inference for a raw local commit origin) is a
+    fallback only while that state file is absent.  Invalid or unsafe state is
+    never ignored.
+    """
+    if state_path is None:
+        from . import channel_selection
+        state_path = channel_selection.DEFAULT_STATE_PATH
+    repository, _tag = armada_os.ref_repository_tag(origin_ref or '')
     if repository is None:
-        # A raw local OSTree origin names a commit, not a container channel.  The
-        # migration channel is inferred and explicitly recorded as such.
-        return armada_os.FREEDOM, 'stable', True
-    if repository in armada_os.REPOSITORIES and tag in _CHANNEL_TAGS:
-        return repository, _CHANNEL_TAGS[tag], False
-    raise OfflineContextError('legacy image origin is not a supported Freedom channel')
+        channel = _read_channel_state(state_path)
+        if channel is None:
+            # No selection exists, so the migration channel is inferred and
+            # explicitly recorded as such.
+            return armada_os.FREEDOM, 'stable', True
+        return armada_os.FREEDOM, _CHANNEL_TAGS[channel], False
+    if repository not in armada_os.REPOSITORIES:
+        raise OfflineContextError('legacy image origin is not a supported Freedom channel')
+    return repository, _CHANNEL_TAGS[_installed_channel(state_path, origin_ref)], False
 
 
-def snapshot(*, sysroot_path=None):
+def snapshot(*, sysroot_path=None, state_path=None):
     """Return the strict snapshot, or an explicit legacy snapshot when allowed.
 
     ``sysroot_path`` is a diagnostic/test override for the booted-deployment
     read only; the authoritative value is the default runtime sysroot.  The
     legacy snapshot reports the staged deployment and a rollback queued by a
     differing default deployment as data, so a read-only query can describe the
-    device while prepare still refuses either state.
+    device while prepare still refuses either state.  ``state_path`` overrides
+    the persisted update-channel file in tests only.
     """
     try:
         return armada_os.snapshot()
@@ -582,7 +689,8 @@ def snapshot(*, sysroot_path=None):
     rollback_queued = evidence.get('rollback_queued')
     if type(rollback_queued) is not bool:
         raise OfflineContextError('legacy pending update state is unavailable')
-    repository, channel, inferred = legacy_channel(evidence.get('originRef'))
+    repository, channel, inferred = legacy_channel(
+        evidence.get('originRef'), state_path=state_path)
     return {
         'booted': dict(evidence['booted']),
         'rollback': None,

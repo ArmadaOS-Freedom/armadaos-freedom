@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import pwd
 import re
 import stat
 import sys
@@ -13,6 +14,23 @@ from . import trial_confirmation
 
 CHANNELS = ("stable", "beta", "testing")
 DEFAULT_STATE_PATH = Path("/var/lib/armada/update-channel")
+INSTALLED_ACCOUNT = "armada"
+
+
+def _state_owner_uids():
+    """Uids allowed to own a persisted channel selection.
+
+    The install declares the stamp for the distro account, so the unprivileged
+    branch selector may leave an ``armada``-owned file as well as the
+    root-owned file written by :func:`set_channel`.  Without that account only
+    root is trusted.
+    """
+    owners = {0}
+    try:
+        owners.add(pwd.getpwnam(INSTALLED_ACCOUNT).pw_uid)
+    except KeyError:
+        pass
+    return owners
 
 
 def set_channel(channel, state_path=DEFAULT_STATE_PATH):
@@ -123,7 +141,8 @@ def read_installed_channel(*, state_path, origin_ref):
     fd = os.open(str(destination), flags)
     try:
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+        if (not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in _state_owner_uids()
                 or info.st_mode & 0o022 or info.st_size > 32):
             raise ValueError("channel state file is unsafe or oversized")
         content = os.read(fd, 33)

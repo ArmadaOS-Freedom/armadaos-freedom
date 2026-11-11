@@ -42,6 +42,13 @@ _EXPORT_STATES = frozenset({
     'awaiting_recovery_export', 'executing', 'awaiting_reboot', 'failed',
     'recovery_required',
 })
+# Receipt states in which a read-only preflight may reuse an existing session's
+# payload: nothing is executing, interrupted or failed, so prepare can still
+# resume from exactly the bytes this session already stores.
+_PREFLIGHT_SESSION_STATES = frozenset({
+    'uploading', 'uploaded', 'prepare_queued', 'preparing', 'prepared',
+    'up_to_date',
+})
 # Read-only dependencies every offline worker needs before a session starts.
 _REQUIRED_UPDATER_FILES = (
     Path('/usr/libexec/armada/kshim-build-boot.py'),
@@ -400,24 +407,214 @@ class OfflineSessionStore:
                 raise OfflineSessionError(
                     'missing executable updater dependency: %s' % path)
 
-    def preflight(self, document: bytes, signature_b64: bytes):
+    def _preflight_session_bytes(self, session, document, signature_b64,
+                                 physical, channel, payload_path, size, digest):
+        """Return the payload bytes already stored by exactly this session.
+
+        Strictly read-only: no session lock (which would create ``.lock``), no
+        receipt update, no job and no write of any kind.  Only the protected
+        directory named by the authenticated ``sessionId`` is inspected, so a
+        caller can never credit bytes of another session, package or device.
+        """
+        try:
+            stored_document = offline_execute._read_bounded(
+                session / 'package.json', _DOCUMENT_MAX, 'session package document')
+            stored_signature = offline_execute._read_bounded(
+                session / 'package.sig', _SIGNATURE_MAX, 'session package signature')
+            receipt = self.read_receipt(session)
+        except ValueError as exc:
+            raise OfflineSessionError(
+                'cannot read the protected session: %s' % exc) from exc
+        # The session must have been created for these exact signed bytes; an
+        # identical-looking descriptor for another package is a different one.
+        if stored_document != document:
+            raise OfflineSessionError(
+                'session belongs to a different package document')
+        if stored_signature != signature_b64:
+            raise OfflineSessionError(
+                'session belongs to a different package signature')
+        # Bind the receipt's device, bridge and slot context to the device that
+        # answers now, exactly as the prepare submission does.
+        if receipt.get('physical') != physical:
+            raise OfflineSessionError('session belongs to a different device state')
+        if receipt.get('model') != physical.get('model'):
+            raise OfflineSessionError('session belongs to a different device model')
+        if receipt.get('channel') != channel:
+            raise OfflineSessionError('session was created for a different channel')
+        if receipt.get('jobInterrupted') or receipt.get('attentionRequired'):
+            raise OfflineSessionError(
+                'interrupted session cannot be preflighted read-only')
+        state = receipt.get('state')
+        if state not in _PREFLIGHT_SESSION_STATES:
+            raise OfflineSessionError(
+                'session state %r cannot be preflighted read-only' % (state,))
+        payload = receipt.get('payload')
+        if not isinstance(payload, dict):
+            raise OfflineSessionError('session receipt has no payload record')
+        # The stored path, declared size and hash must be the signed descriptor's
+        # own values; the receipt alone never authorizes a different payload.
+        if (payload.get('path') != payload_path or
+                payload.get('bytes') != size or
+                payload.get('sha256') != digest):
+            raise OfflineSessionError(
+                'session payload does not match the signed descriptor')
+        return self._received(session, receipt)
+
+    def _prepared_expansion_evidence(self, session, document, expanded_bytes):
+        """Return True only when this session proved the gzip was expanded.
+
+        The session receipt is never enough: the protected transaction's own
+        ``prepared.json`` and ``status.json`` must bind the completed prepare to
+        exactly these signed bytes, and the expanded image must still be a
+        regular file of the declared size.  Anything missing or foreign stays
+        charged in full, so a retry cannot understate its space requirement.
+        """
+        transaction = session / 'transaction'
+        if transaction.is_symlink() or not transaction.is_dir():
+            return False
+        try:
+            prepared = json.loads(offline_execute._read_bounded(
+                transaction / 'prepared.json', _JSON_MAX,
+                'prepared transaction').decode('ascii'))
+            status = json.loads(offline_execute._read_bounded(
+                transaction / 'status.json', _JSON_MAX,
+                'transaction status').decode('ascii'))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(prepared, dict) or not isinstance(status, dict):
+            return False
+        if (prepared.get('schemaVersion') != 1 or
+                prepared.get('operation') != 'offline-upgrade' or
+                prepared.get('packageDescriptor') != 'package.json'):
+            return False
+        transaction_id = prepared.get('transactionId')
+        if (type(transaction_id) is not str or not transaction_id or
+                status.get('transactionId') != transaction_id):
+            return False
+        # Only the state that still owns the completed preparation counts; an
+        # executed, failed or interrupted transaction is refused earlier.
+        if status.get('state') != 'awaiting_recovery_export':
+            return False
+        if prepared.get('packageDescriptorSha256') != hashlib.sha256(document).hexdigest():
+            return False
+        import_dir = transaction / 'import'
+        if import_dir.is_symlink() or not import_dir.is_dir():
+            return False
+        try:
+            entry = os.lstat(import_dir / 'linux-root.img')
+        except OSError:
+            return False
+        return stat.S_ISREG(entry.st_mode) and entry.st_size == expanded_bytes
+
+    @staticmethod
+    def _allocation_dir(path, label):
+        """Nearest existing canonical directory holding *path*, read-only.
+
+        A session or transaction leaf is created only by prepare, so its
+        filesystem is attributed to the nearest ancestor that exists now.
+        Every path segment is inspected without following links: a symlinked or
+        non-directory component is refused instead of being resolved, and
+        nothing is created, locked or written here.
+        """
+        path = Path(path)
+        if not path.is_absolute():
+            raise OfflineSessionError('%s must be an absolute path' % label)
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            candidate = current / part
+            try:
+                entry = os.lstat(candidate)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'cannot inspect %s: %s' % (label, exc)) from exc
+            if stat.S_ISLNK(entry.st_mode):
+                raise OfflineSessionError('%s has a symlinked path segment' % label)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise OfflineSessionError(
+                    '%s has a non-directory path segment' % label)
+            current = candidate
+        try:
+            if current.resolve(strict=True) != current:
+                raise OfflineSessionError('%s is not canonical' % label)
+        except OSError as exc:
+            raise OfflineSessionError(
+                'cannot resolve %s: %s' % (label, exc)) from exc
+        return current
+
+    @staticmethod
+    def _require_free_space(destinations):
+        """Check each write destination's own filesystem, never a proxy.
+
+        ``destinations`` are ``(directory, bytes, label)`` triples for the
+        storage this preflight is about to consume.  Requirements that land on
+        the same device are summed once, so a shared filesystem is never
+        double-charged, while a split upload/expansion pair is checked
+        independently against the device that actually holds each part.
+        """
+        devices = {}
+        for directory, required, label in destinations:
+            if required <= 0:
+                continue
+            try:
+                entry = os.stat(directory)
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'cannot inspect %s storage: %s' % (label, exc)) from exc
+            total = devices.setdefault(entry.st_dev, [directory, 0])
+            total[1] += required
+        for directory, required in devices.values():
+            try:
+                vfs = os.statvfs(directory)
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'cannot check free space on %s: %s' % (directory, exc)) from exc
+            free = vfs.f_bavail * vfs.f_frsize
+            if free < required:
+                raise OfflineSessionError(
+                    'insufficient free space for compressed payload and expansion')
+
+    def preflight(self, document: bytes, signature_b64: bytes, sessionId=None):
         """Read-only readiness check: no session, no staging, no device write.
 
         The result shape is fixed: ``schemaVersion``, ``phase``,
         ``bootWriteState``, ``model``, ``bootContext``, ``actualSlot``,
         ``selectedSlot``, ``currentDeployment``, ``recoveryPartUuid``,
         ``recoveryDescriptorVersion``, ``recoveryMigrationRequired``,
-        ``channel`` and optional ``channelInferred``.  A controller-only
-        legacy system reports ``actualSlot: null`` plus its selected slot; no
-        slot is ever inferred from the controller's selection.  The bound
-        recovery journal is read with the same rules prepare and execute use,
-        so a legacy v1/v2 descriptor is reported as needing migration rather
-        than being ignored; nothing is written here.
+        ``channel`` and optional ``channelInferred``.  When the caller names an
+        existing session, ``sessionId`` is echoed as well.
+
+        ``sessionId`` is optional and only ever selects one existing protected
+        session by name.  With it, the receipt, its package document/signature
+        and the regular payload file already stored there are bound to the
+        authenticated package and the current device, and only those validated
+        bytes are credited against the free-space requirement.  Nothing is
+        created, written, locked or started; the first upgrade of a device
+        keeps the full compressed plus expanded requirement.
+
+        Space is checked on the filesystems that actually receive data: the
+        session's own protected directory for uploads, and the transaction
+        storage where the gzip payload is expanded.  The image sysroot is only
+        validated as canonical, never charged.  A resumed session that proves a
+        completed expansion through its bound transaction documents no longer
+        pays for that expansion; an upload without that proof pays the
+        remaining compressed bytes plus the full expansion.
+
+        A controller-only legacy system reports ``actualSlot: null`` plus its
+        selected slot; no slot is ever inferred from the controller's
+        selection.  The bound recovery journal is read with the same rules
+        prepare and execute use, so a legacy v1/v2 descriptor is reported as
+        needing migration rather than being ignored; nothing is written here.
         """
         if type(document) is not bytes or not 0 < len(document) <= _DOCUMENT_MAX:
             raise ValueError('document must be nonempty bytes of at most 2 MiB')
         if type(signature_b64) is not bytes or not 0 < len(signature_b64) <= _SIGNATURE_MAX:
             raise ValueError('signature must be nonempty bytes of at most 16 KiB')
+        if sessionId is not None and (
+                type(sessionId) is not str or not _SESSION_ID.fullmatch(sessionId)):
+            raise ValueError(
+                'sessionId must be exactly 32 lowercase hexadecimal characters')
         physical = self._require_identity(self._physical_info())
         snapshot = self._snapshot_state()
         # A pending OSTree transaction blocks prepare, execute, the boot
@@ -425,23 +622,53 @@ class OfflineSessionStore:
         # the device is idle, and the modern snapshot carries the same fields,
         # so preflight rejects the snapshot before package, dependency or
         # recovery work instead of claiming readiness prepare would refuse.
-        if isinstance(snapshot, dict) and (
-                snapshot.get('staged') or snapshot.get('rollback_queued')):
-            raise OfflineSessionError(
-                'a pending OSTree transaction refuses an offline upgrade')
+        if isinstance(snapshot, dict):
+            if snapshot.get('staged') or snapshot.get('rollback_queued'):
+                raise OfflineSessionError(
+                    'a pending OSTree transaction refuses an offline upgrade')
+            # prepare refuses a repository outside the trusted pair, so
+            # reporting readiness before this check would promise an upgrade
+            # that prepare must reject.  Both checks precede all expensive work.
+            if snapshot.get('repository') not in armada_os.REPOSITORIES:
+                raise OfflineSessionError(
+                    'configured OSTree repository is not supported')
         channel = system_transaction._snapshot_channel(snapshot)
         package = package_contract.load_package(
             document, signature_b64, trusted_key=self.trusted_key)
         package_contract.require_operation(
             package, physical['model'], 'offline-upgrade',
             updater_version=self.updater_version)
-        _parts, size, _digest, _expanded_size, _expanded_sha = \
+        parts, size, digest, expanded_size, _expanded_sha = \
             offline_payload._select_payload_entry(package)
-        sysroot = self._canonical_sysroot()
-        statvfs = os.statvfs(sysroot)
-        free = statvfs.f_bavail * statvfs.f_frsize
-        if free < size:
-            raise OfflineSessionError('insufficient free space for compressed payload')
+        stored_bytes = 0
+        expansion_done = False
+        if sessionId is not None:
+            session = self.resolve_session(sessionId)
+            stored_bytes = self._preflight_session_bytes(
+                session, document, signature_b64, physical, channel,
+                '/'.join(parts), size, digest)
+            expansion_done = self._prepared_expansion_evidence(
+                session, document, expanded_size)
+            # An existing session keeps its bytes and its expansion in its own
+            # protected directory, so that is the storage a resume consumes.
+            upload_dir = self._allocation_dir(session, 'session storage')
+            expansion_dir = self._allocation_dir(
+                session / 'transaction', 'transaction storage')
+        else:
+            # The session does not exist yet: attribute both the upload and the
+            # expansion to the nearest existing ancestor of the base and never
+            # create it from a read-only preflight.
+            upload_dir = self._allocation_dir(self.base, 'session base')
+            expansion_dir = upload_dir
+        # The image sysroot is validated with the same canonical rules, but the
+        # upload and expansion are never written there, so its free space must
+        # not gate a session stored on another filesystem.
+        self._canonical_sysroot()
+        self._require_free_space([
+            (upload_dir, size - stored_bytes, 'payload upload'),
+            (expansion_dir, 0 if expansion_done else expanded_size,
+             'payload expansion'),
+        ])
         self._check_updater_dependencies()
         # Read the journal and its descriptor version with the same read-only
         # check prepare uses.  Reporting readiness before this would claim a
@@ -467,6 +694,8 @@ class OfflineSessionStore:
         }
         if isinstance(snapshot, dict) and snapshot.get('channelInferred'):
             result['channelInferred'] = True
+        if sessionId is not None:
+            result['sessionId'] = sessionId
         return result
 
     def _ensure_base(self):

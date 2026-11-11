@@ -24,6 +24,7 @@ def _b64(raw: bytes) -> str:
 def _manager() -> mock.MagicMock:
     mgr = mock.MagicMock()
     mgr.store.info.return_value = {'protocol': 1}
+    mgr.store.preflight.return_value = {'phase': 'preflight_passed'}
     mgr.store.begin.return_value = {'sessionId': SID, 'state': 'uploading'}
     mgr.status.return_value = {'sessionId': SID, 'state': 'uploaded'}
     mgr.store.upload.return_value = {'offset': 9}
@@ -86,6 +87,55 @@ class OfflineRpcTests(unittest.TestCase):
         mgr.submit_prepare.assert_called_once_with(SID)
         mgr.submit_execute.assert_called_once_with(SID, ack)
         mgr.store.export.assert_called_once_with(SID, 'recovery.tar', 0, 14)
+
+    def test_preflight_keeps_the_document_only_shape_and_accepts_a_session(self):
+        mgr = _manager()
+        requests = [
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': SID}},
+        ]
+        rc, out = _run_lines(
+            mgr, b''.join((json.dumps(r) + '\n').encode('utf-8') for r in requests))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(r['ok'] for r in out))
+        self.assertEqual(
+            [{'phase': 'preflight_passed'}, {'phase': 'preflight_passed'}],
+            [r['result'] for r in out])
+        self.assertEqual(
+            [call.args for call in mgr.store.preflight.call_args_list],
+            [(b'doc', b'sig'), (b'doc', b'sig', SID)])
+        self.assertEqual(mgr.store.begin.call_count, 0)
+
+    def test_preflight_rejects_unknown_keys_and_malformed_sessions(self):
+        mgr = _manager()
+        bad = [
+            # signature stays mandatory even with a session id
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'sessionId': SID}},
+            # any other extra key is still rejected
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'offset': 0}},
+            # sessionId is validated as 32 lowercase hex characters
+            {'protocolVersion': 1, 'id': 3, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': 'BAD'}},
+            {'protocolVersion': 1, 'id': 4, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': SID.upper()}},
+        ]
+        rc, out = _run_lines(
+            mgr, b''.join((json.dumps(r) + '\n').encode('utf-8') for r in bad))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), len(bad))
+        for response in out:
+            self.assertFalse(response['ok'])
+            self.assertEqual(response['error']['code'], 'invalid_request')
+        _assert_no_calls(mgr)
 
     def test_restart_to_verify_passes_only_the_session_id(self):
         mgr = _manager()

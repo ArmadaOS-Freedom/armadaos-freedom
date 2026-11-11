@@ -24,7 +24,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 import test_update_channel_release as release_fixture  # noqa: E402
 import test_update_physical_slots as ab_fixture  # noqa: E402
 from updates import (  # noqa: E402
-    offline_context, offline_rpc, offline_session, physical_slots, trial_store,
+    channel_selection, offline_context, offline_rpc, offline_session,
+    physical_slots, system_transaction, trial_store,
 )
 from updates.package_contract import validate_package  # noqa: E402
 
@@ -180,6 +181,8 @@ class LegacyBootContextTests(unittest.TestCase):
         self.tmp = Path(self.tmpdir.name)
         self.sysroot = self.tmp / "sysroot"
         self.sysroot.mkdir()
+        # Absent by default so the host's own selection never decides a test.
+        self.state = self.tmp / "update-channel"
 
     def _cmdline(self, text=OPTIONS):
         path = self.tmp / "cmdline"
@@ -361,7 +364,102 @@ class LegacyBootContextTests(unittest.TestCase):
                 with self.assertRaises(offline_context.OfflineContextError):
                     offline_context.bind_legacy_evidence(
                         evidence, cmdline, mounts[offline_context.ROOT_MOUNT],
-                        mounts[offline_context.BOOT_MOUNT])
+                        mounts[offline_context.BOOT_MOUNT],
+                        sysroot_path=self.sysroot)
+
+    def _pointer_options(self, *, bootver=1, index=BOOT_SERIAL, bootcsum=BOOTSUM,
+                         root_uuid=ROOT_UUID, boot_uuid=BOOT_UUID):
+        return ("root=UUID=%s boot=UUID=%s ostree=/ostree/boot.%d/%s/%s/%d rw"
+                % (root_uuid, boot_uuid, bootver, OSNAME, bootcsum, index))
+
+    def _boot_entry(self, *, bootver=1, index=BOOT_SERIAL, bootcsum=BOOTSUM,
+                    target_checksum=CHECKSUM, target_serial=SERIAL):
+        """Create the BLS symlink a rewritten boot entry would leave behind."""
+        deploy = (self.sysroot / "ostree" / "deploy" / OSNAME / "deploy"
+                  / ("%s.%d" % (target_checksum, target_serial)))
+        deploy.mkdir(parents=True, exist_ok=True)
+        entry_dir = (self.sysroot / "ostree" / ("boot.%d.0" % bootver)
+                     / OSNAME / bootcsum)
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        version_link = self.sysroot / "ostree" / ("boot.%d" % bootver)
+        if not version_link.is_symlink() and not version_link.exists():
+            version_link.symlink_to("boot.%d.0" % bootver)
+        (entry_dir / str(index)).symlink_to(os.path.relpath(deploy, entry_dir))
+        return deploy
+
+    def test_rewritten_bls_pointer_after_append_still_binds(self):
+        # append_verified_deployment/write_deployments may rewrite the BLS entry
+        # (boot version and/or index) while /proc/cmdline keeps the pointer the
+        # running boot used.  Both rewrites still name the booted deployment.
+        cases = (
+            ("boot-version", 0, BOOT_SERIAL, 1, BOOT_SERIAL),
+            ("entry-index", 1, BOOT_SERIAL, 1, BOOT_SERIAL + 2),
+        )
+        for label, cmd_version, cmd_index, opt_version, opt_index in cases:
+            with self.subTest(label=label):
+                self._boot_entry(bootver=opt_version, index=opt_index)
+                cmdline = self._pointer_options(bootver=cmd_version, index=cmd_index)
+                options = self._pointer_options(bootver=opt_version, index=opt_index)
+                context = offline_context.bind_legacy_evidence(
+                    _evidence(options=options, bootserial=opt_index),
+                    cmdline, ROOT_UUID, BOOT_UUID, sysroot_path=self.sysroot)
+                self.assertEqual(context["deployment"], LEGACY_DEPLOYMENT)
+                self.assertIsNone(context["actualSlot"])
+
+    def test_rewritten_bls_pointer_to_another_deployment_is_rejected(self):
+        # Same osname and boot serial, but the current pointer names a different
+        # deployment: identity is never inferred from the index or the list.
+        self._boot_entry(bootver=1, index=BOOT_SERIAL + 2,
+                         target_checksum="c" * 64, target_serial=1)
+        options = self._pointer_options(bootver=1, index=BOOT_SERIAL + 2)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "not the booted deployment"):
+            offline_context.bind_legacy_evidence(
+                _evidence(options=options, bootserial=BOOT_SERIAL + 2),
+                self._pointer_options(bootver=0), ROOT_UUID, BOOT_UUID,
+                sysroot_path=self.sysroot)
+
+    def test_rewritten_bls_pointer_with_wrong_identity_is_rejected(self):
+        self._boot_entry(bootver=1, index=BOOT_SERIAL + 2)
+        wrong_checksum = self._pointer_options(
+            bootver=1, index=BOOT_SERIAL + 2, bootcsum="c" * 64)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "checksum"):
+            offline_context.bind_legacy_evidence(
+                _evidence(options=wrong_checksum, bootserial=BOOT_SERIAL + 2),
+                self._pointer_options(bootver=0), ROOT_UUID, BOOT_UUID,
+                sysroot_path=self.sysroot)
+        options = self._pointer_options(bootver=1, index=BOOT_SERIAL + 2)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "/sysroot mount UUID"):
+            offline_context.bind_legacy_evidence(
+                _evidence(options=options, bootserial=BOOT_SERIAL + 2),
+                self._pointer_options(bootver=0), BOOT_UUID, BOOT_UUID,
+                sysroot_path=self.sysroot)
+
+    def test_rewritten_bls_pointer_must_resolve_inside_the_sysroot(self):
+        # A missing entry (or one leaving the sysroot) is refused instead of
+        # falling back to the boot serial or the deployment list.
+        options = self._pointer_options(bootver=1, index=BOOT_SERIAL + 2)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "not a symlink"):
+            offline_context.bind_legacy_evidence(
+                _evidence(options=options, bootserial=BOOT_SERIAL + 2),
+                self._pointer_options(bootver=0), ROOT_UUID, BOOT_UUID,
+                sysroot_path=self.sysroot)
+
+    def test_legacy_reader_binds_a_rewritten_pointer_after_append(self):
+        # The strict reader forwards its sysroot to the pointer check, so the
+        # final physical inspection still binds after prepare rewrote the BLS.
+        self._boot_entry(bootver=1, index=BOOT_SERIAL + 2)
+        options = self._pointer_options(bootver=1, index=BOOT_SERIAL + 2)
+        with mock.patch.object(offline_context, "_read_ostree_booted",
+                               return_value=_evidence(options=options,
+                                                      bootserial=BOOT_SERIAL + 2)):
+            booted, context = self._state(
+                cmdline_path=self._cmdline(self._pointer_options(bootver=1)))
+        self.assertEqual(booted["serial"], SERIAL)
+        self.assertEqual(context["deployment"], LEGACY_DEPLOYMENT)
 
     def test_unrecognized_os_release_is_rejected(self):
         with mock.patch.object(offline_context, "_read_ostree_booted",
@@ -431,7 +529,8 @@ class LegacyBootContextTests(unittest.TestCase):
                                   return_value=False), \
                 mock.patch.object(offline_context, "_read_ostree_booted",
                                   return_value=_evidence(originRef=None)):
-            snap = offline_context.snapshot(sysroot_path=self.sysroot)
+            snap = offline_context.snapshot(
+                sysroot_path=self.sysroot, state_path=self.state)
         self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
         self.assertEqual(snap["channel"], "stable")
         self.assertTrue(snap["channelInferred"])
@@ -447,14 +546,16 @@ class LegacyBootContextTests(unittest.TestCase):
                                   return_value=False), \
                 mock.patch.object(offline_context, "_read_ostree_booted",
                                   return_value=_evidence(originRef=origin)):
-            snap = offline_context.snapshot(sysroot_path=self.sysroot)
+            snap = offline_context.snapshot(
+                sysroot_path=self.sysroot, state_path=self.state)
         self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
         self.assertEqual(snap["channel"], "preview")
         self.assertFalse(snap["channelInferred"])
 
     def test_unknown_container_origin_is_not_guessed(self):
         with self.assertRaises(offline_context.OfflineContextError):
-            offline_context.legacy_channel("docker://example.invalid/os:stable")
+            offline_context.legacy_channel(
+                "docker://example.invalid/os:stable", state_path=self.state)
 
     def _legacy_snapshot(self, sysroot):
         with mock.patch.object(offline_context.armada_os, "snapshot",
@@ -463,7 +564,7 @@ class LegacyBootContextTests(unittest.TestCase):
                                   return_value=False), \
                 mock.patch.object(offline_context, "_gi",
                                   return_value=_fake_gi(sysroot)):
-            return offline_context.snapshot()
+            return offline_context.snapshot(state_path=self.state)
 
     def test_legacy_snapshot_reports_the_booted_default_as_idle(self):
         booted = _FakeDeployment()
@@ -518,6 +619,145 @@ class LegacyBootContextTests(unittest.TestCase):
                                     "default deployment checksum"):
             self._legacy_snapshot(_FakeSysroot(
                 _FakeDeployment(), deployments=[_FakeDeployment(checksum="z")]))
+
+
+class LegacyChannelStateTests(unittest.TestCase):
+    """The persisted update-channel selection wins over the image origin."""
+
+    ORIGIN_STABLE = ("ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+                     "armadaos-freedom:stable@sha256:" + "d" * 64)
+    RAW_ORIGIN = "armada/stable"
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.tmp = Path(self.tmpdir.name)
+        self.sysroot = self.tmp / "sysroot"
+        self.sysroot.mkdir()
+        self.state = self.tmp / "var/lib/armada/update-channel"
+        self.state.parent.mkdir(parents=True)
+
+    def _write_state(self, content, mode=0o644):
+        self.state.write_bytes(content)
+        self.state.chmod(mode)
+
+    @contextmanager
+    def _root_owned(self):
+        # read_installed_channel trusts root and the distro account; emulate
+        # root ownership when the tests do not run as root.
+        if os.geteuid() == 0:
+            yield
+            return
+        original = os.fstat
+        owner = os.geteuid()
+
+        def root_owned(fd):
+            values = list(original(fd))
+            if values[4] == owner:
+                values[4] = 0
+            return os.stat_result(values)
+
+        with mock.patch.object(channel_selection.os, "fstat", side_effect=root_owned):
+            yield
+
+    ARMADA_UID = 4321
+
+    @contextmanager
+    def _armada_owned(self):
+        # The tmpfiles stamp declares the channel file for the distro account;
+        # emulate that owner and its passwd entry without a real chown.
+        original = os.fstat
+
+        def armada_owned(fd):
+            values = list(original(fd))
+            values[4] = self.ARMADA_UID
+            return os.stat_result(values)
+
+        with mock.patch.object(
+                channel_selection.os, "fstat", side_effect=armada_owned), \
+                mock.patch.object(
+                    channel_selection.pwd, "getpwnam",
+                    return_value=mock.Mock(pw_uid=self.ARMADA_UID)):
+            yield
+
+    def _snapshot(self, origin_ref, ownership=None):
+        if ownership is None:
+            ownership = self._root_owned()
+        with mock.patch.object(offline_context.armada_os, "snapshot",
+                               side_effect=RuntimeError("bootc status failed")), \
+                mock.patch.object(offline_context, "new_evidence_present",
+                                  return_value=False), \
+                mock.patch.object(offline_context, "_read_ostree_booted",
+                                  return_value=_evidence(originRef=origin_ref)), \
+                ownership:
+            return offline_context.snapshot(
+                sysroot_path=self.sysroot, state_path=self.state)
+
+    def test_armada_owned_state_reports_the_stored_channel(self):
+        # The current install leaves the selection owned by the distro account;
+        # the legacy snapshot must read it instead of failing as unsafe.
+        self._write_state(b"beta\n")
+        snap = self._snapshot(self.ORIGIN_STABLE, self._armada_owned())
+        self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
+        self.assertEqual(snap["channel"], "beta")
+        self.assertFalse(snap["channelInferred"])
+        self.assertEqual(system_transaction._snapshot_channel(snap), "beta")
+
+    def test_armada_owned_state_selects_a_raw_local_origin(self):
+        self._write_state(b"testing\n")
+        snap = self._snapshot(self.RAW_ORIGIN, self._armada_owned())
+        self.assertEqual(snap["channel"], "preview")
+        self.assertFalse(snap["channelInferred"])
+        self.assertEqual(system_transaction._snapshot_channel(snap), "testing")
+
+    def test_persisted_beta_overrides_a_stable_origin(self):
+        self._write_state(b"beta\n")
+        snap = self._snapshot(self.ORIGIN_STABLE)
+        self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
+        self.assertEqual(snap["channel"], "beta")
+        self.assertFalse(snap["channelInferred"])
+        # Submission identity compares exactly this derived value.
+        self.assertEqual(system_transaction._snapshot_channel(snap), "beta")
+
+    def test_persisted_testing_selects_a_raw_local_origin(self):
+        # A raw local commit origin names no channel, so it is never forced
+        # through the strict OCI parser; the persisted selection still wins.
+        self._write_state(b"testing\n")
+        snap = self._snapshot(self.RAW_ORIGIN)
+        self.assertEqual(snap["repository"], offline_context.armada_os.FREEDOM)
+        self.assertEqual(snap["channel"], "preview")
+        self.assertFalse(snap["channelInferred"])
+        self.assertEqual(system_transaction._snapshot_channel(snap), "testing")
+
+    def test_absent_state_keeps_the_origin_tag_and_stable_inference(self):
+        tagged = self._snapshot(self.ORIGIN_STABLE)
+        self.assertEqual(tagged["channel"], "stable")
+        self.assertFalse(tagged["channelInferred"])
+        inferred = self._snapshot(None)
+        self.assertEqual(inferred["channel"], "stable")
+        self.assertTrue(inferred["channelInferred"])
+        self.assertFalse(self.state.exists())
+
+    def test_invalid_or_unsafe_state_is_never_ignored(self):
+        self._write_state(b"feature\n")
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "channel state"):
+            self._snapshot(self.ORIGIN_STABLE)
+        self._write_state(b"beta\n", 0o666)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "channel state"):
+            self._snapshot(self.ORIGIN_STABLE)
+        # A raw local origin must fail too instead of silently inferring stable.
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "channel state"):
+            self._snapshot(self.RAW_ORIGIN)
+        self.state.unlink()
+        target = self.tmp / "target"
+        target.write_bytes(b"beta\n")
+        self.state.symlink_to(target)
+        with self.assertRaisesRegex(offline_context.OfflineContextError,
+                                    "channel state"):
+            self._snapshot(self.ORIGIN_STABLE)
 
 
 class MountEvidenceTests(unittest.TestCase):
@@ -1068,7 +1308,10 @@ class PreflightTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         patcher = mock.patch.object(
-            offline_session.armada_os, "snapshot", return_value={"channel": "stable"})
+            offline_session.armada_os, "snapshot", return_value={
+                "channel": "stable",
+                "repository": offline_session.armada_os.REPOSITORIES[0],
+            })
         patcher.start()
         self.addCleanup(patcher.stop)
         patcher = mock.patch.object(
