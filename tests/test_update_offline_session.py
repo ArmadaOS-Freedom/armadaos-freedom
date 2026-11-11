@@ -266,9 +266,26 @@ class OfflineSessionStoreTest(unittest.TestCase):
             store.export(sid, "boot/link.img", 0, 4)
         link.unlink()
 
+    _MINIMAL_REPOSITORY_CONFIG = "[core]\nrepo_version=1\n"
+
+    def _write_repository(self, sysroot, config=None):
+        """Create the minimal OSTree repository metadata preflight accepts.
+
+        ``objects`` is the directory libostree requires and ``config`` names
+        the supported format, so every test that is not about repository
+        validity starts from a repository an actual prepare could open.
+        ``config`` defaults to the bare format; reserve tests override it.
+        """
+        repository = sysroot / "ostree" / "repo"
+        repository.mkdir(parents=True, exist_ok=True)
+        (repository / "objects").mkdir(exist_ok=True)
+        (repository / "config").write_text(
+            self._MINIMAL_REPOSITORY_CONFIG if config is None else config)
+        return repository
+
     def _preflight_sysroot(self, name):
         sysroot = (self.tmp / ("sysroot-" + name)).resolve()
-        (sysroot / "ostree" / "repo").mkdir(parents=True, exist_ok=True)
+        self._write_repository(sysroot)
         return sysroot
 
     @staticmethod
@@ -675,11 +692,15 @@ class OfflineSessionStoreTest(unittest.TestCase):
         self.assertFalse(base.exists())
 
     def _preflight_work(self, name):
-        """A resolved working directory holding both the session and sysroot."""
+        """A resolved working directory holding both the session and sysroot.
+
+        The sysroot starts with a usable repository, so these tests vary only
+        the storage they are about.
+        """
         work = (self.tmp / name).resolve()
         work.mkdir(exist_ok=True)
         sysroot = work / "image"
-        (sysroot / "ostree" / "repo").mkdir(parents=True, exist_ok=True)
+        self._write_repository(sysroot)
         return work, work / "offline", sysroot
 
     def test_preflight_rejects_a_destination_without_room_despite_an_ample_session(self):
@@ -719,7 +740,8 @@ class OfflineSessionStoreTest(unittest.TestCase):
     def test_preflight_sums_a_shared_filesystem_and_keeps_the_repository_reserve(self):
         # One filesystem holds the expansion, the extraction and the import, so
         # the three allowances are summed and the repository's default reserve
-        # (3 percent, no config present) is charged once more on top.
+        # (3 percent, because the fixture config declares no reserve keys) is
+        # charged once more on top.
         work, base, sysroot = self._preflight_work("preflight-shared")
         sid, doc, sig, data = self._session_for_preflight(base)
         total = 1_000_000
@@ -740,7 +762,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
         repository = sysroot / "ostree" / "repo"
         repository.mkdir(parents=True, exist_ok=True)
         config = repository / "config"
-        config.write_text("[core]\nmin-free-space-percent=10\n"
+        config.write_text("[core]\nrepo_version=1\nmin-free-space-percent=10\n"
                           "min-free-space-size=1MB\n")
         total = 1_000_000
         allowances = 3 * (2 * len(data))
@@ -760,7 +782,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
             sid)
 
         # A reserve this module cannot honour is refused, never ignored.
-        config.write_text("[core]\nmin-free-space-size=3XB\n")
+        config.write_text("[core]\nrepo_version=1\nmin-free-space-size=3XB\n")
         with self.assertRaisesRegex(
                 offline_session.OfflineSessionError, "reserve size"):
             self._storage_store(base, sysroot, room).preflight(doc, sig, sid)
@@ -768,7 +790,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
         # A zero size disables only the absolute form: the percent reserve the
         # same config still names keeps applying, rather than the reserve
         # collapsing to nothing.
-        config.write_text("[core]\nmin-free-space-size=0\n"
+        config.write_text("[core]\nrepo_version=1\nmin-free-space-size=0\n"
                           "min-free-space-percent=10\n")
         percent_reserve = total * 10 // 100
         percent_short = [(str(work), 1, allowances + percent_reserve - 1, total)]
@@ -781,7 +803,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
             sid)
 
         # The percent form is bounded to 0..99, so 100 is refused, not clamped.
-        config.write_text("[core]\nmin-free-space-percent=100\n")
+        config.write_text("[core]\nrepo_version=1\nmin-free-space-percent=100\n")
         with self.assertRaisesRegex(
                 offline_session.OfflineSessionError, "reserve percent"):
             self._storage_store(base, sysroot, percent_room).preflight(
@@ -857,7 +879,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
         repository = sysroot / "ostree" / "repo"
         repository.mkdir(parents=True, exist_ok=True)
         config = repository / "config"
-        config.write_text("[core]\nmin-free-space-percent=1\n")
+        config.write_text("[core]\nrepo_version=1\nmin-free-space-percent=1\n")
         before = (self._tree(work), config.read_bytes())
         opens = []
         real_open = os.open
@@ -910,6 +932,52 @@ class OfflineSessionStoreTest(unittest.TestCase):
                 offline_session.OfflineSessionError, "symlinked path segment"):
             store.preflight(doc, sig, sid)
         self.assertEqual(list(outside.iterdir()), [])
+
+    @staticmethod
+    def _objects_as_a_file(repository):
+        (repository / "objects").rmdir()
+        (repository / "objects").write_text("not a directory")
+
+    def test_preflight_requires_a_usable_repository_without_writing(self):
+        # An existing repository directory is not enough: ``ostree pull-local``
+        # needs the ``objects`` directory and a bounded config naming the
+        # supported repo_version.  Every other shape is refused before any
+        # storage promise is made, and the valid one passes without a single
+        # file, directory or config change in the sysroot.
+        cases = (
+            ("valid", None),
+            ("absent-config", lambda repo: (repo / "config").unlink()),
+            ("absent-objects", lambda repo: (repo / "objects").rmdir()),
+            ("file-objects", self._objects_as_a_file),
+            ("unsupported-version", lambda repo: (repo / "config").write_text(
+                "[core]\nrepo_version=2\n")),
+            ("missing-version", lambda repo: (repo / "config").write_text(
+                "[core]\nmin-free-space-percent=1\n")),
+            ("malformed-version", lambda repo: (repo / "config").write_text(
+                "[core]\nrepo_version=one\n")),
+            ("malformed-config", lambda repo: (repo / "config").write_text(
+                "[core]\nrepo_version\n")),
+        )
+        for label, prepare in cases:
+            with self.subTest(repository=label):
+                work, base, sysroot = self._preflight_work(
+                    "preflight-repository-" + label)
+                sid, doc, sig, data = self._session_without_lock(base)
+                repository = sysroot / "ostree" / "repo"
+                if prepare is not None:
+                    prepare(repository)
+                before = self._tree(work)
+                store = self._preflight_store(
+                    base, self._preflight_required(data),
+                    sysroot_path=sysroot)
+                if label == "valid":
+                    self.assertEqual(
+                        store.preflight(doc, sig, sid)["sessionId"], sid)
+                else:
+                    with self.assertRaises(
+                            offline_session.OfflineSessionError):
+                        store.preflight(doc, sig, sid)
+                self.assertEqual(self._tree(work), before)
 
     def _space_dirs(self, name, count):
         root = (self.tmp / name).resolve()

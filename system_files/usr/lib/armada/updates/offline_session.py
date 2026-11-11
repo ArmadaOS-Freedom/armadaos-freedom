@@ -38,6 +38,8 @@ _DOCUMENT_MAX = 2 * 1024 * 1024
 _SIGNATURE_MAX = 16 * 1024
 _JSON_MAX = 2 * 1024 * 1024
 _REPOSITORY_CONFIG_MAX = 64 * 1024
+# The only on-disk repository format this updater's ``pull-local`` can open.
+_REPOSITORY_VERSION = 1
 _CHUNK_MAX = 1024 * 1024
 _SESSION_ID = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
 _MODELS = frozenset({'TB322FC', 'TB323FU'})
@@ -139,7 +141,8 @@ def _repository_config(path):
 
     Strictly read-only: the file is inspected without following links and read
     through the same bounded helper the protected session documents use.  A
-    repository without a config keeps libostree's default reserve.
+    missing config returns ``None``; callers that need an openable repository
+    refuse it, while the reserve reader alone would keep libostree's default.
     """
     try:
         os.lstat(path)
@@ -155,6 +158,32 @@ def _repository_config(path):
     except (ValueError, UnicodeDecodeError) as exc:
         raise OfflineSessionError(
             'cannot read the OSTree repository config: %s' % exc) from exc
+
+
+def _require_repository_version(text):
+    """Refuse a repository config that ``ostree pull-local`` cannot open.
+
+    Only the format this updater writes is supported, so a config that is
+    missing, has no ``[core]`` section, or names another or malformed version
+    is refused instead of being planned for.  Nothing is written; the text
+    already passed through the bounded ``_repository_config`` reader.
+    """
+    if text is None:
+        raise OfflineSessionError('OSTree repository config is missing')
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise OfflineSessionError(
+            'OSTree repository config is malformed: %s' % exc) from exc
+    version = parser.get('core', 'repo_version', fallback=None)
+    if version is None:
+        raise OfflineSessionError(
+            'OSTree repository config has no [core] repo_version')
+    digits = version.strip()
+    if not digits.isdigit() or int(digits) != _REPOSITORY_VERSION:
+        raise OfflineSessionError(
+            'OSTree repository repo_version is unsupported: %r' % version)
 
 
 def _reserve_size_bytes(value):
@@ -746,6 +775,24 @@ class OfflineSessionStore:
                     'insufficient free space for the payload, its expansion '
                     'and the repository import')
 
+    def _check_repository(self, repository, config_text):
+        """Refuse an existing repository that ``ostree pull-local`` cannot open.
+
+        The empty ``ostree/repo`` a fresh sysroot may leave, or a repository
+        written by an unsupported libostree, would fail the actual prepare
+        after every allocation was promised.  Only the two things the import
+        needs are proven here, read-only through the existing path-safety
+        helpers: the required ``objects`` directory and a bounded config
+        naming the supported format.  Nothing is created or rewritten.
+        """
+        objects = self._allocation_dir(
+            repository / 'objects', 'repository objects')
+        missing = repository / 'objects'
+        if objects != missing:
+            raise OfflineSessionError(
+                'repository objects directory is missing: %s' % missing)
+        _require_repository_version(config_text)
+
     def preflight(self, document: bytes, signature_b64: bytes, sessionId=None):
         """Read-only readiness check: no session, no staging, no device write.
 
@@ -768,11 +815,12 @@ class OfflineSessionStore:
         session's protected directory for uploads, the transaction storage that
         holds the expanded image, the staging tree ``btrfs restore`` extracts
         the package repository into, and the ``sysroot/ostree/repo`` that
-        ``ostree pull-local`` fills.  The repository must already exist;
-        preflight never creates it.  Allocations on one filesystem are summed
-        once, keyed by the Btrfs pool FSID so subvolumes with different
-        ``st_dev`` are not split, and each path must still report enough of its
-        own available space.  The repository destination also keeps the
+        ``ostree pull-local`` fills.  The repository must already exist and be
+        openable: an ``objects`` directory plus a bounded ``config`` declaring
+        ``[core] repo_version=1``; preflight never creates or rewrites it.
+        Allocations on one filesystem are summed once, keyed by the Btrfs pool
+        FSID so subvolumes with different ``st_dev`` are not split, and each
+        path must still report enough of its own available space.  The repository destination also keeps the
         repository's own reserve, charged once, and distinct filesystems are
         checked independently.
         The authenticated ``expandedBytes`` is the planning allowance for the
@@ -825,6 +873,11 @@ class OfflineSessionStore:
         if repository_dir != repository:
             raise OfflineSessionError(
                 'repository destination does not exist: %s' % repository)
+        # An existing directory is not yet a repository: prove its layout and
+        # format before the package, storage and journal work claims readiness.
+        # The same bounded config text is reused for the reserve below.
+        repository_config = _repository_config(repository / 'config')
+        self._check_repository(repository, repository_config)
         channel = system_transaction._snapshot_channel(snapshot)
         package = package_contract.load_package(
             document, signature_b64, trusted_key=self.trusted_key)
@@ -872,7 +925,7 @@ class OfflineSessionStore:
             # The reserve is the repository's own; it is read from the
             # canonical config and never written back.
             reserve = (repository_dir, _repository_reserve_minimum(
-                _repository_config(root / 'ostree' / 'repo' / 'config')))
+                repository_config))
         self._require_free_space(allocations, reserve=reserve)
         self._check_updater_dependencies()
         # Read the journal and its descriptor version with the same read-only

@@ -1432,6 +1432,9 @@ class PreflightTests(unittest.TestCase):
     def _repository(self):
         repository = self.sysroot / "ostree" / "repo"
         repository.mkdir(parents=True, exist_ok=True)
+        (repository / "objects").mkdir(exist_ok=True)
+        (repository / "config").write_text(
+            "[core]\nrepo_version=1\n", encoding="utf-8")
         return repository
 
     def test_preflight_is_read_only_and_reports_no_slot_claim(self):
@@ -1452,7 +1455,13 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result["recoveryMigrationRequired"])
         self.assertEqual(result["model"], "TB322FC")
         self.assertFalse(self.base.exists())
-        self.assertEqual(list(repository.iterdir()), [])
+        self.assertEqual(
+            sorted(path.name for path in repository.iterdir()),
+            ["config", "objects"])
+        self.assertEqual(
+            (repository / "config").read_text(encoding="utf-8"),
+            "[core]\nrepo_version=1\n")
+        self.assertEqual(list((repository / "objects").iterdir()), [])
         writes.assert_not_called()
 
     def test_preflight_keeps_the_strict_identity(self):
