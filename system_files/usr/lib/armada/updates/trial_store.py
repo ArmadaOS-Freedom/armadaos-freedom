@@ -2,7 +2,15 @@
 """Durable dual-copy journal I/O for the Linux update trial record.
 Callers must supply a fresh, unlocked fd for an already-verified internal partition.
 Functions in this module own flock serialization on the supplied file descriptor.
-Does not perform device selection, partition migration, or slot activation."""
+Does not perform device selection, partition migration, or slot activation.
+
+``save`` is copy-on-write: the next sequence is written into the record copy
+that was *not* selected, then fsynced and read back in full.  The previously
+selected copy is never touched, so the old record stays selectable until the
+new record is durable.  This pins the journal commit boundary only.  It is not
+a claim that a write to any individual boot partition is atomic across a power
+interruption; callers must rely on the journal plus one complete image per
+state, never on intra-partition write atomicity."""
 
 from __future__ import annotations
 
@@ -124,13 +132,26 @@ def save(fd: int, expected: TrialSnapshot, next_record: TrialRecord) -> int:
             raise TrialStoreError("concurrent modification detected")
         target = _validate_transition(fresh, next_record)
         offset = REGION_OFFSET + (TAIL_OFFSET_A if target == 0 else TAIL_OFFSET_B)
+        other = target ^ 1
+        other_offset = REGION_OFFSET + (TAIL_OFFSET_A if other == 0 else TAIL_OFFSET_B)
+        previous_copy = os.pread(fd, RECORD_BYTES, other_offset)
         written = os.pwrite(fd, wire, offset)
         if written != RECORD_BYTES:
             raise TrialStoreError(f"short trial record write: {written}")
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise TrialStoreError(
+                "trial journal fsync failed; durable commit state is ambiguous"
+            ) from exc
         readback = os.pread(fd, RECORD_BYTES, offset)
         if readback != wire:
             raise TrialStoreError("trial record readback verification failed")
+        if os.pread(fd, RECORD_BYTES, other_offset) != previous_copy:
+            raise TrialStoreError("copy-on-write journal copy changed")
+        verified = _read_snapshot(fd, partition_uuid, board)
+        if verified.selected != target or verified.record != next_record:
+            raise TrialStoreError("trial journal durable readback mismatch")
         return target
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)

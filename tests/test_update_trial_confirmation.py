@@ -291,6 +291,54 @@ class TrialConfirmationTest(unittest.TestCase):
             tc.confirm_trial()
         self.assertEqual(self.open_calls, [False])
 
+    def test_early_wayland_readiness_retries_outside_lock_and_rechecks_evidence(self) -> None:
+        self._seed_trial()
+        runtime_valid = self._valid_runtime()
+        self.runtime_mock.side_effect = [
+            runtime_health.RuntimeNotReady("No login sessions reported"),
+            runtime_health.RuntimeNotReady(
+                "No candidate Wayland sockets in /run/user/1000"
+            ),
+            runtime_valid,
+            runtime_valid,
+        ]
+        retry_sleeps = []
+
+        def sleep_and_assert_unlocked(seconds: int) -> None:
+            if seconds != tc.READINESS_RETRY_DELAY_SECONDS:
+                return
+            retry_sleeps.append(seconds)
+            lfd = os.open(self.lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lfd, fcntl.LOCK_UN)
+            finally:
+                os.close(lfd)
+
+        self.sleep_mock.side_effect = sleep_and_assert_unlocked
+        self.assertEqual(tc.confirm_with_readiness_retry()["state"], "confirmed")
+        self.assertEqual(
+            retry_sleeps, [tc.READINESS_RETRY_DELAY_SECONDS] * 2
+        )
+        # Both not-ready attempts abort after their single pre-stability boot
+        # check, while the final successful attempt checks boot twice (before
+        # and after the stability window), so boot is collected four times.
+        self.assertEqual(self.boot_mock.call_count, 4)
+        self.assertEqual(self.runtime_mock.call_count, 4)
+        self.promote_mock.assert_called_once()
+
+    def test_fatal_runtime_evidence_failure_is_not_retried(self) -> None:
+        self._seed_trial()
+        self.runtime_mock.side_effect = runtime_health.RuntimeHealthError(
+            "Unsafe runtime dir ownership/permissions on /run/user/1000"
+        )
+        with self.assertRaises(runtime_health.RuntimeHealthError):
+            tc.confirm_with_readiness_retry()
+        self.assertEqual(self.boot_mock.call_count, 1)
+        self.assertEqual(self.runtime_mock.call_count, 1)
+        self.sleep_mock.assert_not_called()
+        self.promote_mock.assert_not_called()
+
     def test_lock_contention_and_symlink_rejected_before_partition_open(self) -> None:
         lfd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         self.addCleanup(os.close, lfd)
@@ -312,7 +360,7 @@ class TrialConfirmationTest(unittest.TestCase):
     def test_io_or_verification_failure_propagates_and_releases_lock(self) -> None:
         self._seed_trial()
         with mock.patch.object(store.os, "fsync", side_effect=OSError("fsync boom")), mock.patch.object(os, "pwrite", wraps=os.pwrite) as pwrite_mock:
-            with self.assertRaises(OSError):
+            with self.assertRaises(store.TrialStoreError):
                 tc.confirm_trial()
         self.assertEqual(pwrite_mock.call_count, 1)
         self.assertEqual(self.open_calls, [False, True])

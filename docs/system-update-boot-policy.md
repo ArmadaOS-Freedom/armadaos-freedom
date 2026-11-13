@@ -17,16 +17,54 @@ legacy single-slot readiness.
    OSTree deployment is used as the target; nothing is fetched.
 3. Boot materials are produced once per slot from that slot's own boot
    material, so both slots are rebuilt independently for the same deployment.
-4. Both slots are written with the same deployment and one shared transaction
-   UUID.  The inactive slot is written first, then the running slot, each with
-   a full readback.  On a write error the writer attempts to restore and verify each started slot; an unverified restore is reported as uncertain, never as success.
-5. One `OFFLINE_DUAL` (v2) trial record is prepared.  `fromSlot`/`targetSlot`
-   index the two boot hashes and the write order only; `other_boot_sha256`
-   carries the hash of the running slot's mirrored boot image.
-6. Status reports `state=awaiting_reboot`, `bootWriteState=written`,
+4. The non-running (inactive) slot is written first, fsynced and fully read
+   back while the running image and the old journal are still valid.  The
+   running slot is not touched at this point.
+5. At the commit boundary, one `OFFLINE_DUAL` (v2) PREPARED trial record is
+   written with compare-and-swap into the alternate copy of the dual-copy
+   journal, fsynced and read back in full.  Only after that durable readback
+   does the writer touch the running slot, which is also written and read
+   back.  `fromSlot`/`targetSlot` index the two boot hashes and the write order
+   only; `other_boot_sha256` carries the hash of the running slot's mirrored
+   boot image.
+6. Power loss before the commit boundary leaves the old journal and the old
+   running image valid.  A pre-commit failure restores the already-written
+   non-running image only when a full journal re-read proves the previous
+   snapshot, including both record copies, is unchanged.  At or after the
+   boundary the PREPARED journal and the verified non-running image always form
+   one complete matching pair, so a committed matching image is never restored
+   merely because a later status, report, pwrite/readback or journal I/O step
+   failed.  A committed failure preserves that image and reports
+   `recovery_required`; an ambiguous commit (including an fsync failure,
+   ambiguous compare-and-swap, or unreadable readback) preserves it and reports
+   `recovery_required` with `bootWriteState=uncertain` and
+   `journalCommitState=ambiguous`.  These preserved failures carry
+   `bootRestoreState=not_restored`.  Failure statuses never advertise a reboot;
+   `requiresReboot=true` is emitted only after both slots and the journal have
+   been verified.
+7. Status reports `state=awaiting_reboot`, `bootWriteState=written`,
    `bootPolicy=dual-boot-no-slot-control` and `slotControlState=not_issued`.
    No Android slot selection, slot-success marking, retry/priority or UFS
    boot-LUN change, or Android BCB write is issued.
+
+### Power-loss boundary and limits
+
+The durability boundary is the journal record, not a single partition write.
+A `pwrite`/`fsync`/readback of one boot partition is not claimed to be atomic
+across a power interruption: a torn image is tolerated only because the other
+image and the selected journal state still form a complete matching pair.  The
+journal itself is copy-on-write, so the previously selected record copy stays
+intact until the new record has been fsynced and re-read. A complete matching
+image on one physical slot does not guarantee that Android will select it on
+the next power-on. If power fails while the selected slot is being rewritten,
+the other slot can hold the only verified image. The Linux updater does not
+change Android's slot selection to boot that image.
+
+The mirrored policy deliberately uses exactly the two physical boot slots.
+There is no third Linux slot and no automated repartition or recovery: if both
+mirrored images are unusable at once, the transaction reports the failure and
+stops.  An extra selector, stale prepared record, or boot-control fallback is
+never synthesized to escape that limit.
 
 ## Boot
 
@@ -47,10 +85,10 @@ equals the corresponding recorded hash.  It then:
 ## Rollback
 
 An explicit rollback repacks **both** physical slots from the retained previous
-OSTree deployment, writes them in the same verified order, and prepares the
-same v2 trial record for the previous deployment.  Confirmation of that record
-commits the previous deployment as the default and retains the newer one.
-There is no slot selection anywhere in the flow.
+OSTree deployment, using the same non-running-then-commit-then-running order
+and the same v2 trial record for the previous deployment.  Confirmation of that
+record commits the previous deployment as the default and retains the newer
+one.  There is no slot selection anywhere in the flow.
 
 ## Read-only dependencies that remain
 

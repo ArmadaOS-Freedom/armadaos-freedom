@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-only
+"""Root-only behavioral tests for detached offline update jobs.
+
+Private session storage is created with 0700 root-owned directories and is
+opened through ``fcntl``/``O_NOFOLLOW``, so the whole suite is meaningful only
+when it runs as root.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +25,10 @@ from test_update_channel_release import (
     _generate_keypair, _sign_bytes, _upgrade_package_dict,
 )
 
+ROOT_REQUIRED = unittest.skipUnless(
+    getattr(os, 'geteuid', lambda: -1)() == 0,
+    'offline session storage requires root-owned private directories')
+
 PHYSICAL = {
     'model': 'TB322FC', 'actualSlot': 'a', 'inactiveSlot': 'b',
     'deployment': 'armada/' + ('a' * 64) + '.0',
@@ -27,8 +38,11 @@ PAYLOAD = b'data'
 TX = '11111111-2222-4333-8444-555555555555'
 OTHER_TX = '99999999-8888-4777-8666-555555555555'
 NEW_DEPLOYMENT = 'armada/' + ('b' * 64) + '.1'
+ORIGINAL_BOOT = {'a': 'e' * 64, 'b': 'f' * 64}
+NEW_BOOT = {'a': '1' * 64, 'b': '2' * 64}
 
 
+@ROOT_REQUIRED
 class OfflineJobTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -105,43 +119,61 @@ class OfflineJobTests(unittest.TestCase):
                     'recoveryManifestSha256': prepared['recoveryManifestSha256'],
                     'files': manifest['files']}
 
-    def prepared_executed(self, work_dir, **_kwargs):
-        """Like ``prepared`` but the plan carries the executed slot binding."""
+    def write_executed_documents(self, work_dir, transaction_id):
+        """Write the transaction documents a completed prepare leaves behind."""
         work_dir.mkdir()
-        plan = {'transactionId': TX, 'operation': 'offline-upgrade',
+        plan = {'schemaVersion': 1, 'operation': 'offline-upgrade',
+                'policy': 'offline-dual', 'transactionId': transaction_id,
+                'model': PHYSICAL['model'],
                 'oldDeployment': PHYSICAL['deployment'],
                 'newDeployment': NEW_DEPLOYMENT,
-                'fromSlot': 'a', 'targetSlot': 'b'}
+                'fromSlot': 'a', 'targetSlot': 'b',
+                'originalBootSha256': dict(ORIGINAL_BOOT),
+                'newBootSha256': dict(NEW_BOOT)}
         manifest = {'files': [{'path': 'original.img', 'bytes': len(PAYLOAD),
                                'sha256': hashlib.sha256(PAYLOAD).hexdigest()}]}
         plan_raw = system_transaction._save_json(work_dir, 'plan.json', plan)
         manifest_raw = system_transaction._save_json(
             work_dir, 'recovery-manifest.json', manifest)
-        prepared = {'transactionId': TX,
+        prepared = {'transactionId': transaction_id,
                     'planSha256': hashlib.sha256(plan_raw).hexdigest(),
                     'recoveryManifestSha256': hashlib.sha256(
                         manifest_raw).hexdigest()}
         system_transaction._save_json(work_dir, 'prepared.json', prepared)
-        status = {'state': 'awaiting_recovery_export', 'transactionId': TX}
+        status = {'state': 'awaiting_recovery_export',
+                  'transactionId': transaction_id}
         system_transaction._save_json(work_dir, 'status.json', status)
         (work_dir / 'original.img').write_bytes(PAYLOAD)
         return status
 
-    def executed_session(self):
-        """Return a session whose execute worker reported awaiting_reboot."""
+    def prepared_session(self, transaction_id=TX):
+        """Return a session whose prepare job completed for one transaction."""
         sid = self.session()
-        with mock.patch('updates.offline_prepare.prepare_offline_update',
-                        side_effect=self.prepared_executed):
+        with mock.patch(
+                'updates.offline_prepare.prepare_offline_update',
+                side_effect=lambda work_dir, **_kwargs: (
+                    self.write_executed_documents(work_dir, transaction_id))):
             mgr = self.manager()
             mgr.submit_prepare(sid)
             mgr.run_job('prepare', sid)
-        mgr.submit_execute(sid, self.ack(sid))
+        self.runner.reset_mock()
+        return sid
+
+    def submitted_session(self, transaction_id=TX):
+        """Return a session whose execute job was submitted and queued."""
+        sid = self.prepared_session(transaction_id)
+        self.manager().submit_execute(sid, self.ack(sid))
+        return sid
+
+    def executed_session(self):
+        """Return a session whose execute worker reported awaiting_reboot."""
+        sid = self.submitted_session()
         with mock.patch('updates.offline_execute.execute_offline_update',
                         return_value={'state': 'awaiting_reboot',
                                       'bootWriteState': 'written',
                                       'requiresReboot': True}):
             self.assertEqual(
-                mgr.run_job('execute', sid)['state'], 'awaiting_reboot')
+                self.manager().run_job('execute', sid)['state'], 'awaiting_reboot')
         return sid
 
     def evidence(self, sid, **overrides):
@@ -163,6 +195,248 @@ class OfflineJobTests(unittest.TestCase):
     def receipt_bytes(self, sid):
         with self.store.session_lock(sid) as session:
             return (session / 'receipt.json').read_bytes()
+
+    @staticmethod
+    def write_report():
+        """Return the verified dual-slot write report a worker leaves behind."""
+        return {
+            'phase': 'dual_boots_written', 'model': PHYSICAL['model'],
+            'transactionUuid': TX, 'deployment': NEW_DEPLOYMENT,
+            'fromSlot': 'a', 'slotOrder': ['b', 'a'],
+            'writes': {
+                slot: {
+                    'sourceBootSha256': ORIGINAL_BOOT[slot],
+                    'candidate': {'path': '/work/candidate-%s.img' % slot,
+                                  'bytes': 4096,
+                                  'sha256': NEW_BOOT[slot]},
+                    'bytesWritten': 4096,
+                    'readbackSha256': NEW_BOOT[slot],
+                } for slot in ('a', 'b')
+            },
+        }
+
+    def completed_status(self, sid, report=None, **overrides):
+        """Write the durable execute result a worker leaves before it reports."""
+        with self.store.session_lock(sid) as session:
+            transaction = session / 'transaction'
+            prepared = json.loads((transaction / 'prepared.json').read_text())
+            status = {
+                'schemaVersion': 1, 'component': 'system',
+                'operation': 'offline-upgrade', 'policy': 'offline-dual',
+                'bootPolicy': 'dual-boot-no-slot-control',
+                'transactionId': TX, 'model': PHYSICAL['model'],
+                'fromSlot': 'a', 'targetSlot': 'b',
+                'oldDeployment': PHYSICAL['deployment'],
+                'newDeployment': NEW_DEPLOYMENT,
+                'planSha256': prepared['planSha256'],
+                'state': 'awaiting_reboot', 'phase': 'awaiting_reboot',
+                'requiresReboot': True, 'bootWriteState': 'written',
+                'slotControlState': 'not_issued',
+            }
+            status.update(overrides)
+            system_transaction._save_json(transaction, 'status.json', status)
+            write_report = self.write_report() if report is None else report
+            system_transaction._save_json(
+                transaction, 'write-report.json', write_report)
+            return status
+
+    def interrupted_execute(self, receipt_state='executing', report=None,
+                            **overrides):
+        """Return a session whose execute worker died before recording its result."""
+        sid = self.executed_session()
+        self.completed_status(sid, report=report, **overrides)
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            receipt['state'] = receipt_state
+            receipt.pop('result', None)
+            self.store.update_receipt(session, receipt)
+        self.runner.return_value.returncode = 3
+        return sid
+
+    def test_interrupted_execute_adopts_verified_completion_once(self):
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.evidence(sid)
+        mgr = self.manager()
+        launches = sum(1 for call in self.runner.call_args_list
+                       if call.args[0][0] == 'systemd-run')
+
+        first = mgr.status(sid)
+        self.assertEqual(first['state'], 'awaiting_reboot')
+        self.assertEqual(first['result']['state'], 'awaiting_reboot')
+        self.assertNotIn('jobInterrupted', first)
+        self.assertNotIn('attentionRequired', first)
+        self.assertEqual(first['completion']['state'], 'awaiting_reboot')
+        self.assertEqual(first['completion']['transactionId'], TX)
+        self.assertTrue(first['completion']['restartEligible'])
+
+        recorded = self.receipt_bytes(sid)
+        second = mgr.status(sid)
+        self.assertEqual(second['state'], 'awaiting_reboot')
+        self.assertEqual(self.receipt_bytes(sid), recorded)
+        self.assertEqual(
+            sum(1 for call in self.runner.call_args_list
+                if call.args[0][0] == 'systemd-run'), launches)
+        self.reboot.assert_not_called()
+
+        result = mgr.request_restart(sid)
+        self.assertEqual(result['state'], 'awaiting_reboot')
+        self.assertEqual(result['restart']['state'], 'dispatched')
+        self.assertEqual(self.reboot.call_count, 1)
+        again = mgr.request_restart(sid)
+        self.assertEqual(again['restart']['state'], 'dispatched')
+        self.assertEqual(self.reboot.call_count, 1)
+
+    def test_interrupted_dispatch_uncertain_adopts_completion(self):
+        sid = self.interrupted_execute(receipt_state='dispatch_uncertain')
+        self.trial.return_value = self.evidence(sid)
+        result = self.manager().status(sid)
+        self.assertEqual(result['state'], 'awaiting_reboot')
+        self.assertEqual(result['completion']['state'], 'awaiting_reboot')
+        self.reboot.assert_not_called()
+
+    def test_request_restart_adopts_completion_without_a_status_first(self):
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.evidence(sid)
+        result = self.manager().request_restart(sid)
+        self.assertEqual(result['restart']['state'], 'dispatched')
+        self.assertEqual(self.reboot.call_count, 1)
+
+    def test_interrupted_execute_refuses_foreign_or_missing_journal(self):
+        sid = self.interrupted_execute()
+        for trial in (self.evidence(sid, transactionId=OTHER_TX),
+                      self.evidence(sid, planSha256='d' * 64),
+                      {'state': 'unavailable', 'error': 'no journal'}):
+            with self.subTest(trial=trial.get('transactionId')):
+                self.trial.return_value = trial
+                receipt = self.manager().status(sid)
+                self.assertEqual(receipt['state'], 'executing')
+                self.assertTrue(receipt['jobInterrupted'])
+                self.assertTrue(receipt['attentionRequired'])
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    self.manager().request_restart(sid)
+        self.reboot.assert_not_called()
+
+    def test_interrupted_execute_refuses_unverified_durable_evidence(self):
+        cases = (
+            ('uncertain boot write', {'bootWriteState': 'uncertain'}),
+            ('slot control issued', {'slotControlState': 'issued'}),
+            ('no restart requirement', {'requiresReboot': False}),
+            ('failed transaction', {'state': 'failed', 'phase': 'failed',
+                                    'requiresReboot': False}),
+            ('other plan', {'planSha256': 'd' * 64}),
+            ('other transaction', {'transactionId': OTHER_TX}),
+            ('other model', {'model': 'TB323FU'}),
+        )
+        for name, overrides in cases:
+            with self.subTest(case=name):
+                sid = self.interrupted_execute(**overrides)
+                self.trial.return_value = self.evidence(sid)
+                result = self.manager().status(sid)
+                self.assertEqual(result['state'], 'executing')
+                self.assertTrue(result['jobInterrupted'])
+                self.assertTrue(result['attentionRequired'])
+                self.reboot.assert_not_called()
+
+    def test_interrupted_execute_refuses_missing_write_report_or_unapproved_plan(self):
+        for case in ('write-report', 'ack'):
+            with self.subTest(case=case):
+                sid = self.interrupted_execute()
+                with self.store.session_lock(sid) as session:
+                    if case == 'write-report':
+                        (session / 'transaction/write-report.json').unlink()
+                    else:
+                        ack = json.loads((session / 'ack.json').read_text())
+                        ack['planSha256'] = 'd' * 64
+                        system_transaction._save_json(session, 'ack.json', ack)
+                self.trial.return_value = self.evidence(sid)
+                result = self.manager().status(sid)
+                self.assertEqual(result['state'], 'executing')
+                self.assertTrue(result['jobInterrupted'])
+                self.reboot.assert_not_called()
+
+    def test_interrupted_execute_refuses_unverified_write_evidence(self):
+        def slot(slot, **changes):
+            report = self.write_report()
+            report['writes'][slot].update(changes)
+            return report
+
+        def report(**changes):
+            return dict(self.write_report(), **changes)
+
+        cases = (
+            ('empty slot entries', report(writes={'a': {}, 'b': {}})),
+            ('missing writes', {k: v for k, v in self.write_report().items()
+                                if k != 'writes'}),
+            ('writes as a list', report(writes=[])),
+            ('running slot written first', report(slotOrder=['a', 'b'])),
+            ('short write', slot('b', bytesWritten=1)),
+            ('zero write', slot('b', bytesWritten=0)),
+            ('readback mismatch', slot('b', readbackSha256='3' * 64)),
+            ('source mismatch', slot('b', sourceBootSha256=NEW_BOOT['b'])),
+            ('candidate digest mismatch',
+             slot('b', candidate={'path': '/work/b.img', 'bytes': 4096,
+                                  'sha256': ORIGINAL_BOOT['b']})),
+            ('candidate replaced',
+             report(writes=dict(
+                 self.write_report()['writes'], b={'candidate': {}}))),
+            ('missing first slot',
+             report(writes={'a': self.write_report()['writes']['a']})),
+        )
+        for name, write_report in cases:
+            with self.subTest(case=name):
+                sid = self.interrupted_execute(report=write_report)
+                self.trial.return_value = self.evidence(sid)
+                result = self.manager().status(sid)
+                self.assertEqual(result['state'], 'executing')
+                self.assertTrue(result['jobInterrupted'])
+                self.assertTrue(result['attentionRequired'])
+                self.reboot.assert_not_called()
+
+    def test_completion_pointer_is_keyed_by_transaction(self):
+        first = self.submitted_session(TX)
+        second = self.submitted_session(OTHER_TX)
+        pending = self.store.base / 'pending'
+        for transaction, session_id in ((TX, first), (OTHER_TX, second)):
+            pointer = json.loads((pending / (transaction + '.json')).read_text())
+            self.assertEqual(pointer, {'schemaVersion': 1,
+                                       'transactionId': transaction,
+                                       'sessionId': session_id})
+        # A second queued session publishes its own pointer and cannot displace
+        # the one that still describes the first pending transaction.
+        self.assertEqual(
+            sorted(path.name for path in pending.iterdir()),
+            sorted([TX + '.json', OTHER_TX + '.json']))
+        self.assertFalse((self.store.base / 'current.json').exists())
+
+    def test_pointer_is_published_before_execute_is_queued(self):
+        sid = self.prepared_session()
+        ack = self.ack(sid)
+        real = system_transaction._save_json
+
+        def failing_pointer(directory, name, value):
+            if name == TX + '.json':
+                raise OSError('pointer storage is unavailable')
+            return real(directory, name, value)
+
+        with mock.patch('updates.offline_jobs.system_transaction._save_json',
+                        side_effect=failing_pointer):
+            with self.assertRaises(OSError):
+                self.manager().submit_execute(sid, ack)
+        with self.store.session_lock(sid) as session:
+            self.assertEqual(self.store.read_receipt(session)['state'], 'prepared')
+        self.runner.assert_not_called()
+
+    def test_interrupted_execute_never_adopts_while_worker_is_active(self):
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.evidence(sid)
+        self.runner.return_value.returncode = 0
+        result = self.manager().status(sid)
+        self.assertEqual(result['state'], 'executing')
+        self.assertTrue(result['jobActive'])
+        self.assertNotIn('jobInterrupted', result)
+        with self.assertRaises(offline_session.OfflineSessionError):
+            self.manager().request_restart(sid)
+        self.reboot.assert_not_called()
 
     def test_status_binds_completion_without_writing_or_rebooting(self):
         sid = self.executed_session()

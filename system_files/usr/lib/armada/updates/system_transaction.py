@@ -3,9 +3,13 @@
 
 Every transaction (online update or explicit rollback) rebuilds and verifies
 one logical Linux deployment in both physical boot slots from each slot's own
-authenticated material.  It never selects an Android boot slot, marks slot
-success, arms a retry/priority LUN, or writes Android boot-control state: the
-Android bootloader keeps owning slot selection and raw boot state.
+authenticated material.  The non-running slot is written and read back first;
+the durable PREPARED journal is committed before the running slot is touched,
+so a power loss leaves either the old journal plus old running image or the
+new journal plus at least one complete matching image.  It never selects an
+Android boot slot, marks slot success, arms a retry/priority LUN, or writes
+Android boot-control state: the Android bootloader keeps owning slot selection
+and raw boot state.
 """
 
 from __future__ import annotations
@@ -211,6 +215,53 @@ def _check_dual_write_report(report, *, initial, actual, inactive, tx,
         raise ValueError('physical slots changed after mirrored boot writes')
 
 
+def _commit_prepared_journal(*, initial, expected, record):
+    """Durably commit the PREPARED journal between the two boot writes.
+
+    The caller invokes this after the non-running boot image is verified and
+    before the running boot extent is touched.  Returning normally means the
+    new record is selected and was read back from the dual-copy journal.  A
+    failure is classified ``not_committed`` only when a full re-read proves
+    the previous snapshot (including both record copies) is unchanged; every
+    other outcome is ``ambiguous`` because the new record may be durable.
+    """
+    try:
+        with recovery_device.open_recovery(writable=True) as (fd, partuuid, board):
+            if (partuuid != initial['recoveryPartUuid'] or
+                    physical_slots._MODEL.get(board) != initial['model']):
+                raise offline_boot_writer.JournalCommitError(
+                    'recovery identity changed before journal commit',
+                    commit_state='ambiguous')
+            current = trial_store.load(fd, partuuid, board)
+            if current != expected:
+                raise offline_boot_writer.JournalCommitError(
+                    'recovery journal compare-and-swap failed',
+                    commit_state='ambiguous')
+            try:
+                trial_store.save(fd, expected, record)
+            except Exception as exc:
+                try:
+                    unchanged = trial_store.load(fd, partuuid, board) == expected
+                except Exception:
+                    unchanged = False
+                raise offline_boot_writer.JournalCommitError(
+                    'prepared journal commit failed: %s' % exc,
+                    commit_state='not_committed' if unchanged else 'ambiguous',
+                ) from exc
+            verified = trial_store.load(fd, partuuid, board)
+            if verified.record != record:
+                raise offline_boot_writer.JournalCommitError(
+                    'prepared journal readback mismatch',
+                    commit_state='ambiguous')
+            return verified
+    except offline_boot_writer.JournalCommitError:
+        raise
+    except Exception as exc:
+        raise offline_boot_writer.JournalCommitError(
+            'prepared journal commit failed: %s' % exc,
+            commit_state='ambiguous') from exc
+
+
 def _run_transaction(*, mode, sysroot_path, work_dir,
                      channel_url=None, signature_url=None, expected_channel=None,
                      expected_checksum=None, updater_version='0.8.0',
@@ -365,26 +416,6 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
             status['planSha256'] = plan_sha256
 
-            if mode == 'rollback':
-                _recheck_rollback_snapshot(expected_checksum, new)
-            status.update(phase='writing_boot', bootWriteState='writing')
-            _save_json(work, 'status.json', status)
-
-            def progress(event):
-                status['bootWriteEvent'] = event
-                _save_json(work, 'status.json', status)
-
-            report = offline_boot_writer.write_offline_boots(
-                trust, candidates, progress=progress)
-            status['bootWriteEvent'] = {'phase': 'complete', 'slotOrder': [inactive, actual]}
-            status['bootWriteState'] = 'written'
-            _check_dual_write_report(
-                report, initial=initial, actual=actual, inactive=inactive, tx=tx,
-                target_deployment=target_deployment, old_sha=old_sha, new_sha=new_sha)
-            _save_json(work, 'write-report.json', report)
-            status['phase'] = 'preparing_trial'
-            _save_json(work, 'status.json', status)
-
             sequence = 1 if journal.record is None else journal.record.sequence + 1
             record = trial_record.TrialRecord(
                 sequence=sequence, partition_uuid=journal.layout.partition_uuid,
@@ -400,17 +431,31 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 policy=trial_record.OFFLINE_DUAL,
                 other_boot_sha256=bytes.fromhex(new_sha[actual]))
             trial_record.encode_record(record)
-            if not physical_slots.same_physical_identity(
-                    physical_slots.inspect_physical_slots(), initial):
-                raise ValueError('physical slots changed before journal write')
-            with recovery_device.open_recovery(writable=True) as (fd, partuuid, board):
-                if partuuid != initial['recoveryPartUuid'] or physical_slots._MODEL.get(board) != initial['model']:
-                    raise ValueError('recovery identity changed')
-                if trial_store.load(fd, partuuid, board) != journal:
-                    raise ValueError('recovery journal compare-and-swap failed')
-                trial_store.save(fd, journal, record)
-                if trial_store.load(fd, partuuid, board).record != record:
-                    raise ValueError('prepared journal readback mismatch')
+
+            if mode == 'rollback':
+                _recheck_rollback_snapshot(expected_checksum, new)
+            status.update(phase='writing_boot', bootWriteState='writing')
+            _save_json(work, 'status.json', status)
+
+            def progress(event):
+                status['bootWriteEvent'] = event
+                _save_json(work, 'status.json', status)
+
+            def commit():
+                _commit_prepared_journal(
+                    initial=initial, expected=journal, record=record)
+
+            report = offline_boot_writer.write_offline_boots(
+                trust, candidates, commit=commit, progress=progress)
+            status['bootWriteEvent'] = {'phase': 'complete', 'slotOrder': [inactive, actual]}
+            status['bootWriteState'] = 'written'
+            _check_dual_write_report(
+                report, initial=initial, actual=actual, inactive=inactive, tx=tx,
+                target_deployment=target_deployment, old_sha=old_sha, new_sha=new_sha)
+            _save_json(work, 'write-report.json', report)
+            status['phase'] = 'journal_prepared'
+            _save_json(work, 'status.json', status)
+
             status.update(state='awaiting_reboot', phase='awaiting_reboot',
                           requiresReboot=True, bootWriteState='written',
                           slotControlState='not_issued',
@@ -425,20 +470,30 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             status['slotControlState'] = 'not_issued'
             if isinstance(exc, offline_boot_writer.BootWriteError):
                 restore = exc.restore_status
+                commit_state = getattr(exc, 'commit_state', 'not_committed')
                 status['bootRestoreState'] = restore
                 if restore == 'not_needed':
                     status['bootWriteState'] = 'not_started'
                 elif restore == 'restored':
                     status['bootWriteState'] = 'restored'
+                elif restore == 'not_restored':
+                    # The journal is committed or may be committed.  A
+                    # verified non-running image was preserved and the caller
+                    # must never be told to restart on partial evidence.
+                    status['bootWriteState'] = (
+                        'written' if commit_state == 'committed' else 'uncertain')
+                    status['journalCommitState'] = commit_state
+                    status['state'] = 'recovery_required'
                 else:
                     status['bootWriteState'] = 'uncertain'
                     status['state'] = 'uncertain'
                 if getattr(exc, 'slot_results', None) is not None:
                     status['slotResults'] = exc.slot_results
             elif created and status.get('bootWriteState') == 'written':
-                # Mirrored boots are already durable; only journaling failed.
-                # Never report awaiting a restart without a prepared journal.
+                # Both mirrored boots and the PREPARED journal are durable;
+                # only local status/report persistence failed.
                 status['state'] = 'recovery_required'
+                status['journalCommitState'] = 'committed'
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
             if created:
                 try:

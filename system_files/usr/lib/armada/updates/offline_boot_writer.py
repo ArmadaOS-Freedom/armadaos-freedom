@@ -26,6 +26,23 @@ _SLOTS = ('a', 'b')
 _HEX64 = frozenset('0123456789abcdef')
 
 
+class JournalCommitError(RuntimeError):
+    """Raised by the inter-slot durable journal commit hook.
+
+    ``commit_state='not_committed'`` asserts the hook re-read the journal and
+    proved the previous record and its copies are byte-for-byte unchanged, so
+    the already-verified non-running image may be restored.  Every other
+    failure is ``ambiguous``: the new PREPARED record may already be durable
+    and no written boot image may be restored.
+    """
+
+    def __init__(self, message, *, commit_state='ambiguous'):
+        if commit_state not in ('not_committed', 'ambiguous'):
+            raise ValueError('invalid journal commit state')
+        super().__init__(message)
+        self.commit_state = commit_state
+
+
 def _hex64(value):
     if not isinstance(value, str) or len(value) != 64:
         return None
@@ -101,12 +118,22 @@ def _validate_candidate_report(slot, report, trust_report, snapshot, initial, *,
     }
 
 
-def write_offline_boots(trust_report, candidates, *, progress=None):
-    """Write inactive then current native boot extents; caller holds transaction/global lock."""
-    return _write_offline_boots(trust_report, candidates, progress=progress)
+def write_offline_boots(trust_report, candidates, *, commit=None, progress=None):
+    """Write the non-running boot extent, commit the journal, then the running one.
+
+    ``commit`` is required.  It is invoked exactly once after the non-running
+    extent has been written, fsynced and read back while the running image and
+    the old journal are still valid, and before the running extent is opened
+    for writing.  It must durably save, validate and read back the new
+    PREPARED trial journal and return normally only after that readback.  A
+    failure raises :class:`JournalCommitError` with an explicit commit state.
+    Caller holds the transaction/global lock.
+    """
+    return _write_offline_boots(
+        trust_report, candidates, commit=commit, progress=progress)
 
 
-def _write_offline_boots(trust_report, candidates, *, progress):
+def _write_offline_boots(trust_report, candidates, *, commit, progress):
     ro_fds = []
     rw_fds = {}
     started_slots = []
@@ -114,9 +141,13 @@ def _write_offline_boots(trust_report, candidates, *, progress):
     expected_boot_sha = {}
     plan = {}
     target_extents = {}
+    committed = False
+    commit_ambiguous = False
     try:
         if progress is not None and not callable(progress):
             raise BootWriteError('progress must be callable or None')
+        if not callable(commit):
+            raise BootWriteError('inter-slot durable journal commit hook is required')
         expected_phase = 'boot_trust_checked'
         if not isinstance(trust_report, dict) \
                 or type(trust_report.get('schemaVersion')) is not int \
@@ -230,7 +261,7 @@ def _write_offline_boots(trust_report, candidates, *, progress):
                     raise BootWriteError(f'target LUN {lun} read-write fd identity mismatch')
 
         writes = {}
-        for slot in slot_order:
+        for index, slot in enumerate(slot_order):
             check_context()
             t_info = verify_extents()[f'boot_{slot}']
             target_extents[slot] = t_info
@@ -254,6 +285,9 @@ def _write_offline_boots(trust_report, candidates, *, progress):
             started_slots.append(slot)
             slot_results[slot]['status'] = 'writing'
             _pwrite_all(rw_fd, cand_data, offset)
+            # The readback pins this image for the running kernel.  It does not
+            # make the pwrite atomic across a power interruption; the journal
+            # commit boundary and the other complete image are what remain safe.
             os.fsync(rw_fd)
             readback = _rehash_region(rw_fd, offset, len(cand_data))
             if readback != cand_claim['sha256']:
@@ -283,6 +317,25 @@ def _write_offline_boots(trust_report, candidates, *, progress):
                     'deployment': deployment,
                     'evidence': copy.deepcopy(evidence),
                 })
+            if index == 0:
+                # Commit boundary: the non-running image is complete and
+                # verified while the running image and old journal are still
+                # valid.  The durable PREPARED journal must exist before any
+                # byte of the running extent is written.
+                try:
+                    commit()
+                except JournalCommitError as commit_error:
+                    if commit_error.commit_state == 'ambiguous':
+                        commit_ambiguous = True
+                    raise
+                except Exception as commit_error:
+                    commit_ambiguous = True
+                    raise JournalCommitError(
+                        'inter-slot journal commit outcome is ambiguous: %s'
+                        % commit_error,
+                        commit_state='ambiguous',
+                    ) from commit_error
+                committed = True
 
         result = {
             'schemaVersion': 1,
@@ -300,12 +353,33 @@ def _write_offline_boots(trust_report, candidates, *, progress):
         if not started_slots:
             if isinstance(error, BootWriteError) and error.restore_status == 'not_needed':
                 error.slot_results = copy.deepcopy(slot_results)
+                if not hasattr(error, 'commit_state'):
+                    error.commit_state = 'not_committed'
                 raise
-            raise _error_with_results(
+            failure = _error_with_results(
                 f'offline dual-boot write failed before writing: {error}',
                 'not_needed',
                 slot_results,
-            ) from error
+            )
+            failure.commit_state = 'not_committed'
+            raise failure from error
+
+        if committed or commit_ambiguous:
+            # The PREPARED journal is durable or may be durable.  Restoring
+            # either image would break the committed binding, so preserve the
+            # already-verified non-running image and report recovery instead.
+            state = 'committed' if committed else 'ambiguous'
+            for slot in started_slots:
+                if slot_results[slot]['status'] == 'verified':
+                    slot_results[slot]['status'] = 'preserved'
+            failure = _error_with_results(
+                f'{error}; journal commit is {state}; '
+                'verified non-running boot image preserved',
+                'not_restored',
+                slot_results,
+            )
+            failure.commit_state = state
+            raise failure from error
 
         restore_failures = []
         for slot in reversed(started_slots):
@@ -329,16 +403,20 @@ def _write_offline_boots(trust_report, candidates, *, progress):
 
         if restore_failures:
             detail = '; '.join(restore_failures)
-            raise _error_with_results(
+            failure = _error_with_results(
                 f'{error}; offline boot restore failed ({detail}); device writes are uncertain',
                 'failed',
                 slot_results,
-            ) from error
-        raise _error_with_results(
+            )
+            failure.commit_state = 'not_committed'
+            raise failure from error
+        failure = _error_with_results(
             f'{error}; started boot slots restored',
             'restored',
             slot_results,
-        ) from error
+        )
+        failure.commit_state = 'not_committed'
+        raise failure from error
     finally:
         for fd in rw_fds.values():
             try:

@@ -42,6 +42,8 @@ from .trial_record import (
 UPDATE_LOCK_PATH = Path("/run/lock/armada-update.lock")
 SYSROOT_PATH = Path("/sysroot")
 STABILITY_SECONDS = 30
+READINESS_RETRY_ATTEMPTS = 60
+READINESS_RETRY_DELAY_SECONDS = 5
 
 
 class ConfirmationError(RuntimeError):
@@ -197,6 +199,24 @@ def confirm_trial() -> dict:
         }
 
 
+def confirm_with_readiness_retry() -> dict:
+    """Confirm, tolerating only the expected early-startup Wayland gap.
+
+    Each attempt calls confirm_trial() from scratch, so the journal binding
+    and both boot and runtime evidence checks run again.  The update lock is
+    released as confirm_trial() raises, which makes the bounded delay run
+    outside it.  Ambiguous, unsafe or genuinely failing evidence propagates
+    immediately; the final missing-session attempt also propagates so systemd
+    keeps its normal bounded restart behaviour.
+    """
+    for _ in range(READINESS_RETRY_ATTEMPTS - 1):
+        try:
+            return confirm_trial()
+        except runtime_health.RuntimeNotReady:
+            time.sleep(READINESS_RETRY_DELAY_SECONDS)
+    return confirm_trial()
+
+
 def main() -> int:
     """Service entrypoint: run one confirmation attempt and report as JSON."""
     import argparse
@@ -211,7 +231,7 @@ def main() -> int:
     parser.parse_args()
 
     try:
-        result = confirm_trial()
+        result = confirm_with_readiness_retry()
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         failure = {
             "state": "confirmation_failed",

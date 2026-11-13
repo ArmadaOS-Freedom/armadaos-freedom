@@ -34,6 +34,17 @@ class RuntimeHealthError(RuntimeError):
     """Raised when basic runtime service/compositor evidence is not ready."""
 
 
+class RuntimeNotReady(RuntimeHealthError):
+    """Raised when the expected Wayland session has not appeared yet.
+
+    This is limited to the normal graphical-startup gap: logind reports no
+    sessions at all, no session is an eligible local seat0 Wayland user
+    session, or the user's runtime directory/socket does not exist yet.
+    Ambiguous, unsafe or inconsistent evidence stays a plain
+    RuntimeHealthError so it is never retried as if it were merely early.
+    """
+
+
 @dataclass(frozen=True)
 class RuntimeEvidence:
     boot_id: str
@@ -122,7 +133,7 @@ def _list_session_ids() -> list[str]:
         if sid not in seen:
             seen.append(sid)
     if not seen:
-        raise RuntimeHealthError("No login sessions reported")
+        raise RuntimeNotReady("No login sessions reported")
     return seen
 
 
@@ -168,7 +179,9 @@ def _select_wayland_session() -> tuple[str, int, int, dict[str, str]]:
         uid = _eligible_uid(props)
         if uid is not None:
             eligible.append((sid, uid, props))
-    if len(eligible) != 1:
+    if not eligible:
+        raise RuntimeNotReady("No eligible seat0 Wayland user session reported")
+    if len(eligible) > 1:
         raise RuntimeHealthError(
             f"Expected exactly 1 eligible seat0 Wayland user session, found {len(eligible)}"
         )
@@ -184,6 +197,8 @@ def _candidate_sockets(uid: int) -> tuple[Path, list[Path]]:
     runtime_dir = Path(RUNTIME_USERS_ROOT) / str(uid)
     try:
         st = os.lstat(runtime_dir)
+    except FileNotFoundError as exc:
+        raise RuntimeNotReady(f"Missing runtime dir {runtime_dir}: {exc}") from exc
     except OSError as exc:
         raise RuntimeHealthError(f"Missing runtime dir {runtime_dir}: {exc}") from exc
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
@@ -192,13 +207,17 @@ def _candidate_sockets(uid: int) -> tuple[Path, list[Path]]:
         raise RuntimeHealthError(f"Unsafe runtime dir ownership/permissions on {runtime_dir}")
     try:
         names = sorted(os.listdir(runtime_dir))
+    except FileNotFoundError as exc:
+        raise RuntimeNotReady(f"Missing runtime dir {runtime_dir}: {exc}") from exc
     except OSError as exc:
         raise RuntimeHealthError(f"Cannot list runtime dir {runtime_dir}: {exc}") from exc
 
     sockets: list[Path] = []
+    matched_name = False
     for name in names:
         if not _SOCKET_NAME_RE.match(name):
             continue
+        matched_name = True
         candidate = runtime_dir / name
         try:
             cst = os.lstat(candidate)
@@ -212,7 +231,9 @@ def _candidate_sockets(uid: int) -> tuple[Path, list[Path]]:
         if len(sockets) >= MAX_SOCKET_CANDIDATES:
             break
     if not sockets:
-        raise RuntimeHealthError(f"No candidate Wayland sockets in {runtime_dir}")
+        if matched_name:
+            raise RuntimeHealthError(f"No usable Wayland sockets in {runtime_dir}")
+        raise RuntimeNotReady(f"No candidate Wayland sockets in {runtime_dir}")
     return runtime_dir, sockets
 
 

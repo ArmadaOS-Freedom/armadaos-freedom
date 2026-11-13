@@ -4,9 +4,11 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +66,15 @@ class OfflineSessionStoreTest(unittest.TestCase):
 
     def _payload_file(self, session, receipt):
         return session.joinpath("incoming", *receipt["payload"]["path"].split("/"))
+
+    @staticmethod
+    def _age(path, seconds):
+        when = time.time() - seconds
+        os.utime(path, (when, when))
+
+    @staticmethod
+    def _space(free):
+        return SimpleNamespace(f_bavail=free // 4096, f_frsize=4096)
 
     def test_upload_roundtrip_and_seal(self):
         for model in ("TB322FC", "TB323FU"):
@@ -135,7 +146,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
             store.begin(denied_doc, denied_sig)
         self.assertFalse(base.exists())
 
-    def test_seal_rejects_mismatched_payload_and_retains_file(self):
+    def test_seal_resets_only_complete_corruption(self):
         doc, sig, data = self._signed_package()
         base = self.tmp / "seal" / "offline"
         store = self._store(base)
@@ -144,9 +155,12 @@ class OfflineSessionStoreTest(unittest.TestCase):
         store.upload(sid, 0, data)
         payload = self._payload_file(base / sid, receipt)
         payload.write_bytes(data[:-3] + b"abc")
-        with self.assertRaises(offline_session.OfflineSessionError):
+        with self.assertRaisesRegex(offline_session.OfflineSessionError, "reset"):
             store.seal(sid)
-        self.assertTrue(payload.exists())
+        self.assertFalse(payload.exists())
+        status = store.status(sid)
+        self.assertEqual(status["state"], "uploading")
+        self.assertEqual(status["receivedBytes"], 0)
         payload.write_bytes(data[:100])
         with self.assertRaises(offline_session.OfflineSessionError):
             store.seal(sid)
@@ -155,6 +169,35 @@ class OfflineSessionStoreTest(unittest.TestCase):
         with self.assertRaises(offline_session.OfflineSessionError):
             store.status(sid)
         self.assertEqual(payload.read_bytes(), data + b"x")
+
+    def test_seal_resets_complete_corruption_for_a_full_retry(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "seal-retry" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        payload = self._payload_file(base / sid, receipt)
+        corrupt = data[:-1] + bytes([data[-1] ^ 0xFF])
+        payload.write_bytes(corrupt)
+        with self.assertRaises(offline_session.OfflineSessionError):
+            store.seal(sid)
+        store.upload(sid, 0, data[:700])
+        store.upload(sid, 700, data[700:])
+        self.assertEqual(store.seal(sid)["state"], "uploaded")
+
+    def test_seal_keeps_partial_upload_resumable(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "seal-partial" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data[:128])
+        payload = self._payload_file(base / sid, receipt)
+        with self.assertRaises(offline_session.OfflineSessionError):
+            store.seal(sid)
+        self.assertEqual(payload.read_bytes(), data[:128])
+        store.upload(sid, 128, data[128:])
+        self.assertEqual(store.seal(sid)["state"], "uploaded")
 
     def test_upload_rejects_unsafe_payload_targets_and_session_ids(self):
         doc, sig, data = self._signed_package()
@@ -177,6 +220,166 @@ class OfflineSessionStoreTest(unittest.TestCase):
             with self.subTest(sessionId=bad_id):
                 with self.assertRaises(ValueError):
                     store.upload(bad_id, 0, b"x")
+
+    def test_begin_reclaims_stale_upload_only_under_space_pressure(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "reclaim" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        payload = self._payload_file(base / sid, receipt)
+
+        store.begin(doc, sig)
+        self.assertTrue(payload.exists())
+
+        self._age(base / sid / "receipt.json", 2 * 86400)
+        self._age(payload, 2 * 86400)
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), os.statvfs(base)]):
+            store.begin(doc, sig)
+
+        self.assertFalse(payload.exists())
+        self.assertTrue((base / sid / "receipt.json").exists())
+        resumed = store.status(sid)
+        self.assertEqual(resumed["state"], "uploading")
+        self.assertEqual(resumed["receivedBytes"], 0)
+
+    def test_begin_leaves_active_and_slow_uploads_alone(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "active" / "offline"
+        store = self._store(base)
+        slow = store.begin(doc, sig)
+        slow_sid = slow["sessionId"]
+        store.upload(slow_sid, 0, data)
+        slow_payload = self._payload_file(base / slow_sid, slow)
+        # The receipt is old but the payload write is recent: still an upload.
+        self._age(base / slow_sid / "receipt.json", 2 * 86400)
+
+        fresh = store.begin(doc, sig)
+        fresh_sid = fresh["sessionId"]
+        store.upload(fresh_sid, 0, data[:256])
+        fresh_payload = self._payload_file(base / fresh_sid, fresh)
+
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(0)]):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                store.begin(doc, sig)
+
+        self.assertEqual(slow_payload.read_bytes(), data)
+        self.assertEqual(fresh_payload.read_bytes(), data[:256])
+        self.assertEqual(store.status(slow_sid)["receivedBytes"], len(data))
+        self.assertEqual(store.status(fresh_sid)["receivedBytes"], 256)
+
+    def test_begin_does_not_wait_for_a_locked_session(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "locked" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        payload = self._payload_file(base / sid, receipt)
+        self._age(base / sid / "receipt.json", 2 * 86400)
+        self._age(payload, 2 * 86400)
+        with store.session_lock(sid):
+            with mock.patch.object(
+                    offline_session.os, "statvfs",
+                    side_effect=[self._space(0), self._space(0)]):
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    store.begin(doc, sig)
+        self.assertTrue(payload.exists())
+
+    def test_begin_preserves_transaction_symlink_and_ambiguous_sessions(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "preserve" / "offline"
+        store = self._store(base)
+
+        first = store.begin(doc, sig)
+        tx_sid = first["sessionId"]
+        store.upload(tx_sid, 0, data)
+        tx_payload = self._payload_file(base / tx_sid, first)
+        (base / tx_sid / "transaction").mkdir(0o700)
+        self._age(base / tx_sid / "receipt.json", 2 * 86400)
+        self._age(tx_payload, 2 * 86400)
+
+        second = store.begin(doc, sig)
+        link_sid = second["sessionId"]
+        store.upload(link_sid, 0, data)
+        link_payload = self._payload_file(base / link_sid, second)
+        target = base / "target"
+        target.write_bytes(data)
+        link_payload.unlink()
+        link_payload.symlink_to(target)
+        self._age(base / link_sid / "receipt.json", 2 * 86400)
+
+        third = store.begin(doc, sig)
+        state_sid = third["sessionId"]
+        store.upload(state_sid, 0, data)
+        state_payload = self._payload_file(base / state_sid, third)
+        self._age(base / state_sid / "receipt.json", 2 * 86400)
+        self._age(state_payload, 2 * 86400)
+        with store.session_lock(state_sid) as session:
+            receipt = store.read_receipt(session)
+            receipt["state"] = "prepared"
+            store.update_receipt(session, receipt)
+
+        fourth = store.begin(doc, sig)
+        ack_sid = fourth["sessionId"]
+        store.upload(ack_sid, 0, data)
+        ack_payload = self._payload_file(base / ack_sid, fourth)
+        (base / ack_sid / "ack.json").write_text("{}")
+        self._age(base / ack_sid / "receipt.json", 2 * 86400)
+        self._age(ack_payload, 2 * 86400)
+
+        fifth = store.begin(doc, sig)
+        big_sid = fifth["sessionId"]
+        store.upload(big_sid, 0, data)
+        big_payload = self._payload_file(base / big_sid, fifth)
+        (base / big_sid / "package.json").write_bytes(b"x" * (2 * _MIB + 1))
+        self._age(base / big_sid / "receipt.json", 2 * 86400)
+        self._age(big_payload, 2 * 86400)
+
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(0)]):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                store.begin(doc, sig)
+
+        self.assertTrue(tx_payload.exists())
+        self.assertTrue((base / tx_sid / "transaction").is_dir())
+        self.assertTrue(link_payload.is_symlink())
+        self.assertEqual(target.read_bytes(), data)
+        self.assertTrue(state_payload.exists())
+        self.assertTrue(ack_payload.exists())
+        self.assertTrue(big_payload.exists())
+
+    def test_begin_reclaims_completed_payload_proven_unused(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "complete" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        store.seal(sid)
+        with store.session_lock(sid) as session:
+            saved = store.read_receipt(session)
+            saved.update(state="up_to_date", jobOperation="prepare",
+                         result={"state": "up_to_date"})
+            store.update_receipt(session, saved)
+        payload = self._payload_file(base / sid, receipt)
+        self._age(base / sid / "receipt.json", 2 * 86400)
+        self._age(payload, 2 * 86400)
+
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), os.statvfs(base)]):
+            store.begin(doc, sig)
+
+        self.assertFalse(payload.exists())
+        self.assertTrue((base / sid).is_dir())
+        self.assertEqual(store.status(sid)["state"], "up_to_date")
 
     def _export_session(self, state="awaiting_recovery_export"):
         doc, sig, data = self._signed_package()

@@ -1,7 +1,9 @@
 """Behavioral tests for SystemManager status/check."""
 
 import copy
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 import armada_os
-from updates import system_manager
+from updates import offline_completion, system_manager, system_transaction
 from updates.catalog import CatalogError
 
 CANONICAL_REPO = armada_os.REPOSITORIES[0]
@@ -294,6 +296,284 @@ class SystemManagerTests(unittest.TestCase):
             execute.assert_not_called()
             restart.assert_not_called()
             select.assert_not_called()
+
+
+OFFLINE_TX = "11111111-2222-4333-8444-555555555555"
+OFFLINE_OTHER_TX = "99999999-8888-4777-8666-555555555555"
+OFFLINE_SESSION_ID = "0123456789abcdef0123456789abcdef"
+OFFLINE_OLD = "armada/" + "a" * 64 + ".0"
+OFFLINE_NEW = "armada/" + "b" * 64 + ".1"
+OFFLINE_MODEL = "TB322FC"
+OFFLINE_ORIGINAL = {"a": "e" * 64, "b": "f" * 64}
+OFFLINE_NEW_BOOT = {"a": "1" * 64, "b": "2" * 64}
+
+
+@unittest.skipUnless(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    "private offline session storage requires root-owned directories")
+class OfflineCompletionStatusTests(unittest.TestCase):
+    """Status must adopt only a private, journal-matched offline completion."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.compatible = self.root / "compatible"
+        self.compatible.write_bytes(b"lenovo,elden\0")
+        self.offline_root = self.root / "offline"
+        self.offline_root.mkdir(mode=0o700)
+        self.pending = self.offline_root / offline_completion.POINTER_DIRECTORY
+        self.pending.mkdir(mode=0o700)
+        self.session = self.offline_root / OFFLINE_SESSION_ID
+        self.session.mkdir(mode=0o700)
+        self.transaction = self.session / "transaction"
+        self.transaction.mkdir(mode=0o700)
+        self.digest = ""
+        self.write_documents()
+        patcher = patch.object(
+            system_manager, "OFFLINE_SESSION_ROOT", self.offline_root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.manager = system_manager.SystemManager(
+            config_path=self.root / "channels.json",
+            compatible_path=self.compatible,
+            witness_path=self.root / "missing-witness",
+            cmdline_path=self.root / "missing-cmdline",
+        )
+
+    def write_documents(self, status_overrides=None, receipt_state="executing",
+                        report_overrides=None):
+        plan = {
+            "schemaVersion": 1, "operation": "offline-upgrade",
+            "policy": "offline-dual", "transactionId": OFFLINE_TX,
+            "model": OFFLINE_MODEL, "fromSlot": "a", "targetSlot": "b",
+            "oldDeployment": OFFLINE_OLD, "newDeployment": OFFLINE_NEW,
+            "originalBootSha256": dict(OFFLINE_ORIGINAL),
+            "newBootSha256": dict(OFFLINE_NEW_BOOT),
+        }
+        raw = system_transaction._save_json(
+            self.transaction, "plan.json", plan)
+        digest = hashlib.sha256(raw).hexdigest()
+        system_transaction._save_json(self.transaction, "prepared.json", {
+            "schemaVersion": 1, "operation": "offline-upgrade",
+            "policy": "offline-dual", "transactionId": OFFLINE_TX,
+            "plan": "plan.json", "planSha256": digest,
+        })
+        status = {
+            "schemaVersion": 1, "component": "system",
+            "operation": "offline-upgrade", "policy": "offline-dual",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "transactionId": OFFLINE_TX, "model": OFFLINE_MODEL,
+            "fromSlot": "a", "targetSlot": "b",
+            "oldDeployment": OFFLINE_OLD, "newDeployment": OFFLINE_NEW,
+            "planSha256": digest, "state": "awaiting_reboot",
+            "phase": "awaiting_reboot", "requiresReboot": True,
+            "bootWriteState": "written", "slotControlState": "not_issued",
+        }
+        status.update(status_overrides or {})
+        system_transaction._save_json(self.transaction, "status.json", status)
+        report = {
+            "phase": "dual_boots_written", "model": OFFLINE_MODEL,
+            "transactionUuid": OFFLINE_TX, "deployment": OFFLINE_NEW,
+            "fromSlot": "a", "slotOrder": ["b", "a"],
+            "writes": {
+                slot: {
+                    "sourceBootSha256": OFFLINE_ORIGINAL[slot],
+                    "candidate": {"path": "/work/candidate-%s.img" % slot,
+                                  "bytes": 4096,
+                                  "sha256": OFFLINE_NEW_BOOT[slot]},
+                    "bytesWritten": 4096,
+                    "readbackSha256": OFFLINE_NEW_BOOT[slot],
+                } for slot in ("a", "b")
+            },
+        }
+        report.update(report_overrides or {})
+        system_transaction._save_json(
+            self.transaction, "write-report.json", report)
+        system_transaction._save_json(self.session, "receipt.json", {
+            "schemaVersion": 1, "sessionId": OFFLINE_SESSION_ID,
+            "state": receipt_state, "model": OFFLINE_MODEL,
+        })
+        system_transaction._save_json(self.session, "ack.json", {
+            "schemaVersion": 1, "operation": "offline-upgrade",
+            "transactionId": OFFLINE_TX, "planSha256": digest,
+        })
+        system_transaction._save_json(self.pending, OFFLINE_TX + ".json", {
+            "schemaVersion": 1, "transactionId": OFFLINE_TX,
+            "sessionId": OFFLINE_SESSION_ID,
+        })
+        self.digest = digest
+        return status
+
+    def trial(self, **overrides):
+        body = {
+            "state": "available", "recordState": "prepared",
+            "runningDeployment": "old", "transactionId": OFFLINE_TX,
+            "fromSlot": "a", "targetSlot": "b",
+            "oldDeployment": OFFLINE_OLD, "newDeployment": OFFLINE_NEW,
+            "planSha256": self.digest, "bootConfirmed": False,
+        }
+        body.update(overrides)
+        return body
+
+    def status(self, trial=None):
+        with patch("armada_os.snapshot", return_value=snapshot()), patch.object(
+            system_manager, "read_trial_status",
+            return_value=self.trial() if trial is None else trial,
+        ):
+            return self.manager.status()
+
+    def test_valid_offline_completion_reports_awaiting_reboot(self):
+        result = self.status()
+        self.assertEqual(result["state"], "awaiting_reboot")
+        self.assertTrue(result["requiresReboot"])
+        self.assertEqual(result["pendingTransactionId"], OFFLINE_TX)
+        self.assertEqual(result["pendingFromSlot"], "a")
+        self.assertEqual(result["pendingTargetSlot"], "b")
+
+    def test_recorded_and_unrecorded_receipt_states_are_both_accepted(self):
+        for state in ("execute_queued", "executing", "dispatch_uncertain",
+                      "awaiting_reboot"):
+            with self.subTest(state=state):
+                self.write_documents(receipt_state=state)
+                self.assertEqual(self.status()["state"], "awaiting_reboot")
+
+    def test_foreign_journal_is_never_reported_as_awaiting_reboot(self):
+        cases = (
+            ({"transactionId": OFFLINE_OTHER_TX}, "pending_conflict"),
+            ({"planSha256": "d" * 64}, "pending_conflict"),
+            ({"fromSlot": "b", "targetSlot": "a"}, "pending_conflict"),
+            ({"recordState": "trial"}, "pending_conflict"),
+            ({"recordState": "prepared", "runningDeployment": "new"},
+             "awaiting_confirmation"),
+            ({"runningDeployment": None}, "pending_conflict"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                result = self.status(self.trial(**overrides))
+                self.assertNotEqual(result["state"], "awaiting_reboot")
+                self.assertEqual(result["state"], expected)
+                self.assertFalse(result["requiresReboot"])
+
+    def test_unverified_or_tampered_documents_are_refused(self):
+        cases = (
+            ("uncertain boot write", {"bootWriteState": "uncertain"}),
+            ("slot control issued", {"slotControlState": "issued"}),
+            ("no restart requirement", {"requiresReboot": False}),
+            ("failed transaction", {"state": "recovery_required",
+                                    "phase": "failed",
+                                    "requiresReboot": False}),
+            ("other deployment", {"newDeployment": "armada/" + "c" * 64 + ".2"}),
+            ("other plan digest", {"planSha256": "d" * 64}),
+            ("other model", {"model": "TB323FU"}),
+        )
+        for name, overrides in cases:
+            with self.subTest(case=name):
+                self.write_documents(status_overrides=overrides)
+                result = self.status()
+                self.assertEqual(result["state"], "pending_conflict")
+                self.assertFalse(result["requiresReboot"])
+
+    def test_write_evidence_must_match_the_plan(self):
+        writes = {
+            slot: {
+                "sourceBootSha256": OFFLINE_ORIGINAL[slot],
+                "candidate": {"path": "/work/%s.img" % slot, "bytes": 4096,
+                              "sha256": OFFLINE_NEW_BOOT[slot]},
+                "bytesWritten": 4096,
+                "readbackSha256": OFFLINE_NEW_BOOT[slot],
+            } for slot in ("a", "b")
+        }
+
+        def slot(slot, **changes):
+            return dict(writes, **{slot: dict(writes[slot], **changes)})
+
+        cases = (
+            ("empty slot entries", {"writes": {"a": {}, "b": {}}}),
+            ("missing slot", {"writes": {"a": writes["a"]}}),
+            ("writes as a list", {"writes": []}),
+            ("missing writes", {"writes": None}),
+            ("running slot written first", {"slotOrder": ["a", "b"]}),
+            ("source digest mismatch",
+             {"writes": slot("b", sourceBootSha256=OFFLINE_NEW_BOOT["b"])}),
+            ("readback digest mismatch",
+             {"writes": slot("a", readbackSha256="3" * 64)}),
+            ("short write", {"writes": slot("a", bytesWritten=1)}),
+            ("candidate bytes mismatch",
+             {"writes": slot("b", candidate={
+                 "path": "/work/b.img", "bytes": 1,
+                 "sha256": OFFLINE_NEW_BOOT["b"]})}),
+            ("physical slot conflict",
+             {"physical": {"model": OFFLINE_MODEL, "actualSlot": "b",
+                           "inactiveSlot": "a"}}),
+        )
+        for name, overrides in cases:
+            with self.subTest(case=name):
+                self.write_documents(report_overrides=overrides)
+                result = self.status()
+                self.assertEqual(result["state"], "pending_conflict")
+                self.assertFalse(result["requiresReboot"])
+
+    def test_matching_physical_evidence_is_accepted(self):
+        self.write_documents(report_overrides={
+            "physical": {"model": OFFLINE_MODEL, "actualSlot": "a",
+                         "inactiveSlot": "b", "deployment": OFFLINE_OLD}})
+        self.assertEqual(self.status()["state"], "awaiting_reboot")
+
+    def test_pointer_is_required_instead_of_scanning_sessions(self):
+        (self.pending / (OFFLINE_TX + ".json")).unlink()
+        self.assertEqual(self.status()["state"], "pending_conflict")
+
+    def test_pointer_cannot_select_an_arbitrary_or_foreign_session(self):
+        for pointer in (
+            {"schemaVersion": 1, "sessionId": OFFLINE_SESSION_ID},
+            {"schemaVersion": 1, "transactionId": OFFLINE_OTHER_TX,
+             "sessionId": OFFLINE_SESSION_ID},
+            {"schemaVersion": 1, "transactionId": OFFLINE_TX,
+             "sessionId": "../escape"},
+            {"schemaVersion": 1, "transactionId": OFFLINE_TX,
+             "sessionId": None},
+            {"schemaVersion": True, "transactionId": OFFLINE_TX,
+             "sessionId": OFFLINE_SESSION_ID},
+            {"schemaVersion": 1, "transactionId": OFFLINE_TX,
+             "sessionId": OFFLINE_SESSION_ID, "jobId": OFFLINE_TX},
+        ):
+            with self.subTest(pointer=pointer):
+                system_transaction._save_json(
+                    self.pending, OFFLINE_TX + ".json", pointer)
+                self.assertEqual(self.status()["state"], "pending_conflict")
+
+    def test_pointer_for_another_transaction_is_never_adopted(self):
+        system_transaction._save_json(self.pending, OFFLINE_OTHER_TX + ".json", {
+            "schemaVersion": 1, "transactionId": OFFLINE_OTHER_TX,
+            "sessionId": OFFLINE_SESSION_ID,
+        })
+        result = self.status(self.trial(transactionId=OFFLINE_OTHER_TX))
+        self.assertEqual(result["state"], "pending_conflict")
+        self.assertFalse(result["requiresReboot"])
+
+    def test_missing_pointer_directory_is_a_conflict_not_a_failure(self):
+        (self.pending / (OFFLINE_TX + ".json")).unlink()
+        self.pending.rmdir()
+        result = self.status()
+        self.assertEqual(result["state"], "pending_conflict")
+        self.assertFalse(result["requiresReboot"])
+
+    def test_session_documents_must_be_root_private(self):
+        os.chmod(self.session, 0o777)
+        self.addCleanup(os.chmod, self.session, 0o700)
+        self.assertEqual(self.status()["state"], "pending_conflict")
+
+    def test_terminal_receipt_state_is_not_revived(self):
+        self.write_documents(receipt_state="failed")
+        self.assertEqual(self.status()["state"], "pending_conflict")
+
+    def test_symlinked_documents_are_refused(self):
+        outside = self.root / "outside-plan.json"
+        outside.write_bytes((self.transaction / "plan.json").read_bytes())
+        (self.transaction / "plan.json").unlink()
+        os.symlink(outside, self.transaction / "plan.json")
+        self.assertEqual(self.status()["state"], "pending_conflict")
 
 
 if __name__ == "__main__":
