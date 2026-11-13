@@ -1,0 +1,599 @@
+"""Focused tests for updater-owned deployment retention.
+
+These tests use isolated fake OSTree objects only. They never touch a real
+sysroot, repository, bootloader or deployment directory. They are plain
+unittest tests so the repository's unittest discovery runs them without any
+extra dependency.
+"""
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+LIB = Path(__file__).resolve().parents[1] / "system_files" / "usr" / "lib"
+sys.path.insert(0, str(LIB))
+
+from armada.updates import deployment_store as store  # noqa: E402
+
+
+class FakeKeyFile:
+    def __init__(self):
+        self.values = {}
+
+    def set_string(self, group, key, value):
+        self.values[(group, key)] = value
+
+    def get_string(self, group, key):
+        return self.values[(group, key)]
+
+    def remove_key(self, group, key):
+        return self.values.pop((group, key), None) is not None
+
+
+class FakeBootConfig:
+    def __init__(self, options="quiet"):
+        self.options = options
+
+    def get(self, key):
+        return self.options if key == "options" else None
+
+
+class FakeDeployment:
+    def __init__(self, osname, csum, serial, *, origin=None, pinned=False,
+                 unlocked=0, options="quiet"):
+        self.osname = osname
+        self.csum = csum
+        self.serial = serial
+        self.origin = origin
+        self.pinned = pinned
+        self.unlocked = unlocked
+        self.boot = FakeBootConfig(options)
+
+    def get_osname(self):
+        return self.osname
+
+    def get_csum(self):
+        return self.csum
+
+    def get_deployserial(self):
+        return self.serial
+
+    def get_origin(self):
+        return self.origin
+
+    def is_pinned(self):
+        return self.pinned
+
+    def get_unlocked(self):
+        return self.unlocked
+
+    def get_bootconfig(self):
+        return self.boot
+
+
+class FakeSysroot:
+    active = None
+
+    def __init__(self, deployments, staged=None, repo=None, booted=None):
+        self.deployments = list(deployments)
+        self.staged = staged
+        self.repo = repo
+        self.booted = booted
+        self.writes = []
+        self.pin_changes = []
+        self.origin_writes = []
+        self.events = []
+        self.deployed_origin = None
+
+    @classmethod
+    def new(cls, _gfile):
+        return cls.active
+
+    def initialize_with_mount_namespace(self, _flags):
+        return True
+
+    def try_lock(self):
+        return True, True
+
+    def load(self, _flags):
+        return True
+
+    def unlock(self):
+        pass
+
+    def get_deployments(self):
+        return list(self.deployments)
+
+    def get_staged_deployment(self):
+        return self.staged
+
+    def get_booted_deployment(self):
+        return self.booted
+
+    def get_repo(self, _flags):
+        return True, self.repo
+
+    def deployment_set_pinned(self, dep, pinned):
+        dep.pinned = pinned
+        self.pin_changes.append((store._binding_of(dep), pinned))
+        self.events.append(("pin", store._binding_of(dep), pinned))
+        return True
+
+    def write_origin_file(self, dep, new_origin, _cancellable):
+        self.origin_writes.append((store._binding_of(dep), dict(new_origin.values)))
+        self.events.append(("origin", store._binding_of(dep)))
+        dep.origin = new_origin
+        return True
+
+    def deployment_set_kargs(self, dep, kargs, _options):
+        dep.boot.options = " ".join(kargs)
+        return True
+
+    def write_deployments(self, deployments, _options):
+        self.writes.append(list(deployments))
+        self.deployments = list(deployments)
+        return True
+
+    def deploy_tree(self, osname, commit, origin, _parent, _ref, _flags):
+        self.deployed_origin = origin
+        return True, FakeDeployment(osname, commit, 7, origin=origin)
+
+
+class FakeRepo:
+    def __init__(self, commit):
+        self.commit = commit
+
+    def load_commit(self, commit):
+        if commit != self.commit:
+            return False, None, 0
+        return True, object(), 0
+
+
+class FakeGLib:
+    KeyFile = FakeKeyFile
+
+
+class FakeGio:
+    class File:
+        @staticmethod
+        def new_for_path(_path):
+            return object()
+
+
+class FakeOSTree:
+    class DeploymentUnlockedState:
+        NONE = 0
+
+    Sysroot = FakeSysroot
+
+
+def binding(commit, serial, osname="armada"):
+    return f"{osname}/{commit}.{serial}"
+
+
+def origin_ref(digest=None):
+    return (
+        "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+        "armadaos-freedom:stable@" + (digest or "sha256:" + "d" * 64)
+    )
+
+
+def make_origin(marked=True, ref=None):
+    origin = FakeKeyFile()
+    origin.set_string("origin", "container-image-reference", ref or origin_ref())
+    if marked:
+        origin.set_string("origin", "armada-managed", "1")
+    return origin
+
+
+def deployment(commit, serial, *, marked=True, pinned=False, unlocked=0,
+               osname="armada", marker_binding=None):
+    dep_binding = binding(commit, serial, osname)
+    origin = make_origin(marked=marked)
+    if marked:
+        origin.set_string("origin", "armada-managed-binding",
+                          marker_binding or dep_binding)
+    return FakeDeployment(
+        osname,
+        commit,
+        serial,
+        origin=origin,
+        pinned=pinned,
+        unlocked=unlocked,
+        options=f"quiet armada.deployment={dep_binding}",
+    )
+
+
+class ManagedRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name) / "sysroot"
+        (self.root / "ostree" / "repo").mkdir(parents=True)
+        (self.root / "boot").mkdir()
+
+        patches = [
+            mock.patch.object(store, "_gi", lambda: (FakeGio, FakeGLib, FakeOSTree)),
+            mock.patch.object(store, "_require_nonsymlink_dir", lambda *args: None),
+            mock.patch.object(store, "_candidate_path", lambda *args: "/fake/deployment"),
+            mock.patch.object(store, "_load_manifest", lambda *args: {"kernelRelease": "6.1.0"}),
+            mock.patch.object(store, "_validate_commit_metadata", lambda *args: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def use_sysroot(self, sysroot):
+        FakeSysroot.active = sysroot
+        return sysroot
+
+    def test_write_origin_uses_ostree_sysroot_api(self):
+        """The origin write goes through Sysroot.write_origin_file only."""
+        dep = deployment("a" * 64, 3)
+        sysroot = mock.Mock()
+        sysroot.write_origin_file.return_value = True
+
+        store._write_origin(sysroot, dep)
+
+        sysroot.write_origin_file.assert_called_once_with(dep, dep.origin, None)
+        self.assertEqual(dep.origin.get_string("origin", "container-image-reference"),
+                         origin_ref())
+
+    def test_write_origin_reports_failure(self):
+        dep = deployment("a" * 64, 3)
+        sysroot = mock.Mock()
+        sysroot.write_origin_file.return_value = False
+
+        with self.assertRaises(store.DeploymentError):
+            store._write_origin(sysroot, dep)
+
+    def test_write_origin_rejects_missing_origin(self):
+        dep = deployment("a" * 64, 3)
+        dep.origin = None
+        sysroot = mock.Mock()
+
+        with self.assertRaises(store.DeploymentError):
+            store._write_origin(sysroot, dep)
+        sysroot.write_origin_file.assert_not_called()
+
+    def test_two_step_release_then_remove_on_distinct_confirmation(self):
+        current = deployment("a" * 64, 3, pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        old_one = deployment("c" * 64, 1, pinned=True)
+        old_two = deployment("d" * 64, 1, pinned=True)
+        unmarked_user_owned = deployment("e" * 64, 1, marked=False, pinned=True)
+        cloned_marker = deployment("7" * 64, 1, pinned=True,
+                                   marker_binding=binding("8" * 64, 1))
+        unlocked = deployment("1" * 64, 1, pinned=True, unlocked=1)
+        foreign = deployment("2" * 64, 1, pinned=True, osname="other-stateroot")
+
+        deps = [current, previous, old_one, old_two, unmarked_user_owned,
+                cloned_marker, unlocked, foreign]
+        sysroot = self.use_sysroot(FakeSysroot(deps))
+
+        first = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+
+        self.assertEqual(first, {
+            "deployment": binding("a" * 64, 3),
+            "previousDeployment": binding("b" * 64, 2),
+            "changed": False,
+        })
+        self.assertEqual(sysroot.writes, [])
+        self.assertFalse(old_one.pinned)
+        self.assertFalse(old_two.pinned)
+        self.assertEqual(store._retire_after(old_one), binding("a" * 64, 3))
+        self.assertEqual(store._retire_after(old_two), binding("a" * 64, 3))
+        for stale in (old_one, old_two):
+            stale_binding = store._binding_of(stale)
+            self.assertLess(
+                sysroot.events.index(("origin", stale_binding)),
+                sysroot.events.index(("pin", stale_binding, False)),
+            )
+        self.assertTrue(unmarked_user_owned.pinned)
+        self.assertIsNone(store._retire_after(unmarked_user_owned))
+        self.assertTrue(cloned_marker.pinned)
+        self.assertIsNone(store._retire_after(cloned_marker))
+        self.assertFalse(store._is_updater_created(cloned_marker))
+        self.assertTrue(unlocked.pinned)
+        self.assertTrue(foreign.pinned)
+
+        # Each origin write targets the redeployment's own binding, so the
+        # marker keeps its per-binding identity after the release rewrite.
+        released_writes = [w for w in sysroot.origin_writes]
+        self.assertEqual(
+            [w[0] for w in released_writes],
+            [store._binding_of(old_one), store._binding_of(old_two)],
+        )
+        for dep_binding, values in released_writes:
+            self.assertEqual(values[(store._MANAGED_GROUP, store._MANAGED_BINDING_KEY)],
+                             dep_binding)
+            self.assertEqual(values[(store._MANAGED_GROUP, store._RETIRE_AFTER_KEY)],
+                             binding("a" * 64, 3))
+
+        new_current = deployment("9" * 64, 4, pinned=True)
+        sysroot.deployments.insert(0, new_current)
+        sysroot.pin_changes.clear()
+        sysroot.origin_writes.clear()
+
+        second = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("9" * 64, 4),
+            previous_binding=binding("a" * 64, 3),
+        )
+
+        expected = [
+            binding("9" * 64, 4),
+            binding("a" * 64, 3),
+            binding("b" * 64, 2),
+            binding("e" * 64, 1),
+            binding("7" * 64, 1),
+            binding("1" * 64, 1),
+            binding("2" * 64, 1, "other-stateroot"),
+        ]
+        self.assertEqual(second["deployment"], binding("9" * 64, 4))
+        self.assertEqual(second["previousDeployment"], binding("a" * 64, 3))
+        self.assertTrue(second["changed"])
+        self.assertEqual([store._binding_of(d) for d in sysroot.deployments], expected)
+        self.assertEqual(len(sysroot.writes), 1)
+        self.assertEqual([store._binding_of(d) for d in sysroot.writes[0]], expected)
+        self.assertNotIn((binding("c" * 64, 1), False), sysroot.pin_changes)
+        self.assertNotIn((binding("d" * 64, 1), False), sysroot.pin_changes)
+        self.assertIn((binding("b" * 64, 2), False), sysroot.pin_changes)
+        self.assertTrue(cloned_marker.pinned)
+        self.assertTrue(unlocked.pinned)
+        self.assertTrue(foreign.pinned)
+
+    def test_repinned_released_deployment_is_protected_forever(self):
+        current = deployment("a" * 64, 3, pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        stale = deployment("c" * 64, 1, pinned=True)
+        sysroot = self.use_sysroot(FakeSysroot([current, previous, stale]))
+
+        first = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+        self.assertEqual([store._binding_of(d) for d in sysroot.deployments], [
+            binding("a" * 64, 3),
+            binding("b" * 64, 2),
+            binding("c" * 64, 1),
+        ])
+        self.assertFalse(stale.pinned)
+        self.assertEqual(store._retire_after(stale), binding("a" * 64, 3))
+
+        stale.pinned = True  # administrator takes the released deployment back
+        sysroot.pin_changes.clear()
+        new_current = deployment("9" * 64, 4, pinned=True)
+        sysroot.deployments.insert(0, new_current)
+
+        second = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("9" * 64, 4),
+            previous_binding=binding("a" * 64, 3),
+        )
+
+        self.assertFalse(second["changed"])
+        self.assertEqual(sysroot.writes, [])
+        self.assertTrue(stale.pinned)
+        self.assertNotIn((binding("c" * 64, 1), False), sysroot.pin_changes)
+        self.assertEqual([store._binding_of(d) for d in sysroot.deployments], [
+            binding("9" * 64, 4),
+            binding("a" * 64, 3),
+            binding("b" * 64, 2),
+            binding("c" * 64, 1),
+        ])
+
+    def test_retry_same_confirmation_is_idempotent(self):
+        current = deployment("a" * 64, 3, pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        stale = deployment("c" * 64, 1, pinned=True)
+        sysroot = self.use_sysroot(FakeSysroot([current, previous, stale]))
+
+        first = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+        pins = list(sysroot.pin_changes)
+        origins = list(sysroot.origin_writes)
+        self.assertFalse(stale.pinned)
+
+        second = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(sysroot.pin_changes, pins)
+        self.assertEqual(sysroot.origin_writes, origins)
+        self.assertEqual(sysroot.writes, [])
+        self.assertFalse(stale.pinned)
+
+    def test_actually_booted_deployment_is_protected(self):
+        current = deployment("a" * 64, 3, pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        booted_other_slot = deployment("c" * 64, 4, pinned=True)
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, previous, booted_other_slot],
+                        booted=booted_other_slot))
+
+        result = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+
+        self.assertFalse(result["changed"])
+        self.assertEqual([store._binding_of(d) for d in sysroot.deployments], [
+            binding("a" * 64, 3),
+            binding("b" * 64, 2),
+            binding("c" * 64, 4),
+        ])
+        self.assertEqual(sysroot.writes, [])
+        self.assertTrue(booted_other_slot.pinned)
+        self.assertIsNone(store._retire_after(booted_other_slot))
+
+    def test_staged_deployment_refuses_before_any_state_change(self):
+        current = deployment("a" * 64, 3, pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        stale = deployment("c" * 64, 1, pinned=True)
+        staged = deployment("d" * 64, 9, pinned=True)
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, previous, stale, staged], staged=staged))
+
+        with self.assertRaises(store.DeploymentError):
+            store.promote_confirmed_deployment(
+                sysroot_path=str(self.root),
+                current_binding=binding("a" * 64, 3),
+                previous_binding=binding("b" * 64, 2),
+            )
+
+        self.assertEqual(sysroot.writes, [])
+        self.assertEqual(sysroot.pin_changes, [])
+        self.assertEqual(sysroot.origin_writes, [])
+        self.assertTrue(stale.pinned)
+
+    def test_fresh_deployment_origin_is_marked_updater_created(self):
+        current = deployment("a" * 64, 3)
+        target = "e" * 64
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=FakeRepo(target)))
+
+        result = store.append_verified_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            target_commit=target,
+            oci_digest="sha256:" + "d" * 64,
+            source_revision="f" * 40,
+            version="1.2.3",
+            model="TB322FC",
+            origin_ref=origin_ref(),
+        )
+
+        self.assertFalse(result["reused"])
+        candidate = [d for d in sysroot.deployments if d.get_csum() == target][0]
+        self.assertEqual(candidate.origin.get_string("origin", "armada-managed"), "1")
+        self.assertEqual(
+            candidate.origin.get_string("origin", "armada-managed-binding"),
+            store._binding_of(candidate))
+        self.assertEqual(candidate.origin.get_string("origin", "container-image-reference"),
+                         origin_ref())
+        self.assertEqual(sysroot.origin_writes[0][0], store._binding_of(candidate))
+        self.assertTrue(store._is_updater_created(candidate))
+
+    def test_reused_admin_target_is_not_marked(self):
+        current = deployment("a" * 64, 3)
+        target = "b" * 64
+        admin_origin = make_origin(marked=False)
+        reused = FakeDeployment(
+            "armada",
+            target,
+            4,
+            origin=admin_origin,
+            options=f"quiet armada.deployment={binding(target, 4)}",
+        )
+        sysroot = self.use_sysroot(FakeSysroot([current, reused], repo=FakeRepo(target)))
+
+        result = store.append_verified_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            target_commit=target,
+            oci_digest="sha256:" + "d" * 64,
+            source_revision="f" * 40,
+            version="1.2.3",
+            model="TB322FC",
+            origin_ref=origin_ref(),
+        )
+
+        self.assertTrue(result["reused"])
+        self.assertFalse(store._is_updater_created(reused))
+        self.assertEqual(sysroot.origin_writes, [])
+        with self.assertRaises(KeyError):
+            reused.origin.get_string("origin", "armada-managed")
+
+    def test_reused_released_target_clears_retirement_marker(self):
+        """Re-pinning a released updater deployment resets its retirement."""
+        current = deployment("a" * 64, 3, pinned=True)
+        target = "b" * 64
+        released = deployment(target, 4)
+        released.origin.set_string(store._MANAGED_GROUP, store._RETIRE_AFTER_KEY,
+                                   binding("a" * 64, 3))
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, released], repo=FakeRepo(target)))
+
+        result = store.append_verified_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            target_commit=target,
+            oci_digest="sha256:" + "d" * 64,
+            source_revision="f" * 40,
+            version="1.2.3",
+            model="TB322FC",
+            origin_ref=origin_ref(),
+        )
+
+        self.assertTrue(result["reused"])
+        self.assertTrue(released.pinned)
+        self.assertIn((store._binding_of(released), True), sysroot.pin_changes)
+        self.assertIsNone(store._retire_after(released))
+        self.assertTrue(store._is_updater_created(released))
+        self.assertEqual([w[0] for w in sysroot.origin_writes],
+                         [store._binding_of(released)])
+        written = sysroot.origin_writes[0][1]
+        self.assertNotIn((store._MANAGED_GROUP, store._RETIRE_AFTER_KEY), written)
+        self.assertEqual(
+            written[(store._MANAGED_GROUP, store._MANAGED_BINDING_KEY)],
+            store._binding_of(released))
+
+        # The reused deployment carries no retirement marker any more, so a
+        # later staleness pass releases it again instead of treating this
+        # updater re-pin as an administrator take-over.
+        new_current = deployment("9" * 64, 4, pinned=True)
+        sysroot.deployments.insert(0, new_current)
+        sysroot.pin_changes.clear()
+        store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("9" * 64, 4),
+            previous_binding=binding("a" * 64, 3),
+        )
+
+        self.assertFalse(released.pinned)
+        self.assertIn((store._binding_of(released), False), sysroot.pin_changes)
+        self.assertEqual(store._retire_after(released), binding("9" * 64, 4))
+
+    def test_already_repinned_released_target_keeps_retirement_marker(self):
+        """A deployment an administrator pinned again is left untouched."""
+        current = deployment("a" * 64, 3, pinned=True)
+        target = "b" * 64
+        repinned = deployment(target, 4, pinned=True)
+        repinned.origin.set_string(store._MANAGED_GROUP, store._RETIRE_AFTER_KEY,
+                                   binding("a" * 64, 3))
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, repinned], repo=FakeRepo(target)))
+
+        result = store.append_verified_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            target_commit=target,
+            oci_digest="sha256:" + "d" * 64,
+            source_revision="f" * 40,
+            version="1.2.3",
+            model="TB322FC",
+            origin_ref=origin_ref(),
+        )
+
+        self.assertTrue(result["reused"])
+        self.assertTrue(repinned.pinned)
+        self.assertEqual(store._retire_after(repinned), binding("a" * 64, 3))
+        self.assertEqual(sysroot.pin_changes, [])
+        self.assertEqual(sysroot.origin_writes, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -209,7 +209,7 @@ static void test_corruption(void)
 static void test_select(void)
 {
     struct kshim_update_trial r, out, before;
-    uint8_t a[4096], b[4096], zero[4096] = {0}, torn[4096];
+    uint8_t a[4096], b[4096], zero[4096] = {0}, torn[4096], marker[4096];
     unsigned selected = 99;
     uint64_t seq;
     int pass;
@@ -254,6 +254,32 @@ static void test_select(void)
                 r.installation_uuid, &out, &selected) == KSHIM_STORAGE_ARG);
     assert(kshim_update_trial_select(a, b, 4096, r.partition_uuid,
                 r.installation_uuid, &out, NULL) == KSHIM_STORAGE_ARG);
+
+    /* Logical-empty sentinel.  The exact marker is accepted only in copy B
+     * and only when copy A is blank or CRC-damaged; it is still an error in
+     * copy A, next to any CRC-valid image, or when a real record selects. */
+    assert(kshim_update_trial_empty_marker(marker, sizeof(marker)) == KSHIM_STORAGE_OK);
+    selected = 99;
+    assert(kshim_update_trial_select(zero, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_EMPTY && selected == 99);
+    memcpy(torn, b, 4096); torn[300] ^= 1;
+    assert(kshim_update_trial_select(torn, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_EMPTY);
+    assert(kshim_update_trial_select(marker, zero, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_FORMAT);
+    assert(kshim_update_trial_select(marker, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_EMPTY);
+    selected = 99;
+    assert(kshim_update_trial_select(b, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_OK && selected == 0);
+    /* Foreign identity and unsupported magic keep a valid CRC and are
+     * refused, never treated as empty next to the marker. */
+    memcpy(torn, b, 4096); torn[40] ^= 1; seal(torn);
+    assert(kshim_update_trial_select(torn, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_FORMAT);
+    memcpy(torn, b, 4096); torn[0] ^= 1; seal(torn);
+    assert(kshim_update_trial_select(torn, marker, 4096, r.partition_uuid,
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_FORMAT);
 }
 
 int main(void)

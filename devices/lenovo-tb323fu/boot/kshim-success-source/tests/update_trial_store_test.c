@@ -146,17 +146,29 @@ static struct kshim_update_trial make_rec(uint64_t seq) {
     return r;
 }
 
-static void assert_only_trial_slot_changed(unsigned n, const struct kshim_update_trial *expected) {
+static void assert_only_trial_slot_changed(unsigned n, const struct kshim_update_trial *expected, int anchored) {
     size_t rel = n == 0 ? KSHIM_UPDATE_TRIAL_TAIL_OFFSET_A : KSHIM_UPDATE_TRIAL_TAIL_OFFSET_B;
     size_t begin = 4096 + rel;
+    size_t tail = begin + 4096;
     unsigned char enc[4096];
     assert(kshim_update_trial_encode(expected, enc, sizeof(enc)) == KSHIM_STORAGE_OK);
     assert(memcmp(before, media, begin) == 0);
-    assert(memcmp(before + begin + 4096, media + begin + 4096, sizeof(media) - begin - 4096) == 0);
     assert(memcmp(media + begin, enc, 4096) == 0);
     assert(write_lba == store.region_lba + rel / dev.block_size);
     assert(write_count == 4096 / dev.block_size);
-    assert(writes == 1 && flushes == 1 && reads == 3);
+    if (anchored) {
+        /* The initial anchor wrote only the exact marker into copy B before
+         * the record went to copy A. */
+        unsigned char marker[4096];
+        size_t anchor = 4096 + KSHIM_UPDATE_TRIAL_TAIL_OFFSET_B;
+        assert(kshim_update_trial_empty_marker(marker, sizeof(marker)) == KSHIM_STORAGE_OK);
+        assert(memcmp(media + anchor, marker, 4096) == 0);
+        tail = anchor + 4096;
+        assert(writes == 2 && flushes == 2 && reads == 5);
+    } else {
+        assert(writes == 1 && flushes == 1 && reads == 3);
+    }
+    assert(memcmp(before + tail, media + tail, sizeof(media) - tail) == 0);
 }
 
 static void test_lifecycle_and_rejects(unsigned bs) {
@@ -173,21 +185,21 @@ static void test_lifecycle_and_rejects(unsigned bs) {
     memcpy(before, media, sizeof(media));
     reset_faults();
     assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
-    assert_only_trial_slot_changed(0, &r1);
+    assert_only_trial_slot_changed(0, &r1, 1);
     assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 0 && rec.sequence == 1);
 
     r2 = make_rec(2);
     memcpy(before, media, sizeof(media));
     reset_faults();
     assert(kshim_update_trial_save(&store, 1, &r2, &written) == KSHIM_STORAGE_OK && written == 1);
-    assert_only_trial_slot_changed(1, &r2);
+    assert_only_trial_slot_changed(1, &r2, 0);
     assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 1 && rec.sequence == 2);
 
     r3 = make_rec(3);
     memcpy(before, media, sizeof(media));
     reset_faults();
     assert(kshim_update_trial_save(&store, 2, &r3, &written) == KSHIM_STORAGE_OK && written == 0);
-    assert_only_trial_slot_changed(0, &r3);
+    assert_only_trial_slot_changed(0, &r3, 0);
     assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 0 && rec.sequence == 3);
 
     /* Rejections: stale expected, invalid next seq, wrong identity, invalid state, UINT64_MAX */
@@ -289,11 +301,199 @@ static void test_io_faults(unsigned bs) {
     }
 }
 
+static int buffer_is_zero(const void *p, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; ++i) if (b[i]) return 0;
+    return 1;
+}
+
+/*
+ * Initial-anchor tests.  The only durable thing before the first record is
+ * the exact marker in copy B, so every fault below must end either in "plain
+ * empty" (marker never landed) or "logical empty" (exact marker in B), never
+ * in an unreadable journal.  Foreign or CRC-valid content must stay refused.
+ */
+static void test_initial_anchor(unsigned bs) {
+    struct kshim_update_trial r1, rec, foreign;
+    unsigned char marker[4096], altered[4096];
+    unsigned sel = 77, written = 99;
+
+    memset(marker, 0, sizeof(marker));
+    assert(kshim_update_trial_empty_marker(marker, sizeof(marker)) == KSHIM_STORAGE_OK);
+    assert(kshim_update_trial_is_empty_marker(marker, sizeof(marker)) == 1);
+    assert(kshim_update_trial_decode(marker, sizeof(marker), partition_uuid,
+                                     install_uuid, &rec) == KSHIM_STORAGE_CRC);
+    memcpy(altered, marker, sizeof(altered));
+    altered[0] ^= 1;
+    assert(kshim_update_trial_is_empty_marker(altered, sizeof(altered)) == 0);
+    memcpy(altered, marker, sizeof(altered));
+    altered[KSHIM_UPDATE_TRIAL_EMPTY_MARKER_OFFSET] ^= 2;
+    assert(kshim_update_trial_is_empty_marker(altered, sizeof(altered)) == 0);
+    assert(kshim_update_trial_empty_marker(marker, 4095) == KSHIM_STORAGE_ARG);
+
+    /* (a) anchor write tears before the distinguishing bit: copy B stays
+     * zero and nothing reaches A.  The journal is plain empty and retries. */
+    fixture(bs);
+    r1 = make_rec(1);
+    partial_bytes = 100; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO);
+    assert(written == 99);
+    assert(buffer_is_zero(trial_slot(0), 4096));
+    assert(buffer_is_zero(trial_slot(1), 4096));
+    reset_faults();
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY && sel == 77);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 0 && rec.sequence == 1);
+
+    /* (b) the marker bit lands but the first record write tears: load must
+     * recover the exact logical-empty state from copy B, and sequence 1 may
+     * be retried. */
+    fixture(bs);
+    r1 = make_rec(1);
+    partial_bytes = 4092; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO);
+    assert(written == 99);
+    assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    assert(!buffer_is_zero(trial_slot(0), 4096));
+    reset_faults();
+    memset(&rec, 0x4d, sizeof(rec)); sel = 77;
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+    assert(sel == 77);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 0 && rec.sequence == 1);
+
+    /* (c) marker write lands but reports failure: copy A is untouched and a
+     * retry accepts the already durable marker without rewriting it. */
+    fixture(bs);
+    r1 = make_rec(1);
+    fail_write = 1; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO && written == 99);
+    assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    assert(buffer_is_zero(trial_slot(0), 4096));
+    reset_faults();
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+
+    /* (d) marker flush fails: same state, still retryable. */
+    fixture(bs);
+    r1 = make_rec(1);
+    fail_flush = 1; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO && written == 99);
+    assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    assert(buffer_is_zero(trial_slot(0), 4096));
+    reset_faults();
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+
+    /* (e) marker readback is altered: refused before copy A is written. */
+    fixture(bs);
+    r1 = make_rec(1);
+    corrupt_readback = 1; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO && written == 99);
+    assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    assert(buffer_is_zero(trial_slot(0), 4096));
+    reset_faults();
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+
+    /* (f) a complete but foreign record image with a valid CRC in A plus the
+     * exact marker in B is refused, never downgraded to empty. */
+    fixture(bs);
+    assert(kshim_update_trial_empty_marker(trial_slot(1), 4096) == KSHIM_STORAGE_OK);
+    foreign = make_rec(1);
+    foreign.partition_uuid[0] ^= 1;
+    assert(kshim_update_trial_encode(&foreign, trial_slot(0), 4096) == KSHIM_STORAGE_OK);
+    reset_faults();
+    r1 = make_rec(1); written = 99;
+    assert(kshim_update_trial_load(&store, &rec, &sel) != KSHIM_STORAGE_OK);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_FORMAT);
+    assert(writes == 0 && written == 99);
+
+    /* (g) the same holds for an incompatible but CRC-valid image. */
+    fixture(bs);
+    assert(kshim_update_trial_empty_marker(trial_slot(1), 4096) == KSHIM_STORAGE_OK);
+    r1 = make_rec(1);
+    assert(kshim_update_trial_encode(&r1, trial_slot(0), 4096) == KSHIM_STORAGE_OK);
+    trial_slot(0)[0] ^= 1; /* wrong magic, CRC resealed below */
+    seal(trial_slot(0));
+    reset_faults();
+    written = 99;
+    assert(kshim_update_trial_load(&store, &rec, &sel) != KSHIM_STORAGE_OK);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_FORMAT);
+    assert(writes == 0 && written == 99);
+
+    /* (h) the marker is only recognised in its designated copy B. */
+    fixture(bs);
+    r1 = make_rec(1);
+    assert(kshim_update_trial_empty_marker(trial_slot(0), 4096) == KSHIM_STORAGE_OK);
+    reset_faults();
+    written = 99;
+    assert(kshim_update_trial_load(&store, &rec, &sel) != KSHIM_STORAGE_OK);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_FORMAT);
+    assert(writes == 0 && written == 99);
+
+    /* (i) CRC damage next to a zeroed copy stays ordinary corruption. */
+    fixture(bs);
+    r1 = make_rec(1);
+    assert(kshim_update_trial_encode(&r1, trial_slot(0), 4096) == KSHIM_STORAGE_OK);
+    trial_slot(0)[100] ^= 1;
+    reset_faults();
+    written = 99;
+    assert(kshim_update_trial_load(&store, &rec, &sel) != KSHIM_STORAGE_OK);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_FORMAT);
+    assert(writes == 0 && written == 99);
+}
+
+/*
+ * An exact marker in copy B is not proof of durability: the bytes may be
+ * cached while the flush that would have committed them failed.  Every retry
+ * must therefore flush the existing marker again and keep copy A blank until
+ * the flush succeeds.
+ */
+static void test_initial_anchor_repeated_flush(unsigned bs) {
+    struct kshim_update_trial r1, rec;
+    unsigned char marker[4096];
+    unsigned sel = 77, written = 99;
+
+    assert(kshim_update_trial_empty_marker(marker, sizeof(marker)) == KSHIM_STORAGE_OK);
+
+    fixture(bs);
+    r1 = make_rec(1);
+    fail_flush = 1; written = 99;
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO);
+    assert(written == 99);
+    assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    assert(buffer_is_zero(trial_slot(0), 4096));
+
+    /* The marker is visible but never confirmed durable: each retry rejects
+     * the state without rewriting the marker or writing record A. */
+    for (unsigned retry = 0; retry < 3; retry++) {
+        reset_faults();
+        fail_flush = 1; written = 99;
+        assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+        assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_IO);
+        assert(written == 99);
+        assert(writes == 0 && flushes == 1);
+        assert(buffer_is_zero(trial_slot(0), 4096));
+        assert(memcmp(trial_slot(1), marker, 4096) == 0);
+    }
+
+    /* With the flush working again the same marker is accepted as-is and
+     * sequence 1 commits. */
+    reset_faults();
+    written = 99;
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_EMPTY);
+    assert(kshim_update_trial_save(&store, 0, &r1, &written) == KSHIM_STORAGE_OK && written == 0);
+    assert(kshim_update_trial_load(&store, &rec, &sel) == KSHIM_STORAGE_OK && sel == 0 && rec.sequence == 1);
+}
+
 int main(void) {
     const unsigned sizes[] = {512, 4096};
     for (unsigned i = 0; i < 2; i++) {
         test_lifecycle_and_rejects(sizes[i]);
         test_io_faults(sizes[i]);
+        test_initial_anchor(sizes[i]);
+        test_initial_anchor_repeated_flush(sizes[i]);
     }
     puts("update_trial_store_test: ok");
     return 0;

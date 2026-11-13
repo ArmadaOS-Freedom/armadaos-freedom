@@ -5,6 +5,18 @@ Matches the C kshim_update_trial wire contract (4096-byte little-endian
 record). CRC32 provides an integrity check only, not authentication. Callers
 must verify storage descriptor version/capabilities and manage I/O durability;
 this module never reads, writes, or activates storage.
+
+The journal has one additional, deliberately tiny state next to a real record:
+the *logical empty* sentinel.  It is a single fixed bit in an otherwise all-zero
+copy B (``EMPTY_MARKER``), written and flushed by the store before the very
+first record goes to copy A.  Its only purpose is to make an interrupted first
+write distinguishable from an unreadable journal: a torn A plus an exact
+marker in B still means "no record was ever committed".  It is recognised only
+in copy B, only after ordinary record selection found no record, and only when
+A is blank or CRC-damaged.  A complete record image with a valid CRC, a foreign
+or unsupported but CRC-valid record, a conflicting equal-sequence pair or any
+other non-marker pair stays an error.  Once a real record is durable it always
+wins; the next copy-on-write write replaces the marker.
 """
 
 from __future__ import annotations
@@ -22,6 +34,21 @@ DESCRIPTOR_MIN_VERSION = 3
 TAIL_OFFSET_A = 28672
 TAIL_OFFSET_B = 32768
 ATTEMPT_MAX = 7
+
+# Logical-empty sentinel, stored only in the copy that is *not* used for the
+# first record (copy B).  The image is all zero except one bit in the last
+# reserved byte, immediately before the CRC field.  Any torn sector write of
+# this image can therefore only produce the all-zero copy or the exact marker,
+# and a marker can never decode as a record: its stored CRC stays zero while
+# the computed CRC over the marked body is not.
+EMPTY_MARKER_COPY = 1
+EMPTY_MARKER_OFFSET = RECORD_BYTES - 5
+EMPTY_MARKER_BYTE = 0x01
+EMPTY_MARKER = (
+    b"\x00" * EMPTY_MARKER_OFFSET
+    + bytes((EMPTY_MARKER_BYTE,))
+    + b"\x00" * (RECORD_BYTES - EMPTY_MARKER_OFFSET - 1)
+)
 OS_NAME_MAX = 64
 
 ONLINE_SINGLE = 0
@@ -52,6 +79,14 @@ class TrialRecordError(ValueError):
 
 class EmptyTrialJournal(TrialRecordError):
     """Raised when a trial journal slot or pair is completely zeroed."""
+
+
+class LogicalEmptyTrialJournal(EmptyTrialJournal):
+    """Raised when copy B holds the exact empty marker and A holds no record.
+
+    This is still an empty journal for every caller; the subclass only records
+    that the durable sentinel, not two zeroed copies, proved the state.
+    """
 
 
 @dataclass(frozen=True)
@@ -263,6 +298,17 @@ def decode_record(
     return record
 
 
+def _record_crc_valid(data: bytes) -> bool:
+    """True when the trailing CRC matches, i.e. the image is not a torn write.
+
+    Deliberately ignores magic/version/identity: anything with a valid record
+    CRC is treated as a complete record image so a foreign or unsupported one
+    can never be downgraded to "empty" by the sentinel rule.
+    """
+    stored = struct.unpack_from("<I", data, RECORD_BYTES - 4)[0]
+    return stored == (zlib.crc32(data[: RECORD_BYTES - 4]) & 0xFFFFFFFF)
+
+
 def select_record(
     a: bytes,
     b: bytes,
@@ -307,4 +353,12 @@ def select_record(
         return rec_b, 1
     if empty_a and empty_b:
         raise EmptyTrialJournal("both trial journal slots are empty")
+    # The logical-empty sentinel is consulted only after real-record selection
+    # failed, only in its designated copy B, and only for a blank or torn A.
+    # A CRC-valid image in A (foreign, unsupported or otherwise incompatible)
+    # is a record that must be refused, never silently called empty.
+    if b == EMPTY_MARKER and (empty_a or not _record_crc_valid(a)):
+        raise LogicalEmptyTrialJournal(
+            "trial journal holds only the empty marker in copy B"
+        )
     raise TrialRecordError("no valid trial journal record")
