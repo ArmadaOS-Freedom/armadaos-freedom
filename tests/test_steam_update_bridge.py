@@ -1,4 +1,5 @@
 import json
+import ipaddress
 from pathlib import Path
 import sys
 import tempfile
@@ -50,6 +51,43 @@ def connection(ws=None):
     client = Client()
     stop_event = ws.stop if ws is not None else None
     return sb.SteamConnection(lambda: ws, client, "injected", stop_event), client
+
+
+PROC_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+               "retrnsmt   uid  timeout inode")
+SERVER = ("127.0.0.1", 8080)
+CLIENT = ("127.0.0.1", 40000)
+
+
+def proc_endpoint(endpoint, v6=False):
+    packed = ipaddress.ip_address(endpoint[0]).packed
+    if v6:
+        packed = b"".join(packed[i:i + 4][::-1] for i in range(0, 16, 4))
+    else:
+        packed = packed[::-1]
+    return "%s:%04X" % (packed.hex().upper(), endpoint[1])
+
+
+def proc_row(local, remote, v6=False, state="01", uid=1000):
+    return ("  0: %s %s %s 00000000:00000000 00:00000000 00000000 %d 0 0"
+            % (proc_endpoint(local, v6), proc_endpoint(remote, v6), state, uid))
+
+
+def tcp_table(*rows):
+    return "\n".join((PROC_HEADER,) + rows) + "\n"
+
+
+def ip_endpoint(endpoint):
+    return ipaddress.ip_address(endpoint[0]), endpoint[1]
+
+
+def verdict(*tables, peer=SERVER, local=CLIENT, uid=1000):
+    """Run the peer ownership check over explicit (is_ipv6, table) sources."""
+    return sb._verify_peer(ip_endpoint(peer), ip_endpoint(local), tables, uid)
+
+
+def mapped(endpoint):
+    return "::ffff:%s" % endpoint[0], endpoint[1]
 
 
 def context(cid=1, frame="root"):
@@ -283,12 +321,20 @@ class BridgeTests(unittest.TestCase):
     def test_ws_factory_timeout_and_close(self):
         ws = mock.Mock()
         module = mock.Mock(WebSocket=mock.Mock(return_value=ws))
-        with mock.patch.dict(sys.modules, {"websocket": module}):
+        with mock.patch.dict(sys.modules, {"websocket": module}), \
+                mock.patch.object(sb, "_verify_ws_peer") as verify:
             factory = sb._default_ws_factory("ws://localhost:8080/devtools/page/x")
             self.assertIs(factory(), ws)
             ws.connect.assert_called_once_with("ws://localhost:8080/devtools/page/x", timeout=5.0,
                 http_no_proxy=["localhost", "127.0.0.1"], suppress_origin=True)
             ws.settimeout.assert_called_once_with(1.0)
+            verify.assert_called_once_with(ws)
+            verify.side_effect = sb.BridgeError("foreign peer")
+            with self.assertRaises(sb.BridgeError):
+                factory()
+            self.assertTrue(ws.close.called)
+            ws.reset_mock()
+            verify.side_effect = None
             ws.connect.side_effect = OSError("no")
             with self.assertRaises(OSError):
                 factory()
@@ -302,6 +348,128 @@ class BridgeTests(unittest.TestCase):
             Path(base, sb.JS_FILES[0]).unlink()
             with self.assertRaises(sb.BridgeError):
                 sb.load_js_sources(base)
+
+
+class PeerOwnershipTests(unittest.TestCase):
+    """Fictional /proc table entries: same uid, other uid, absent/ambiguous rows."""
+
+    def test_established_same_uid_server_socket_accepted(self):
+        table = tcp_table(proc_row(SERVER, CLIENT, uid=1000),
+                          proc_row(CLIENT, SERVER, uid=1000),
+                          proc_row(SERVER, ("0.0.0.0", 0), state="0A", uid=1000))
+        self.assertIsNone(verdict((False, table), (True, tcp_table())))
+
+    def test_dual_stack_listener_mapped_row_in_tcp6_accepted(self):
+        # Ordinary IPv4 client of a same-uid dual-stack listener: the accepted
+        # socket is IPv6, so the reversed tuple exists only in tcp6 and its
+        # endpoints are stored IPv4-mapped.
+        tcp = tcp_table(proc_row(CLIENT, SERVER, uid=1000))
+        tcp6 = tcp_table(proc_row(mapped(SERVER), mapped(CLIENT), v6=True, uid=1000))
+        self.assertIsNone(verdict((False, tcp), (True, tcp6)))
+
+    def test_foreign_uid_rejected(self):
+        native = proc_row(SERVER, CLIENT, uid=1001)
+        dual = proc_row(mapped(SERVER), mapped(CLIENT), v6=True, uid=1001)
+        for tables in (((False, tcp_table(native)), (True, tcp_table())),
+                       ((False, tcp_table()), (True, tcp_table(dual)))):
+            with self.subTest(tables=tables):
+                with self.assertRaises(sb.BridgeError):
+                    verdict(*tables)
+
+    def test_root_socket_and_root_euid_rejected(self):
+        table = tcp_table(proc_row(SERVER, CLIENT, uid=0))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, table), (True, tcp_table()))
+        table = tcp_table(proc_row(SERVER, CLIENT, uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, table), (True, tcp_table()), uid=0)
+
+    def test_missing_and_listener_only_evidence_rejected(self):
+        only_client = tcp_table(proc_row(CLIENT, SERVER, uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, only_client), (True, tcp_table()))
+        listener = tcp_table(proc_row(SERVER, ("0.0.0.0", 0), state="0A", uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, listener), (True, tcp_table()))
+        # A listening dual-stack socket alone is not evidence either.
+        dual_listener = tcp_table(proc_row(("::", 8080), ("::", 0), v6=True, state="0A"))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, tcp_table()), (True, dual_listener))
+        wrong_port = tcp_table(proc_row(SERVER, ("127.0.0.1", 40001), uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, wrong_port), (True, tcp_table()))
+
+    def test_ambiguous_and_malformed_evidence_rejected(self):
+        twin = tcp_table(proc_row(SERVER, CLIENT, uid=1000), proc_row(SERVER, CLIENT, uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, twin), (True, tcp_table()))
+        # One matching row per table is still ambiguous across all sources.
+        native = tcp_table(proc_row(SERVER, CLIENT, uid=1000))
+        dual = tcp_table(proc_row(mapped(SERVER), mapped(CLIENT), v6=True, uid=1000))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, native), (True, dual))
+        for row in ("  0: zz:1 0 01 0 0 0 1000", "  0: 0100007F:1F90 0100007F 01 0 0 0 1000",
+                    "  0: 0100007F:1F90 0100007F:9C40 01 0 0 0 x"):
+            with self.subTest(row=row):
+                with self.assertRaises(sb.BridgeError):
+                    verdict((False, tcp_table(row)), (True, tcp_table()))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, tcp_table()), (True, tcp_table("  0: zz:1 0 01 0 0 0 1000")))
+
+    def test_absent_tcp6_requires_confirmed_ipv4_match(self):
+        matched = tcp_table(proc_row(SERVER, CLIENT, uid=1000))
+        self.assertIsNone(verdict((False, matched), (True, None)))
+        with self.assertRaises(sb.BridgeError):
+            verdict((False, tcp_table()), (True, None))
+        with self.assertRaises(sb.BridgeError):
+            verdict((True, None))
+
+    def test_tcp6_absence_recognized_only_when_missing(self):
+        with mock.patch.object(sb, "PROC_NET_DIR", "/nonexistent-armada-proc"):
+            self.assertIsNone(sb._read_net_table(True, missing_ok=True))
+            with self.assertRaises(sb.BridgeError):
+                sb._read_net_table(True)
+            with self.assertRaises(sb.BridgeError):
+                sb._read_net_table(False, missing_ok=True)
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(sb.BridgeError):
+                sb._read_net_table(True, missing_ok=True)
+
+    def test_ipv6_table_and_mapped_loopback_canonicalized(self):
+        peer6, client6 = ("::1", 8080), ("::1", 40001)
+        table6 = tcp_table(proc_row(peer6, client6, v6=True, uid=1000))
+        self.assertIsNone(verdict((True, table6), peer=peer6, local=client6))
+        self.assertEqual(sb._loopback_endpoint(("::ffff:127.0.0.1", 8080)),
+                         (ipaddress.ip_address("127.0.0.1"), 8080))
+        for endpoint in (("192.0.2.10", 8080), ("::ffff:192.0.2.10", 8080),
+                         ("nope", 8080), ("127.0.0.1", "8080"), ("127.0.0.1", 0)):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(sb.BridgeError):
+                    sb._loopback_endpoint(endpoint)
+
+    def test_ws_peer_verification_and_unavailable_table(self):
+        class Sock:
+            def getpeername(self): return ("127.0.0.1", 8080)
+            def getsockname(self): return ("127.0.0.1", 40000)
+
+        class Broken(Sock):
+            def getpeername(self): raise OSError("no peer")
+
+        def table_for(v6, missing_ok=False):
+            return tcp_table() if v6 else tcp_table(proc_row(SERVER, CLIENT, uid=1000))
+
+        with mock.patch.object(sb, "_read_net_table", side_effect=table_for) as read, \
+                mock.patch.object(sb.os, "geteuid", return_value=1000):
+            sb._verify_ws_peer(mock.Mock(sock=Sock()))
+        self.assertEqual([call[0][0] for call in read.call_args_list], [False, True])
+        with mock.patch.object(sb, "_read_net_table", side_effect=table_for), \
+                mock.patch.object(sb.os, "geteuid", return_value=1001):
+            with self.assertRaises(sb.BridgeError):
+                sb._verify_ws_peer(mock.Mock(sock=Sock()))
+        with self.assertRaises(sb.BridgeError):
+            sb._verify_ws_peer(mock.Mock(sock=None))
+        with self.assertRaises(sb.BridgeError):
+            sb._verify_ws_peer(mock.Mock(sock=Broken()))
 
 
 if __name__ == "__main__":

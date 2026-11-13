@@ -227,6 +227,25 @@ test('refresh rejection is failed, never up to date', async () => {
   assert.match(snap.error, /info unavailable/);
 });
 
+test('initial refresh failure keeps pending client restart evidence and its error', async () => {
+  const h = host();
+  h.data.apply.requires_client_restart = true;
+  h.data.infoError = new Error('system info unavailable');
+  const adapter = createAdapter(h);
+  const snap = await adapter.refresh();
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  assert.equal(snap.busy, false);
+  assert.match(snap.error, /system info unavailable/);
+
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+  const restarted = adapter.snapshot();
+  assert.equal(restarted.state, 'restart_required');
+  assert.equal(restarted.requiresClientRestart, true);
+  assert.equal(restarted.error, null);
+});
+
 test('explicit successful check recovers a failed idle adapter', async () => {
   const h = host();
   h.data.check = null;

@@ -5,9 +5,14 @@ Connects to the local Steam client CEF remote debugging endpoint, injects the
 packaged Armada updates page scripts into the trusted steamloopback context,
 and serves a small validated request bridge to the update service D-Bus client.
 No Decky dependency; runs as an unprivileged user process.
+
+Every newly opened websocket is accepted only when the connected loopback peer
+is an established socket owned by this non-root user, as recorded in the
+network namespace's /proc tcp and tcp6 tables.
 """
 
 from collections import OrderedDict
+import ipaddress
 import json
 import logging
 import os
@@ -25,6 +30,9 @@ DISCOVERY_TIMEOUT = 5.0
 DISCOVERY_MAX_BYTES = 1024 * 1024
 JS_BASE = "/usr/share/armada/steam-updates"
 JS_FILES = ("native-client.js", "page.js")
+PROC_NET_DIR = "/proc/self/net"
+NET_TABLE_MAX_BYTES = 1024 * 1024
+TCP_ESTABLISHED = "01"
 BINDING_NAME = "__armadaUpdatesRequest"
 BINDING_EVENT = "Runtime.bindingCalled"
 TRUSTED_ORIGIN = "https://steamloopback.host"
@@ -413,6 +421,146 @@ class SteamConnection:
             self._on_event(message)
 
 
+def _net_endpoint(token, v6):
+    """Decode one local_address:port column of a /proc/net/tcp{,6} table."""
+    try:
+        raw, raw_port = token.split(":", 1)
+        data = bytes.fromhex(raw)
+        port = int(raw_port, 16)
+    except ValueError:
+        raise BridgeError("malformed network table endpoint")
+    if v6:
+        if len(data) != 16:
+            raise BridgeError("malformed network table endpoint")
+        data = b"".join(data[i:i + 4][::-1] for i in range(0, 16, 4))
+        address = ipaddress.IPv6Address(data)
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+    elif len(data) == 4:
+        address = ipaddress.IPv4Address(data[::-1])
+    else:
+        raise BridgeError("malformed network table endpoint")
+    if not 0 <= port <= 0xFFFF:
+        raise BridgeError("malformed network table endpoint")
+    return address, port
+
+
+def _net_table_rows(text, v6):
+    """Yield (local, remote, state, uid) for each row of a tcp table."""
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or fields[0] == "sl":
+            continue
+        if len(fields) < 8:
+            raise BridgeError("malformed network table row")
+        try:
+            uid = int(fields[7])
+        except ValueError:
+            raise BridgeError("malformed network table row")
+        yield (_net_endpoint(fields[1], v6), _net_endpoint(fields[2], v6),
+               fields[3], uid)
+
+
+def _read_net_table(v6, missing_ok=False):
+    """Read one /proc/net table; None only for a tcp6 absent without IPv6."""
+    path = os.path.join(PROC_NET_DIR, "tcp6" if v6 else "tcp")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(NET_TABLE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        if missing_ok and v6:
+            # A kernel without IPv6 has no tcp6 table at all, so no IPv6
+            # socket can exist and nothing there can contradict the tcp row.
+            return None
+        raise BridgeError("network table unavailable: %s" % path)
+    except OSError as exc:
+        raise BridgeError("network table unavailable: %s" % exc)
+    if len(text) > NET_TABLE_MAX_BYTES:
+        raise BridgeError("network table too large")
+    return text
+
+
+def _net_table_sources(v6):
+    """Return the (is_ipv6, text) tables that can hold the accepted socket.
+
+    A native IPv4 listener records the accepted socket in ``tcp``. A dual-stack
+    IPv6 listener accepts the same ordinary IPv4 client through an IPv6 socket,
+    and that accepted row then exists only in ``tcp6`` with the IPv4 endpoints
+    stored as IPv4-mapped addresses. Both tables are therefore consulted for an
+    IPv4 peer; an IPv6 peer can only ever be recorded in ``tcp6``.
+    """
+    if v6:
+        return ((True, _read_net_table(True)),)
+    return ((False, _read_net_table(False)),
+            (True, _read_net_table(True, missing_ok=True)))
+
+
+def _established_owners(peer, local, text, v6):
+    """Collect owners of established rows that hold the reversed tuple."""
+    return [uid for row_local, row_remote, state, uid in _net_table_rows(text, v6)
+            if state == TCP_ESTABLISHED and row_local == peer and row_remote == local]
+
+
+def _verify_peer(peer, local, sources, euid):
+    """Require exactly one established same-uid socket across the proc tables.
+
+    The bridge owns the client socket (local -> peer); the CDP server owns the
+    accepting socket (peer -> local). Only that established server-side row is
+    evidence; a listening socket alone says nothing about the connected peer.
+    Endpoints are canonicalized, so the IPv4-mapped row of a dual-stack
+    listener matches the same reversed tuple as a native IPv4 row, and matches
+    from every source are counted together: exactly one owner must be found,
+    and it must be the expected uid. A ``None`` source is a tcp6 table absent
+    because the kernel has no IPv6; any other read failure raises before it can
+    be mistaken for a match. This is a same-uid boundary check only: it does
+    not attest the peer binary.
+    """
+    if not isinstance(euid, int) or euid <= 0:
+        raise BridgeError("peer ownership check requires a non-root uid")
+    owners = []
+    for v6, text in sources:
+        if text is not None:
+            owners.extend(_established_owners(peer, local, text, v6))
+    if not owners:
+        raise BridgeError("no established socket for the connected peer")
+    if len(owners) > 1:
+        raise BridgeError("ambiguous established socket for the connected peer")
+    if owners[0] != euid:
+        raise BridgeError("connected peer socket is owned by another user")
+
+
+def _loopback_endpoint(address):
+    """Canonicalize a socket endpoint tuple and require loopback."""
+    try:
+        host = ipaddress.ip_address(address[0])
+        port = address[1]
+    except (IndexError, TypeError, ValueError):
+        raise BridgeError("malformed socket endpoint")
+    if host.version == 6 and host.ipv4_mapped is not None:
+        host = host.ipv4_mapped
+    if not host.is_loopback:
+        raise BridgeError("websocket peer is not loopback")
+    if not isinstance(port, int) or not 0 < port <= 0xFFFF:
+        raise BridgeError("malformed socket endpoint")
+    return host, port
+
+
+def _verify_ws_peer(ws):
+    """Reject the websocket unless its connected peer is a same-uid loopback socket."""
+    sock = getattr(ws, "sock", None)
+    if sock is None:
+        raise BridgeError("websocket has no socket")
+    try:
+        peer = _loopback_endpoint(sock.getpeername())
+        local = _loopback_endpoint(sock.getsockname())
+    except OSError as exc:
+        raise BridgeError("websocket endpoint unavailable: %s" % exc)
+    if peer[0].version != local[0].version:
+        raise BridgeError("websocket endpoints use different address families")
+    _verify_peer(peer, local, _net_table_sources(peer[0].version == 6),
+                 os.geteuid())
+
+
 def _default_ws_factory(ws_url):
     import websocket
 
@@ -426,6 +574,7 @@ def _default_ws_factory(ws_url):
                 suppress_origin=True,
             )
             ws.settimeout(1.0)
+            _verify_ws_peer(ws)  # never hand an unverified peer to SteamConnection
             return ws
         except Exception:
             try:

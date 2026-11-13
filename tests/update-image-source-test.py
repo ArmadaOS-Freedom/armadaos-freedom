@@ -132,14 +132,16 @@ class ImageSourceIntegrationTests(unittest.TestCase):
             return work / "pull.log"
         return pull
 
-    def _fetch(self, routes, work, *, model=None, updater="1.0.0", channel="stable"):
+    def _fetch(self, routes, work, *, model=None, updater="1.0.0", channel="stable",
+               current_commit=None):
         fake = channel_fix.FakeOpener(routes)
         with _install_opener(fake):
             return image_source.fetch_online_image(
                 channel_url=CH_URL, signature_url=CH_SIG_URL,
                 expected_channel=channel, model=model or self.model,
                 updater_version=updater, sysroot_path=self.store.root,
-                work_dir=work, trusted_key=self.pub_key,
+                work_dir=work, current_commit=current_commit,
+                trusted_key=self.pub_key,
             )
 
     # -- 1: successful import ---------------------------------------------
@@ -177,6 +179,72 @@ class ImageSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(store_fix.tree_digest(case.current_path / "etc"), etc_before)
         case._assert_user_data_unchanged()
         self.assertEqual(stat.S_IMODE(os.stat(work).st_mode), 0o700)
+
+    def test_authenticated_current_commit_is_up_to_date_without_pull(self):
+        case = self._fixture()
+        commit = case.commits[1]
+        pkg = self._pkg(commit)
+        raw, sig = self._signed(pkg)
+        channel = self._channel(pkg, raw, sig)
+        work = self.base / "work-up-to-date"
+        calls = []
+        with mock.patch.object(
+            image_source, "_pull", side_effect=self._fake_pull(commit, record=calls)
+        ) as pull:
+            result = self._fetch(
+                self._routes(raw, sig, channel), work, current_commit=commit)
+        self.assertEqual(pull.call_count, 0)
+        self.assertEqual(calls, [])
+        self.assertFalse(work.exists())
+        self.assertEqual(result["phase"], "up_to_date")
+        self.assertEqual(result["commit"], commit)
+        self.assertEqual(result["package"], pkg)
+        self.assertEqual(case._bindings(), [case.initial_binding])
+
+    def test_changed_current_commit_pulls_verified_metadata_once(self):
+        case = self._fixture()
+        commit = case.commits[1]
+        current = case.commits[0]
+        pkg = self._pkg(commit)
+        raw, sig = self._signed(pkg)
+        channel = self._channel(pkg, raw, sig)
+        work = self.base / "work-changed"
+        calls = []
+        with mock.patch.object(
+            image_source, "_pull", side_effect=self._fake_pull(commit, record=calls)
+        ) as pull:
+            result = self._fetch(
+                self._routes(raw, sig, channel), work, current_commit=current)
+        self.assertEqual(pull.call_count, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["phase"], "downloaded")
+        self.assertEqual(result["commit"], commit)
+        self.assertEqual(result["package"], pkg)
+        self.assertTrue((work / "pull.log").is_file())
+        self.assertTrue((work / "import.log").is_file())
+        self.assertFalse((work / "staging-repo").exists())
+        self.assertEqual(case._bindings(), [case.initial_binding])
+
+    def test_invalid_current_commit_rejected_before_network(self):
+        case = self._fixture()
+        commit = case.commits[1]
+        pkg = self._pkg(commit)
+        raw, sig = self._signed(pkg)
+        channel = self._channel(pkg, raw, sig)
+        fake = channel_fix.FakeOpener(self._routes(raw, sig, channel))
+        work = self.base / "work-invalid-current"
+        with _install_opener(fake):
+            for bad in ("not-a-commit", "A" * 64, 64, True):
+                with self.subTest(value=bad):
+                    with self.assertRaises(image_source.ImageSourceError):
+                        image_source.fetch_online_image(
+                            channel_url=CH_URL, signature_url=CH_SIG_URL,
+                            expected_channel="stable", model=self.model,
+                            updater_version="1.0.0",
+                            sysroot_path=self.store.root, work_dir=work,
+                            current_commit=bad, trusted_key=self.pub_key)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(work.exists())
 
     def test_interrupted_stage_retry_imports_previously_absent_commit(self):
         case = self._fixture()
@@ -216,7 +284,8 @@ class ImageSourceIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(image_source.ImageSourceError, "interrupted"):
                 self._fetch(routes, failed_work)
         failed_stage = failed_work / "staging-repo"
-        self.assertTrue(failed_stage.is_dir())
+        self.assertFalse(failed_stage.exists())
+        self.assertTrue((failed_work / "init.log").is_file())
         self.assertFalse((failed_work / "commit").exists())
         self.assertFalse((failed_work / "import.log").exists())
         still_absent = subprocess.run(
@@ -239,7 +308,7 @@ class ImageSourceIntegrationTests(unittest.TestCase):
         self.assertIn(commit, present)
         self.assertTrue((retry_work / "import.log").is_file())
         self.assertFalse((retry_work / "staging-repo").exists())
-        self.assertTrue(failed_stage.is_dir())
+        self.assertFalse(failed_stage.exists())
         self.assertFalse((failed_work / "import.log").exists())
         self.assertEqual(store_fix.run("ostree", "refs", f"--repo={live_repo}"), refs_before)
         self.assertEqual(case._bindings(), [case.initial_binding])
@@ -324,8 +393,34 @@ class ImageSourceIntegrationTests(unittest.TestCase):
                     with self.assertRaises(image_source.ImageSourceError):
                         self._fetch(routes, work)
                 self.assertEqual(fake_pull.call_count, 1)
+                self.assertFalse((work / "staging-repo").exists())
+                self.assertTrue((work / "pull.log").is_file())
                 self.assertEqual(case._bindings(), [case.initial_binding])
                 case._assert_user_data_unchanged()
+
+    def test_cleanup_failure_keeps_original_error_and_logs(self):
+        case = self._fixture()
+        commit = case.commits[1]
+        pkg = self._pkg(commit)
+        raw, sig = self._signed(pkg)
+        channel = self._channel(pkg, raw, sig)
+        routes = self._routes(raw, sig, channel)
+        work = self.base / "work-cleanup-fails"
+
+        def pull(repo, origin, w):
+            (w / "pull.log").write_bytes(b"pulled\n")
+            (w / "commit").write_text(case.commits[0] + "\n", encoding="ascii")
+            return w / "pull.log"
+
+        with mock.patch.object(image_source, "_pull", side_effect=pull), \
+             mock.patch.object(image_source.shutil, "rmtree",
+                               side_effect=OSError("device busy")):
+            with self.assertRaisesRegex(
+                    image_source.ImageSourceError, "does not match channel"):
+                self._fetch(routes, work)
+        self.assertTrue((work / "staging-repo").is_dir())
+        self.assertTrue((work / "pull.log").is_file())
+        self.assertEqual(case._bindings(), [case.initial_binding])
 
     # -- 4: real commit metadata must match signed package ------------------
     def test_signed_metadata_mismatch_against_real_commit_rejected(self):
@@ -363,6 +458,8 @@ class ImageSourceIntegrationTests(unittest.TestCase):
                     with self.assertRaisesRegex(image_source.ImageSourceError, error):
                         self._fetch(routes, work)
                 self.assertEqual(fake_pull.call_count, 1)
+                self.assertFalse((work / "staging-repo").exists())
+                self.assertTrue((work / "pull.log").is_file())
                 self.assertFalse((work / "import.log").exists())
                 self.assertEqual(case._bindings(), [case.initial_binding])
                 case._assert_user_data_unchanged()

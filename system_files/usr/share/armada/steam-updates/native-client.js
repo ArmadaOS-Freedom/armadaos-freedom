@@ -115,7 +115,19 @@
           currentVersion = String(info.nSteamVersion);
         else if (!operation) failed('refresh', 'Malformed Steam version in system info');
       } catch (error) {
-        if (!operation) failed('refresh', error);
+        if (!operation) {
+          if (pendingRestart()) {
+            // Failing to read the client version says nothing about the
+            // native restart evidence: keep it (and the failure text) so the
+            // user can still see the error and perform the restart.
+            local = {
+              state: 'restart_required', phase: 'refresh',
+              error: errorText(error), restart: true
+            };
+          } else {
+            failed('refresh', error);
+          }
+        }
       }
       return snapshot();
     }

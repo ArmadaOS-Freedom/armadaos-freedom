@@ -238,6 +238,23 @@ class SystemTransactionTests(unittest.TestCase):
                                          uuid.UUID(status['transactionId']).bytes)
                         act_test._assert_all_closed(case)
 
+    def test_online_transaction_supplies_current_commit(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            fetch = stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image',
+                return_value={
+                    'package': copy.deepcopy(PACKAGE), 'commit': 'b' * 64,
+                    'originRef': 'armada/stable', 'phase': 'downloaded'}))
+            status = self._run(sysroot, work)
+            self.assertEqual(status['state'], 'awaiting_reboot')
+            self.assertEqual(fetch.call_count, 1)
+            kwargs = fetch.call_args.kwargs
+            self.assertEqual(kwargs['current_commit'], 'a' * 64)
+            self.assertEqual(kwargs['expected_channel'], 'stable')
+            self.assertEqual(kwargs['sysroot_path'], sysroot)
+            self.assertEqual(kwargs['work_dir'], work / 'download')
+
     def test_online_transaction_no_op_and_preflight_failures(self) -> None:
         with self.subTest('up_to_date'), ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(
@@ -249,6 +266,7 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertEqual(status['phase'], 'complete')
             self.assertFalse(status['requiresReboot'])
             self.assertEqual(status['bootWriteState'], 'not_started')
+            self.assertFalse((work / 'download').exists())
             act_test._assert_all_closed(case)
 
         with self.subTest('channel_mismatch'), ExitStack() as stack:

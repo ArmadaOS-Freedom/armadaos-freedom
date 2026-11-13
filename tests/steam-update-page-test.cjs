@@ -825,6 +825,57 @@ test('U367 - explicit read-only "Check for updates" recovers system status after
 });
 
 
+test('14: pending client restart survives a failed client refresh, skips only the client check and stays restartable', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+  await page.evaluate(() => {
+    window.fixture.state.applyResult.requires_client_restart = true;
+    window.SteamClient.System.GetSystemInfo = function() {
+      return Promise.reject(new Error('system info unavailable'));
+    };
+  });
+  // Re-inject the page so its initial client refresh hits the failing
+  // GetSystemInfo while native restart evidence is already pending.
+  await page.addScriptTag({ path: PAGE_JS_PATH });
+
+  const clientRow = page.locator('.armada-row[data-comp="client"]');
+  const clientErr = clientRow.locator('.armada-error-box');
+  const clientBtn = clientRow.locator('.armada-btn-primary');
+  await clientErr.waitFor({ state: 'visible' });
+  assert.match(await clientErr.textContent(), /system info unavailable/);
+  await clientBtn.waitFor({ state: 'visible' });
+  assert.match(await clientBtn.textContent(), /Restart Steam/);
+  assert.equal(await clientBtn.isEnabled(), true);
+
+  await page.waitForFunction(() => {
+    const sys = document.querySelector('.armada-row[data-comp="system"] .armada-btn-primary');
+    const dky = document.querySelector('.armada-row[data-comp="decky"] .armada-btn-primary');
+    return sys && !sys.disabled && sys.offsetParent !== null &&
+      dky && !dky.disabled && dky.offsetParent !== null;
+  }, null, { timeout: 5000 });
+  await page.click('.armada-header-row button');
+
+  await page.waitForFunction(() => {
+    const calls = window.fixture.state.bridgeCalls;
+    return calls.some(c => c.method === 'StartCheck' && c.argument === 'system') &&
+      calls.some(c => c.method === 'StartCheck' && c.argument === 'decky');
+  }, null, { timeout: 5000 });
+
+  assert.equal(await page.evaluate(() => window.fixture.state.nativeCheckCalls), 0);
+  assert.match(await clientErr.textContent(), /system info unavailable/);
+  assert.doesNotMatch(await clientErr.textContent(), /pending client restart/i);
+  assert.match(await clientBtn.textContent(), /Restart Steam/);
+  assert.equal(await clientBtn.isEnabled(), true);
+
+  await clientBtn.click();
+  const confirm = clientRow.locator('.armada-btn-danger');
+  await confirm.waitFor({ state: 'visible' });
+  await confirm.click();
+  await page.waitForFunction(() => window.fixture.state.startRestartCalls.length === 1,
+    null, { timeout: 5000 });
+  assert.equal(await page.evaluate(() => window.fixture.state.startRestartCalls[0]), false);
+});
+
 test('poll transport errors recover automatically without clearing action failures', async (t) => {
   const { page } = await createTestPage(t, 'en-US');
   await setupSyntheticSteamDom(page);
