@@ -96,24 +96,25 @@ class HookTest(unittest.TestCase):
     def clear_calls(self):
         self.log.unlink(missing_ok=True)
 
-    def set_dt(self, compatible=(), medium=None, witness=None):
-        """Replace the fixture's device-tree identity for one subtest."""
-        paths = [self.dt / "compatible",
-                 self.dt / "chosen/armada,root-medium",
-                 self.dt / "chosen/armada,boot-witness"]
+    def set_dt(self, compatible=(), medium=None, witness=None, root=None):
+        """Replace a fixture device tree's identity for one subtest."""
+        tree = self.dt if root is None else Path(root)
+        paths = [tree / "compatible",
+                 tree / "chosen/armada,root-medium",
+                 tree / "chosen/armada,boot-witness"]
         for path in paths:
             path.unlink(missing_ok=True)
         if compatible:
-            self.dt.mkdir(parents=True, exist_ok=True)
-            (self.dt / "compatible").write_bytes(
+            tree.mkdir(parents=True, exist_ok=True)
+            (tree / "compatible").write_bytes(
                 b"\0".join(token.encode("ascii") for token in compatible)
                 + b"\0")
         if medium is not None or witness is not None:
-            (self.dt / "chosen").mkdir(parents=True, exist_ok=True)
+            (tree / "chosen").mkdir(parents=True, exist_ok=True)
         if medium is not None:
-            (self.dt / "chosen/armada,root-medium").write_bytes(medium)
+            (tree / "chosen/armada,root-medium").write_bytes(medium)
         if witness is not None:
-            (self.dt / "chosen/armada,boot-witness").write_bytes(witness)
+            (tree / "chosen/armada,boot-witness").write_bytes(witness)
 
     def run_script(self, script, env=None, args=()):
         environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.root)}
@@ -361,13 +362,35 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_no_environment_override_changes_the_gate(self):
-        self.set_dt()
+        # Two device-tree identities with opposite gate outcomes: the supported
+        # board with an internal medium skips the writer, the unrelated board
+        # keeps it.  The installed gate must keep reading its own tree even
+        # though both override variables name the tree that skips.
+        override = self.root / "device-tree-override"
+        self.set_dt(("lenovo,elden", "qcom,sm8750"), b"internal\0",
+                    b"\0" * 16, root=override)
+        self.set_dt(("lenovo,tb710fu", "qcom,sm8650"), b"internal\0",
+                    b"\0" * 16)
         self.method.write_text("kshimc\n", encoding="utf-8")
+
+        # Control: the same helper bound to the override tree really does
+        # choose the other branch, so the main run below is discriminating.
+        rewrite(GATE, self.gate, [(GATE_DT, str(override))])
+        code, out = self.run_script(self.update, self.legacy)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls(), [])
+
+        # With its own root restored, the helper keeps the legacy writer while
+        # both overrides point at the tree that would have skipped it.
+        rewrite(GATE, self.gate, [(GATE_DT, str(self.dt))])
+        self.clear_calls()
         env = dict(self.legacy, ARMADA_BOOT_MEDIUM="internal",
-                   ARMADA_BOOT_MEDIUM_DT=str(self.dt))
+                   ARMADA_BOOT_MEDIUM_DT=str(override))
         code, out = self.run_script(self.update, env)
         self.assertEqual(code, 0, out)
         self.assertEqual(self.calls(), [str(self.state), "sync"])
+        self.assertNotIn("refusing", out)
+        self.assertFalse(Path(self.legacy["ESP"]).exists())
 
     def test_unusable_medium_gate_fails_both_hooks_before_any_action(self):
         # A source-tree or damaged image copy must not fall back to the old
