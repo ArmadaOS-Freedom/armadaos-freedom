@@ -15,6 +15,7 @@ from . import (
     offline_session,
     physical_slots,
     system_transaction,
+    trial_confirmation,
     trial_status,
 )
 
@@ -544,6 +545,24 @@ class OfflineJobManager:
             receipt['result'] = result
             self.store.update_receipt(session, receipt)
 
+    def _restore_contended_submission(self, session_id, operation, busy, queued):
+        """Undo a worker claim that lost the shared update lock.
+
+        Prepare and execute take the update lock as their first action, so this
+        specific error proves the transaction was not touched.  The receipt
+        goes back to the exact queued state a new explicit submission requires;
+        nothing is dispatched, recorded as failed, or relaunched here.
+        """
+        with self.store.session_lock(session_id) as session:
+            receipt = self.store.read_receipt(session)
+            if (receipt.get('state') != busy or
+                    receipt.get('jobOperation') != operation):
+                raise offline_session.OfflineSessionError(
+                    'worker session state changed unexpectedly')
+            receipt['state'] = queued
+            receipt.pop('error', None)
+            self.store.update_receipt(session, receipt)
+
     def run_job(self, operation, sessionId):
         if operation not in ('prepare', 'execute'):
             raise ValueError('invalid offline job operation')
@@ -567,6 +586,11 @@ class OfflineJobManager:
             if not isinstance(result, dict) or result.get('state') not in states:
                 raise ValueError('offline worker returned an unexpected result')
             final = states[result['state']]
+        except trial_confirmation.UpdateLockBusyError:
+            # Contention only.  Any other error may follow a mutation and must
+            # stay terminal, so it is handled below and never replayed.
+            self._restore_contended_submission(sessionId, operation, busy, queued)
+            return self.store.status(sessionId)
         except system_transaction.SystemTransactionError as exc:
             final, result = 'failed', exc.result
         except Exception as exc:

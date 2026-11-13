@@ -147,6 +147,55 @@ class TestDeckyManager(unittest.TestCase):
         self.assertEqual(plugin_sentinel.read_text(encoding="utf-8"), "plugin-ok")
         self.assertEqual(settings_sentinel.read_text(encoding="utf-8"), "{\"ok\":true}")
 
+    def test_version_file_symlink_fifo_and_oversize_fail_without_following_or_blocking(self) -> None:
+        self._seed_installed("v1.0.0", self.old_bytes)
+        version_path = self.services_dir / ".loader.version"
+        outside = self.root / "outside-version"
+        outside.write_text("v9.9.9\n", encoding="utf-8")
+
+        version_path.unlink()
+        version_path.symlink_to(outside)
+        res = self._make_manager(FakeDeckyService(active=True)).status()
+        self.assertEqual(res["state"], "failed")
+        self.assertIsNone(res["currentVersion"])
+        self.assertIn("Invalid version file type", res["error"])
+
+        version_path.unlink()
+        os.mkfifo(version_path)
+        res = self._make_manager(FakeDeckyService(active=True)).status()
+        self.assertEqual(res["state"], "failed")
+        self.assertIn("Invalid version file type", res["error"])
+
+        version_path.unlink()
+        version_path.write_bytes(b"v" * (decky_manager.MAX_VERSION_BYTES + 1))
+        res = self._make_manager(FakeDeckyService(active=True)).status()
+        self.assertEqual(res["state"], "failed")
+        self.assertIn("exceeds", res["error"])
+
+    def test_version_is_validated_and_read_through_one_descriptor(self) -> None:
+        self._seed_installed("v1.0.0", self.old_bytes)
+        version_path = self.services_dir / ".loader.version"
+        replacement = self.root / "replacement-version"
+        replacement.write_text("v9.9.9\n", encoding="utf-8")
+        real_open = os.open
+        swapped: list[bool] = []
+
+        def open_then_swap(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            # Swap the name after the descriptor is open: the value reported
+            # must come from the descriptor that was validated, not the name.
+            if not swapped and os.fspath(path) == os.fspath(version_path):
+                swapped.append(True)
+                os.replace(replacement, version_path)
+            return fd
+
+        with mock.patch("os.open", side_effect=open_then_swap):
+            res = self._make_manager(FakeDeckyService(active=True)).status()
+
+        self.assertTrue(swapped)
+        self.assertEqual(res["currentVersion"], "v1.0.0")
+        self.assertEqual(res["state"], "installed")
+
     def test_check_matrix_restores_clean_state_between_cases(self) -> None:
         with mock.patch.object(decky_manager, "fetch_preview", return_value=self.v2_rel):
             self._seed_installed("v2.0.0", self.v2_bytes)

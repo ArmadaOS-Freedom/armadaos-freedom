@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import stat
@@ -75,21 +76,35 @@ class DeckyManager:
 
     def _read_installed_version(self) -> str | None:
         path = self.version_path
+        # One descriptor is used for both the validation and the read, so the
+        # inode that is checked for type and size is the inode whose bytes are
+        # decoded.  O_NOFOLLOW refuses a symlinked version file outright and
+        # O_NONBLOCK keeps a FIFO from blocking the open.
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         try:
-            st = os.lstat(path)
+            fd = os.open(path, flags)
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise RuntimeError(f"Failed to stat {path}: {exc}") from exc
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise RuntimeError(f"Invalid version file type at {path}")
-        if st.st_size > MAX_VERSION_BYTES:
-            raise RuntimeError(f"Version file {path} exceeds {MAX_VERSION_BYTES} bytes")
+            if exc.errno == errno.ELOOP:
+                raise RuntimeError(f"Invalid version file type at {path}") from exc
+            raise RuntimeError(f"Failed to read {path}: {exc}") from exc
         try:
-            with path.open("rb") as handle:
-                raw = handle.read(MAX_VERSION_BYTES + 1)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise RuntimeError(f"Invalid version file type at {path}")
+            if st.st_size > MAX_VERSION_BYTES:
+                raise RuntimeError(f"Version file {path} exceeds {MAX_VERSION_BYTES} bytes")
+            raw = bytearray()
+            while len(raw) <= MAX_VERSION_BYTES:
+                chunk = os.read(fd, MAX_VERSION_BYTES + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
         except OSError as exc:
             raise RuntimeError(f"Failed to read {path}: {exc}") from exc
+        finally:
+            os.close(fd)
         if len(raw) > MAX_VERSION_BYTES:
             raise RuntimeError(f"Version file {path} exceeds {MAX_VERSION_BYTES} bytes")
         try:

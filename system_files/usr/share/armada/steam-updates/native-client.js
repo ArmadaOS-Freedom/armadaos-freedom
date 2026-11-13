@@ -183,8 +183,14 @@
       if (!permitted || !result || !result.requires_client_restart)
         throw new Error('Client-specific restart evidence is required');
       operation = 'restart';
-      try { await parts().steam.User.StartRestart(false); }
-      catch (error) { failed('restart', error); }
+      try {
+        await parts().steam.User.StartRestart(false);
+        local = { state: 'restart_required', phase: 'restart', error: null, restart: true };
+      } catch (error) {
+        // A refused restart keeps the client-specific evidence so the user can
+        // see why it failed and try again.
+        local = { state: 'restart_required', phase: 'restart', error: errorText(error), restart: true };
+      }
       finally { operation = null; }
       return snapshot();
     }

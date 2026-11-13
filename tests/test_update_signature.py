@@ -97,6 +97,27 @@ class TestUpdateSignature(unittest.TestCase):
         parsed = load_signed_json(doc, sig, trusted_key=self.pub1)
         self.assertEqual(parsed, {"ok": True})
 
+    def test_bytearray_snapshotted_before_verify_and_parsed_from_snapshot(self):
+        raw = b'{"channel":"stable","version":2}'
+        doc = bytearray(raw)
+        sig = self._sign(raw)
+        real_verify = signature.verify_document
+        seen = {}
+
+        def verify_then_mutate(document, signature_b64, **kwargs):
+            seen["type"] = type(document)
+            seen["value"] = bytes(document)
+            doc[:] = b'{"channel":"changed","version":0}'
+            return real_verify(document, signature_b64, **kwargs)
+
+        with mock.patch.object(signature, "verify_document", side_effect=verify_then_mutate):
+            parsed = load_signed_json(doc, sig, trusted_key=self.pub1)
+
+        self.assertIs(seen["type"], bytes)
+        self.assertEqual(seen["value"], raw)
+        self.assertEqual(bytes(doc), b'{"channel":"changed","version":0}')
+        self.assertEqual(parsed, {"channel": "stable", "version": 2})
+
     def test_reject_modified_document_whitespace_signature_and_wrong_key(self):
         doc = b'{"a":1,"b":2}'
         sig = self._sign(doc)

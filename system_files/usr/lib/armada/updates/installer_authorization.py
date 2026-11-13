@@ -264,12 +264,14 @@ def authorize_key(installer_key_str, user_home, user_uid, host_key_file=HOST_KEY
     try:
 
         existing_content = b""
+        auth_fd = None
         if os.path.lexists(auth_keys_path):
             try:
                 auth_fd = os.open(auth_keys_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             except OSError as err:
                 raise AuthorizationError(f"Failed to open {auth_keys_path}: {err}") from err
-            try:
+        try:
+            if auth_fd is not None:
                 st = os.fstat(auth_fd)
                 if not stat.S_ISREG(st.st_mode):
                     raise AuthorizationError(f"{auth_keys_path} is not a regular file")
@@ -291,29 +293,51 @@ def authorize_key(installer_key_str, user_home, user_uid, host_key_file=HOST_KEY
                         raise AuthorizationError("authorized_keys file exceeds size limit")
                     chunks.append(chunk)
                 existing_content = b"".join(chunks)
-            finally:
-                os.close(auth_fd)
 
-            target_entry_found = False
-            for raw_line in existing_content.split(b"\n"):
-                line = raw_line.decode("utf-8", "surrogateescape").rstrip("\r")
-                opts, k_type, k_b64 = parse_authorized_keys_line(line)
-                if k_b64 == canonical_b64:
-                    if line.strip() == expected_entry:
-                        target_entry_found = True
-                    else:
-                        raise AuthorizationError(
-                            "Installer key is already present in authorized_keys with different options or permissions"
-                        )
+                target_entry_found = False
+                for raw_line in existing_content.split(b"\n"):
+                    line = raw_line.decode("utf-8", "surrogateescape").rstrip("\r")
+                    opts, k_type, k_b64 = parse_authorized_keys_line(line)
+                    if k_b64 == canonical_b64:
+                        if line.strip() == expected_entry:
+                            target_entry_found = True
+                        else:
+                            raise AuthorizationError(
+                                "Installer key is already present in authorized_keys with different options or permissions"
+                            )
 
-            if target_entry_found:
-                current_mode = stat.S_IMODE(st.st_mode)
-                if current_mode != 0o600:
+                if target_entry_found:
+                    # The exact entry is already present, but its mode and its
+                    # durability are still this call's responsibility: an earlier
+                    # attempt may have landed the rename and then failed to flush
+                    # the directory.  Repair the mode on the verified descriptor
+                    # and flush both the file and .ssh before reporting success.
+                    current_mode = stat.S_IMODE(st.st_mode)
+                    if current_mode != 0o600:
+                        try:
+                            os.fchmod(auth_fd, 0o600)
+                        except OSError as err:
+                            raise AuthorizationError(f"Failed to set mode 0600 on {auth_keys_path}: {err}") from err
                     try:
-                        os.chmod(auth_keys_path, 0o600)
+                        os.fsync(auth_fd)
                     except OSError as err:
-                        raise AuthorizationError(f"Failed to set mode 0600 on {auth_keys_path}: {err}") from err
-                return host_fp, installer_fp
+                        raise AuthorizationError(f"Failed to flush {auth_keys_path}: {err}") from err
+                    dir_fd = _open_verified_dir(ssh_dir, user_uid)
+                    try:
+                        try:
+                            os.fsync(dir_fd)
+                        except OSError as err:
+                            raise AuthorizationError(f"Failed to flush {ssh_dir}: {err}") from err
+                    finally:
+                        os.close(dir_fd)
+                    return host_fp, installer_fp
+        finally:
+            # The descriptor must stay open until the matching entry has been
+            # inspected and repaired; closing it earlier would make the repair
+            # and flush above operate on a stale descriptor.  Closing here
+            # covers the missing, mismatched and returning paths alike.
+            if auth_fd is not None:
+                os.close(auth_fd)
 
         new_content = existing_content
         if new_content and not new_content.endswith(b"\n"):
@@ -335,7 +359,10 @@ def authorize_key(installer_key_str, user_home, user_uid, host_key_file=HOST_KEY
 
             dir_fd = os.open(ssh_dir, os.O_RDONLY)
             try:
-                os.fsync(dir_fd)
+                try:
+                    os.fsync(dir_fd)
+                except OSError as err:
+                    raise AuthorizationError(f"Failed to flush {ssh_dir}: {err}") from err
             finally:
                 os.close(dir_fd)
         except Exception:

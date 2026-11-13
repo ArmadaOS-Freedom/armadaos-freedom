@@ -138,6 +138,25 @@ class ReceiptFilesystemTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), before)
         self.assertEqual(list(self.target.parent.iterdir()), [self.target])
 
+    def test_directory_open_failure_before_replace_preserves_previous_receipt(self):
+        receipt.write(self.record)
+        before = self.target.read_bytes()
+        real_open = os.open
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+
+        def open_dir_fails(path, flags, *args, **kwargs):
+            if directory_flag and flags & directory_flag:
+                raise OSError(errno.EACCES, "simulated directory open failure")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(receipt.os, "open", side_effect=open_dir_fails):
+            with self.assertRaises(OSError):
+                receipt.write(self.record)
+
+        self.assertEqual(self.target.read_bytes(), before)
+        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+        self.assertEqual(receipt.read(self.record), {"state": "complete"})
+
     def test_flush_fsync_replace_and_directory_fsync_order(self):
         events = []
         real_fsync = os.fsync

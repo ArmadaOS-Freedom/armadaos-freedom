@@ -51,6 +51,15 @@ class ConfirmationError(RuntimeError):
     """Raised when confirmation cannot proceed or complete safely."""
 
 
+class UpdateLockBusyError(ConfirmationError):
+    """Raised when another transaction already holds the shared update lock.
+
+    This is the only failure the lock can raise before an operation runs, so
+    callers may treat it as proof that they mutated nothing yet: prepare and
+    execute acquire the lock as their very first action.
+    """
+
+
 @contextlib.contextmanager
 def _locked() -> Iterator[None]:
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -61,7 +70,7 @@ def _locked() -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise ConfirmationError("update lock is busy") from exc
+            raise UpdateLockBusyError("update lock is busy") from exc
         try:
             yield
         finally:

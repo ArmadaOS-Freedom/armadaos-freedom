@@ -843,3 +843,106 @@ test('poll transport errors recover automatically without clearing action failur
   await page.waitForTimeout(150);
   assert.match(await error.textContent(), /Action failure/);
 });
+
+test('13: superseded expected job consumes its completed entry while the newer job is busy and still reports the newer outcome after eviction', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+  const row = page.locator('.armada-row[data-comp="system"]');
+  await row.locator('.armada-btn-primary').click();
+  await row.locator('.armada-btn-danger').click();
+  await page.waitForFunction(() => {
+    const c = window.fixture.state.status.components.system;
+    return c.busy === true && typeof c.jobId === 'string' && c.jobId.length > 0;
+  }, null, { timeout: 5000 });
+  const startedId = await page.evaluate(() => window.fixture.state.status.components.system.jobId);
+
+  const applying = (target) => target.waitForFunction(() => {
+    const current = document.querySelector('.armada-row[data-comp="system"]');
+    const pill = current.querySelector('.armada-status-pill');
+    const btn = current.querySelector('.armada-btn-primary');
+    return pill.textContent === 'Applying update...' && btn.style.display === 'none';
+  }, null, { timeout: 5000 });
+
+  // A's terminal entry is available while a newer job B still owns the row.
+  await page.evaluate((jobId) => {
+    window.fixture.setBackendComponent('system', {
+      busy: true,
+      jobId: 'job_newer',
+      operation: 'update',
+      completed: {
+        [jobId]: { component: 'system', state: 'completed', phase: 'update', requiresReboot: false }
+      },
+      result: { state: 'update_available', targetVersion: '3.5.2' }
+    });
+    return window.ArmadaUpdatesPage.refresh();
+  }, startedId);
+
+  await applying(page);
+
+  // A's history is evicted before B ends: A must already be consumed, so the
+  // row cannot stay stuck on the superseded job.
+  await page.evaluate(() => {
+    window.fixture.setBackendComponent('system', { completed: {} });
+    return window.ArmadaUpdatesPage.refresh();
+  });
+  await applying(page);
+
+  // B finishes with A no longer pending: B's own current result decides the row.
+  await page.evaluate(() => {
+    window.fixture.setBackendComponent('system', {
+      busy: false,
+      jobId: 'job_newer',
+      operation: null,
+      result: { state: 'update_available', targetVersion: '3.5.2', requiresReboot: false }
+    });
+    return window.ArmadaUpdatesPage.refresh();
+  });
+  await page.waitForFunction(() => {
+    const current = document.querySelector('.armada-row[data-comp="system"]');
+    const pill = current.querySelector('.armada-status-pill');
+    const btn = current.querySelector('.armada-btn-primary');
+    return pill.textContent === 'Update available' && btn.style.display !== 'none' &&
+      !btn.disabled && current.textContent.includes('3.5.2');
+  }, null, { timeout: 5000 });
+
+  // With B already idle and A still in history, A is shown first and is only
+  // replaced by B's own result on the following poll.
+  const second = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(second.page);
+  const row2 = second.page.locator('.armada-row[data-comp="system"]');
+  await row2.locator('.armada-btn-primary').click();
+  await row2.locator('.armada-btn-danger').click();
+  await second.page.waitForFunction(() => {
+    const c = window.fixture.state.status.components.system;
+    return c.busy === true && typeof c.jobId === 'string' && c.jobId.length > 0;
+  }, null, { timeout: 5000 });
+  const secondStartedId = await second.page.evaluate(() => window.fixture.state.status.components.system.jobId);
+
+  await second.page.evaluate((jobId) => {
+    window.fixture.setBackendComponent('system', {
+      busy: false,
+      jobId: 'job_newer',
+      operation: null,
+      completed: {
+        [jobId]: { component: 'system', state: 'completed', phase: 'update', requiresReboot: false }
+      },
+      result: { state: 'update_available', targetVersion: '3.5.2', requiresReboot: false }
+    });
+    return window.ArmadaUpdatesPage.refresh();
+  }, secondStartedId);
+
+  await second.page.waitForFunction(() => {
+    const current = document.querySelector('.armada-row[data-comp="system"]');
+    const pill = current.querySelector('.armada-status-pill');
+    const btn = current.querySelector('.armada-btn-primary');
+    return pill.textContent === 'Operation completed' && btn.style.display === 'none' &&
+      !current.textContent.includes('3.5.2');
+  }, null, { timeout: 5000 });
+
+  await second.page.evaluate(() => window.ArmadaUpdatesPage.refresh());
+  await second.page.waitForFunction(() => {
+    const current = document.querySelector('.armada-row[data-comp="system"]');
+    const btn = current.querySelector('.armada-btn-primary');
+    return btn.style.display !== 'none' && !btn.disabled && current.textContent.includes('3.5.2');
+  }, null, { timeout: 5000 });
+});

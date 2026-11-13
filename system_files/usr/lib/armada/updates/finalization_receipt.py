@@ -118,18 +118,22 @@ def write(record) -> dict:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
+        # Open the containing directory before the rename so that a failure to
+        # open it leaves the previous receipt in place instead of replacing
+        # evidence this call could never make durable.
         dir_fd = os.open(
             target.parent,
             os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
         )
         try:
-            os.fsync(dir_fd)
-        except OSError:
-            # The receipt is visible but its directory entry is not durable,
-            # so it must not stay readable as complete evidence.
-            _discard_installed(target, installed)
-            raise
+            os.replace(tmp_path, target)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                # The receipt is visible but its directory entry is not durable,
+                # so it must not stay readable as complete evidence.
+                _discard_installed(target, installed)
+                raise
         finally:
             os.close(dir_fd)
     except BaseException:

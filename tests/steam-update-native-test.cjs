@@ -252,6 +252,34 @@ test('explicit restart uses only StartRestart(false)', async () => {
   assert.deepEqual(h.data.calls.restart, [false]);
 });
 
+test('refused restart keeps client restart evidence, shows the error and allows a retry', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  await adapter.apply();
+  const attempts = [];
+  h.SteamClient.User.StartRestart = async (value) => {
+    attempts.push(value);
+    if (attempts.length === 1) throw new Error('restart refused');
+  };
+
+  const refused = await adapter.restartClient();
+  assert.equal(refused.state, 'restart_required');
+  assert.equal(refused.requiresClientRestart, true);
+  assert.equal(refused.busy, false);
+  assert.match(refused.error, /restart refused/);
+
+  const retried = await adapter.restartClient();
+  assert.deepEqual(attempts, [false, false]);
+  assert.equal(retried.state, 'restart_required');
+  assert.equal(retried.requiresClientRestart, true);
+  assert.equal(retried.error, null);
+});
+
 test('late client restart evidence after awaiting status authorizes explicit restart', async () => {
   const h = host();
   const adapter = createAdapter(h);
