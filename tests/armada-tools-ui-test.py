@@ -471,6 +471,39 @@ with tempfile.TemporaryDirectory() as directory, \
         os_state.update(original_os_state)
         updates.render(os_state.copy())
 
+    busy_watch = os_state.copy()
+    busy_watch.update(update_busy=True, update_allowed=False, reboot_ready=False,
+                      update_target=None, update_message="Downloading update (42%).")
+    assert updates.watch_id is None
+    updates.render(busy_watch)
+    watch_id = updates.watch_id
+    assert watch_id is not None
+    updates.render(busy_watch)
+    assert updates.watch_id == watch_id
+    with patch.object(updates, "refresh") as duplicate:
+        updates.requesting = True
+        assert updates.watch_tick() == ui.GLib.SOURCE_CONTINUE
+        duplicate.assert_not_called()
+        updates.requesting = False
+    updates.render(os_state.copy())
+    assert updates.watch_id is None
+
+    os_state["update_busy"] = True
+    os_state["update_message"] = "Downloading update (42%)."
+    updates.render(os_state.copy())
+    assert updates.watch_id is not None
+    os_state["update_busy"] = False
+    os_state["update_message"] = "Update installed. Restart to apply."
+    os_state["reboot_ready"] = True
+    updates.watch_tick()
+    wait_for(lambda: not updates.loading)
+    assert updates.watch_id is None
+    assert updates.message.get_text() == "Update installed. Restart to apply."
+    os_state["update_message"] = None
+    os_state["reboot_ready"] = False
+    updates.result = ""
+
     window.close()
     assert not window.get_visible()
-print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, and narrow layout checks passed")
+    assert updates.watch_id is None
+print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update watch and narrow layout checks passed")

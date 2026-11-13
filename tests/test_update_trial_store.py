@@ -215,7 +215,16 @@ class TrialStoreTest(unittest.TestCase):
         with self.assertRaises(rec.TrialRecordError):
             store.load(self.fd, self.part, 1)
 
+        # Two exact markers are a writer fault, never the logical-empty
+        # journal: the sentinel is only ever durable in copy B.
+        os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_A)
+        os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_B)
+        with self.assertRaises(rec.TrialRecordError) as ctx:
+            store.load(self.fd, self.part, 1)
+        self.assertNotIsInstance(ctx.exception, rec.EmptyTrialJournal)
+
         # The same damage next to the exact marker is the torn initial write.
+        os.pwrite(self.fd, bytes(torn), REGION_OFFSET + rec.TAIL_OFFSET_A)
         os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_B)
         self.assertIsNone(store.load(self.fd, self.part, 1).record)
 

@@ -138,6 +138,9 @@ class SystemTransactionTests(unittest.TestCase):
             deployment_store, 'append_verified_deployment',
             side_effect=lambda **kw: {'model': kw['model'], 'deployment': wf.TARGET_DEP}))
         stack.enter_context(mock.patch.object(
+            deployment_store, 'ensure_deployment_binding',
+            side_effect=lambda **kw: {'deployment': kw['binding'], 'changed': False}))
+        stack.enter_context(mock.patch.object(
             boot_materials, 'prepare_boot_materials',
             side_effect=lambda **kw: {
                 'model': kw['model'],
@@ -380,7 +383,9 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertIsNone(store.load(
                 case.journal.fd, case.journal.part, case.board).record)
 
-    def test_journal_fsync_failure_after_write_is_ambiguous(self) -> None:
+    def test_journal_marker_fsync_failure_is_ambiguous(self) -> None:
+        # The very first journal fsync flushes the logical-empty marker before
+        # copy A is touched, so no record can be durable yet.
         with ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
             running = 'ab'[case.current]
@@ -408,6 +413,74 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertEqual(
                 self._boot_bytes(case, inactive, 512),
                 Path(candidates[inactive]['candidate']['path']).read_bytes())
+            # Copy A was never written, so the journal still loads as empty
+            # and the whole initial write stays retryable.
+            self.assertIsNone(store.load(
+                case.journal.fd, case.journal.part, case.board).record)
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_A),
+                bytes(rec.RECORD_BYTES),
+            )
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_B),
+                rec.EMPTY_MARKER,
+            )
+
+    def test_journal_record_fsync_failure_after_marker_is_ambiguous(self) -> None:
+        # The marker fsync succeeds and only the record fsync fails, so the
+        # PREPARED bytes are visible in copy A while their durability is
+        # unproven.  That is ambiguous, never a committed or restorable state.
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            real_fsync = os.fsync
+            journal_ino = os.fstat(case.journal.fd).st_ino
+            calls = {'n': 0}
+
+            def fail_second_journal_fsync(fd):
+                if os.fstat(fd).st_ino == journal_ino:
+                    calls['n'] += 1
+                    if calls['n'] == 2:
+                        raise OSError(errno.EIO, 'simulated record fsync failure')
+                return real_fsync(fd)
+
+            stack.enter_context(mock.patch.object(
+                store.os, 'fsync', side_effect=fail_second_journal_fsync))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(calls['n'], 2)
+            self.assertEqual(res['state'], 'recovery_required')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'uncertain')
+            self.assertEqual(res['journalCommitState'], 'ambiguous')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertEqual(
+                self._boot_bytes(case, inactive, 512),
+                Path(candidates[inactive]['candidate']['path']).read_bytes())
+
+            # Copy A holds the complete PREPARED record and copy B the durable
+            # marker; the running boot extent was never opened for writing.
+            snap = store.load(case.journal.fd, case.journal.part, case.board)
+            self.assertEqual(snap.selected, 0)
+            self.assertEqual(snap.record.state, rec.PREPARED)
+            self.assertEqual(snap.record.sequence, 1)
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_A),
+                rec.encode_record(snap.record),
+            )
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_B),
+                rec.EMPTY_MARKER,
+            )
+            act_test._assert_all_closed(case)
 
     def test_journal_cas_mismatch_is_ambiguous_and_preserves_alternate(self) -> None:
         with ExitStack() as stack:
@@ -859,6 +932,48 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertEqual(record.policy, rec.OFFLINE_DUAL)
             self.assertEqual(record.old_commit, bytes.fromhex('c' * 64))
             self.assertEqual(record.new_commit, bytes.fromhex('b' * 64))
+            act_test._assert_all_closed(case)
+
+    def test_rollback_ensures_retained_binding_before_boot_writes(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare_rollback(stack)
+            target = 'armada/%s.0' % ('a' * 64)
+            ensure = stack.enter_context(mock.patch.object(
+                deployment_store, 'ensure_deployment_binding',
+                return_value={'deployment': target, 'changed': True}))
+            write = stack.enter_context(mock.patch.object(
+                offline_boot_writer, 'write_offline_boots',
+                side_effect=RuntimeError('stop before boot write')))
+
+            with self.assertRaises(tx_mod.SystemTransactionError):
+                tx_mod.run_rollback_transaction(
+                    expected_checksum='a' * 64, sysroot_path=sysroot, work_dir=work)
+
+            ensure.assert_called_once_with(sysroot_path=sysroot, binding=target)
+            write.assert_called_once()
+
+    def test_rollback_binding_failure_stops_before_boot_writes(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare_rollback(stack)
+            stack.enter_context(mock.patch.object(
+                deployment_store, 'ensure_deployment_binding',
+                side_effect=deployment_store.DeploymentError(
+                    'retained target binding unavailable')))
+            write = stack.enter_context(mock.patch.object(
+                offline_boot_writer, 'write_offline_boots'))
+
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                tx_mod.run_rollback_transaction(
+                    expected_checksum='a' * 64, sysroot_path=sysroot, work_dir=work)
+
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'failed')
+            self.assertEqual(res['bootWriteState'], 'not_started')
+            self.assertFalse(res['requiresReboot'])
+            write.assert_not_called()
+            self.assertEqual(store.load(
+                case.journal.fd, case.journal.part, case.board).record.state,
+                rec.CONFIRMED)
             act_test._assert_all_closed(case)
 
 

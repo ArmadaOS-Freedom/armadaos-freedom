@@ -336,9 +336,10 @@ class RuntimeHealthTests(unittest.TestCase):
                 runtime_health, "_probe_sockets", return_value="wayland-7"
             ) as probe, mock.patch.object(
                 runtime_health, "_show_session", return_value=final_props
-            ):
+            ) as show_session:
                 result = runtime_health.collect_runtime_evidence()
                 probe.assert_called_once_with(runtime_dir, sockets, 1000, 1000)
+                show_session.assert_called_once_with("session-1")
                 return result
 
         evidence = collect(["boot-a", "boot-a"], props)

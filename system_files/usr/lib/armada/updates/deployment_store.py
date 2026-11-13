@@ -30,6 +30,13 @@ class DeploymentError(Exception):
     pass
 
 
+def _unique_binding(deployments, binding, label):
+    matches = [d for d in deployments if _binding_of(d) == binding]
+    if len(matches) != 1:
+        raise DeploymentError(f"{label} deployment not found uniquely")
+    return matches[0]
+
+
 def _gi():
     import gi
     gi.require_version("OSTree", "1.0")
@@ -287,6 +294,93 @@ def _check_candidate_binding(dep, expected_binding):
         raise DeploymentError("candidate armada.deployment binding not persisted exactly once")
 
 
+def _persist_self_binding(sysroot, dep, binding, label):
+    """Write this deployment's own canonical armada.deployment token.
+
+    Reads the current options, refuses any other binding and any duplicate or
+    bare token (``_binding_tokens``), then rewrites the options so exactly one
+    ``armada.deployment=<binding>`` token is present.  Returns True when a
+    write was required.  The caller re-reads the sysroot and calls
+    ``_check_candidate_binding`` to confirm the write persisted.
+    """
+    tokens = _candidate_options(dep)
+    values = _binding_tokens(tokens)
+    if values and values[0] != binding:
+        raise DeploymentError(f"{label} has conflicting armada.deployment: {values[0]!r}")
+    if values:
+        return False
+    new_kargs = [tok for tok in tokens if not tok.startswith("armada.deployment=")]
+    new_kargs.append(f"armada.deployment={binding}")
+    if not sysroot.deployment_set_kargs(dep, new_kargs, None):
+        raise DeploymentError(f"failed setting {label} armada.deployment binding")
+    return True
+
+
+def ensure_deployment_binding(*, sysroot_path, binding):
+    """Persist a deployment's own canonical armada.deployment token.
+
+    Used before rollback boot writes so a retained rollback target that
+    predates the token (for example the first installed deployment) names
+    itself, and by every caller that must recover an already outstanding
+    unbound target.  The write happens while the sysroot is locked, refuses a
+    conflicting or duplicated token, and is confirmed by a sysroot reload.
+    The read-only option reader is unaffected.
+    """
+    Gio, GLib, OSTree = _gi()
+    osname, commit, serial = _parse_binding(binding)
+
+    if sysroot_path is None or not isinstance(sysroot_path, (str, Path)):
+        raise DeploymentError("sysroot_path must be str or Path")
+    raw_root = Path(sysroot_path)
+    if (not str(raw_root) or not raw_root.is_absolute() or raw_root.is_symlink()
+            or not raw_root.exists() or not raw_root.is_dir()):
+        raise DeploymentError(f"sysroot directory invalid: {raw_root}")
+    try:
+        root = raw_root.resolve(strict=True)
+    except OSError as exc:
+        raise DeploymentError(f"cannot resolve sysroot_path: {exc}") from exc
+    if root != raw_root or not root.is_dir():
+        raise DeploymentError(f"non-canonical sysroot_path: {raw_root}")
+    _require_nonsymlink_dir(root, "ostree", "repo")
+    _require_nonsymlink_dir(root, "boot")
+
+    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
+    if not sysroot.initialize_with_mount_namespace(None):
+        raise DeploymentError("sysroot initialize_with_mount_namespace failed")
+    ok, acquired = sysroot.try_lock()
+    if not (ok and acquired):
+        raise DeploymentError("sysroot busy: try_lock not acquired")
+    try:
+        if not sysroot.load(None):
+            raise DeploymentError("sysroot load failed")
+        staged = sysroot.get_staged_deployment()
+        if staged is not None:
+            raise DeploymentError("staged deployment present")
+        deployments = list(sysroot.get_deployments() or [])
+        bindings = [_binding_of(d) for d in deployments]
+        if len(set(bindings)) != len(bindings):
+            raise DeploymentError("duplicate deployment bindings in sysroot")
+        dep = _unique_binding(deployments, binding, "deployment")
+        if dep.get_deployserial() != serial:
+            raise DeploymentError("deployment serial mismatch")
+        if dep.get_unlocked() != OSTree.DeploymentUnlockedState.NONE:
+            raise DeploymentError("deployment unlocked state is not NONE")
+        _candidate_path(sysroot, root, dep, osname, commit)
+
+        changed = _persist_self_binding(sysroot, dep, binding, "deployment")
+        if changed:
+            if not sysroot.load(None):
+                raise DeploymentError("sysroot reload after binding update failed")
+            deployments = list(sysroot.get_deployments() or [])
+            if [_binding_of(d) for d in deployments] != bindings:
+                raise DeploymentError("deployment bindings changed on binding update")
+            dep = _unique_binding(deployments, binding, "deployment")
+        _check_candidate_binding(dep, binding)
+        return {"deployment": binding, "changed": changed}
+    finally:
+        sysroot.unlock()
+
+
 def append_verified_deployment(*, sysroot_path, current_binding, target_commit, oci_digest,
                                source_revision, version, model, origin_ref):
     Gio, GLib, OSTree = _gi()
@@ -333,6 +427,12 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
     try:
         if not sysroot.load(None):
             raise DeploymentError("sysroot load failed")
+        # A staged deployment means another OSTree client already owns the
+        # sysroot state.  Refuse before any pin, origin or deployment-list
+        # write, exactly like promote_confirmed_deployment does.
+        staged = sysroot.get_staged_deployment()
+        if staged is not None:
+            raise DeploymentError("staged deployment present")
         ok, repo = sysroot.get_repo(None)
         if not ok or repo is None:
             raise DeploymentError("no repo in sysroot")
@@ -355,11 +455,31 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
         _candidate_path(sysroot, root, current, osname, cur_commit)
         original_bindings = [_binding_of(d) for d in deployments]
 
+        # A first-install deployment predates the per-deployment
+        # armada.deployment token.  Persist the running deployment's own
+        # canonical binding now, under the same locked sysroot and before any
+        # pin or deployment-list write, so the retained rollback target names
+        # itself and later promotion can verify it.
+        if _persist_self_binding(sysroot, current, current_binding, "current"):
+            if not sysroot.load(None):
+                raise DeploymentError("sysroot reload after current binding update failed")
+            deployments = list(sysroot.get_deployments() or [])
+            if [_binding_of(d) for d in deployments] != original_bindings:
+                raise DeploymentError("deployment bindings changed on current binding update")
+            current = _unique_binding(deployments, current_binding, "current")
+        _check_candidate_binding(current, current_binding)
+
+        # Every deployment of the target commit shares the authenticated
+        # checksum/digest/version, so a pre-existing deployment is only ever a
+        # reuse candidate.  Its origin still has to authenticate this exact
+        # digest from the approved repository; a foreign or tampered reference
+        # is rejected outright.  A legitimate deployment published on another
+        # channel is left untouched and a fresh deployment with the requested
+        # origin is created instead of rewriting an administrator or retained
+        # origin.
         matches = [d for d in deployments if d.get_csum() == target_commit and d.get_osname() == osname]
-        if matches:
-            if len(matches) != 1:
-                raise DeploymentError("ambiguous existing target deployments")
-            td = matches[0]
+        exact_matches = []
+        for td in matches:
             origin_kf = td.get_origin()
             if origin_kf is None:
                 raise DeploymentError("existing target deployment missing origin")
@@ -367,8 +487,16 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
                 existing_ref = origin_kf.get_string("origin", "container-image-reference")
             except Exception as exc:
                 raise DeploymentError(f"failed reading existing target origin: {exc}") from exc
-            if existing_ref != origin_ref:
-                raise DeploymentError("existing target origin mismatch")
+            try:
+                _validate_origin(existing_ref, oci_digest)
+            except DeploymentError as exc:
+                raise DeploymentError(f"existing target origin mismatch: {exc}") from exc
+            if existing_ref == origin_ref:
+                exact_matches.append(td)
+        if len(exact_matches) > 1:
+            raise DeploymentError("ambiguous existing target deployments")
+        if exact_matches:
+            td = exact_matches[0]
             cpath = _candidate_path(sysroot, root, td, osname, target_commit)
             verified = _load_manifest(cpath, model)
             _ensure_pinned(sysroot, current, "current")
@@ -486,6 +614,19 @@ def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_bind
 
         _candidate_path(sysroot, root, current, osname, cur_commit)
         _candidate_path(sysroot, root, previous, osname, prev_commit)
+        # The confirmed current deployment may have been reached through a
+        # rollback to a first-install target that predates the
+        # armada.deployment token.  Persist its own canonical binding before
+        # verification instead of failing a legitimate confirmation.
+        if _persist_self_binding(sysroot, current, current_binding, "current"):
+            if not sysroot.load(None):
+                raise DeploymentError("sysroot reload after current binding update failed")
+            deployments = list(sysroot.get_deployments() or [])
+            bindings = [_binding_of(d) for d in deployments]
+            if len(set(bindings)) != len(bindings):
+                raise DeploymentError("duplicate deployment bindings in sysroot")
+            current = _unique_binding(deployments, current_binding, "current")
+            previous = _unique_binding(deployments, previous_binding, "previous")
         _check_candidate_binding(current, current_binding)
         _ensure_pinned(sysroot, current, "current")
         _ensure_pinned(sysroot, previous, "previous")

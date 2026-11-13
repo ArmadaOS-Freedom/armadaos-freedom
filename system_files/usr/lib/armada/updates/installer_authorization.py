@@ -125,28 +125,78 @@ def parse_authorized_keys_line(line):
     return None, None, None
 
 
-def _verify_safe_dir(dir_path, expected_uid):
-    try:
-        st = os.lstat(dir_path)
-    except OSError as err:
-        raise AuthorizationError(f"Cannot access directory {dir_path}: {err}") from err
-
+def _check_dir_stat(st, dir_path, expected_uid):
     if not stat.S_ISDIR(st.st_mode):
         raise AuthorizationError(f"Path {dir_path} is not a directory")
-    if stat.S_ISLNK(st.st_mode):
-        raise AuthorizationError(f"Directory {dir_path} cannot be a symbolic link")
     if st.st_uid != expected_uid:
         raise AuthorizationError(f"Directory {dir_path} is owned by UID {st.st_uid}, expected {expected_uid}")
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise AuthorizationError(f"Directory {dir_path} is group or world writable")
 
 
-def _ensure_ssh_dir(ssh_dir, expected_uid):
-    if not os.path.exists(ssh_dir):
+def _verify_safe_dir(dir_path, expected_uid):
+    try:
+        st = os.lstat(dir_path)
+    except OSError as err:
+        raise AuthorizationError(f"Cannot access directory {dir_path}: {err}") from err
+
+    if stat.S_ISLNK(st.st_mode):
+        raise AuthorizationError(f"Directory {dir_path} cannot be a symbolic link")
+    _check_dir_stat(st, dir_path, expected_uid)
+
+
+def _open_verified_dir(dir_path, expected_uid):
+    """Open and verify the directory itself, returning its descriptor.
+
+    The descriptor, not the path, is what the caller acts on, so the checks
+    below apply to the very directory that will be flushed: its inode must
+    still be the one at ``dir_path``, it must be owned by the user and it must
+    not be group or world writable.
+    """
+    try:
+        fd = os.open(
+            dir_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as err:
+        raise AuthorizationError(f"Cannot open directory {dir_path}: {err}") from err
+    try:
+        st = os.fstat(fd)
         try:
-            os.mkdir(ssh_dir, 0o700)
+            path_st = os.lstat(dir_path)
+        except OSError as err:
+            raise AuthorizationError(f"Cannot access directory {dir_path}: {err}") from err
+        if (st.st_dev, st.st_ino) != (path_st.st_dev, path_st.st_ino):
+            raise AuthorizationError(f"Directory {dir_path} changed while being verified")
+        _check_dir_stat(st, dir_path, expected_uid)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _ensure_ssh_dir(ssh_dir, expected_uid):
+    user_home = os.path.dirname(ssh_dir)
+    home_fd = _open_verified_dir(user_home, expected_uid)
+    try:
+        try:
+            os.mkdir(os.path.basename(ssh_dir), 0o700, dir_fd=home_fd)
+        except FileExistsError:
+            pass
         except OSError as err:
             raise AuthorizationError(f"Failed to create {ssh_dir}: {err}") from err
+        # Flush the parent's directory entry for .ssh before anything is
+        # created inside it.  This runs on every attempt, not only when the
+        # directory is new: an earlier attempt whose flush failed must not be
+        # reported as durable just because the name is already visible.
+        try:
+            os.fsync(home_fd)
+        except OSError as err:
+            raise AuthorizationError(
+                f"Failed to flush {user_home} after ensuring {ssh_dir}: {err}"
+            ) from err
+    finally:
+        os.close(home_fd)
 
     _verify_safe_dir(ssh_dir, expected_uid)
     st = os.lstat(ssh_dir)

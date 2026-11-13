@@ -74,6 +74,29 @@ def _pending(error: object) -> dict:
     return {"state": "pending", "error": message[:_MAX_ERROR_CHARS]}
 
 
+def _discard_installed(target: Path, identity: tuple[int, int]) -> None:
+    """Remove the receipt file this call installed at ``target``.
+
+    Used only when the rename landed but the containing directory could not be
+    flushed: the new receipt is then readable without being provably durable,
+    and a later ``read`` would report ``complete`` from state that may vanish
+    on power loss.  Only the exact inode written by this call is removed, so a
+    different file (for example one installed by another writer) is never
+    touched.  Cleanup failures are ignored: the caller still propagates the
+    original flush error, so the receipt is never reported as durable.
+    """
+    try:
+        st = os.lstat(target)
+    except OSError:
+        return
+    if (st.st_dev, st.st_ino) != identity or not stat.S_ISREG(st.st_mode):
+        return
+    try:
+        os.unlink(target)
+    except OSError:
+        pass
+
+
 def write(record) -> dict:
     if os.geteuid() != 0:
         raise PermissionError("finalization receipt write requires root")
@@ -88,6 +111,8 @@ def write(record) -> dict:
     tmp_path = Path(tmp_name)
     try:
         os.fchmod(fd, 0o600)
+        st = os.fstat(fd)
+        installed = (st.st_dev, st.st_ino)
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(payload)
@@ -100,6 +125,11 @@ def write(record) -> dict:
         )
         try:
             os.fsync(dir_fd)
+        except OSError:
+            # The receipt is visible but its directory entry is not durable,
+            # so it must not stay readable as complete evidence.
+            _discard_installed(target, installed)
+            raise
         finally:
             os.close(dir_fd)
     except BaseException:

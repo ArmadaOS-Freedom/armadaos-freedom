@@ -22,7 +22,15 @@ from updates.package_contract import validate_package  # noqa: E402
 
 _MIB = 1024 * 1024
 
+# OfflineSessionStore refuses to open private storage unless the process owns
+# it as root; mirror that production check so the suite skips instead of
+# failing every test on an unprivileged host.
+ROOT_REQUIRED = unittest.skipUnless(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    "offline session storage requires euid 0 (root-owned private directories)")
 
+
+@ROOT_REQUIRED
 class OfflineSessionStoreTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

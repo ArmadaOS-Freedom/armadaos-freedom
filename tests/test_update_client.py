@@ -18,10 +18,13 @@ COMMIT = "a" * 64
 DEPLOY = f"os/{COMMIT}.2"
 
 
-def _status_json(comp, busy, job_id, op, result):
-    return json.dumps({"schemaVersion": 1, "components": {comp: {
+def _status_json(comp, busy, job_id, op, result, completed=None):
+    record = {
         "busy": busy, "jobId": job_id, "operation": op, "result": result
-    }}})
+    }
+    if completed is not None:
+        record["completed"] = completed
+    return json.dumps({"schemaVersion": 1, "components": {comp: record}})
 
 
 class LegacyCliTest(unittest.TestCase):
@@ -253,6 +256,82 @@ class UpdateClientTest(unittest.TestCase):
                 cli.run("system", "check", timeout=1.0)
         self.assertEqual(calls, ["StartCheck", "GetStatus", "GetStatus"])
         msleep.assert_called_once_with(0.5)
+
+    def test_completed_result_is_returned_for_the_exact_job_after_refresh(self):
+        final = {"component": "system", "state": "awaiting_reboot",
+                 "requiresReboot": True}
+        running = {"component": "system", "state": "running", "phase": "apply"}
+        other = {"component": "system", "state": "running", "phase": "status"}
+        replies = [
+            "job-original",
+            _status_json("system", True, "job-original", "update", running),
+            _status_json("system", True, "job-refresh", "status", other,
+                         completed={"job-original": final}),
+        ]
+        cli = update_client.UpdateClient(poll_interval=0)
+        calls, seen = [], []
+
+        def fake_call(method, argument=None, _r=replies, _c=calls):
+            _c.append(method)
+            return _r.pop(0)
+
+        with mock.patch.object(cli, "call", side_effect=fake_call), mock.patch("time.sleep"):
+            result = cli.run("system", "update", on_progress=seen.append)
+        self.assertEqual(result, final)
+        self.assertEqual(calls, ["StartSystemUpdate", "GetStatus", "GetStatus"])
+        self.assertEqual([item["state"] for item in seen],
+                         ["running", "awaiting_reboot"])
+
+    def test_evicted_or_foreign_job_results_are_rejected_explicitly(self):
+        cases = [
+            (_status_json("system", True, "job-new", "status",
+                          {"component": "system"}, completed={}),
+             "no longer available"),
+            (_status_json("system", True, "job-new", "status",
+                          {"component": "system"},
+                          completed={"job-old": {"component": "decky"}}),
+             "invalid update result"),
+            (_status_json("system", True, "job-new", "status",
+                          {"component": "system"},
+                          completed={"job-old": "not-a-dict"}),
+             "invalid update result"),
+            (_status_json("system", True, "job-new", "status",
+                          {"component": "system"}, completed=[]),
+             "invalid job history"),
+        ]
+        for payload, message in cases:
+            with self.subTest(message=message):
+                cli = update_client.UpdateClient(poll_interval=0)
+                replies = ["job-old", payload]
+                calls = []
+
+                def fake_call(method, argument=None, _r=replies, _c=calls):
+                    _c.append(method)
+                    return _r.pop(0)
+
+                with mock.patch.object(cli, "call", side_effect=fake_call), \
+                        mock.patch("time.sleep"):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        cli.run("system", "update")
+                self.assertEqual(calls, ["StartSystemUpdate", "GetStatus"])
+
+    def test_missing_completed_history_on_older_service_is_eviction(self):
+        cli = update_client.UpdateClient(poll_interval=0)
+        replies = ["job-old",
+                   _status_json("system", True, "job-new", "status",
+                                {"component": "system"})]
+        with mock.patch.object(cli, "call", side_effect=lambda m, a=None: (
+                replies.pop(0))), mock.patch("time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "no longer available"):
+                cli.run("system", "update")
+
+    def test_busy_error_recognition_matches_only_the_service_error_name(self):
+        self.assertTrue(update_client.is_busy_error(RuntimeError(
+            "GDBus.Error:org.armada.Updates.Error.Busy: component already has a pending job")))
+        self.assertFalse(update_client.is_busy_error(RuntimeError(
+            "GDBus.Error:org.armada.Updates.Error.Failed: operation failed")))
+        self.assertFalse(update_client.is_busy_error(RuntimeError("update service is busy")))
+        self.assertEqual(update_client.BUSY_ERROR, "org.armada.Updates.Error.Busy")
 
 
 if __name__ == "__main__":

@@ -152,6 +152,36 @@ class OfflineJobManager:
                 'systemctl is-active failed with status %s' % completed.returncode)
         return False
 
+    def _job_owned(self, operation, session_id):
+        """Return whether the transient unit of the recorded name exists.
+
+        ``systemd-run --unit=`` is the only thing that creates the unit and
+        ``--collect`` drops it again once it exits, so ``LoadState`` is the
+        unit ownership marker of the submission: only ``not-found`` is
+        positive proof that the queued launch never happened.  A failed or
+        unrecognized answer is reported as ``None`` (unknown) so callers
+        never restart work they cannot prove never started.
+        """
+        try:
+            completed = self._runner(
+                ['systemctl', 'show', '--property=LoadState',
+                 self._unit(operation, session_id)],
+                capture_output=True, check=False, timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if getattr(completed, 'returncode', None) != 0:
+            return None
+        stdout = getattr(completed, 'stdout', b'') or b''
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode('ascii', 'replace')
+        for line in stdout.splitlines():
+            if line.startswith('LoadState='):
+                value = line.split('=', 1)[1].strip()
+                if not value:
+                    return None
+                return value != 'not-found'
+        return None
+
     @staticmethod
     def _durable_completion(session, receipt):
         """Return this session's durable execute result, or None.
@@ -305,84 +335,148 @@ class OfflineJobManager:
             return None
         return status
 
-    def _reconcile_interrupted(self, session_id):
+    def _adopt_interrupted(self, session, receipt):
         """Adopt a durable terminal result that its dead worker never recorded.
 
-        Returns True only when the receipt was changed; a second call sees the
-        recorded result and does nothing.  No worker is relaunched and no
-        restart is issued here.  A prepare is adopted only as ``prepared`` from
-        its own terminal transaction documents, never as ``up_to_date``.
+        The receipt object is updated in place and True is returned when new
+        durable evidence was found; the caller owns persistence so the same
+        decision is reusable under an already-held session lock.  Nothing is
+        fabricated: partial, foreign or contradictory documents are refused
+        rather than repaired, and no worker is ever relaunched here.
         """
+        state = receipt.get('state')
+        operation = receipt.get('jobOperation')
+        if operation == 'prepare' and state in _UNRECORDED_PREPARE_STATES:
+            result = self._durable_prepare(session, receipt)
+            final = 'prepared'
+        elif operation == 'execute' and state in _UNRECORDED_EXECUTE_STATES:
+            result = self._durable_completion(session, receipt)
+            final = 'awaiting_reboot'
+        else:
+            return False
+        if result is None:
+            return False
+        receipt['state'] = final
+        receipt['result'] = result
+        receipt.pop('error', None)
+        return True
+
+    def _reconcile_interrupted(self, session_id):
+        """Persist one adopted durable result; never launch a worker."""
         with self.store.session_lock(session_id) as session:
             receipt = self.store.read_receipt(session)
-            state = receipt.get('state')
-            operation = receipt.get('jobOperation')
-            if operation == 'prepare' and state in _UNRECORDED_PREPARE_STATES:
-                result = self._durable_prepare(session, receipt)
-                final = 'prepared'
-            elif operation == 'execute' and state in _UNRECORDED_EXECUTE_STATES:
-                result = self._durable_completion(session, receipt)
-                final = 'awaiting_reboot'
-            else:
+            if not self._adopt_interrupted(session, receipt):
                 return False
-            if result is None:
-                return False
-            receipt['state'] = final
-            receipt['result'] = result
-            receipt.pop('error', None)
             try:
                 self.store.update_receipt(session, receipt)
             except OSError:
                 return False
             return True
 
+    def _never_started(self, session, operation, session_id):
+        """Return True only with positive proof that the queued job never ran.
+
+        A worker's first action is the atomic claim of its queued receipt under
+        the session lock (``prepare_queued`` -> ``preparing`` or
+        ``execute_queued`` -> ``executing``), so a receipt that is still queued
+        has not been claimed.  The transient systemd unit named by the
+        submission is the second marker: while it is loaded the worker may not
+        have reached that claim yet.  Partial output of either worker, or an
+        unreadable systemd answer, is treated as started and never restarted.
+        """
+        transaction = session / 'transaction'
+        if operation == 'prepare':
+            # offline_prepare creates the transaction work directory as its
+            # first step, so its absence proves that no prepare ran.
+            if transaction.exists() or transaction.is_symlink():
+                return False
+        else:
+            if transaction.is_symlink() or not transaction.is_dir():
+                return False
+            # An execute worker writes these before it reports anything.
+            for name in _EXECUTE_ARTIFACTS:
+                path = transaction / name
+                if path.exists() or path.is_symlink():
+                    return False
+            try:
+                status, _raw = offline_execute._load_json(
+                    transaction, 'status.json')
+            except (OSError, ValueError, RuntimeError):
+                return False
+            if status.get('state') != _PREPARED_STATE:
+                return False
+        return self._job_owned(operation, session_id) is False
+
+    def _resume_queued(self, session, receipt, operation, session_id):
+        """Adopt a durable result, or allow one relaunch of a queued job.
+
+        Returns True only when a queued submission may be dispatched again.
+        A worker that really ran but died before recording its result leaves
+        terminal documents (adopted instead), partial output (never
+        restarted), or a loaded unit (unknown; never restarted).
+        """
+        if self._adopt_interrupted(session, receipt):
+            self.store.update_receipt(session, receipt)
+            return False
+        return self._never_started(session, operation, session_id)
+
+    def _launch_job(self, session, operation, session_id, queued):
+        """Dispatch a queued job, keeping an already-owned unit a success.
+
+        A parallel client can create the same transient unit between this
+        request's ownership check and its ``systemd-run``.  That collision is
+        idempotent: the named unit already owns the work and the worker will
+        claim the queued receipt, so it must not be recorded as a failed
+        dispatch.  Only a launch with no owned unit becomes uncertain.
+        """
+        try:
+            self._launch(operation, session_id)
+        except (subprocess.SubprocessError, OSError) as exc:
+            current = self.store.read_receipt(session)
+            if (current.get('state') != queued or
+                    current.get('jobOperation') != operation):
+                return
+            if self._job_owned(operation, session_id) is True:
+                return
+            self.store.update_receipt(
+                session, self._dispatch_failed(session, current, exc))
+
     def submit_prepare(self, sessionId):
-        launch = False
         with self.store.session_lock(sessionId) as session:
             receipt = self.store.read_receipt(session)
             state = receipt.get('state')
-            if state != 'uploaded':
-                if state == 'uploading':
-                    raise offline_session.OfflineSessionError(
-                        'session payload has not been sealed')
-                if (state not in _IDEMPOTENT or
-                        receipt.get('jobOperation') not in ('prepare', 'execute')):
-                    raise offline_session.OfflineSessionError(
-                        'session receipt has an unrecognized state')
-            else:
+            if state == 'uploaded':
                 self._recheck_submission_identity(receipt)
                 receipt.update(
                     state='prepare_queued', jobOperation='prepare',
                     jobUnit=self._unit('prepare', sessionId))
                 receipt.pop('error', None)
                 self.store.update_receipt(session, receipt)
-                launch = True
-            if launch:
-                try:
-                    self._launch('prepare', sessionId)
-                except (subprocess.SubprocessError, OSError) as exc:
-                    current = self.store.read_receipt(session)
-                    if (current.get('state') == 'prepare_queued' and
-                            current.get('jobOperation') == 'prepare'):
-                        self.store.update_receipt(
-                            session, self._dispatch_failed(session, current, exc))
+                self._launch_job(session, 'prepare', sessionId, 'prepare_queued')
+            elif state == 'prepare_queued':
+                if receipt.get('jobOperation') != 'prepare':
+                    raise offline_session.OfflineSessionError(
+                        'session receipt has an unrecognized state')
+                if self._resume_queued(session, receipt, 'prepare', sessionId):
+                    self._launch_job(
+                        session, 'prepare', sessionId, 'prepare_queued')
+            elif state == 'uploading':
+                raise offline_session.OfflineSessionError(
+                    'session payload has not been sealed')
+            elif (state not in _IDEMPOTENT or
+                    receipt.get('jobOperation') not in ('prepare', 'execute')):
+                raise offline_session.OfflineSessionError(
+                    'session receipt has an unrecognized state')
         return self.store.status(sessionId)
 
     def submit_execute(self, sessionId, recovery_ack):
         with self.store.session_lock(sessionId) as session:
             receipt = self.store.read_receipt(session)
             state = receipt.get('state')
-            if state != 'prepared':
-                if receipt.get('jobOperation') != 'execute':
-                    raise offline_session.OfflineSessionError(
-                        'session is not prepared for execution')
-                saved, _raw = offline_execute._load_json(session, 'ack.json')
-                if recovery_ack != saved:
-                    raise ValueError('recovery acknowledgement differs from saved acknowledgement')
-            else:
+            if state == 'prepared':
                 prepared_status, _raw = offline_execute._load_json(
                     session / 'transaction', 'status.json')
-                if prepared_status.get('state') != 'awaiting_recovery_export':
+                if prepared_status.get('state') != _PREPARED_STATE:
                     raise offline_session.OfflineSessionError(
                         'transaction is not awaiting recovery export')
                 prepared, _raw = offline_execute._load_json(
@@ -400,14 +494,21 @@ class OfflineJobManager:
                     jobUnit=self._unit('execute', sessionId))
                 receipt.pop('error', None)
                 self.store.update_receipt(session, receipt)
-                try:
-                    self._launch('execute', sessionId)
-                except (subprocess.SubprocessError, OSError) as exc:
-                    current = self.store.read_receipt(session)
-                    if (current.get('state') == 'execute_queued' and
-                            current.get('jobOperation') == 'execute'):
-                        self.store.update_receipt(
-                            session, self._dispatch_failed(session, current, exc))
+                self._launch_job(session, 'execute', sessionId, 'execute_queued')
+            else:
+                if receipt.get('jobOperation') != 'execute':
+                    raise offline_session.OfflineSessionError(
+                        'session is not prepared for execution')
+                # The acknowledgement saved at submission is the only one an
+                # execute worker may use; a reconnect repeats it verbatim.
+                saved, _raw = offline_execute._load_json(session, 'ack.json')
+                if recovery_ack != saved:
+                    raise ValueError('recovery acknowledgement differs from saved acknowledgement')
+                if state == 'execute_queued':
+                    if self._resume_queued(
+                            session, receipt, 'execute', sessionId):
+                        self._launch_job(
+                            session, 'execute', sessionId, 'execute_queued')
         return self.store.status(sessionId)
 
     def _prepare(self, session, receipt):

@@ -29,8 +29,10 @@ class DesktopPrintStatusTest(unittest.TestCase):
         state = copy.deepcopy(self.state)
         state.update(changes)
         output = io.StringIO()
-        with patch.object(armada_tools, "privileged_request", return_value=state), redirect_stdout(output):
+        with patch.object(armada_tools, "privileged_request", return_value=state) as request, \
+                redirect_stdout(output):
             self.assertEqual(armada_tools.print_status("Operating System"), 0)
+        request.assert_called_once_with("get-os")
         text = output.getvalue()
         self.assertIn("Current Version: 20260919.current", text)
         self.assertIn("Previous Version: 20260907.previous", text)

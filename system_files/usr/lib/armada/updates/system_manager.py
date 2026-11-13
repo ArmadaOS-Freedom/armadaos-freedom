@@ -309,10 +309,12 @@ def _private_directory(path):
         raise RuntimeError(f"{path} is not a private root-owned directory")
 
 
+def _json_bytes(raw):
+    return json.loads(raw, object_pairs_hook=_no_duplicate_properties)
+
+
 def _json_document(path):
-    return json.loads(
-        _read_regular(path, MAX_CONFIG_BYTES),
-        object_pairs_hook=_no_duplicate_properties)
+    return _json_bytes(_read_regular(path, MAX_CONFIG_BYTES))
 
 
 def _valid_offline_completion(trial, model):
@@ -358,8 +360,11 @@ def _valid_offline_completion(trial, model):
             return False
         _private_directory(transaction)
         prepared = _json_document(transaction / "prepared.json")
-        plan = _json_document(transaction / "plan.json")
+        # Read the approved plan once: the digest must be computed over the
+        # exact bytes that were parsed, never over a second read that could
+        # observe a replaced file.
         plan_raw = _read_regular(transaction / "plan.json", MAX_CONFIG_BYTES)
+        plan = _json_bytes(plan_raw)
         status = _json_document(transaction / "status.json")
         report = _json_document(transaction / "write-report.json")
         ack = _json_document(session / "ack.json")

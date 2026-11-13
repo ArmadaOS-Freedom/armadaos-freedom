@@ -83,6 +83,7 @@ class FakeSysroot:
         self.writes = []
         self.pin_changes = []
         self.origin_writes = []
+        self.kargs_changes = []
         self.events = []
         self.deployed_origin = None
 
@@ -128,6 +129,7 @@ class FakeSysroot:
 
     def deployment_set_kargs(self, dep, kargs, _options):
         dep.boot.options = " ".join(kargs)
+        self.kargs_changes.append((store._binding_of(dep), tuple(kargs)))
         return True
 
     def write_deployments(self, deployments, _options):
@@ -176,6 +178,13 @@ def origin_ref(digest=None):
     return (
         "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
         "armadaos-freedom:stable@" + (digest or "sha256:" + "d" * 64)
+    )
+
+
+def channel_ref(channel, digest=None):
+    return (
+        "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+        "armadaos-freedom:" + channel + "@" + (digest or "sha256:" + "d" * 64)
     )
 
 
@@ -593,6 +602,230 @@ class ManagedRetentionTests(unittest.TestCase):
         self.assertEqual(store._retire_after(repinned), binding("a" * 64, 3))
         self.assertEqual(sysroot.pin_changes, [])
         self.assertEqual(sysroot.origin_writes, [])
+
+    def append(self, sysroot, target, current="a" * 64, serial=3):
+        return store.append_verified_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding(current, serial),
+            target_commit=target,
+            oci_digest="sha256:" + "d" * 64,
+            source_revision="f" * 40,
+            version="1.2.3",
+            model="TB322FC",
+            origin_ref=origin_ref(),
+        )
+
+    def test_append_refuses_staged_deployment_before_any_state_change(self):
+        current = deployment("a" * 64, 3)
+        staged = deployment("d" * 64, 9, pinned=True)
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, staged], staged=staged))
+
+        with self.assertRaises(store.DeploymentError):
+            self.append(sysroot, "e" * 64)
+
+        self.assertEqual(sysroot.writes, [])
+        self.assertEqual(sysroot.pin_changes, [])
+        self.assertEqual(sysroot.origin_writes, [])
+        self.assertEqual(sysroot.kargs_changes, [])
+        self.assertEqual(current.boot.options,
+                         f"quiet armada.deployment={binding('a' * 64, 3)}")
+        self.assertTrue(staged.pinned)
+
+    def test_append_persists_first_install_current_self_binding(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=FakeRepo(target)))
+
+        result = self.append(sysroot, target)
+
+        self.assertFalse(result["reused"])
+        self.assertEqual(
+            current.boot.options,
+            f"quiet armada.deployment={binding('a' * 64, 3)}")
+        self.assertEqual(
+            current.boot.options.split().count(
+                f"armada.deployment={binding('a' * 64, 3)}"), 1)
+        self.assertEqual(
+            [b for b, _ in sysroot.kargs_changes].count(binding("a" * 64, 3)), 1)
+        self.assertNotIn(binding("a" * 64, 3),
+                         [b for b, _ in sysroot.origin_writes])
+        self.assertEqual(result["deployment"], binding(target, 7))
+        candidate = [d for d in sysroot.deployments if d.get_csum() == target][0]
+        self.assertTrue(store._is_updater_created(candidate))
+
+    def test_existing_target_on_other_channel_gets_fresh_deployment(self):
+        current = deployment("a" * 64, 3)
+        target = "b" * 64
+        other = FakeDeployment(
+            "armada", target, 4,
+            origin=make_origin(marked=False, ref=channel_ref("beta")),
+            options=f"quiet armada.deployment={binding(target, 4)}")
+        before = dict(other.origin.values)
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, other], repo=FakeRepo(target)))
+
+        result = self.append(sysroot, target)
+
+        self.assertFalse(result["reused"])
+        self.assertEqual(result["deployment"], binding(target, 7))
+        self.assertEqual(dict(other.origin.values), before)
+        self.assertNotIn(binding(target, 4),
+                         [b for b, _ in sysroot.origin_writes])
+        self.assertNotIn(binding(target, 4),
+                         [b for b, _ in sysroot.kargs_changes])
+        fresh = [d for d in sysroot.deployments if store._binding_of(d) == binding(target, 7)][0]
+        self.assertEqual(fresh.origin.get_string("origin", "container-image-reference"),
+                         origin_ref())
+
+    def test_exact_origin_target_is_selected_over_other_channel_serial(self):
+        current = deployment("a" * 64, 3)
+        target = "b" * 64
+        beta = FakeDeployment(
+            "armada", target, 4,
+            origin=make_origin(marked=False, ref=channel_ref("beta")),
+            options=f"quiet armada.deployment={binding(target, 4)}")
+        stable = FakeDeployment(
+            "armada", target, 5,
+            origin=make_origin(marked=False, ref=origin_ref()),
+            options=f"quiet armada.deployment={binding(target, 5)}")
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, beta, stable], repo=FakeRepo(target)))
+
+        result = self.append(sysroot, target)
+
+        self.assertTrue(result["reused"])
+        self.assertEqual(result["deployment"], binding(target, 5))
+        self.assertNotIn(binding(target, 4),
+                         [b for b, _ in sysroot.origin_writes])
+        self.assertNotIn(binding(target, 4),
+                         [b for b, _ in sysroot.kargs_changes])
+        self.assertEqual(sysroot.writes, [])
+
+    def test_ambiguous_exact_origin_targets_are_rejected(self):
+        current = deployment("a" * 64, 3)
+        target = "b" * 64
+        first = FakeDeployment(
+            "armada", target, 4, origin=make_origin(marked=False, ref=origin_ref()),
+            options=f"quiet armada.deployment={binding(target, 4)}")
+        second = FakeDeployment(
+            "armada", target, 5, origin=make_origin(marked=False, ref=origin_ref()),
+            options=f"quiet armada.deployment={binding(target, 5)}")
+        sysroot = self.use_sysroot(
+            FakeSysroot([current, first, second], repo=FakeRepo(target)))
+
+        with self.assertRaises(store.DeploymentError):
+            self.append(sysroot, target)
+
+        self.assertEqual(sysroot.writes, [])
+        self.assertEqual(sysroot.pin_changes, [])
+        self.assertEqual(sysroot.origin_writes, [])
+        self.assertEqual(sysroot.kargs_changes, [])
+
+    def test_tampered_existing_target_origin_is_rejected(self):
+        target = "b" * 64
+        for bad_ref in (
+            channel_ref("stable", "sha256:" + "e" * 64),
+            "ostree-image-signed:docker://evil.example/armadaos-freedom/"
+            "armadaos-freedom:stable@sha256:" + "d" * 64,
+            "docker://ghcr.io/armadaos-freedom/armadaos-freedom:"
+            "stable@sha256:" + "d" * 64,
+            channel_ref("nightly"),
+        ):
+            with self.subTest(bad_ref=bad_ref):
+                current = deployment("a" * 64, 3)
+                existing = FakeDeployment(
+                    "armada", target, 4, origin=make_origin(marked=False, ref=bad_ref),
+                    options=f"quiet armada.deployment={binding(target, 4)}")
+                sysroot = self.use_sysroot(
+                    FakeSysroot([current, existing], repo=FakeRepo(target)))
+
+                with self.assertRaises(store.DeploymentError):
+                    self.append(sysroot, target)
+
+                self.assertEqual(sysroot.writes, [])
+                self.assertEqual(sysroot.pin_changes, [])
+                self.assertEqual(sysroot.origin_writes, [])
+                self.assertEqual(sysroot.kargs_changes, [])
+                self.assertEqual(existing.origin.get_string(
+                    "origin", "container-image-reference"), bad_ref)
+
+    def test_ensure_deployment_binding_persists_canonical_binding_once(self):
+        dep = FakeDeployment(
+            "armada", "b" * 64, 4, origin=make_origin(marked=False), options="quiet")
+        sysroot = self.use_sysroot(FakeSysroot([dep]))
+
+        first = store.ensure_deployment_binding(
+            sysroot_path=str(self.root), binding=binding("b" * 64, 4))
+
+        self.assertEqual(first, {"deployment": binding("b" * 64, 4), "changed": True})
+        self.assertEqual(dep.boot.options,
+                         f"quiet armada.deployment={binding('b' * 64, 4)}")
+        self.assertEqual(sysroot.origin_writes, [])
+
+        second = store.ensure_deployment_binding(
+            sysroot_path=str(self.root), binding=binding("b" * 64, 4))
+
+        self.assertEqual(second, {"deployment": binding("b" * 64, 4), "changed": False})
+        self.assertEqual(len(sysroot.kargs_changes), 1)
+
+    def test_ensure_deployment_binding_rejects_conflicting_tokens(self):
+        for options in (
+            f"quiet armada.deployment={binding('c' * 64, 4)}",
+            f"quiet armada.deployment={binding('b' * 64, 4)} "
+            f"armada.deployment={binding('c' * 64, 4)}",
+            "quiet armada.deployment",
+        ):
+            with self.subTest(options=options):
+                dep = FakeDeployment(
+                    "armada", "b" * 64, 4, origin=make_origin(marked=False),
+                    options=options)
+                sysroot = self.use_sysroot(FakeSysroot([dep]))
+
+                with self.assertRaises(store.DeploymentError):
+                    store.ensure_deployment_binding(
+                        sysroot_path=str(self.root), binding=binding("b" * 64, 4))
+
+                self.assertEqual(sysroot.kargs_changes, [])
+                self.assertEqual(dep.boot.options, options)
+
+    def test_ensure_deployment_binding_refuses_staged_sysroot(self):
+        dep = FakeDeployment(
+            "armada", "b" * 64, 4, origin=make_origin(marked=False), options="quiet")
+        staged = deployment("d" * 64, 9, pinned=True)
+        sysroot = self.use_sysroot(FakeSysroot([dep, staged], staged=staged))
+
+        with self.assertRaises(store.DeploymentError):
+            store.ensure_deployment_binding(
+                sysroot_path=str(self.root), binding=binding("b" * 64, 4))
+
+        self.assertEqual(sysroot.kargs_changes, [])
+        self.assertEqual(dep.boot.options, "quiet")
+        self.assertTrue(staged.pinned)
+
+    def test_promote_persists_unbound_current_binding(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet", pinned=True)
+        previous = deployment("b" * 64, 2, pinned=True)
+        sysroot = self.use_sysroot(FakeSysroot([current, previous]))
+
+        result = store.promote_confirmed_deployment(
+            sysroot_path=str(self.root),
+            current_binding=binding("a" * 64, 3),
+            previous_binding=binding("b" * 64, 2),
+        )
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["deployment"], binding("a" * 64, 3))
+        self.assertEqual(current.boot.options,
+                         f"quiet armada.deployment={binding('a' * 64, 3)}")
+        self.assertEqual([b for b, _ in sysroot.kargs_changes],
+                         [binding("a" * 64, 3)])
+        self.assertEqual(sysroot.origin_writes, [])
+        self.assertEqual(sysroot.writes, [])
 
 
 if __name__ == "__main__":

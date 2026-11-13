@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -157,6 +158,15 @@ class OfflinePrepareTest(unittest.TestCase):
                 }
 
             def _import_side_effect(**kw) -> dict:
+                # The real importer expands the full-size root image and
+                # extracts the whole OSTree repository under this exact leaf.
+                staging = kw["work_dir"]
+                staging.mkdir(parents=True, exist_ok=True)
+                (staging / "linux-root.img").write_bytes(b"expanded-image" * 4096)
+                extracted = staging / "content/root/ostree/repo"
+                extracted.mkdir(parents=True, exist_ok=True)
+                (extracted / "config").write_bytes(b"[core]\nrepo_version=1\n")
+                (staging / "extract.log").write_bytes(b"btrfs restore log\n")
                 return {
                     "package": json.loads(kw["document"].decode("utf-8")),
                     "commit": NEW_COMMIT,
@@ -330,6 +340,93 @@ class OfflinePrepareTest(unittest.TestCase):
                         self.assertEqual(plan["newBootSha256"][s], cand_json["candidate"]["sha256"])
                         self.assertNotEqual(plan["originalBootSha256"][s], plan["newBootSha256"][s])
                     env.assert_untouched()
+
+    def test_import_and_deploy_receive_exact_arguments(self) -> None:
+        with self._case() as env:
+            env.run()
+            package = json.loads(env.document)
+            self.assertEqual(env.import_payload.call_count, 1)
+            self.assertEqual(env.import_payload.call_args.kwargs, {
+                "document": env.document,
+                "signature_b64": env.signature_b64,
+                "payload_directory": env.payload,
+                "expected_channel": "stable",
+                "model": "TB322FC",
+                "updater_version": "0.8.0",
+                "sysroot_path": env.sysroot,
+                "work_dir": env.work / "import",
+                "trusted_key": self.pub_key,
+            })
+            self.assertEqual(env.deploy.call_count, 1)
+            self.assertEqual(env.deploy.call_args.kwargs, {
+                "sysroot_path": env.sysroot,
+                "current_binding": OLD_DEPLOYMENT,
+                "target_commit": NEW_COMMIT,
+                "oci_digest": package["ociDigest"],
+                "source_revision": package["sourceRevision"],
+                "version": package["version"],
+                "model": "TB322FC",
+                "origin_ref": ORIGIN_REF,
+            })
+
+    def test_success_reclaims_only_the_owned_import_workspace(self) -> None:
+        with self._case() as env:
+            staging = env.work / "import"
+            status = env.run()
+            self.assertEqual(status["state"], "awaiting_recovery_export")
+            self.assertFalse(staging.exists() or staging.is_symlink())
+            for name in ("status.json", "plan.json", "prepared.json",
+                         "recovery-manifest.json", "recovery-header.bin",
+                         "recovery-region.bin", "package.json", "package.sig"):
+                self.assertTrue((env.work / name).is_file(), name)
+            for rel, expected in env.captured_originals.items():
+                self.assertEqual((env.work / "trust" / rel).read_bytes(), expected)
+            for slot in ("a", "b"):
+                self.assertTrue(any((env.work / ("candidate-" + slot)).iterdir()))
+            env.assert_untouched()
+
+    def test_import_workspace_is_kept_until_deployment_identity_is_verified(self) -> None:
+        with self._case() as env:
+            env.deploy.side_effect = lambda **kw: {
+                "model": kw["model"], "deployment": "armada/" + ("c" * 64) + ".2"}
+            with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                env.run()
+            self.assertIn("deployment does not match authenticated package",
+                          str(ctx.exception))
+            self.assertTrue((env.work / "import/linux-root.img").is_file())
+
+    def test_import_workspace_symlink_is_never_followed_or_removed(self) -> None:
+        with self._case() as env:
+            outside = env.temp / "foreign-import-target"
+            outside.mkdir()
+            marker = outside / "keep.bin"
+            marker.write_bytes(b"keep")
+
+            def _import_symlink(**kw):
+                kw["work_dir"].symlink_to(outside)
+                return {
+                    "package": json.loads(kw["document"].decode("utf-8")),
+                    "commit": NEW_COMMIT,
+                    "originRef": ORIGIN_REF,
+                }
+
+            env.import_payload.side_effect = _import_symlink
+            env.run()
+            self.assertTrue((env.work / "import").is_symlink())
+            self.assertEqual(marker.read_bytes(), b"keep")
+
+    def test_import_workspace_with_unsafe_mode_is_left_in_place(self) -> None:
+        with self._case() as env:
+            real = env.import_payload.side_effect
+
+            def _import_shared(**kw):
+                result = real(**kw)
+                os.chmod(kw["work_dir"], 0o777)
+                return result
+
+            env.import_payload.side_effect = _import_shared
+            env.run()
+            self.assertTrue((env.work / "import/linux-root.img").is_file())
 
     def test_package_authentication_and_up_to_date_gates(self) -> None:
         bad_doc, bad_sig, _ = self._signed_package(priv_key=self.other_priv)

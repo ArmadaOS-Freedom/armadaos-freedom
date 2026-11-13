@@ -13,10 +13,13 @@ first record goes to copy A.  Its only purpose is to make an interrupted first
 write distinguishable from an unreadable journal: a torn A plus an exact
 marker in B still means "no record was ever committed".  It is recognised only
 in copy B, only after ordinary record selection found no record, and only when
-A is blank or CRC-damaged.  A complete record image with a valid CRC, a foreign
-or unsupported but CRC-valid record, a conflicting equal-sequence pair or any
-other non-marker pair stays an error.  Once a real record is durable it always
-wins; the next copy-on-write write replaces the marker.
+A is blank or CRC-damaged.  An exact marker in A is a writer fault and stays an
+error: the sentinel belongs to copy B alone, and accepting a marker pair as
+empty would hide a record copy that was overwritten with the sentinel.  A
+complete record image with a valid CRC, a foreign or unsupported but CRC-valid
+record, a conflicting equal-sequence pair or any other non-marker pair stays an
+error.  Once a real record is durable it always wins; the next copy-on-write
+write replaces the marker.
 """
 
 from __future__ import annotations
@@ -356,8 +359,11 @@ def select_record(
     # The logical-empty sentinel is consulted only after real-record selection
     # failed, only in its designated copy B, and only for a blank or torn A.
     # A CRC-valid image in A (foreign, unsupported or otherwise incompatible)
-    # is a record that must be refused, never silently called empty.
-    if b == EMPTY_MARKER and (empty_a or not _record_crc_valid(a)):
+    # is a record that must be refused, never silently called empty.  An exact
+    # marker in A is refused too: the sentinel belongs to copy B, so a marker
+    # there means a record copy was overwritten by the sentinel.
+    if (b == EMPTY_MARKER and a != EMPTY_MARKER
+            and (empty_a or not _record_crc_valid(a))):
         raise LogicalEmptyTrialJournal(
             "trial journal holds only the empty marker in copy B"
         )
