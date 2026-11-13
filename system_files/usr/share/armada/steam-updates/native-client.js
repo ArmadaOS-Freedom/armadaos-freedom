@@ -10,6 +10,7 @@
     var local = null;
     var applyEvidenceToken = null;
     var applyEvidenceAbsent = false;
+    var applyEvidenceUnknown = false;
 
     function parts() {
       var steam = host && host.SteamClient;
@@ -37,11 +38,23 @@
           Number.isSafeInteger(r.rtime_checked) && r.rtime_checked > 0 ? r : null;
       } catch (_) { return null; }
     }
-    function rawApplyResult() {
+    // GetApplyResult has three distinct outcomes that must never be conflated:
+    // a valid client-specific result, an observed absence (the read succeeded
+    // and no result is published), and a failed/unknown read.  Only the
+    // second is a gap; a throwing read proves neither a result nor a gap.
+    function readApplyResult() {
+      var result;
       try {
-        var r = parts().updater.GetApplyResult(1);
-        return r && r.type === 1 && typeof r.eresult === 'number' ? r : null;
-      } catch (_) { return null; }
+        result = parts().updater.GetApplyResult(1);
+      } catch (_) { return { kind: 'unknown', result: null }; }
+      if (result === null || result === undefined)
+        return { kind: 'absent', result: null };
+      if (result.type === 1 && typeof result.eresult === 'number')
+        return { kind: 'result', result: result };
+      return { kind: 'unknown', result: null };
+    }
+    function rawApplyResult() {
+      return readApplyResult().result;
     }
     function applyResult() {
       var r = rawApplyResult();
@@ -55,19 +68,45 @@
     }
     // GetApplyResult may hand back a fresh object on every read carrying the
     // same flags, so evidence is the semantic token, never object identity.
-    // An actually observed gap (no result) is remembered so identical values
-    // republished after the gap count as new evidence.
+    // An actually observed gap (a successful read with no result) is
+    // remembered so identical values republished after the gap count as new
+    // evidence.  A failed baseline read leaves the pre-apply publication
+    // unknown: a later valid result may be historical, so it is only adopted
+    // as a comparison point and must genuinely change (or follow an observed
+    // gap) before it can be promoted to fresh evidence.
     function recordApplyBaseline() {
-      applyEvidenceToken = applyResultToken(rawApplyResult());
-      applyEvidenceAbsent = !applyEvidenceToken;
+      var observed = readApplyResult();
+      applyEvidenceToken = observed.kind === 'result' ?
+        applyResultToken(observed.result) : null;
+      applyEvidenceAbsent = observed.kind === 'absent';
+      applyEvidenceUnknown = observed.kind === 'unknown';
     }
     function observeApplyResult() {
-      var raw = rawApplyResult();
+      var observed = readApplyResult();
+      if (observed.kind === 'unknown') {
+        // A failed read is not an observation at all: it neither creates a
+        // gap nor erases one that was genuinely observed before it.
+        return null;
+      }
+      if (observed.kind === 'absent') {
+        applyEvidenceAbsent = true;
+        return null;
+      }
+      var raw = observed.result;
       var token = applyResultToken(raw);
-      if (!token) { applyEvidenceAbsent = true; return null; }
-      if (!applyEvidenceAbsent && token === applyEvidenceToken) return null;
+      if (applyEvidenceUnknown) {
+        if (applyEvidenceToken === null && !applyEvidenceAbsent) {
+          // First valid value after a failed baseline: remember it only.
+          applyEvidenceToken = token;
+          return null;
+        }
+        if (!applyEvidenceAbsent && token === applyEvidenceToken) return null;
+      } else if (!applyEvidenceAbsent && token === applyEvidenceToken) {
+        return null;
+      }
       applyEvidenceToken = token;
       applyEvidenceAbsent = false;
+      applyEvidenceUnknown = false;
       return raw;
     }
     function awaitingApply() {

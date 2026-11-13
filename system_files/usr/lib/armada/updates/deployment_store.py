@@ -29,8 +29,15 @@ _ORIGIN_RE = re.compile(
 # Updater-owned namespace for the temporary ref that keeps a freshly imported
 # target commit alive while the sysroot is mutated.  Nothing else writes here,
 # and every name carries a fresh random UUID, so an existing ref is never
-# replaced.  libostree stores local refs under refs/ itself.
+# replaced.  libostree stores local refs under refs/ itself.  The constant is
+# also the refspec prefix handed to list_refs_ext, which takes a refspec and
+# not a path: libostree rejects a trailing "/" as an invalid refspec, so it is
+# stored without a separator here.
 _TEMP_REF_PREFIX = "armada-update/pending"
+# Exactly the names _hold_target_ref generates.  Reconciliation only ever
+# considers local refs in this namespace that match this form, so foreign,
+# manual and remote refs are never touched.
+_TEMP_REF_RE = re.compile(re.escape(_TEMP_REF_PREFIX) + r"/[0-9a-f]{32}")
 
 
 class DeploymentError(Exception):
@@ -98,6 +105,58 @@ def _release_target_ref(repo, name):
         raise DeploymentError(f"failed removing temporary ref {name}: {exc}") from exc
     if not removed:
         raise DeploymentError(f"failed removing temporary ref {name}")
+
+
+def _reconcile_temp_refs(OSTree, repo, keep):
+    """Drop temporary refs leaked by earlier interrupted transactions.
+
+    The caller holds the updater transaction lock and the sysroot try_lock, so
+    no other transaction can own a ref in the updater namespace: only
+    ``_hold_target_ref`` writes there, every name is a fresh random UUID, and
+    every completed transaction removes exactly the ref it created.  Any other
+    matching ref is therefore leaked and safe to remove.
+
+    The caller has already protected the target commit with ``keep`` (or the
+    target is reachable from an existing deployment), so releasing a leaked
+    ref cannot make the pending target unreachable before mutation.  This only
+    deletes refs: it does not prune objects, touch retained deployments or
+    record timestamps.  Remote refs are excluded by the listing flags and the
+    remaining names must match the exact generated form, so foreign or manual
+    refs are never removed.
+
+    The listing prefix is the bare namespace without a trailing separator:
+    ``list_refs_ext`` takes a refspec prefix, not a directory path, and
+    libostree rejects a trailing "/" with ``Invalid refspec``.  It returns
+    full ref names (``armada-update/pending/<uuid>``), so the anchored
+    ``_TEMP_REF_RE`` below decides membership on the complete name.
+    """
+    try:
+        flags = (OSTree.RepoListRefsExtFlags.EXCLUDE_REMOTES |
+                 OSTree.RepoListRefsExtFlags.EXCLUDE_MIRRORS)
+        ok, refs = repo.list_refs_ext(_TEMP_REF_PREFIX, flags, None)
+    except Exception as exc:
+        raise DeploymentError(f"failed listing temporary refs: {exc}") from exc
+    if not ok or refs is None:
+        raise DeploymentError("failed listing temporary refs")
+    leaked = sorted(
+        name for name in refs
+        if isinstance(name, str) and name != keep and
+        _TEMP_REF_RE.fullmatch(name) is not None
+    )
+    failed = []
+    for name in leaked:
+        try:
+            removed = repo.set_ref_immediate(None, name, None, None)
+        except Exception as exc:
+            failed.append(f"{name}: {exc}")
+            continue
+        if not removed:
+            failed.append(f"{name}: not removed")
+    if failed:
+        # Keep the failure visible so the next attempt retries reconciliation
+        # instead of silently leaving the leaked refs in place.
+        raise DeploymentError(
+            "failed removing leaked temporary refs: " + "; ".join(failed))
 
 
 def _require_str(value, name):
@@ -523,6 +582,17 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
         if not any(d.get_csum() == target_commit and d.get_osname() == osname
                    for d in deployments):
             temp_ref = _hold_target_ref(repo, target_commit)
+
+        # Reconcile refs leaked by earlier interrupted appends.  This runs
+        # under the same exclusive sysroot lock and only after the sysroot,
+        # staged, target-commit and current-binding validations above, so it
+        # cannot race another transaction.  The target commit is already
+        # protected by the ref just acquired (or by an existing deployment),
+        # which means dropping a leaked ref cannot let a later prune discard
+        # the pending target.  It also happens before the first kargs/deploy
+        # mutation that can prune.  Only exact local updater-owned names are
+        # removed.
+        _reconcile_temp_refs(OSTree, repo, temp_ref)
 
         # A first-install deployment predates the per-deployment
         # armada.deployment token.  Persist the running deployment's own

@@ -146,11 +146,15 @@ class FakeSysroot:
 
 
 class FakeRepo:
-    def __init__(self, commit, refs=None, resolve_ok=True):
+    def __init__(self, commit, refs=None, resolve_ok=True, list_ok=True,
+                 remove_fail_names=()):
         self.commit = commit
         self.refs = dict(refs or {})
         self.resolve_ok = resolve_ok
+        self.list_ok = list_ok
+        self.remove_fail_names = set(remove_fail_names)
         self.ref_changes = []
+        self.list_calls = []
         self.events = None
 
     def load_commit(self, commit):
@@ -168,10 +172,32 @@ class FakeRepo:
             return True, self.refs[name]
         return True, None
 
+    def list_refs_ext(self, refspec_prefix, flags, _cancellable):
+        # Mirrors libostree: the argument is a refspec prefix, not a path, so a
+        # trailing separator is rejected outright with "Invalid refspec" (the
+        # real GI call raises GLib.Error).  A valid prefix returns FULL ref
+        # names, and remote refs, which libostree keys as "remote:ref", are
+        # excluded when EXCLUDE_REMOTES is set; the prefix is a plain string.
+        if refspec_prefix is not None and refspec_prefix.endswith("/"):
+            raise ValueError(f"Invalid refspec {refspec_prefix}")
+        self.list_calls.append((refspec_prefix, flags))
+        if not self.list_ok:
+            return False, None
+        visible = {}
+        for name, checksum in self.refs.items():
+            if ":" in name:
+                continue
+            if refspec_prefix and not name.startswith(refspec_prefix):
+                continue
+            visible[name] = checksum
+        return True, visible
+
     def set_ref_immediate(self, remote, ref, commit, _cancellable):
         self.ref_changes.append((remote, ref, commit))
         if self.events is not None:
             self.events.append(("ref", ref, commit))
+        if commit is None and ref in self.remove_fail_names:
+            return False
         if commit is None:
             self.refs.pop(ref, None)
         else:
@@ -193,6 +219,10 @@ class FakeGio:
 class FakeOSTree:
     class DeploymentUnlockedState:
         NONE = 0
+
+    class RepoListRefsExtFlags:
+        EXCLUDE_REMOTES = 1 << 1
+        EXCLUDE_MIRRORS = 1 << 2
 
     Sysroot = FakeSysroot
 
@@ -819,6 +849,125 @@ class ManagedRetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(store.DeploymentError,
                                     "failed removing temporary ref"):
             self.append(sysroot_ok, target)
+
+    def test_append_reconciles_leaked_temporary_refs_before_mutation(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        leaked_one = f"{store._TEMP_REF_PREFIX}/{'1' * 32}"
+        leaked_two = f"{store._TEMP_REF_PREFIX}/{'2' * 32}"
+        foreign_refs = {
+            "refs/heads/main": "f" * 64,
+            f"{store._TEMP_REF_PREFIX}/not-a-uuid": "c" * 64,
+            f"{store._TEMP_REF_PREFIX}/{'3' * 31}": "c" * 64,
+            f"{store._TEMP_REF_PREFIX}/{'4' * 32}/extra": "c" * 64,
+            f"{store._TEMP_REF_PREFIX}-sibling/{'6' * 32}": "c" * 64,
+            "other/pending/" + "5" * 32: "c" * 64,
+            "origin:refs/heads/main": "c" * 64,
+        }
+        repo = FakeRepo(target, refs={
+            leaked_one: "b" * 64,
+            leaked_two: "c" * 64,
+            **foreign_refs,
+        })
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+        repo.events = sysroot.events
+
+        self.append(sysroot, target)
+
+        for name in (leaked_one, leaked_two):
+            self.assertNotIn(name, repo.refs)
+            self.assertIn((None, name, None), repo.ref_changes)
+        for name in foreign_refs:
+            self.assertIn(name, repo.refs)
+            self.assertNotIn((None, name, None), repo.ref_changes)
+
+        created = [c for c in repo.ref_changes if c[2] is not None]
+        self.assertEqual(len(created), 1)
+        held = created[0][1]
+        self.assertRegex(held, r"^armada-update/pending/[0-9a-f]{32}$")
+        # The target commit is protected by this transaction's own ref before
+        # any leaked ref is dropped.
+        first_release = min(
+            sysroot.events.index(("ref", name, None))
+            for name in (leaked_one, leaked_two))
+        self.assertLess(sysroot.events.index(("ref", held, target)),
+                        first_release)
+        # Cleanup completes before the first mutation that can prune.
+        first_kargs = sysroot.events.index(("kargs", binding("a" * 64, 3)))
+        self.assertLess(first_release, first_kargs)
+        self.assertNotEqual(repo.list_calls, [])
+        prefix, flags = repo.list_calls[0]
+        self.assertEqual(prefix, store._TEMP_REF_PREFIX)
+        self.assertFalse(prefix.endswith("/"))
+        self.assertTrue(flags & FakeOSTree.RepoListRefsExtFlags.EXCLUDE_REMOTES)
+        self.assertTrue(flags & FakeOSTree.RepoListRefsExtFlags.EXCLUDE_MIRRORS)
+
+    def test_append_reports_leaked_ref_cleanup_failure_for_retry(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        leaked = f"{store._TEMP_REF_PREFIX}/{'1' * 32}"
+        repo = FakeRepo(target, refs={leaked: "b" * 64},
+                        remove_fail_names={leaked})
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError,
+                                    "failed removing leaked temporary refs"):
+            self.append(sysroot, target)
+
+        # The leaked ref survives so the next attempt sees and retries it,
+        # and no mutation happened on this one.
+        self.assertEqual(repo.refs, {leaked: "b" * 64})
+        self.assertEqual(sysroot.writes, [])
+        self.assertEqual(sysroot.kargs_changes, [])
+        self.assertEqual(sysroot.pin_changes, [])
+        created = [c for c in repo.ref_changes if c[2] is not None]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(repo.ref_changes[-1], (None, created[0][1], None))
+
+    def test_append_failed_temp_ref_listing_aborts_before_mutation(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        repo = FakeRepo(target, list_ok=False)
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError,
+                                    "failed listing temporary refs"):
+            self.append(sysroot, target)
+
+        self.assertEqual(sysroot.kargs_changes, [])
+        self.assertEqual(sysroot.writes, [])
+        self.assertEqual(sysroot.pin_changes, [])
+        # This attempt's own protection is released again.
+        created = [c for c in repo.ref_changes if c[2] is not None]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(repo.ref_changes[-1], (None, created[0][1], None))
+        self.assertEqual(repo.refs, {})
+
+    def test_append_failed_try_lock_touches_no_refs(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        repo = FakeRepo(target)
+
+        class BusySysroot(FakeSysroot):
+            def try_lock(self):
+                return True, False
+
+        sysroot = self.use_sysroot(BusySysroot([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError, "sysroot busy"):
+            self.append(sysroot, target)
+
+        self.assertEqual(repo.list_calls, [])
+        self.assertEqual(repo.ref_changes, [])
+        self.assertEqual(sysroot.writes, [])
 
     def test_existing_target_on_other_channel_gets_fresh_deployment(self):
         current = deployment("a" * 64, 3)

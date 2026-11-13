@@ -603,6 +603,114 @@ test('identical values republished after an observed gap are accepted as new evi
   assert.deepEqual(h.data.calls.restart, []);
 });
 
+test('a failed apply baseline keeps a historical result non-fresh until it changes', async () => {
+  const h = host();
+  const historical = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  h.data.apply = historical;
+  let mode = 'result';
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    if (mode === 'throw') throw new Error('native read failed');
+    return Object.assign({}, historical);
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  // The baseline read fails, so the pre-apply publication is unknown.
+  mode = 'throw';
+  const awaiting = await adapter.apply();
+  assert.equal(awaiting.state, 'awaiting_status');
+  assert.equal(awaiting.busy, true);
+  assert.equal(awaiting.requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+
+  // The unchanged historical value is adopted only as a comparison point.
+  mode = 'result';
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  // A genuine change during the pending apply is fresh evidence.
+  h.UpdateStore.m_updater.GetApplyResult = (type) =>
+    type === 1 ? {
+      type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
+    } : { type, eresult: 2 };
+  const ready = adapter.snapshot();
+  assert.equal(ready.state, 'restart_required');
+  assert.equal(ready.requiresClientRestart, true);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('a failed apply-result read is unknown, not an observed gap', async () => {
+  const h = host();
+  const historical = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  h.data.apply = historical;
+  let mode = 'result';
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    if (mode === 'throw') throw new Error('native read failed');
+    if (mode === 'reject')
+      return {
+        type: 1, eresult: 2,
+        requires_client_restart: false, requires_system_restart: false
+      };
+    return Object.assign({}, historical);
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  // A throw proves nothing, so the unchanged historical value that follows
+  // must still not count as fresh.
+  mode = 'throw';
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  mode = 'result';
+  const unchanged = adapter.snapshot();
+  assert.equal(unchanged.state, 'awaiting_status');
+  assert.equal(unchanged.busy, true);
+
+  // A real change after the failed read is fresh and surfaces the rejection.
+  mode = 'reject';
+  const failed = adapter.snapshot();
+  assert.equal(failed.state, 'failed');
+  assert.match(failed.error, /Client apply failed \(2\)/);
+  assert.equal(failed.requiresClientRestart, false);
+});
+
+test('after a failed baseline an observed gap makes the next result fresh', async () => {
+  const h = host();
+  let mode = 'result';
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    if (mode === 'throw') throw new Error('native read failed');
+    if (mode === 'absent') return null;
+    return {
+      type: 1, eresult: 2,
+      requires_client_restart: false, requires_system_restart: false
+    };
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  mode = 'throw';
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  // An observed gap (successful read with no result) is real evidence even
+  // when the baseline itself was unknown.
+  mode = 'absent';
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  mode = 'reject';
+  const failed = adapter.snapshot();
+  assert.equal(failed.state, 'failed');
+  assert.match(failed.error, /Client apply failed \(2\)/);
+  assert.equal(failed.busy, false);
+});
+
 test('failed refresh while a client apply awaits preserves awaiting status and its error', async () => {
   const h = host();
   h.data.apply = null;
