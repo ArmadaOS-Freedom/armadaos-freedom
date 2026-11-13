@@ -37,9 +37,13 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
+    # Exit status 77 is the suite's "skipped: precondition unavailable" code and
+    # exit status 0 is success; only those keep the run going. Any other status
+    # is a real failure, so the loop stops there and exits with that code before
+    # the Python tests run, keeping the first failure from being masked.
     for test_file in tests/*-test.sh; do
         echo "Running test: ${test_file}"
-        bash "${test_file}"
+        bash "${test_file}" || { status=$?; if [[ "${status}" -ne 77 ]]; then echo "FAIL: ${test_file} exited ${status}" >&2; exit "${status}"; fi; echo "Skipped test: ${test_file} (exit 77)"; }
     done
     python3 -m unittest discover -s tests -p test_plugin_sources.py
     python3 -m unittest discover -s tests -p 'test_decky_*.py'
