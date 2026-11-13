@@ -116,9 +116,19 @@ int kshim_update_trial_before_boot(const struct kshim_update_trial *record,
                                    const uint8_t commit[32], uint32_t serial,
                                    struct kshim_update_trial_decision *decision);
 
-/* Callers must establish real system health before requesting confirmation. */
+/*
+ * Confirmation requires the boot SHA-256 observed on actual_slot.  An
+ * OFFLINE_DUAL record confirms on target_slot with new_boot_sha256 and on
+ * from_slot with other_boot_sha256 (the mirrored copy of the new deployment).
+ * A legacy single-slot record confirms only on target_slot with
+ * new_boot_sha256.  A digest that belongs to the other slot is refused without
+ * touching the journal.  Callers must establish real system health before
+ * requesting confirmation.
+ */
 int kshim_update_trial_confirm(const struct kshim_update_trial *record,
-                               uint32_t actual_slot, const char *os_name,
+                               uint32_t actual_slot,
+                               const uint8_t boot_sha256[32],
+                               const char *os_name,
                                const uint8_t commit[32], uint32_t serial,
                                struct kshim_update_trial *next);
 

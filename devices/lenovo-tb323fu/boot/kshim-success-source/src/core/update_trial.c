@@ -428,8 +428,34 @@ int kshim_update_trial_before_boot(const struct kshim_update_trial *record,
     return KSHIM_STORAGE_CONFLICT;
 }
 
+static int observed_boot_matches(const struct kshim_update_trial *record,
+                                 uint32_t actual_slot,
+                                 const uint8_t boot_sha256[32])
+{
+    const uint8_t *expected;
+
+    if (!boot_sha256)
+        return 0;
+
+    /*
+     * A mirrored write puts the new deployment in both slots, so the digest
+     * that belongs to the slot that actually booted is the only acceptable
+     * evidence.  The digest of the other slot is not interchangeable.
+     */
+    if (record->policy == KSHIM_UPDATE_POLICY_OFFLINE_DUAL &&
+        actual_slot == record->from_slot)
+        expected = record->other_boot_sha256;
+    else
+        expected = record->new_boot_sha256;
+
+    return memcmp(boot_sha256, expected,
+                  sizeof(record->new_boot_sha256)) == 0;
+}
+
 int kshim_update_trial_confirm(const struct kshim_update_trial *record,
-                               uint32_t actual_slot, const char *os_name,
+                               uint32_t actual_slot,
+                               const uint8_t boot_sha256[32],
+                               const char *os_name,
                                const uint8_t commit[32], uint32_t serial,
                                struct kshim_update_trial *next)
 {
@@ -437,7 +463,8 @@ int kshim_update_trial_confirm(const struct kshim_update_trial *record,
     int slot_matches;
     int rc;
 
-    if (!record || !os_name || !commit || !next || actual_slot > 1u)
+    if (!record || !boot_sha256 || !os_name || !commit || !next ||
+        actual_slot > 1u)
         return KSHIM_STORAGE_ARG;
     if (!validate_logical_record(record, NULL))
         return KSHIM_STORAGE_FORMAT;
@@ -458,6 +485,10 @@ int kshim_update_trial_confirm(const struct kshim_update_trial *record,
     else
         slot_matches = actual_slot == record->target_slot;
     if (!slot_matches)
+        return KSHIM_STORAGE_CONFLICT;
+
+    /* The booted slot's own digest must be the one recorded for it. */
+    if (!observed_boot_matches(record, actual_slot, boot_sha256))
         return KSHIM_STORAGE_CONFLICT;
 
     rc = start_mutation(record, &tmp);
