@@ -3,6 +3,8 @@
 from http.client import HTTPException
 from math import isfinite
 from numbers import Real
+from socket import SHUT_RDWR
+from threading import Event, Timer
 from time import monotonic
 from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -40,20 +42,84 @@ def _body_socket(response):
     return getattr(raw, "_sock", None)
 
 
-def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
-    """Fetch at most ``limit`` bytes, bounded by one monotonic deadline.
+class _DeadlineSocketShutdown:
+    """Shut a live response socket down at one absolute deadline.
 
-    ``read1`` returns whatever has arrived so the deadline is re-checked
-    between chunks instead of after an unbounded ``read(limit + 1)``; a
-    slow trickle of bytes therefore cannot hold the fetch past ``timeout``.
-    The check also runs after the EOF read, so a body that only finishes
-    after the deadline is rejected rather than accepted as complete. When
-    CPython exposes the connected socket, each read is additionally bounded
-    by the remaining budget so one read cannot block past the deadline. The
-    socket is looked up again before every read because a read that still
-    returns body bytes may already have closed ``response.fp`` and the
-    descriptor; reusing the object captured earlier would make the next
-    ``settimeout`` raise EBADF on a response that is otherwise complete.
+    A single ``HTTPResponse.read1`` call can consume several chunks of
+    transfer framing internally (for example while decoding chunk sizes),
+    so a socket timeout applied to each internal ``recv`` does not bound
+    the call as a whole: every internal read can make progress within the
+    budget while the call overruns it. One daemon timer is armed per live
+    response with the exact socket CPython exposes when body reading
+    starts; at the deadline it calls ``shutdown(SHUT_RDWR)``, which makes
+    an in-flight read return EOF or raise instead of running on.
+
+    ``shutdown`` is used instead of ``close`` on purpose. Closing from the
+    timer would race with ``http.client`` closing the same connection and
+    could release a descriptor the process has already recycled. A socket
+    object that ``http.client`` has closed invalidates its own descriptor,
+    so shutting it down then raises ``EBADF``; that is ignored because the
+    response is already finished. The timer is cancelled and joined on
+    every path, so no thread outlives the response.
+    """
+
+    def __init__(self, sock, remaining):
+        self._sock = sock
+        self._fired = Event()
+        self._timer = None
+        if sock is not None:
+            timer = Timer(max(remaining, 0.0), self._expire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    @property
+    def fired(self):
+        """Whether the deadline passed and the socket was shut down."""
+        return self._fired.is_set()
+
+    def _expire(self):
+        self._fired.set()
+        try:
+            self._sock.shutdown(SHUT_RDWR)
+        except OSError:
+            pass
+
+    def stop(self):
+        """Cancel and join the timer; call once on every exit path."""
+        timer = self._timer
+        if timer is None:
+            return
+        timer.cancel()
+        timer.join()
+
+
+def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
+    """Fetch at most ``limit`` bytes of one response body under a deadline.
+
+    ``timeout`` is passed to ``urllib``, so DNS resolution, connection
+    setup and header ingestion are bounded per socket operation by it; they
+    are not covered by the single absolute body deadline below.
+
+    For the body, ``read1`` returns whatever has arrived so the deadline is
+    re-checked between chunks instead of after an unbounded
+    ``read(limit + 1)``; a slow trickle of bytes therefore cannot hold the
+    fetch past ``timeout``. The check also runs after the EOF read, so a
+    body that only finishes after the deadline is rejected rather than
+    accepted as complete. Each read is additionally bounded by the
+    remaining budget through the connected socket.
+
+    A real ``HTTPResponse`` read may still consume several framing chunks
+    inside one call, which per-read socket timeouts cannot interrupt, so
+    one daemon timer is armed with the socket captured when body reading
+    starts. At the absolute deadline it shuts that socket down; the blocked
+    read then ends and the fetch fails closed as a timeout even if the read
+    was making progress. The socket is looked up again before every read
+    because a read that still returns body bytes may already have closed
+    ``response.fp`` and the descriptor; reusing the object captured earlier
+    would make the next ``settimeout`` raise EBADF on a response that is
+    otherwise complete. When the transport exposes no socket (an in-memory
+    or mocked response), only the between-read checks apply.
     """
     _url(url, "fetch URL")
     request = Request(
@@ -68,6 +134,10 @@ def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
     deadline = monotonic() + timeout
     body = bytearray()
     total = 0
+
+    def timed_out():
+        return CatalogError(f"fetch of {url} timed out after {timeout} seconds")
+
     try:
         with opener.open(request, timeout=timeout) as response:
             _url(response.geturl(), "final response URL")
@@ -79,32 +149,39 @@ def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
                 raise CatalogError(
                     f"fetch of {url} response does not support bounded reads"
                 )
-            while True:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise CatalogError(
-                        f"fetch of {url} timed out after {timeout} seconds"
-                    )
-                sock = _body_socket(response)
-                if sock is not None:
-                    sock.settimeout(remaining)
-                chunk = read1(min(_READ_SIZE, limit + 1 - total))
-                if not chunk:
-                    if deadline - monotonic() <= 0:
+            guard = _DeadlineSocketShutdown(
+                _body_socket(response), deadline - monotonic()
+            )
+            try:
+                while True:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise timed_out()
+                    sock = _body_socket(response)
+                    if sock is not None:
+                        sock.settimeout(remaining)
+                    try:
+                        chunk = read1(min(_READ_SIZE, limit + 1 - total))
+                    except (OSError, HTTPException):
+                        if guard.fired:
+                            raise timed_out() from None
+                        raise
+                    if not chunk:
+                        if guard.fired or deadline - monotonic() <= 0:
+                            raise timed_out()
+                        break
+                    body.extend(chunk)
+                    total += len(chunk)
+                    if total > limit:
                         raise CatalogError(
-                            f"fetch of {url} timed out after {timeout} seconds"
+                            f"document fetched from {url} exceeds {limit} bytes"
                         )
-                    break
-                body.extend(chunk)
-                total += len(chunk)
-                if total > limit:
-                    raise CatalogError(
-                        f"document fetched from {url} exceeds {limit} bytes"
-                    )
-                if deadline - monotonic() <= 0:
-                    raise CatalogError(
-                        f"fetch of {url} timed out after {timeout} seconds"
-                    )
+                    if guard.fired or deadline - monotonic() <= 0:
+                        raise timed_out()
+            finally:
+                guard.stop()
+            if guard.fired:
+                raise timed_out()
     except CatalogError:
         raise
     except (TypeError, URLError, HTTPException, OSError) as exc:

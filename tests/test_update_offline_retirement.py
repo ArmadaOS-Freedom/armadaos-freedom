@@ -460,12 +460,13 @@ class OfflineRetirementTest(unittest.TestCase):
         self.assert_preserved(snapshot)
 
     def test_unconfirmed_or_foreign_journal_is_retained(self):
-        for name, record in (
-            ("trial", make_record(state=trial_record.TRIAL)),
-            ("online", make_record(policy=trial_record.ONLINE_SINGLE)),
+        for name, changes in (
+            ("trial", {"state": trial_record.TRIAL}),
+            ("online", {"policy": trial_record.ONLINE_SINGLE}),
         ):
             with self.subTest(case=name):
                 self.fresh()
+                record = replace(self.record, **changes)
                 self.assertFalse(self.retire(record=record))
                 self.assert_retained()
 
