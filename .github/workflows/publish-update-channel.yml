@@ -239,6 +239,8 @@ jobs:
             create_token="${ARMADA_RELEASE_TOKEN}"
           fi
 
+          # A draft may store a branch target, so both publication edits below
+          # restate the verified SOURCE_REVISION; an existing tag is never moved.
           case "${state}" in
             absent)
               if ! GH_TOKEN="${create_token}" gh release create "${TAG}" \
@@ -262,7 +264,8 @@ jobs:
             matching)
               if [ "$(jq -r '.isDraft' "${SCRATCH}/release.json")" = "true" ]; then
                 GH_TOKEN="${create_token}" gh release edit "${TAG}" \
-                  --repo "${REPOSITORY}" --draft=false
+                  --repo "${REPOSITORY}" --draft=false \
+                  --target "${SOURCE_REVISION}"
               fi
               ;;
             *)
@@ -283,7 +286,8 @@ jobs:
             fi
             gh release upload "${TAG}" --repo "${REPOSITORY}" "${uploads[@]}"
             GH_TOKEN="${create_token}" gh release edit "${TAG}" \
-              --repo "${REPOSITORY}" --draft=false
+              --repo "${REPOSITORY}" --draft=false \
+              --target "${SOURCE_REVISION}"
           fi
 
       - name: Verify the published release before the channel changes

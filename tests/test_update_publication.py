@@ -8,6 +8,7 @@ import base64
 import importlib.util
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -1435,6 +1436,24 @@ class WorkflowConsistencyTest(unittest.TestCase):
             "Verify signed package and parts",
         ):
             self.assertNotIn("ARMADA_RELEASE_TOKEN", self._step_text(text, step), step)
+
+    def test_resumed_draft_publication_binds_the_verified_revision(self):
+        text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
+            encoding="utf-8")
+        step = self._step_text(text, "Reconcile the package release")
+        self.assertIn(
+            "SOURCE_REVISION: ${{ steps.package.outputs.revision }}", step)
+        # Both publication edits bind the tag target to the verified revision.
+        edits = [
+            line for line in step.replace("\\\n", " ").splitlines()
+            if "gh release edit" in line and "--draft=false" in line
+            and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(edits), 2)
+        for line in edits:
+            argv = shlex.split(line)
+            self.assertIn(
+                ("--target", "${SOURCE_REVISION}"), list(zip(argv, argv[1:])))
 
     def test_publication_and_promotion_share_one_concurrency_group(self):
         for name in ("publish-update-channel.yml", "promote.yml"):
