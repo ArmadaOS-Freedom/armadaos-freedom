@@ -130,11 +130,14 @@ class FakeSysroot:
     def deployment_set_kargs(self, dep, kargs, _options):
         dep.boot.options = " ".join(kargs)
         self.kargs_changes.append((store._binding_of(dep), tuple(kargs)))
+        self.events.append(("kargs", store._binding_of(dep)))
         return True
 
     def write_deployments(self, deployments, _options):
         self.writes.append(list(deployments))
         self.deployments = list(deployments)
+        self.events.append(
+            ("write", tuple(store._binding_of(d) for d in deployments)))
         return True
 
     def deploy_tree(self, osname, commit, origin, _parent, _ref, _flags):
@@ -143,13 +146,37 @@ class FakeSysroot:
 
 
 class FakeRepo:
-    def __init__(self, commit):
+    def __init__(self, commit, refs=None, resolve_ok=True):
         self.commit = commit
+        self.refs = dict(refs or {})
+        self.resolve_ok = resolve_ok
+        self.ref_changes = []
+        self.events = None
 
     def load_commit(self, commit):
         if commit != self.commit:
             return False, None, 0
         return True, object(), 0
+
+    def resolve_rev(self, name, _allow_noent):
+        # Mirrors libostree: (True, checksum) when the ref exists,
+        # (True, None) for a missing ref under allow_noent, and (False, None)
+        # only when the lookup itself fails.
+        if not self.resolve_ok:
+            return False, None
+        if name in self.refs:
+            return True, self.refs[name]
+        return True, None
+
+    def set_ref_immediate(self, remote, ref, commit, _cancellable):
+        self.ref_changes.append((remote, ref, commit))
+        if self.events is not None:
+            self.events.append(("ref", ref, commit))
+        if commit is None:
+            self.refs.pop(ref, None)
+        else:
+            self.refs[ref] = commit
+        return True
 
 
 class FakeGLib:
@@ -655,6 +682,143 @@ class ManagedRetentionTests(unittest.TestCase):
         self.assertEqual(result["deployment"], binding(target, 7))
         candidate = [d for d in sysroot.deployments if d.get_csum() == target][0]
         self.assertTrue(store._is_updater_created(candidate))
+
+    def test_append_holds_target_ref_until_candidate_is_registered(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        repo = FakeRepo(target)
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+        repo.events = sysroot.events
+
+        result = self.append(sysroot, target)
+
+        created = [c for c in repo.ref_changes if c[2] is not None]
+        self.assertEqual(len(created), 1)
+        remote, held, commit = created[0]
+        self.assertIsNone(remote)
+        self.assertEqual(commit, target)
+        self.assertRegex(held, r"^armada-update/pending/[0-9a-f]{32}$")
+        self.assertFalse(result["reused"])
+        self.assertEqual(repo.ref_changes[-1], (None, held, None))
+        self.assertEqual(repo.refs, {})
+        self.assertLess(sysroot.events.index(("ref", held, target)),
+                        sysroot.events.index(("kargs", binding("a" * 64, 3))))
+        registered = sysroot.events.index(
+            ("write", (binding("a" * 64, 3), binding(target, 7))))
+        self.assertLess(sysroot.events.index(("kargs", binding("a" * 64, 3))),
+                        registered)
+        self.assertLess(registered, sysroot.events.index(("ref", held, None)))
+
+    def test_append_releases_target_ref_when_deploy_fails(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        repo = FakeRepo(target)
+
+        class FailingDeploy(FakeSysroot):
+            def deploy_tree(self, *_args):
+                return False, None
+
+        sysroot = self.use_sysroot(FailingDeploy([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError, "deploy_tree failed"):
+            self.append(sysroot, target)
+
+        self.assertEqual(len(repo.ref_changes), 2)
+        remote, held, commit = repo.ref_changes[0]
+        self.assertIsNone(remote)
+        self.assertEqual(commit, target)
+        self.assertRegex(held, r"^armada-update/pending/[0-9a-f]{32}$")
+        self.assertEqual(repo.ref_changes[1], (None, held, None))
+        self.assertEqual(repo.refs, {})
+
+    def test_append_reuse_creates_no_temporary_ref(self):
+        current = deployment("a" * 64, 3)
+        target = "b" * 64
+        reused = FakeDeployment(
+            "armada", target, 4, origin=make_origin(marked=False),
+            options=f"quiet armada.deployment={binding(target, 4)}")
+        repo = FakeRepo(target)
+        sysroot = self.use_sysroot(FakeSysroot([current, reused], repo=repo))
+
+        result = self.append(sysroot, target)
+
+        self.assertTrue(result["reused"])
+        self.assertEqual(repo.ref_changes, [])
+        self.assertEqual(repo.refs, {})
+
+    def test_append_refuses_ref_that_already_resolves(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        held = f"{store._TEMP_REF_PREFIX}/{'0' * 32}"
+        foreign_commit = "c" * 64
+        repo = FakeRepo(target, refs={held: foreign_commit})
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+
+        with mock.patch.object(store, "_new_temp_ref", return_value=held):
+            with self.assertRaisesRegex(store.DeploymentError, "already exists"):
+                self.append(sysroot, target)
+
+        self.assertEqual(repo.refs, {held: foreign_commit})
+        self.assertEqual(repo.ref_changes, [])
+
+    def test_append_refuses_when_ref_probe_fails(self):
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        target = "e" * 64
+        repo = FakeRepo(target, resolve_ok=False)
+        sysroot = self.use_sysroot(FakeSysroot([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError,
+                                    "failed checking temporary ref"):
+            self.append(sysroot, target)
+
+        self.assertEqual(repo.refs, {})
+        self.assertEqual(repo.ref_changes, [])
+
+    def test_cleanup_failure_keeps_operation_error_or_surfaces_alone(self):
+        target = "e" * 64
+
+        class RefusingRelease(FakeRepo):
+            def set_ref_immediate(self, remote, ref, commit, cancellable):
+                if commit is None:
+                    self.ref_changes.append((remote, ref, commit))
+                    return False
+                return super().set_ref_immediate(
+                    remote, ref, commit, cancellable)
+
+        class FailingDeploy(FakeSysroot):
+            def deploy_tree(self, *_args):
+                return False, None
+
+        current = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        repo = RefusingRelease(target)
+        sysroot = self.use_sysroot(FailingDeploy([current], repo=repo))
+
+        with self.assertRaisesRegex(store.DeploymentError, "deploy_tree failed"):
+            self.append(sysroot, target)
+        self.assertEqual(len(repo.refs), 1)
+        held = next(iter(repo.refs))
+        self.assertRegex(held, r"^armada-update/pending/[0-9a-f]{32}$")
+        self.assertEqual(repo.refs[held], target)
+
+        current_ok = FakeDeployment(
+            "armada", "a" * 64, 3, origin=make_origin(marked=False),
+            options="quiet")
+        repo_ok = RefusingRelease(target)
+        sysroot_ok = self.use_sysroot(FakeSysroot([current_ok], repo=repo_ok))
+
+        with self.assertRaisesRegex(store.DeploymentError,
+                                    "failed removing temporary ref"):
+            self.append(sysroot_ok, target)
 
     def test_existing_target_on_other_channel_gets_fresh_deployment(self):
         current = deployment("a" * 64, 3)

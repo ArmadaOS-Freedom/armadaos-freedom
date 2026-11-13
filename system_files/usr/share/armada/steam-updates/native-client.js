@@ -176,9 +176,13 @@
             'Native client apply failed (' + returned.result + ')';
         if (!ok) failed('apply', failureMessage || 'Client apply outcome is uncertain');
         else {
+          // The native call only reports that the apply was accepted; its
+          // status may not be published yet, so GetApplyResult can still be
+          // null here. Await it rather than inventing a failure, and never
+          // claim success or a restart from a missing result: syncLateApply()
+          // promotes a later rejection or client restart requirement.
           var result = applyResult();
-          if (!result) failed('apply', 'Client apply outcome is uncertain');
-          else if (result.requires_client_restart)
+          if (result && result.requires_client_restart)
             local = { state: 'restart_required', phase: 'apply', error: null, restart: true };
           else local = { state: 'awaiting_status', phase: 'apply', error: null, restart: false };
         }
