@@ -8,13 +8,15 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
-from updates import job_retirement as jr
+from updates import job_retirement as jr  # noqa: E402
 
 TX = "11111111-2222-4333-8444-555555555555"
 OTHER_TX = "99999999-8888-4777-8666-555555555555"
@@ -284,6 +286,26 @@ class JobRetirementTest(unittest.TestCase):
             self.assertFalse(self.retire())
             self.assertTrue((job / "download").is_dir())
         status.write_text(valid_status)
+
+    def test_confirmation_retires_both_artifact_stores_best_effort(self):
+        from updates import trial_confirmation as tc
+
+        record = SimpleNamespace(
+            transaction_uuid=uuid.UUID(TX).bytes,
+            plan_sha256=bytes.fromhex(PLAN))
+        online = mock.patch.object(
+            jr, "retire_finalized_job", side_effect=OSError("online"))
+        offline = mock.patch.object(
+            jr, "retire_confirmed_offline_session",
+            side_effect=RuntimeError("offline"))
+        with online as online_mock, offline as offline_mock:
+            tc._retire_job_artifacts(record)
+        online_mock.assert_called_once_with(TX, plan_sha256=PLAN)
+        offline_mock.assert_called_once_with(record)
+
+    def test_offline_retirement_needs_a_confirmed_record(self):
+        self.assertFalse(jr.retire_confirmed_offline_session(
+            SimpleNamespace(state=1), base=self.tmp))
 
 
 if __name__ == "__main__":

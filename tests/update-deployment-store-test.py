@@ -14,7 +14,7 @@ import gi
 gi.require_version("OSTree", "1.0")
 from gi.repository import Gio, GLib, OSTree
 
-import test_update_boot_payload as payload_fixture
+import update_boot_payload_fixture as payload_fixture
 from updates import boot_payload, deployment_store
 
 
@@ -61,17 +61,15 @@ def tree_digest(root: Path) -> str:
 class DeploymentStoreIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        payload_fixture.UpdateBootPayloadTests.setUpClass()
-        cls.model = payload_fixture.UpdateBootPayloadTests.models[0]
+        payload_fixture.UpdateBootPayloadFixture.setUpClass()
+        cls.model = payload_fixture.UpdateBootPayloadFixture.models[0]
 
     @classmethod
     def tearDownClass(cls) -> None:
-        payload_fixture.UpdateBootPayloadTests.tearDownClass()
+        payload_fixture.UpdateBootPayloadFixture.tearDownClass()
 
     def setUp(self) -> None:
-        self.payload = payload_fixture.UpdateBootPayloadTests(
-            "test_roundtrip_and_zero_writes"
-        )
+        self.payload = payload_fixture.UpdateBootPayloadFixture()
         self.addCleanup(self.payload.doCleanups)
         tmp = tempfile.TemporaryDirectory(
             prefix="deployment-store-", dir=os.environ.get("TMPDIR")
@@ -562,7 +560,7 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
                 self._assert_user_data_unchanged()
 
     def test_unverifiable_candidate_is_not_registered(self) -> None:
-        profile = payload_fixture.UpdateBootPayloadTests.cfg["profiles"][self.model]
+        profile = payload_fixture.UpdateBootPayloadFixture.cfg["profiles"][self.model]
 
         def remove_dtb(source: Path) -> None:
             (source / f"usr/lib/modules/{payload_fixture.KVER}/dtb" /

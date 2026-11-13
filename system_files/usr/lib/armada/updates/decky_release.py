@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import os
 from pathlib import Path
 import re
+import stat
 import struct
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -145,6 +147,20 @@ def select_preview(releases: Any) -> DeckyRelease:
     )
 
 
+def _open_payload(path: str | Path) -> int:
+    """Open the payload once, without following a link or blocking on a node.
+
+    Everything after this point inspects the returned descriptor with
+    ``fstat``, so a path swapped between validation and reading cannot
+    redirect the verification, and a FIFO or device node cannot hang it.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        return os.open(os.fspath(path), flags)
+    except OSError as exc:
+        raise DeckyReleaseError(f"Payload read failed: {exc}") from exc
+
+
 def verify_payload(release: DeckyRelease, path: str | Path) -> None:
     if not isinstance(release, DeckyRelease):
         raise DeckyReleaseError("Invalid release metadata")
@@ -152,22 +168,51 @@ def verify_payload(release: DeckyRelease, path: str | Path) -> None:
         raise DeckyReleaseError("Invalid release sha256")
     _require_pos_int(release.size, "release size")
 
+    expected_size = release.size
     hasher = hashlib.sha256()
     total = 0
     header = b""
 
+    fd = _open_payload(path)
     try:
-        with Path(path).open("rb") as f:
-            while chunk := f.read(65536):
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise DeckyReleaseError("Payload is not a regular file")
+            # The declared size is compared to the descriptor before a single
+            # byte is read, so the bounded loop can never be driven past it.
+            if st.st_size != expected_size:
+                raise DeckyReleaseError(
+                    f"Size mismatch: expected {expected_size}, got {st.st_size}"
+                )
+            while total < expected_size:
+                chunk = os.read(fd, min(expected_size - total, 1 << 20))
+                if not chunk:
+                    break
                 if len(header) < 64:
-                    header += chunk[: 64 - len(header)]
+                    header = (header + chunk)[:64]
                 total += len(chunk)
                 hasher.update(chunk)
-    except OSError as exc:
-        raise DeckyReleaseError(f"Payload read failed: {exc}") from exc
+            if total != expected_size:
+                raise DeckyReleaseError(
+                    f"Size mismatch: expected {expected_size}, got {total}"
+                )
+            if os.read(fd, 1):
+                raise DeckyReleaseError(
+                    f"Size mismatch: expected {expected_size}, got more than declared"
+                )
+            end_st = os.fstat(fd)
+        except OSError as exc:
+            raise DeckyReleaseError(f"Payload read failed: {exc}") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
-    if total != release.size:
-        raise DeckyReleaseError(f"Size mismatch: expected {release.size}, got {total}")
+    if (end_st.st_size != st.st_size
+            or (end_st.st_dev, end_st.st_ino) != (st.st_dev, st.st_ino)):
+        raise DeckyReleaseError("Payload changed while reading")
     if hasher.hexdigest().lower() != release.sha256:
         raise DeckyReleaseError("SHA256 mismatch")
     if len(header) < 64 or header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:

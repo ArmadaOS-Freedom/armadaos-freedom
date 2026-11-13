@@ -1,10 +1,20 @@
+import hashlib
+import os
+import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "system_files" / "usr" / "lib" / "armada"))
 
-from updates.decky_release import DeckyReleaseError, select_preview
+from updates.decky_release import (
+    DeckyRelease,
+    DeckyReleaseError,
+    select_preview,
+    verify_payload,
+)
 
 SHA = "a" * 64
 URL = "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/{tag}/PluginLoader-arm64"
@@ -133,6 +143,101 @@ class TestSelectPreview(unittest.TestCase):
         r = self.select(releases)
         self.assertEqual((r.release_id, r.asset_id, r.size), (42, 77, 5))
         self.assertEqual(r.sha256, up.lower())
+
+
+def payload(machine=183, size=128):
+    buf = bytearray(size)
+    buf[:4] = b"\x7fELF"
+    buf[4] = 2
+    buf[5] = 1
+    struct.pack_into("<H", buf, 18, machine)
+    return bytes(buf)
+
+
+def release_for(data, size=None, digest=None):
+    return DeckyRelease(
+        release_id=1,
+        tag="v1",
+        published_at="2024-01-01T00:00:00Z",
+        asset_id=700,
+        url=URL.format(tag="v1"),
+        size=len(data) if size is None else size,
+        sha256=hashlib.sha256(data).hexdigest() if digest is None else digest,
+    )
+
+
+class TestVerifyPayload(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "PluginLoader-arm64"
+
+    def test_regular_file_matching_size_digest_and_header_passes(self):
+        data = payload()
+        self.path.write_bytes(data)
+        verify_payload(release_for(data), self.path)
+        self.assertEqual(self.path.read_bytes(), data)
+
+    def test_declared_size_is_checked_against_the_descriptor(self):
+        data = payload()
+        self.path.write_bytes(data)
+        for declared in (len(data) - 1, len(data) + 1):
+            with self.subTest(declared=declared):
+                with self.assertRaisesRegex(DeckyReleaseError, "Size mismatch"):
+                    verify_payload(release_for(data, size=declared), self.path)
+
+    def test_early_eof_is_rejected(self):
+        data = payload()
+        self.path.write_bytes(data)
+        real_read = os.read
+        served = {"bytes": 0}
+
+        def truncated_read(fd, count):
+            if served["bytes"] >= len(data) // 2:
+                return b""
+            chunk = real_read(fd, min(count, 8))
+            served["bytes"] += len(chunk)
+            return chunk
+
+        with mock.patch.object(os, "read", side_effect=truncated_read):
+            with self.assertRaisesRegex(DeckyReleaseError, "Size mismatch"):
+                verify_payload(release_for(data), self.path)
+
+    def test_late_size_change_is_rejected(self):
+        data = payload()
+        self.path.write_bytes(data)
+        real_fstat = os.fstat
+        calls = {"count": 0}
+
+        def grown(fd):
+            st = real_fstat(fd)
+            calls["count"] += 1
+            if calls["count"] > 1:
+                values = list(st)
+                values[6] = st.st_size + 1
+                return os.stat_result(tuple(values))
+            return st
+
+        with mock.patch.object(os, "fstat", side_effect=grown):
+            with self.assertRaisesRegex(DeckyReleaseError, "changed while reading"):
+                verify_payload(release_for(data), self.path)
+
+    def test_digest_header_and_non_regular_inputs_rejected(self):
+        data = payload()
+        self.path.write_bytes(data)
+        with self.assertRaisesRegex(DeckyReleaseError, "SHA256 mismatch"):
+            verify_payload(release_for(data, digest="0" * 64), self.path)
+        for bad in (payload(machine=62), payload(size=63)):
+            with self.subTest(size=len(bad)):
+                self.path.write_bytes(bad)
+                with self.assertRaises(DeckyReleaseError):
+                    verify_payload(release_for(bad), self.path)
+        directory = Path(self.tmp.name) / "directory"
+        directory.mkdir()
+        with self.assertRaisesRegex(DeckyReleaseError, "not a regular file"):
+            verify_payload(release_for(data), directory)
+        with self.assertRaisesRegex(DeckyReleaseError, "Payload read failed"):
+            verify_payload(release_for(data), Path(self.tmp.name) / "missing")
 
 
 if __name__ == "__main__":

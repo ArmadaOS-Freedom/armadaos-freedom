@@ -172,20 +172,79 @@ class ReceiptFilesystemTests(unittest.TestCase):
 
         with mock.patch.object(receipt.os, "fsync", side_effect=fsync), mock.patch.object(receipt.os, "replace", side_effect=replace_file):
             receipt.write(self.record)
-        self.assertEqual(events, ["fsync", "replace", "fsync"])
+        # The temp file is flushed first, then every directory entry leading to
+        # the receipt, then the rename, then the immediate parent again so the
+        # new entry itself is durable.
+        self.assertEqual(events[0], "fsync")
+        self.assertEqual(events[-1], "fsync")
+        self.assertEqual(events.count("replace"), 1)
+        replace_at = events.index("replace")
+        self.assertGreaterEqual(replace_at, 2)
+        self.assertTrue(all(event == "fsync" for event in events if event != "replace"))
+        self.assertEqual(events[replace_at - 1], "fsync")
+
+    def test_ancestor_inspection_failure_is_not_swallowed(self):
+        self.target.parent.mkdir(mode=0o755)
+        real_lstat = os.lstat
+        blocked = self.target.parent.parent
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == blocked:
+                raise OSError(errno.EIO, "simulated ancestor lstat failure")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(receipt.os, "lstat", side_effect=lstat):
+            with self.assertRaises(OSError):
+                receipt._durable_ancestors(self.target.parent)
+
+    def test_filesystem_root_entry_is_flushed_when_on_same_device(self):
+        self.target.parent.mkdir(mode=0o755)
+        real_fsync = os.fsync
+        flushed = []
+
+        def record(fd):
+            info = os.fstat(fd)
+            flushed.append((info.st_dev, info.st_ino))
+            return real_fsync(fd)
+
+        with mock.patch.object(receipt.os, "fsync", side_effect=record):
+            receipt._durable_ancestors(self.target.parent)
+
+        root = Path(self.target.anchor)
+        root_info = os.lstat(root)
+        parent_info = os.lstat(self.target.parent)
+        # Outermost first, ending at the receipt's own parent.
+        self.assertEqual(flushed[-1], (parent_info.st_dev, parent_info.st_ino))
+        if root_info.st_dev == parent_info.st_dev:
+            # The top-level directory's entry lives in the filesystem root, so
+            # the root must be part of the flushed chain too.
+            self.assertEqual(flushed[0], (root_info.st_dev, root_info.st_ino))
 
     def test_directory_fsync_failure_invalidates_replaced_receipt(self):
         self.target.parent.mkdir(mode=0o755)
         unrelated = self.target.parent / "unrelated.json"
         unrelated.write_text("other writer\n")
         real_fsync = os.fsync
+        real_replace = os.replace
+        renamed = {"done": False}
+
+        def replace_file(src, dst):
+            result = real_replace(src, dst)
+            renamed["done"] = True
+            return result
 
         def fail_directory_fsync(fd):
-            if stat.S_ISDIR(os.fstat(fd).st_mode):
+            # Fail only the flush that follows the rename, so this exercises
+            # the "receipt visible but directory entry not durable" path.
+            if renamed["done"] and stat.S_ISDIR(os.fstat(fd).st_mode):
                 raise OSError(errno.EIO, "simulated directory flush failure")
             return real_fsync(fd)
 
-        with mock.patch.object(receipt.os, "fsync", side_effect=fail_directory_fsync):
+        with mock.patch.object(
+            receipt.os, "replace", side_effect=replace_file
+        ), mock.patch.object(
+            receipt.os, "fsync", side_effect=fail_directory_fsync
+        ):
             with self.assertRaises(OSError):
                 receipt.write(self.record)
 
@@ -200,6 +259,53 @@ class ReceiptFilesystemTests(unittest.TestCase):
 
         # A retry installs and flushes a fresh complete receipt.
         doc = receipt.write(self.record)
+        self.assertEqual(receipt.read(self.record), {"state": "complete"})
+        self.assertEqual(
+            self.target.read_bytes(),
+            (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode())
+
+    def test_partially_synced_created_parents_are_flushed_again_on_retry(self):
+        real_fsync = os.fsync
+        failed = {"done": False}
+
+        def fail_created_parent_fsync(fd):
+            # Fail the flush of the directory this call created, not a
+            # pre-existing ancestor, so the retry story below is exact.
+            info = os.fstat(fd)
+            parent = os.lstat(self.target.parent)
+            if (
+                not failed["done"]
+                and stat.S_ISDIR(info.st_mode)
+                and (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino)
+            ):
+                failed["done"] = True
+                raise OSError(errno.EIO, "simulated parent flush failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(receipt.os, "fsync", side_effect=fail_created_parent_fsync):
+            with self.assertRaises(OSError):
+                receipt.write(self.record)
+
+        # The directories were created but their entries were not flushed, so
+        # no receipt may be visible and the failure must not be stranded.
+        self.assertTrue(failed["done"])
+        self.assertTrue(self.target.parent.is_dir())
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertEqual(receipt.read(self.record)["state"], "pending")
+
+        # A retry finds the directories already present; it must flush them
+        # again instead of skipping straight to the rename.
+        flushed = []
+
+        def count_directory_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                flushed.append(fd)
+            return real_fsync(fd)
+
+        with mock.patch.object(receipt.os, "fsync", side_effect=count_directory_fsync):
+            doc = receipt.write(self.record)
+
+        self.assertGreaterEqual(len(flushed), 2)
         self.assertEqual(receipt.read(self.record), {"state": "complete"})
         self.assertEqual(
             self.target.read_bytes(),

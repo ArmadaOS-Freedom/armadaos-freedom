@@ -145,20 +145,27 @@ def _finalize_deployment(record, boot: BootEvidence, *, sysroot_path=None) -> di
 
 
 def _retire_job_artifacts(record) -> None:
-    """Best-effort cleanup of the apply job that wrote this confirmed trial.
+    """Best-effort cleanup of the job that wrote this confirmed trial.
 
     Runs only after ``finalization_receipt.write`` returned, so the durable
-    receipt already proves the transaction completed.  The job is resolved by
+    receipt already proves the transaction completed.  Each job is resolved by
     its own pointer and receipt rather than by scanning, and any failure is
     ignored: retired artifacts are a space saving, never evidence, so a
     cleanup problem must not turn a confirmed update into a failure or imply
-    that some other job was closed.
+    that some other job was closed.  A confirmed offline session keeps its
+    dead payload and build trees in a different private store, so it is
+    retired separately by the same best-effort rule; retried confirmations
+    reach both paths again and only find already-absent artifacts.
     """
     try:
         job_retirement.retire_finalized_job(
             str(uuid.UUID(bytes=bytes(record.transaction_uuid))),
             plan_sha256=bytes(record.plan_sha256).hex(),
         )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        job_retirement.retire_confirmed_offline_session(record)
     except (OSError, RuntimeError, TypeError, ValueError):
         pass
 

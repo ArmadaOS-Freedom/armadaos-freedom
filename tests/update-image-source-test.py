@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -54,6 +55,28 @@ def _install_opener(fake):
     """Patch the channel_source opener injection point."""
     import updates.channel_source as src
     return mock.patch.object(src, "build_opener", lambda *a, **k: fake)
+
+
+_REAL_RMTREE = shutil.rmtree
+
+
+def _shutil_failing_only(stage, error):
+    """Stand-in for image_source's ``shutil`` binding.
+
+    ``image_source.shutil`` is the one process-wide shutil module, so patching
+    ``rmtree`` on it also broke tempfile cleanup in the signature verifier.
+    Rebinding the name inside image_source leaves the real module alone, fails
+    only for ``stage`` and forwards every other call, with its kwargs, to the
+    original.
+    """
+    def rmtree(path, *args, **kwargs):
+        if Path(os.fspath(path)) == stage:
+            raise error
+        return _REAL_RMTREE(path, *args, **kwargs)
+
+    fake = mock.Mock(wraps=shutil)
+    fake.rmtree = mock.Mock(side_effect=rmtree)
+    return fake
 
 
 class ImageSourceIntegrationTests(unittest.TestCase):
@@ -413,8 +436,10 @@ class ImageSourceIntegrationTests(unittest.TestCase):
             return w / "pull.log"
 
         with mock.patch.object(image_source, "_pull", side_effect=pull), \
-             mock.patch.object(image_source.shutil, "rmtree",
-                               side_effect=OSError("device busy")):
+             mock.patch.object(
+                 image_source, "shutil",
+                 _shutil_failing_only(work / "staging-repo", OSError("device busy")),
+             ):
             with self.assertRaisesRegex(
                     image_source.ImageSourceError, "does not match channel"):
                 self._fetch(routes, work)

@@ -665,6 +665,10 @@
           if (disposed) return;
           var components = validateStatus(res);
           var sys = validateComponent('system', components.system);
+          var decky = validateComponent('decky', components.decky);
+          if (decky.busy !== false) {
+            throw new Error('Restart verification rejected: Decky is not idle');
+          }
           if (sys.busy !== false || sys.result.component !== 'system' || sys.result.state !== 'awaiting_reboot' || sys.result.requiresReboot !== true) {
             throw new Error('Restart verification rejected: system is not freshly awaiting reboot');
           }
