@@ -54,7 +54,8 @@ class SystemManagerApplyTests(unittest.TestCase):
             "phase": "complete",
             "requiresReboot": True,
             "bootWriteState": "written",
-            "activationOutcome": "activated",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "slotControlState": "not_issued",
             "targetVersion": "2.0.0",
             "targetCommit": TARGET_COMMIT,
             "workDir": str(self.work_dir),
@@ -110,7 +111,8 @@ class SystemManagerApplyTests(unittest.TestCase):
         self.assertEqual(result["targetVersion"], "2.0.0")
         self.assertEqual(result["targetCommit"], TARGET_COMMIT)
         self.assertEqual(result["bootWriteState"], "written")
-        self.assertEqual(result["activationOutcome"], "activated")
+        self.assertEqual(result["bootPolicy"], "dual-boot-no-slot-control")
+        self.assertEqual(result["slotControlState"], "not_issued")
         self.assertEqual(result["workDir"], str(self.work_dir))
 
     def test_apply_preserves_worker_failed_and_uncertain_evidence(self):
@@ -121,7 +123,7 @@ class SystemManagerApplyTests(unittest.TestCase):
             requiresReboot=False,
             bootWriteState="failed_restored",
             bootRestoreState="restored",
-            activationOutcome="not_activated",
+            slotControlState="not_issued",
             nativeResult={"stage": "boot_write", "rc": 5},
             error="slot write failed",
         )
@@ -131,7 +133,7 @@ class SystemManagerApplyTests(unittest.TestCase):
             requiresReboot=False,
             bootWriteState="written",
             bootRestoreState="restore_failed",
-            activationOutcome="uncertain",
+            slotControlState="uncertain",
             nativeResult={"stage": "activate", "rc": 9},
             error="restore uncertain",
         )
@@ -199,7 +201,7 @@ class SystemManagerApplyTests(unittest.TestCase):
                         state="failed",
                         requiresReboot=False,
                         bootWriteState="not_started",
-                        activationOutcome="not_attempted",
+                        slotControlState="not_issued",
                     )
                 ),
                 0,
@@ -214,6 +216,31 @@ class SystemManagerApplyTests(unittest.TestCase):
                     )
                 ),
                 0,
+            ),
+            # An old or slot-controlling worker is not compatible with the
+            # mirrored boot policy even when its own state is a failure.
+            (
+                json.dumps(
+                    self.worker_report(
+                        state="failed",
+                        requiresReboot=False,
+                        bootWriteState="not_started",
+                        bootPolicy="legacy-single-slot",
+                        slotControlState="not_issued",
+                    )
+                ),
+                1,
+            ),
+            (
+                json.dumps(
+                    self.worker_report(
+                        state="failed",
+                        requiresReboot=False,
+                        bootWriteState="not_started",
+                        slotControlState="issued",
+                    )
+                ),
+                1,
             ),
             (
                 json.dumps(
@@ -231,8 +258,93 @@ class SystemManagerApplyTests(unittest.TestCase):
                 self.assertEqual(result["phase"], "worker_result")
                 self.assertFalse(result["requiresReboot"])
                 self.assertEqual(result["bootWriteState"], "uncertain")
-                self.assertEqual(result["activationOutcome"], "uncertain")
+                self.assertEqual(result["slotControlState"], "uncertain")
                 self.assertEqual(result["workDir"], str(self.work_dir))
+
+    def test_apply_outcome_rejects_non_definite_slot_control_evidence(self):
+        base = {
+            "schemaVersion": 1,
+            "component": "system",
+            "model": "TB322FC",
+            "channel": "stable",
+            "currentVersion": "1.0.0",
+            "currentCommit": BOOTED_COMMIT,
+        }
+        missing_evidence = self.worker_report(
+            state="up_to_date", requiresReboot=False, bootWriteState="not_started"
+        )
+        del missing_evidence["slotControlState"]
+        cases = (
+            (
+                "missing slot control",
+                json.dumps(missing_evidence),
+                0,
+                "incompatible boot-policy evidence",
+            ),
+            (
+                "uncertain up_to_date",
+                json.dumps(
+                    self.worker_report(
+                        state="up_to_date",
+                        requiresReboot=False,
+                        bootWriteState="not_started",
+                        slotControlState="uncertain",
+                    )
+                ),
+                0,
+                "definite slot control",
+            ),
+            (
+                "uncertain awaiting_reboot",
+                json.dumps(self.worker_report(slotControlState="uncertain")),
+                0,
+                "definite slot control",
+            ),
+            (
+                "issued slot control",
+                json.dumps(self.worker_report(slotControlState="issued")),
+                0,
+                "incompatible boot-policy evidence",
+            ),
+            (
+                "old policy success",
+                json.dumps(
+                    self.worker_report(
+                        state="up_to_date",
+                        requiresReboot=False,
+                        bootWriteState="not_started",
+                        bootPolicy="legacy-single-slot",
+                    )
+                ),
+                0,
+                "incompatible boot-policy evidence",
+            ),
+            (
+                "old policy failure",
+                json.dumps(
+                    self.worker_report(
+                        state="failed",
+                        requiresReboot=False,
+                        bootWriteState="not_started",
+                        bootPolicy="legacy-single-slot",
+                    )
+                ),
+                1,
+                "incompatible boot-policy evidence",
+            ),
+        )
+        for name, stdout, rc, match in cases:
+            with self.subTest(case=name):
+                result = system_manager._apply_outcome(
+                    stdout, rc, base, self.work_dir
+                )
+                self.assertEqual(result["state"], "uncertain")
+                self.assertEqual(result["phase"], "worker_result")
+                self.assertFalse(result["requiresReboot"])
+                self.assertEqual(result["bootWriteState"], "uncertain")
+                self.assertEqual(result["slotControlState"], "uncertain")
+                self.assertEqual(result["workDir"], str(self.work_dir))
+                self.assertIn(match, result["error"])
 
     def test_apply_preflight_and_spawn_failures(self):
         manager = self.make_manager()
@@ -246,7 +358,7 @@ class SystemManagerApplyTests(unittest.TestCase):
         self.assertEqual(nonroot["phase"], "apply")
         self.assertFalse(nonroot["requiresReboot"])
         self.assertEqual(nonroot["bootWriteState"], "not_started")
-        self.assertEqual(nonroot["activationOutcome"], "not_attempted")
+        self.assertEqual(nonroot["slotControlState"], "not_issued")
 
         with patch.object(
             system_manager, "SYSTEM_APPLY_STATE_ROOT", self.state_root
@@ -262,7 +374,7 @@ class SystemManagerApplyTests(unittest.TestCase):
         self.assertEqual(missing_exec["phase"], "apply")
         self.assertFalse(missing_exec["requiresReboot"])
         self.assertEqual(missing_exec["bootWriteState"], "not_started")
-        self.assertEqual(missing_exec["activationOutcome"], "not_attempted")
+        self.assertEqual(missing_exec["slotControlState"], "not_issued")
         self.assertEqual(missing_exec["currentVersion"], "1.0.0")
         self.assertIsNone(manager._active_work)
 
@@ -281,7 +393,7 @@ class SystemManagerApplyTests(unittest.TestCase):
         self.assertEqual(subproc_err["phase"], "worker_spawn")
         self.assertFalse(subproc_err["requiresReboot"])
         self.assertEqual(subproc_err["bootWriteState"], "uncertain")
-        self.assertEqual(subproc_err["activationOutcome"], "uncertain")
+        self.assertEqual(subproc_err["slotControlState"], "uncertain")
         self.assertEqual(subproc_err["workDir"], str(self.work_dir))
         self.assertIsNone(manager._active_work)
 
@@ -325,7 +437,7 @@ class SystemManagerApplyTests(unittest.TestCase):
                         state="up_to_date",
                         requiresReboot=False,
                         bootWriteState="not_started",
-                        activationOutcome="not_needed",
+                        slotControlState="not_issued",
                     )
                 ),
                 stderr="",
@@ -429,7 +541,7 @@ class SystemManagerApplyTests(unittest.TestCase):
         self.assertEqual(result["state"], "awaiting_reboot")
         self.assertTrue(result["requiresReboot"])
         self.assertEqual(result["bootWriteState"], "written")
-        self.assertEqual(result["activationOutcome"], "activated")
+        self.assertEqual(result["bootPolicy"], "dual-boot-no-slot-control")
         self.assertEqual(result["targetCommit"], TARGET_COMMIT)
         self.assertEqual(result["workDir"], str(self.work_dir))
 
@@ -449,7 +561,7 @@ class SystemManagerApplyTests(unittest.TestCase):
             self.assertEqual(result["phase"], "rollback")
             self.assertFalse(result["requiresReboot"])
             self.assertEqual(result["bootWriteState"], "not_started")
-            self.assertEqual(result["activationOutcome"], "not_attempted")
+            self.assertEqual(result["slotControlState"], "not_issued")
             self.assertIn("checksum", result["error"])
 
     def test_rollback_worker_non_success_and_invalid_outcomes_never_succeed(self):
@@ -459,13 +571,16 @@ class SystemManagerApplyTests(unittest.TestCase):
             phase="activate",
             requiresReboot=False,
             bootWriteState="written",
-            activationOutcome="uncertain",
+            slotControlState="uncertain",
             error="rollback slot switch uncertain",
         )
-        for rc, stdout, expected_phase in (
-            (1, json.dumps(uncertain_payload), "activate"),
-            (1, json.dumps(self.worker_report()), "worker_result"),
-            (0, "{malformed", "worker_result"),
+        for rc, stdout, expected_phase, expected_slot_control in (
+            # The worker's own ambiguous evidence is genuine uncertainty and
+            # must survive; a synthesized uncertain outcome never claims
+            # definite slot-control evidence.
+            (1, json.dumps(uncertain_payload), "activate", "uncertain"),
+            (1, json.dumps(self.worker_report()), "worker_result", "uncertain"),
+            (0, "{malformed", "worker_result", "uncertain"),
         ):
             completed = subprocess.CompletedProcess(
                 args=[], returncode=rc, stdout=stdout, stderr=""
@@ -484,7 +599,8 @@ class SystemManagerApplyTests(unittest.TestCase):
             self.assertEqual(result["state"], "uncertain")
             self.assertEqual(result["phase"], expected_phase)
             self.assertFalse(result["requiresReboot"])
-            self.assertEqual(result["activationOutcome"], "uncertain")
+            self.assertEqual(
+                result["slotControlState"], expected_slot_control)
 
 
 if __name__ == "__main__":

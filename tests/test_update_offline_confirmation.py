@@ -2,7 +2,13 @@
 """Focused offline-confirmation integration tests.
 
 Composes the supplied TrialConfirmationTest and TrialStatusTests fixtures
-instead of duplicating their suites."""
+instead of duplicating their suites.
+
+The mirrored deployment occupies both physical slots, so evidence is judged by
+the deployment, the transaction marker and the hash recorded for whichever slot
+actually booted.  from_slot/target_slot only index those hashes and the write
+order; neither slot is rejected merely for being the original one.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,6 @@ from pathlib import Path
 import sys
 import unittest
 from unittest import mock
-import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -36,15 +41,25 @@ BOOT_BYTES = 4194304
 
 
 def _offline(r: rec.TrialRecord, **kw) -> rec.TrialRecord:
-    return replace(
-        r, policy=rec.OFFLINE_DUAL,
-        other_boot_sha256=OTHER_HASH if "other_boot_sha256" not in kw else kw.pop("other_boot_sha256"),
-        **kw,
-    )
+    kw.setdefault("other_boot_sha256", OTHER_HASH)
+    return replace(r, policy=rec.OFFLINE_DUAL, **kw)
 
 
 def _new_binding(r: rec.TrialRecord) -> str:
     return f"{r.os_name}/{r.new_commit.hex()}.{r.new_serial}"
+
+
+def _deployment_boot(r: rec.TrialRecord, actual_slot: int) -> boot_health.BootEvidence:
+    """Evidence for the mirrored deployment observed on one physical slot."""
+    return boot_health.BootEvidence(
+        transaction_uuid=r.transaction_uuid,
+        actual_slot=actual_slot,
+        deployment=_new_binding(r),
+        kernel_release="6.12.0-armada",
+        boot_sha256=(
+            r.new_boot_sha256 if actual_slot == r.target_slot else r.other_boot_sha256
+        ),
+    )
 
 
 class OfflineConfirmationTest(unittest.TestCase):
@@ -54,9 +69,10 @@ class OfflineConfirmationTest(unittest.TestCase):
         cases = [
             (rec.ONLINE_SINGLE, rec.TRIAL, 1, base.new_boot_sha256),
             (rec.ONLINE_SINGLE, rec.CONFIRMED, 1, base.new_boot_sha256),
+            (rec.OFFLINE_DUAL, rec.TRIAL, 0, OTHER_HASH),
             (rec.OFFLINE_DUAL, rec.TRIAL, 1, base.new_boot_sha256),
-            (rec.OFFLINE_DUAL, rec.CONFIRMED, 1, base.new_boot_sha256),
             (rec.OFFLINE_DUAL, rec.CONFIRMED, 0, OTHER_HASH),
+            (rec.OFFLINE_DUAL, rec.CONFIRMED, 1, base.new_boot_sha256),
         ]
         for policy, state, slot, want in cases:
             with self.subTest(policy=policy, state=state, slot=slot):
@@ -79,11 +95,12 @@ class OfflineConfirmationTest(unittest.TestCase):
             rec.expected_boot_sha256(replace(base, target_slot=0), 0)
 
     def _collect(self, record, live_ctx, marker, boot_hash):
+        letter = live_ctx["actualSlot"]
         with contextlib.ExitStack() as st:
             st.enter_context(mock.patch.object(
                 boot_health, "_read_live_evidence",
                 return_value=({"booted": 1}, live_ctx, marker)))
-            vp = st.enter_context(mock.patch.object(
+            st.enter_context(mock.patch.object(
                 boot_health, "_verify_boot_payload",
                 return_value=("6.12.0-armada", BOOT_BYTES)))
             st.enter_context(mock.patch.object(
@@ -91,15 +108,15 @@ class OfflineConfirmationTest(unittest.TestCase):
                 return_value=(0, 0, 0, 9)))
             loc = st.enter_context(mock.patch.object(
                 boot_health, "_locate_boot_partition",
-                return_value=(Path("/dev/boot_a"), 5)))
+                return_value=(Path(f"/dev/boot_{letter}"), 5)))
             hsh = st.enter_context(mock.patch.object(
                 boot_health, "_hash_boot_partition", return_value=boot_hash))
-            return boot_health.collect_boot_evidence(record), vp, loc, hsh
+            return boot_health.collect_boot_evidence(record), loc, hsh
 
     def test_health_collect_offline_confirmed_from(self) -> None:
         r = _offline(status_mod.make_record(state=rec.CONFIRMED, from_slot=0, target_slot=1))
         ctx = {"actualSlot": "a", "deployment": _new_binding(r)}
-        ev, vp, loc, hsh = self._collect(r, ctx, r.transaction_uuid, OTHER_HASH)
+        ev, loc, hsh = self._collect(r, ctx, r.transaction_uuid, OTHER_HASH)
         self.assertEqual(
             (ev.boot_sha256, ev.actual_slot, ev.deployment),
             (OTHER_HASH, 0, _new_binding(r)),
@@ -107,29 +124,26 @@ class OfflineConfirmationTest(unittest.TestCase):
         loc.assert_called_once_with("a", 9, BOOT_BYTES)
         hsh.assert_called_once_with(Path("/dev/boot_a"), 5, BOOT_BYTES)
 
+        # The original slot still has to carry the hash the journal recorded
+        # for it, and the running transaction still has to be this one.
         with self.assertRaises(boot_health.BootHealthError):
             self._collect(r, ctx, r.transaction_uuid, r.new_boot_sha256)
         with self.assertRaises(boot_health.BootHealthError):
             self._collect(r, ctx, b"z" * 16, OTHER_HASH)
 
+        # The first trial is accepted on either origin as well; a slot-neutral
+        # gate must reach the physical hash comparison instead of rejecting the
+        # original slot up front.
         pending = _offline(status_mod.make_record(state=rec.TRIAL, from_slot=0, target_slot=1))
-        with contextlib.ExitStack() as st:
-            st.enter_context(mock.patch.object(
-                boot_health, "_read_live_evidence",
-                return_value=({"booted": 1}, ctx, pending.transaction_uuid)))
-            vp2 = st.enter_context(mock.patch.object(
-                boot_health, "_verify_boot_payload",
-                return_value=("6.12.0-armada", BOOT_BYTES)))
-            loc2 = st.enter_context(mock.patch.object(
-                boot_health, "_locate_boot_partition",
-                return_value=(Path("/dev/boot_a"), 5)))
-            hsh2 = st.enter_context(mock.patch.object(
-                boot_health, "_hash_boot_partition", return_value=OTHER_HASH))
-            with self.assertRaises(boot_health.BootHealthError):
-                boot_health.collect_boot_evidence(pending)
-        vp2.assert_not_called()
-        loc2.assert_not_called()
-        hsh2.assert_not_called()
+        ev, loc, hsh = self._collect(
+            pending, ctx, pending.transaction_uuid, pending.other_boot_sha256)
+        self.assertEqual((ev.actual_slot, ev.boot_sha256), (0, OTHER_HASH))
+        loc.assert_called_once_with("a", 9, BOOT_BYTES)
+        hsh.assert_called_once_with(Path("/dev/boot_a"), 5, BOOT_BYTES)
+        with self.assertRaises(boot_health.BootHealthError):
+            self._collect(pending, ctx, pending.transaction_uuid, pending.new_boot_sha256)
+
+        # A single-slot (online) record is never confirmed from the other slot.
         online = status_mod.make_record(state=rec.CONFIRMED, from_slot=0, target_slot=1)
         with self.assertRaises(boot_health.BootHealthError):
             self._collect(online, ctx, online.transaction_uuid, online.new_boot_sha256)
@@ -147,82 +161,70 @@ class OfflineConfirmationTest(unittest.TestCase):
         fx.boot_ev = fx._valid_boot(record)
 
     def test_durable_journal_confirmation_then_confirmed_from(self) -> None:
-        fx = self._fixture()
-        trial = _offline(fx._trial_sample(from_slot=0, target_slot=1))
-        self._seed(fx, trial)
-        with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
-            res = tc.confirm_trial()
-        self.assertEqual(res["state"], "confirmed")
-        self.assertEqual(pw.call_count, 1)
-        confirmed = replace(trial, sequence=2, state=rec.CONFIRMED)
-        got = store.load(fx.fx.fd, fx.fx.part, 1).record
-        self.assertEqual(got, confirmed)
-        self.assertEqual(got.other_boot_sha256, OTHER_HASH)
-        fx.receipt_mock.assert_called_once()
-        self.assertEqual(fx.receipt_mock.call_args.args[0], confirmed)
-        fx.receipt_mock.reset_mock()
+        for actual_slot in (0, 1):
+            with self.subTest(origin="ab"[actual_slot]):
+                fx = self._fixture()
+                trial = _offline(fx._trial_sample(from_slot=0, target_slot=1))
+                self._seed(fx, trial)
+                fx.boot_ev = _deployment_boot(trial, actual_slot)
 
-        fx.boot_ev = boot_health.BootEvidence(
-            transaction_uuid=trial.transaction_uuid, actual_slot=0,
-            deployment=_new_binding(trial), kernel_release="6.12.0-armada",
-            boot_sha256=OTHER_HASH,
-        )
+                # Same deployment, same transaction, and the hash recorded for
+                # the slot that actually booted: confirming from the original
+                # slot is the first trial succeeding, not a rejection.
+                with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
+                    res = tc.confirm_trial()
+                self.assertEqual(res["state"], "confirmed")
+                self.assertEqual(res["bootSlot"], "ab"[actual_slot])
+                self.assertEqual(res["targetSlot"], "b")
+                self.assertEqual(res["deployment"], _new_binding(trial))
+                self.assertEqual(res["slotControlState"], "not_issued")
+                self.assertEqual(pw.call_count, 1)
 
-        def mark_from_actual(record):
-            return {
-                "schemaVersion": 1, "phase": "slot_confirmed",
-                "targetSlot": "ab"[fx.boot_ev.actual_slot],
-                "deployment": fx.boot_ev.deployment,
-                "transactionUuid": str(uuid.UUID(bytes=record.transaction_uuid)),
-                "recordSequence": record.sequence,
-            }
+                confirmed = replace(trial, sequence=2, state=rec.CONFIRMED)
+                got = store.load(fx.fx.fd, fx.fx.part, 1).record
+                self.assertEqual(got, confirmed)
+                self.assertEqual(got.other_boot_sha256, OTHER_HASH)
+                self.assertEqual((got.from_slot, got.target_slot), (0, 1))
+                fx.receipt_mock.assert_called_once_with(confirmed)
+                fx.promote_mock.assert_called_once_with(**fx._promotion_kwargs(trial))
 
-        def mark_wrong_slot(record):
-            out = mark_from_actual(record)
-            out["targetSlot"] = "ab"[1 - fx.boot_ev.actual_slot]
-            return out
+                # Confirming again re-verifies the running deployment but
+                # rewrites nothing: the journal already says CONFIRMED and no
+                # Android boot-slot success state is touched or reported.
+                with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
+                    res = tc.confirm_trial()
+                self.assertEqual(
+                    res, {"state": "not_pending", "recordState": rec.CONFIRMED})
+                self.assertNotIn("slotControlState", res)
+                pw.assert_not_called()
+                self.assertEqual(
+                    store.load(fx.fx.fd, fx.fx.part, 1).record, confirmed)
+                self.assertEqual(fx.promote_mock.call_count, 2)
+                fx.promote_mock.assert_called_with(**fx._promotion_kwargs(trial))
+                self.assertEqual(fx.receipt_mock.call_count, 2)
+                self.assertEqual(fx.runtime_mock.call_count, 2)
 
-        fx.mark_mock.side_effect = mark_wrong_slot
-        with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
-            with self.assertRaises(tc.ConfirmationError):
-                tc.confirm_trial()
-        pw.assert_not_called()
-        self.assertEqual(store.load(fx.fx.fd, fx.fx.part, 1).record, confirmed)
-        self.receipt_mock_none(fx)
-
-        fx.mark_mock.side_effect = mark_from_actual
-        with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
-            res = tc.confirm_trial()
-        self.assertEqual(res, {"state": "not_pending", "recordState": rec.CONFIRMED})
-        pw.assert_not_called()
-        self.assertEqual(store.load(fx.fx.fd, fx.fx.part, 1).record, confirmed)
-        fx.promote_mock.assert_called_with(**fx._promotion_kwargs(trial))
-        kwargs = fx.promote_mock.call_args.kwargs
-        self.assertEqual(
-            kwargs["previous_binding"],
-            f"armada/{trial.old_commit.hex()}.{trial.old_serial}",
-        )
-        self.assertEqual(kwargs["current_binding"], _new_binding(trial))
-
-    def receipt_mock_none(self, fx) -> None:
-        fx.receipt_mock.assert_not_called()
-
-    def test_unconfirmed_from_rejected_before_writable_journal(self) -> None:
-        fx = self._fixture()
-        trial = _offline(fx._trial_sample(from_slot=0, target_slot=1))
-        self._seed(fx, trial)
-        fx.boot_ev = boot_health.BootEvidence(
-            transaction_uuid=trial.transaction_uuid, actual_slot=0,
-            deployment=_new_binding(trial), kernel_release="6.12.0-armada",
-            boot_sha256=OTHER_HASH,
-        )
-        with self.assertRaises(tc.ConfirmationError):
-            tc.confirm_trial()
-        self.assertEqual(fx.open_calls, [False])
-        self.assertEqual(store.load(fx.fx.fd, fx.fx.part, 1).record, trial)
-        fx.mark_mock.assert_not_called()
-        fx.promote_mock.assert_not_called()
-        fx.receipt_mock.assert_not_called()
+    def test_origin_evidence_wrong_hash_or_tx_rejected_before_writable_journal(self) -> None:
+        for name, evidence in (
+            ("hash", lambda r: replace(_deployment_boot(r, r.from_slot),
+                                       boot_sha256=r.new_boot_sha256)),
+            ("tx", lambda r: replace(_deployment_boot(r, r.from_slot),
+                                     transaction_uuid=b"z" * 16)),
+        ):
+            with self.subTest(case=name):
+                fx = self._fixture()
+                trial = _offline(fx._trial_sample(from_slot=0, target_slot=1))
+                self._seed(fx, trial)
+                fx.boot_ev = evidence(trial)
+                with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pw:
+                    with self.assertRaises(tc.ConfirmationError):
+                        tc.confirm_trial()
+                pw.assert_not_called()
+                self.assertEqual(fx.open_calls, [False])
+                self.assertEqual(
+                    store.load(fx.fx.fd, fx.fx.part, 1).record, trial)
+                fx.promote_mock.assert_not_called()
+                fx.receipt_mock.assert_not_called()
 
     def test_status_offline_confirmed(self) -> None:
         st = status_mod.TrialStatusTests(
@@ -234,6 +236,8 @@ class OfflineConfirmationTest(unittest.TestCase):
         ctx_from_new = status_mod.make_context(0, status_mod.NEW_COMMIT, 2, boot_ver=0)
         ctx_target_new = status_mod.make_context(1, status_mod.NEW_COMMIT, 2, boot_ver=0)
         with st.patch_journal(record=confirmed):
+            # The mirrored deployment on either physical slot is the same
+            # confirmation evidence.
             for ctx in (ctx_from_new, ctx_target_new):
                 res = trial_status.read_trial_status(ctx, st.marker_path)
                 self.assertEqual(res["runningDeployment"], "new")
@@ -248,10 +252,21 @@ class OfflineConfirmationTest(unittest.TestCase):
             self.assertFalse(old["bootConfirmed"])
         pending = _offline(status_mod.make_record(state=rec.TRIAL, from_slot=0, target_slot=1))
         with st.patch_journal(record=pending):
-            res = trial_status.read_trial_status(ctx_from_new, st.marker_path)
-            self.assertIsNone(res["runningDeployment"])
-            self.assertFalse(res["bootConfirmed"])
-            self.assertNotIn("finalization", res)
+            # The first trial may be observed on the original slot; it is not
+            # confirmed yet and the running deployment is still only "new".
+            for ctx in (ctx_from_new, ctx_target_new):
+                res = trial_status.read_trial_status(ctx, st.marker_path)
+                self.assertEqual(res["runningDeployment"], "new")
+                self.assertFalse(res["bootConfirmed"])
+                self.assertNotIn("finalization", res)
+
+            # Slot neutrality never replaces the transaction marker check.
+            st.marker_path.write_bytes(b"\xff" * 16)
+            wrong = trial_status.read_trial_status(ctx_from_new, st.marker_path)
+            self.assertIsNone(wrong["runningDeployment"])
+            self.assertFalse(wrong["bootConfirmed"])
+            self.assertTrue(wrong.get("bootEvidenceError"))
+            st.marker_path.write_bytes(status_mod.TXN_UUID)
         last = _offline(status_mod.make_record(state=rec.TRIAL, from_slot=0, target_slot=1, remaining=0))
         with st.patch_journal(record=last):
             res = trial_status.read_trial_status(ctx_target_new, st.marker_path)

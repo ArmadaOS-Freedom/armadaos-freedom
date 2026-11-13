@@ -15,6 +15,7 @@ import subprocess
 import uuid
 
 from .boot_materials import BootMaterialsError, _validate_helper_path, _validate_output_dir
+from .boot_payload import require_runtime_marker
 from .deployment_store import DeploymentError, _parse_binding
 
 _ALLOWED_MODELS = frozenset({"TB322FC", "TB323FU", "TB710FU"})
@@ -229,6 +230,11 @@ def _validate_inputs(slot, slot_files, materials, mode, max_raw_bytes):
         key: _verify_claim(raw_artifacts[key], f"materials.artifacts.{key}")
         for key in _MATERIAL_ARTIFACT_KEYS
     }
+    require_runtime_marker(
+        verified_artifacts["runtime"]["path"],
+        model,
+        "materials.artifacts.runtime",
+    )
     validated = {
         "budget": budget,
         "model": model,

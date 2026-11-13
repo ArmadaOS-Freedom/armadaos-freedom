@@ -27,14 +27,16 @@ class ConfirmationCliTest(unittest.TestCase):
             code = tc.main()
         return code, out.getvalue(), err.getvalue()
 
-    def test_confirmed_preserves_pending_bootloader(self) -> None:
+    def test_confirmed_reports_mirrored_boot_policy(self) -> None:
         payload = {
             "state": "confirmed",
             "sequence": 2,
             "transactionId": "11111111-2222-3333-4444-555555555555",
+            "bootSlot": "b",
             "targetSlot": "b",
             "deployment": "armada/" + "a" * 64 + ".1",
-            "firmwareSlotSuccess": "pending_bootloader",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "slotControlState": "not_issued",
         }
         with mock.patch.object(tc, "confirm_trial", return_value=dict(payload)):
             code, out, err = self._run_main(["trial_confirmation"])

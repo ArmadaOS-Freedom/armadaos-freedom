@@ -23,6 +23,7 @@ from . import (
     recovery_device,
     signature,
     system_transaction,
+    trial_record,
 )
 
 _DEFAULT_BASE = Path('/var/lib/armada-updates/offline')
@@ -94,14 +95,13 @@ def _regular(fd, label):
 def read_device_identity():
     """Read the running system's identity for read-only queries.
 
-    ``inspect_physical_slots`` deliberately fails while the controller's selected
-    slot differs from the slot the machine booted from.  That is the expected
-    state between a successful activation of the inactive slot and the reboot, so
-    queries made in that window must not reuse the strict mutation precheck.  The
-    identity here comes from the same verified evidence the boot precheck trusts:
-    the booted deployment record, the firmware witness and cmdline binding, and
-    the located internal recovery partition.  Nothing is cached from a previous
-    session and no slot is inferred from the controller's selection.
+    ``inspect_physical_slots`` is the mutation precheck: it opens and
+    cross-checks every LUN and boot extent.  A read-only query does not need
+    that full precheck, so it uses the same verified evidence the boot precheck
+    trusts without duplicating it: the booted deployment record, the firmware
+    witness and cmdline binding, and the located internal recovery partition.
+    Nothing is cached from a previous session and no slot is inferred from the
+    controller's selection.
     """
     snapshot = armada_os.snapshot()
     if not isinstance(snapshot, dict):
@@ -186,7 +186,7 @@ class OfflineSessionStore:
         return physical
 
     def _info_physical(self):
-        """Identity for read-only info; mutation paths keep the strict precheck."""
+        """Identity for read-only info; mutation paths keep the full precheck."""
         if self._info_reader is not None:
             return self._require_identity(self._info_reader())
         if self._inspect is _DEFAULT_INSPECT:
@@ -206,6 +206,7 @@ class OfflineSessionStore:
         return {
             'schemaVersion': 1,
             'updaterVersion': self.updater_version,
+            'bootPolicy': trial_record.BOOT_POLICY,
             'model': physical['model'],
             'actualSlot': physical['actualSlot'],
             'inactiveSlot': physical['inactiveSlot'],

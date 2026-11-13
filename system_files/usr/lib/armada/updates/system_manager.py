@@ -12,6 +12,7 @@ from pathlib import Path
 import armada_os
 
 from .boot_context import BootContextError, read_boot_context
+from .trial_record import BOOT_POLICY
 from .trial_status import read_trial_status
 from .channel_source import fetch_update
 from . import channel_selection
@@ -31,7 +32,8 @@ MODELS = {
 
 SYSTEM_APPLY_STATE_ROOT = Path("/var/lib/armada/updates/system")
 SYSTEM_APPLY_ARGV = ["/usr/bin/python3", "-m", "updates.system_apply"]
-_APPLY_STATES = ("awaiting_reboot", "up_to_date", "failed", "uncertain")
+_APPLY_STATES = (
+    "awaiting_reboot", "up_to_date", "failed", "uncertain", "recovery_required")
 
 
 def _apply_uncertain(base, phase, error, work_dir):
@@ -42,8 +44,9 @@ def _apply_uncertain(base, phase, error, work_dir):
         "state": "uncertain",
         "phase": phase,
         "requiresReboot": False,
+        "bootPolicy": BOOT_POLICY,
         "bootWriteState": "uncertain",
-        "activationOutcome": "uncertain",
+        "slotControlState": "uncertain",
         "workDir": str(work_dir) if work_dir is not None else None,
         "error": str(error)[:1024] or "unknown worker failure",
     })
@@ -54,8 +57,9 @@ def _apply_not_started(error, result=None, operation="apply"):
     outcome = _failure(operation, "failed", error, result)
     outcome.update({
         "requiresReboot": False,
+        "bootPolicy": BOOT_POLICY,
         "bootWriteState": "not_started",
-        "activationOutcome": "not_attempted",
+        "slotControlState": "not_issued",
         "error": outcome["error"][:1024],
     })
     return outcome
@@ -93,13 +97,29 @@ def _apply_outcome(stdout, returncode, base, work_dir):
     if returncode == 0 and state not in ("awaiting_reboot", "up_to_date"):
         return uncertain(
             "The system apply worker exited without a success state")
-    if returncode != 0 and state not in ("failed", "uncertain"):
+    if returncode != 0 and state not in ("failed", "uncertain", "recovery_required"):
         return uncertain(
             "The system apply worker failed without a failure state")
+    # A report from a worker that predates the mirrored boot policy (or that
+    # claims Android slot control was issued) is not compatible with this
+    # manager.  Treat it as uncertain instead of merging its policy fields.
+    # A genuine worker "uncertain" value is preserved for failure states,
+    # never rewritten to definite evidence.
+    if (report.get("bootPolicy") != BOOT_POLICY
+            or report.get("slotControlState") not in ("not_issued", "uncertain")):
+        return uncertain(
+            "The system apply worker returned incompatible boot-policy evidence")
+    # A success report must confirm that slot control was definitely not
+    # issued; an absent or ambiguous value may come from an old worker whose
+    # actual slot state is unknown.
+    if (state in ("awaiting_reboot", "up_to_date")
+            and report.get("slotControlState") != "not_issued"):
+        return uncertain(
+            "The system apply worker did not confirm definite slot control")
     if state == "awaiting_reboot":
         if (not report["requiresReboot"]
                 or report.get("bootWriteState") != "written"
-                or report.get("activationOutcome") != "activated"):
+                or report.get("bootPolicy") != BOOT_POLICY):
             return uncertain(
                 "The system apply worker reported inconsistent reboot evidence")
     elif report["requiresReboot"]:
@@ -180,6 +200,7 @@ def _base(snapshot, model, phase):
         "phase": phase,
         "model": model,
         "channel": _channel(snapshot),
+        "bootPolicy": BOOT_POLICY,
         "currentVersion": version,
         "targetVersion": None,
         "currentCommit": commit,
@@ -196,6 +217,7 @@ def _failure(phase, state, error, result=None):
             "phase": phase,
             "model": None,
             "channel": None,
+            "bootPolicy": BOOT_POLICY,
             "currentVersion": None,
             "targetVersion": None,
             "currentCommit": None,
@@ -266,8 +288,9 @@ def _valid_trial_receipt(trial, model):
         return (receipt.get("state") == "awaiting_reboot"
                 and receipt.get("phase") == "awaiting_reboot"
                 and receipt.get("requiresReboot") is True
+                and receipt.get("bootPolicy") == BOOT_POLICY
                 and receipt.get("bootWriteState") == "written"
-                and receipt.get("activationOutcome") == "activated")
+                and receipt.get("slotControlState") == "not_issued")
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return False
 

@@ -1,0 +1,101 @@
+# Read-only identity gate for the automatic boot-image writer.
+#
+# Source this before the boot-method fallback, any ESP/BLS work, the legacy
+# /KERNEL writer, the kShimC state sync, and the bootc rollback. It never
+# writes, mounts, locks, or opens a block device.
+#
+# armada_boot_medium_gate sets ARMADA_BOOT_MEDIUM:
+#   internal  supported board booted from the installed internal medium:
+#             callers must succeed without any storage action.
+#   refuse    supported board carries the installed new-system boot identity
+#             (or other new-system evidence) but its medium is not usable:
+#             callers must refuse the old writer, not fall back to it.
+#   legacy    TF, unrelated platforms, or a genuine legacy boot: callers keep
+#             their existing behavior.
+#
+# The fixed path is deliberate: production has no environment override. The
+# hook tests rewrite this literal into their fixture, as they already do for
+# the hooks' other fixed paths.
+ARMADA_BOOT_MEDIUM_DT=/sys/firmware/devicetree/base
+
+# Exact NUL-separated token, never a prefix or substring match.
+_armada_boot_medium_has_token() {
+    local file=$1 wanted=$2 token=
+    [ -r "${file}" ] || return 1
+    while IFS= read -r -d '' token || [ -n "${token}" ]; do
+        if [ "${token}" = "${wanted}" ]; then
+            return 0
+        fi
+    done < "${file}"
+    return 1
+}
+
+# NUL-terminated string; empty on an unreadable or malformed value.
+_armada_boot_medium_string() {
+    local file=$1 value=
+    [ -f "${file}" ] || return 1
+    IFS= read -r -d '' value < "${file}" || true
+    printf '%s' "${value}"
+    return 0
+}
+
+# Exactly these bytes including the trailing NUL: a value that lost its
+# terminator, or that carries a second NUL-separated string, was not written
+# by the installed image and must not select its meaning.
+_armada_boot_medium_exact() {
+    printf '%s\0' "$2" | cmp -s - "$1"
+}
+
+armada_boot_medium_gate() {
+    local root="${ARMADA_BOOT_MEDIUM_DT}"
+    local compatible="${root}/compatible"
+    local chosen="${root}/chosen"
+    local medium="${chosen}/armada,root-medium"
+    local witness="${chosen}/armada,boot-witness"
+    local supported=0 value=
+
+    ARMADA_BOOT_MEDIUM=legacy
+
+    # The supported pairing mirrors the device profiles and recovery layout:
+    # Gen4 elden/SM8750, Gen5 baldur/SM8850 (kaanapali is the same SoC family).
+    if _armada_boot_medium_has_token "${compatible}" 'lenovo,elden' &&
+        _armada_boot_medium_has_token "${compatible}" 'qcom,sm8750'; then
+        supported=1
+    elif _armada_boot_medium_has_token "${compatible}" 'lenovo,baldur' &&
+        { _armada_boot_medium_has_token "${compatible}" 'qcom,sm8850' ||
+          _armada_boot_medium_has_token "${compatible}" 'qcom,kaanapali'; }; then
+        supported=1
+    fi
+    [ "${supported}" -eq 1 ] || return 0
+
+    # The installed boot image is the only writer of this property, so its
+    # presence is an immutable new-system marker even when the value cannot
+    # be decoded. A missing witness can never send such a board back to the
+    # old writer; only an unrelated platform, TF, or an explicit legacy boot
+    # stays on the legacy path.
+    if [ -e "${medium}" ] || [ -L "${medium}" ]; then
+        # Only the exact tf<NUL> is the defined TF-card boot; a truncated or
+        # multi-string value is malformed and belongs with the refusals below.
+        if _armada_boot_medium_exact "${medium}" 'tf'; then
+            return 0
+        fi
+        value=$(_armada_boot_medium_string "${medium}") || value=
+        case "${value}" in
+            internal)
+                ARMADA_BOOT_MEDIUM=internal
+                ;;
+            *)
+                ARMADA_BOOT_MEDIUM=refuse
+                ;;
+        esac
+        return 0
+    fi
+
+    # No installed identity. Observed boot evidence alone is enough to refuse
+    # an old write on a supported board, but its absence leaves genuine legacy
+    # (including ABL and old single-slot kShimC) untouched.
+    if [ -e "${witness}" ] || [ -L "${witness}" ]; then
+        ARMADA_BOOT_MEDIUM=refuse
+    fi
+    return 0
+}

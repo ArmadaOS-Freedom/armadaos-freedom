@@ -161,6 +161,24 @@ class BootSourcesTests(unittest.TestCase):
                             self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR))
                         self.fixture.assert_closed_unchanged(env, before)
 
+    def test_android_telemetry_difference_is_not_capture_drift(self):
+        with self.fixture.environment() as env:
+            before = self.fixture.digests(env)
+            report = slots.inspect_physical_slots()
+            expected = json.loads(json.dumps(report))
+            expected['selectedSlot'] = (
+                'b' if report['selectedSlot'] == 'a' else 'a')
+            expected['bootableSlots'] = {
+                'a': report['bootableSlots']['a'],
+                'b': not report['bootableSlots']['b'],
+            }
+            out = self.output_for(env)
+            returned = sources.capture_boot_sources(
+                expected, out, extra_labels=('efisp',))
+            self.assertTrue(
+                slots.same_physical_identity(returned['physical'], expected))
+            self.fixture.assert_closed_unchanged(env, before)
+
     def test_argument_report_and_board_failures_do_not_create_success(self):
         with self.fixture.environment() as env:
             before = self.fixture.digests(env)
@@ -178,7 +196,7 @@ class BootSourcesTests(unittest.TestCase):
                     self.assert_no_manifest(out)
             report = slots.inspect_physical_slots()
             mismatched = json.loads(json.dumps(report))
-            mismatched['selectedSlot'] = 'b' if report['selectedSlot'] == 'a' else 'a'
+            mismatched['deployment'] += '.drifted'
             with self.assertRaisesRegex(sources.BootSourcesError, 'drifted'):
                 sources.capture_boot_sources(mismatched, out, extra_labels=('efisp',))
             self.assert_no_manifest(out)

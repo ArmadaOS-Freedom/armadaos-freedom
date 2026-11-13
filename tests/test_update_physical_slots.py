@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -79,6 +80,7 @@ class PhysicalSlotsTests(unittest.TestCase):
             images.mkdir()
             subprocess.run([str(self.helper), str(images), str(bs), str(current)], check=True)
             env = SimpleNamespace(images=[images / f'lun{i}.img' for i in range(6)])
+            env.bs = bs
             env.sysfs = root / 'sys'
             env.class_block = env.sysfs / 'class/block'
             env.dev_block = root / 'dev/block'
@@ -177,6 +179,51 @@ class PhysicalSlotsTests(unittest.TestCase):
                 REAL_FSTAT(fd)
             self.assertEqual(ctx.exception.errno, errno.EBADF)
 
+    def mark_android_slot_unbootable(self, env, slot_index):
+        """Set GPT attribute bit 55 on boot_a/boot_b and refresh both GPT CRCs."""
+        bs = env.bs
+        entries = 16
+        array_blocks = (entries * 128 + bs - 1) // bs
+        image = env.images[4]
+        data = bytearray(image.read_bytes())
+        for header_lba, array_lba in ((1, 2), (BLOCKS - 1, BLOCKS - 1 - array_blocks)):
+            entry_offset = array_lba * bs + slot_index * 128
+            attrs = int.from_bytes(data[entry_offset + 48:entry_offset + 56], 'little')
+            data[entry_offset + 48:entry_offset + 56] = (
+                attrs | (1 << 55)).to_bytes(8, 'little')
+            table = data[array_lba * bs:array_lba * bs + entries * 128]
+            data[header_lba * bs + 88:header_lba * bs + 92] = (
+                zlib.crc32(table).to_bytes(4, 'little'))
+            header = header_lba * bs
+            data[header + 16:header + 20] = b'\x00' * 4
+            data[header + 16:header + 20] = (
+                zlib.crc32(data[header:header + 92]).to_bytes(4, 'little'))
+        image.write_bytes(data)
+
+    def test_identity_comparison_excludes_only_android_telemetry(self):
+        base = {
+            'model': 'TB322FC', 'actualSlot': 'a', 'inactiveSlot': 'b',
+            'deployment': 'armada/' + ('a' * 64) + '.0',
+            'recoveryPartUuid': '12345678-1234-5678-9abc-123456789abc',
+            'ufsController': '/sys/devices/controller.ufs',
+            'luns': [{'lun': 0}], 'selectedSlot': 'a',
+            'bootableSlots': {'a': True, 'b': True},
+        }
+        telemetry = dict(
+            base, selectedSlot='b', bootableSlots={'a': True, 'b': False})
+        self.assertTrue(slots.same_physical_identity(base, telemetry))
+        legacy = {key: value for key, value in base.items()
+                  if key not in ('selectedSlot', 'bootableSlots')}
+        self.assertTrue(slots.same_physical_identity(base, legacy))
+        for field, value in (
+                ('actualSlot', 'b'), ('inactiveSlot', 'a'),
+                ('deployment', 'armada/' + ('b' * 64) + '.0'),
+                ('recoveryPartUuid', 'changed'),
+                ('ufsController', 'changed'), ('luns', [{'lun': 1}])):
+            with self.subTest(field=field):
+                changed = dict(base, **{field: value})
+                self.assertFalse(slots.same_physical_identity(base, changed))
+
     def test_valid_matrix_report_native_geometry_and_read_only(self):
         for board in (1, 2):
             for current in (0, 1):
@@ -221,13 +268,12 @@ class PhysicalSlotsTests(unittest.TestCase):
                 self.assertEqual(env.opened, [])
                 self.assertEqual(self.digests(env), before)
 
-    def test_native_gpt_crc_misc_ota_and_empty_init_boot_rejections(self):
+    def test_native_gpt_crc_and_misc_ota_rejections(self):
         for name, lun, offset, data in [
             ('gpt-crc', 4, 512 + 16, None),
             ('misc-ota', 0, 8 * 512 + 2048, b'\x01'),
             ('ab-pending-merging', 0, 8 * 512 + 32768,
              b'\x02\xb0\x0a\x74\x56\x03\x00' + b'\x00' * 57),
-            ('empty-init-boot-b', 4, 64 * 512, b'\0' * 8),
         ]:
             with self.subTest(name=name), self.environment() as env:
                 with env.images[lun].open('r+b') as stream:
@@ -238,22 +284,85 @@ class PhysicalSlotsTests(unittest.TestCase):
                         data = bytes([old[0] ^ 1])
                     stream.write(data)
                 before = self.digests(env)
-                with self.assertRaisesRegex(slots.PhysicalSlotsError,
-                                            'inspection failed|both slots must be bootable'):
+                with self.assertRaisesRegex(slots.PhysicalSlotsError, 'inspection failed'):
                     slots.inspect_physical_slots()
                 self.assert_closed_unchanged(env, before)
 
-    def test_boot_witness_and_post_native_attribute_drift(self):
+    def test_selected_slot_differing_from_the_boot_witness_is_telemetry(self):
+        for selected, booted in ((0, 'b'), (1, 'a')):
+            with self.subTest(selected='ab'[selected], booted=booted), \
+                    self.environment(current=selected) as env:
+                env.context_mock.return_value = {
+                    'actualSlot': booted,
+                    'inactiveSlot': 'a' if booted == 'b' else 'b',
+                    'deployment': 'test',
+                }
+                before = self.digests(env)
+                report = slots.inspect_physical_slots()
+                self.assertEqual(report['selectedSlot'], 'ab'[selected])
+                self.assertEqual(report['actualSlot'], booted)
+                self.assertEqual(report['inactiveSlot'],
+                                 'a' if booted == 'b' else 'b')
+                self.assertEqual(report['bootableSlots'], {'a': True, 'b': True})
+                self.assert_closed_unchanged(env, before)
+
+    def test_each_real_android_bootable_bit_is_reported_not_gated(self):
+        for bs in (512, 4096):
+            for selected in (0, 1):
+                for slot_index in (0, 1):
+                    with self.subTest(
+                            bs=bs, selected='ab'[selected], slot='ab'[slot_index]), \
+                            self.environment(bs, selected) as env:
+                        self.mark_android_slot_unbootable(env, slot_index)
+                        before = self.digests(env)
+                        report = slots.inspect_physical_slots()
+                        expected = {'a': True, 'b': True}
+                        expected['ab'[slot_index]] = False
+                        self.assertEqual(report['bootableSlots'], expected)
+                        self.assertEqual(report['selectedSlot'], 'ab'[selected])
+                        self.assertEqual(report['actualSlot'], 'ab'[selected])
+                        self.assertEqual(report['inactiveSlot'], 'ba'[selected])
+                        self.assert_closed_unchanged(env, before)
+
+    def test_empty_secondary_boot_chain_is_reported_not_fabricated(self):
+        # The probe reports the real Android bit instead of fabricating true.
+        # Signed boot-material trust still refuses this empty source later;
+        # only the slot probe stops using bootability as its trust gate.
         with self.environment() as env:
-            env.context_mock.return_value = dict(env.context, actualSlot='b', inactiveSlot='a')
-            with self.assertRaisesRegex(slots.PhysicalSlotsError, 'actual boot != next selected'):
+            with env.images[4].open('r+b') as stream:
+                stream.seek(64 * env.bs)
+                stream.write(b'\0' * 8)
+            before = self.digests(env)
+            report = slots.inspect_physical_slots()
+            self.assertEqual(report['bootableSlots'], {'a': True, 'b': False})
+            self.assert_closed_unchanged(env, before)
+
+    def test_all_zero_gpt_input_is_still_refused(self):
+        with self.environment() as env:
+            env.images[4].write_bytes(b'\0' * env.images[4].stat().st_size)
+            before = self.digests(env)
+            with self.assertRaisesRegex(slots.PhysicalSlotsError, 'inspection failed'):
                 slots.inspect_physical_slots()
+            self.assert_closed_unchanged(env, before)
+
+    def test_all_zero_bootability_is_still_refused(self):
+        for bs in (512, 4096):
+            with self.subTest(bs=bs), self.environment(bs) as env:
+                self.mark_android_slot_unbootable(env, 0)
+                self.mark_android_slot_unbootable(env, 1)
+                before = self.digests(env)
+                with self.assertRaisesRegex(slots.PhysicalSlotsError,
+                                            'no bootable slot'):
+                    slots.inspect_physical_slots()
+                self.assert_closed_unchanged(env, before)
+
+    def test_post_native_attribute_drift(self):
         for attribute in ('enabled', 'boot-id'):
             with self.subTest(attribute=attribute), self.environment() as env:
-                real_run = slots._run_inspection
+                real_read = slots._read_slot_state
 
-                def run_then_mutate(fds, found):
-                    result = real_run(fds, found)
+                def read_then_mutate(fds, found):
+                    result = real_read(fds, found)
                     if attribute == 'enabled':
                         self.write(env.controller / 'attributes/boot_lun_enabled', 2)
                     else:
@@ -261,7 +370,8 @@ class PhysicalSlotsTests(unittest.TestCase):
                                    'unit_descriptor/boot_lun_id', 0)
                     return result
 
-                with mock.patch.object(slots, '_run_inspection', side_effect=run_then_mutate):
+                with mock.patch.object(slots, '_read_slot_state',
+                                       side_effect=read_then_mutate):
                     with self.assertRaisesRegex(slots.PhysicalSlotsError, 'drifted during check'):
                         slots.inspect_physical_slots()
 

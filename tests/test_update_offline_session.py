@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import test_update_channel_release as release  # noqa: E402
 import test_update_package_contract as fixture  # noqa: E402
-from updates import offline_session  # noqa: E402
+from updates import offline_session, trial_record  # noqa: E402
 from updates.package_contract import validate_package  # noqa: E402
 
 _MIB = 1024 * 1024
@@ -88,6 +88,20 @@ class OfflineSessionStoreTest(unittest.TestCase):
                 self.assertEqual(sealed["state"], "uploaded")
                 with self.assertRaises(offline_session.OfflineSessionError):
                     store.upload(receipt["sessionId"], len(data), b"z")
+
+    def test_info_advertises_boot_policy_across_a_transfer(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "info-transfer" / "offline"
+        store = self._store(base)
+        before = store.info()
+        self.assertEqual(before['bootPolicy'], 'dual-boot-no-slot-control')
+        receipt = store.begin(doc, sig)
+        session_id = receipt["sessionId"]
+        store.upload(session_id, 0, data)
+        store.seal(session_id)
+        after = store.info()
+        self.assertEqual(after['bootPolicy'], trial_record.BOOT_POLICY)
+        self.assertEqual(before['bootPolicy'], after['bootPolicy'])
 
     def test_begin_rejects_invalid_packages_before_session_creation(self):
         doc, sig, data = self._signed_package()

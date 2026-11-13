@@ -19,7 +19,6 @@ from . import (
     physical_slots,
     recovery_device,
     signature,
-    slot_activation,
     system_transaction,
     trial_confirmation,
     trial_record,
@@ -250,9 +249,11 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
         raise ValueError('plan slot/model bindings mismatch physical state')
 
     if (not _is_schema_one(trust.get('schemaVersion')) or
-            trust.get('physical') != initial or
-            trust.get('sources', {}).get('physical') != initial or
-            manifest.get('physical') != initial or manifest.get('model') != initial['model']):
+            not physical_slots.same_physical_identity(trust.get('physical'), initial) or
+            not physical_slots.same_physical_identity(
+                trust.get('sources', {}).get('physical'), initial) or
+            not physical_slots.same_physical_identity(manifest.get('physical'), initial) or
+            manifest.get('model') != initial['model']):
         raise ValueError('boot trust physical report mismatch')
     sources = trust['sources']
     candidates = {}
@@ -371,7 +372,6 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
         boots_written = False
         report_validated = False
         journal_attempted = False
-        activation_started = False
         try:
             ctx = _preflight(work, recovery_ack, updater_version, trusted_key)
             status = dict(ctx['saved_status'])
@@ -382,7 +382,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             system_transaction._save_json(work, 'recovery-ack.json', recovery_ack)
             status.update(state='executing', phase='writing_boot',
                           bootWriteState='writing',
-                          activationOutcome='not_attempted', requiresReboot=False)
+                          bootPolicy=trial_record.BOOT_POLICY,
+                          slotControlState='not_issued', requiresReboot=False)
             system_transaction._save_json(work, 'status.json', status)
 
             def progress(event):
@@ -396,7 +397,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             if ( not isinstance(report, dict) or
                     report.get('phase') != 'dual_boots_written' or
                     report.get('model') != initial['model'] or
-                    report.get('physical') != initial or
+                    not physical_slots.same_physical_identity(
+                        report.get('physical'), initial) or
                     report.get('transactionUuid') != ctx['tx'] or
                     report.get('deployment') != plan['newDeployment'] or
                     report.get('fromSlot') != actual or
@@ -418,7 +420,7 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             system_transaction._save_json(work, 'status.json', status)
 
             after_write = (physical_slots.inspect_physical_slots())
-            if after_write != initial:
+            if not physical_slots.same_physical_identity(after_write, initial):
                 raise ValueError('physical slots changed after boot writes')
             status['phase'] = 'preparing_trial'
             system_transaction._save_json(work, 'status.json', status)
@@ -436,25 +438,10 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             status['phase'] = 'journal_prepared'
             system_transaction._save_json(work, 'status.json', status)
 
-            status.update(phase='activating', activationOutcome='attempting')
-            system_transaction._save_json(work, 'status.json', status)
-            activation_started = True
-            activated = slot_activation.activate_offline_slots(report)
-            if (activated.get('phase') != 'offline_slots_activated' or
-                    activated.get('model') != initial['model'] or
-                    activated.get('fromSlot') != actual or
-                    activated.get('targetSlot') != inactive or
-                    activated.get('selectedSlot') != inactive or
-                    activated.get('transactionUuid') != ctx['tx'] or
-                    activated.get('deployment') != plan['newDeployment'] or
-                    activated.get('recordSequence') != record.sequence or
-                    activated.get('currentReadbackSha256') != plan['newBootSha256'][actual] or
-                    activated.get('targetReadbackSha256') != plan['newBootSha256'][inactive]):
-                raise ValueError('offline slot activation report mismatch')
             status.update(state='awaiting_reboot', phase='awaiting_reboot',
-                          requiresReboot=True, activationOutcome='activated',
-                          bootWriteState='written')
-            system_transaction._save_json(work, 'activation-report.json', activated)
+                          requiresReboot=True, bootWriteState='written',
+                          slotControlState='not_issued',
+                          journalSequence=record.sequence)
             system_transaction._save_json(work, 'status.json', status)
             return status
         except Exception as exc:
@@ -462,17 +449,20 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 raise
             if not started:
                 result = {'phase': 'preflight', 'state': 'failed',
+                          'bootPolicy': trial_record.BOOT_POLICY,
+                          'slotControlState': 'not_issued',
                           'error': str(exc), 'requiresReboot': False}
                 raise system_transaction.SystemTransactionError(
                     str(exc), result) from exc
             status['failedPhase'] = status.get('phase')
             status['phase'] = 'failed'
             status['requiresReboot'] = False
+            status['slotControlState'] = 'not_issued'
             if not write_call_started:
                 status['bootWriteState'] = 'not_started'
                 status['state'] = 'failed'
             elif (isinstance(exc, offline_boot_writer.BootWriteError) and
-                    not boots_written and not journal_attempted and not activation_started):
+                    not boots_written and not journal_attempted):
                 restore = exc.restore_status
                 status['bootRestoreState'] = restore
                 if restore == 'not_needed':
@@ -489,12 +479,6 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             else:
                 status['bootWriteState'] = 'written' if report_validated else 'uncertain'
                 status['state'] = 'recovery_required'
-            if isinstance(exc, slot_activation.ActivationError):
-                status['activationOutcome'] = exc.outcome
-                if exc.native_result is not None:
-                    status['nativeResult'] = exc.native_result
-            elif activation_started:
-                status['activationOutcome'] = 'uncertain'
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
             try:
                 system_transaction._save_json(work, 'status.json', status)

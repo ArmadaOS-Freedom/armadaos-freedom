@@ -81,7 +81,8 @@ class SystemApplyWorkerTests(unittest.TestCase):
             "pendingDeployment": TARGET_COMMIT,
             "requiresReboot": True,
             "bootWriteState": "written",
-            "activationOutcome": "activated",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "slotControlState": "not_issued",
         }
         with patch.object(system_apply, "os", wraps=os) as os_mock, \
              patch("armada_os.snapshot", return_value=snapshot(channel="beta")), \
@@ -112,7 +113,8 @@ class SystemApplyWorkerTests(unittest.TestCase):
             "pendingDeployment": TARGET_COMMIT,
             "requiresReboot": True,
             "bootWriteState": "written",
-            "activationOutcome": "activated",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "slotControlState": "not_issued",
         }
         missing_config = self.base / "missing_channels.json"
         with patch.object(system_apply, "CONFIG_PATH", missing_config), \
@@ -149,7 +151,7 @@ class SystemApplyWorkerTests(unittest.TestCase):
             "pendingDeployment": TARGET_COMMIT,
             "requiresReboot": False,
             "bootWriteState": "written",
-            "activationOutcome": "uncertain",
+            "slotControlState": "not_issued",
             "error": "post-write finalize failed",
         }
         err = SystemTransactionError("post-write finalize failed", detailed)
@@ -159,7 +161,7 @@ class SystemApplyWorkerTests(unittest.TestCase):
 
         self.assertEqual(result, detailed)
         self.assertEqual(result["bootWriteState"], "written")
-        self.assertEqual(result["activationOutcome"], "uncertain")
+        self.assertEqual(result["slotControlState"], "not_issued")
 
     def test_nonroot_rejects_before_snapshot(self):
         with patch.object(system_apply.os, "geteuid", return_value=1000), \
@@ -335,7 +337,7 @@ class SystemApplyWorkerTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["phase"], "preflight")
         self.assertEqual(result["bootWriteState"], "not_started")
-        self.assertEqual(result["activationOutcome"], "not_attempted")
+        self.assertEqual(result["slotControlState"], "not_issued")
         self.assertIn("ostree", result["error"])
 
     def test_main_exit_codes_json_output_and_strict_arguments(self):

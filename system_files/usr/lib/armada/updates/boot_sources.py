@@ -189,7 +189,7 @@ def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,
         initial = inspector()
     except PhysicalSlotsError as error:
         raise BootSourcesError(f'physical slot precheck failed: {error}') from error
-    if initial != expected_physical:
+    if not physical_slots.same_physical_identity(initial, expected_physical):
         raise BootSourcesError('physical slot report drifted from expected report')
 
     try:
@@ -304,7 +304,7 @@ def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,
         except PhysicalSlotsError as error:
             raise BootSourcesError(
                 f'final physical slot precheck failed: {error}') from error
-        if final != initial:
+        if not physical_slots.same_physical_identity(final, initial):
             raise BootSourcesError('physical slot report drifted during snapshot')
         try:
             re_recovery = physical_slots.locate_recovery_partition(require_edl=False)

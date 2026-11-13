@@ -106,7 +106,8 @@ class OperationTests(unittest.TestCase):
                 "state": "awaiting_reboot",
                 "requiresReboot": True,
                 "bootWriteState": "written",
-                "activationOutcome": "activated",
+                "bootPolicy": "dual-boot-no-slot-control",
+                "slotControlState": "not_issued",
                 "newDeployment": binding,
                 "trial": {"newDeployment": binding},
             }
@@ -520,14 +521,16 @@ class OperationTests(unittest.TestCase):
             "state": "awaiting_reboot",
             "requiresReboot": True,
             "bootWriteState": "written",
-            "activationOutcome": "activated",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "slotControlState": "not_issued",
             "newDeployment": f"default/{'b' * 64}.0",
         }
         for bad in (
             None,
             ["unexpected"],
             {**good, "bootWriteState": "pending"},
-            {**good, "activationOutcome": "skipped"},
+            {**good, "bootPolicy": "legacy-single-slot"},
+            {**good, "slotControlState": "issued"},
             {**good, "requiresReboot": False},
             {**good, "newDeployment": f"default/{'a' * 64}.0"},
             {"component": "system", "state": "failed", "phase": "rollback", "error": "write failed"},

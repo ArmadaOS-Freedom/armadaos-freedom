@@ -45,8 +45,9 @@ def _preflight_failure(error):
         "currentCommit": None,
         "pendingDeployment": None,
         "requiresReboot": False,
+        "bootPolicy": "dual-boot-no-slot-control",
         "bootWriteState": "not_started",
-        "activationOutcome": "not_attempted",
+        "slotControlState": "not_issued",
         "error": str(error) or type(error).__name__,
     }
 

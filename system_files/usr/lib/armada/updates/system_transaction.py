@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""Orchestrate one locked, inactive-slot online system transaction."""
+"""Orchestrate one locked, mirrored Linux system transaction.
+
+Every transaction (online update or explicit rollback) rebuilds and verifies
+one logical Linux deployment in both physical boot slots from each slot's own
+authenticated material.  It never selects an Android boot slot, marks slot
+success, arms a retry/priority LUN, or writes Android boot-control state: the
+Android bootloader keeps owning slot selection and raw boot state.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +21,12 @@ from . import (
     boot_candidate,
     boot_materials,
     boot_trust,
-    boot_writer,
     deployment_store,
     image_source,
+    offline_boot_writer,
     physical_slots,
     recovery_device,
     signature,
-    slot_activation,
     trial_confirmation,
     trial_record,
     trial_store,
@@ -28,6 +34,8 @@ from . import (
 
 _CHANNELS = frozenset({'stable', 'beta', 'testing'})
 _TERMINAL = frozenset({trial_record.CONFIRMED, trial_record.ROLLED_BACK})
+_SLOTS = ('a', 'b')
+BOOT_POLICY = trial_record.BOOT_POLICY
 
 
 class SystemTransactionError(RuntimeError):
@@ -137,13 +145,70 @@ def _check_recovery(initial, old):
         if record.state == trial_record.CONFIRMED:
             expected = {(record.target_slot, record.os_name, record.new_commit.hex(), record.new_serial)}
             if record.policy == trial_record.OFFLINE_DUAL:
-                expected.add((record.from_slot, record.os_name, record.new_commit.hex(), record.new_serial))
+                # A confirmed mirrored deployment owns both physical slots with
+                # the same deployment binding, so either observed slot is valid.
+                expected.add(
+                    (record.from_slot, record.os_name, record.new_commit.hex(), record.new_serial))
         else:
             expected = {(record.from_slot, record.os_name, record.old_commit.hex(), record.old_serial)}
         actual = (0 if initial['actualSlot'] == 'a' else 1, old[0], old[1], old[2])
         if actual not in expected:
             raise ValueError('terminal trial record does not match physical deployment')
     return snapshot
+
+
+def _prepare_candidates(*, trust, materials, tx, target_deployment, work,
+                        boot_tool_path):
+    candidates = {}
+    old_sha = {}
+    new_sha = {}
+    for slot in _SLOTS:
+        original = boot_candidate._verify_claim(
+            trust['sources']['slots'][slot]['boot'], 'old boot %s' % slot)
+        old_sha[slot] = original['sha256']
+        candidate = boot_candidate.prepare_boot_candidate(
+            slot=slot, slot_files=trust['sources']['slots'][slot],
+            materials=materials, mode=trust['mode'],
+            max_raw_bytes=trust['trust'][slot]['maxRawBytes'],
+            output_dir=work / ('candidate-' + slot), boot_tool_path=boot_tool_path)
+        if (candidate.get('phase') != 'candidate_prepared' or
+                candidate.get('slot') != slot or
+                candidate.get('transactionUuid') != tx or
+                candidate.get('deployment') != target_deployment or
+                candidate.get('model') != trust['physical']['model']):
+            raise ValueError('boot candidate binding mismatch for slot %s' % slot)
+        claim = boot_candidate._verify_claim(
+            candidate['candidate'], 'new boot %s' % slot)
+        candidates[slot] = candidate
+        new_sha[slot] = claim['sha256']
+    return candidates, old_sha, new_sha
+
+
+def _check_dual_write_report(report, *, initial, actual, inactive, tx,
+                             target_deployment, old_sha, new_sha):
+    if (not isinstance(report, dict) or
+            report.get('phase') != 'dual_boots_written' or
+            report.get('model') != initial['model'] or
+            not physical_slots.same_physical_identity(
+                report.get('physical'), initial) or
+            report.get('transactionUuid') != tx or
+            report.get('deployment') != target_deployment or
+            report.get('fromSlot') != actual or
+            report.get('slotOrder') != [inactive, actual] or
+            set(report.get('writes', {})) != set(_SLOTS)):
+        raise ValueError('mirrored dual boot write report mismatch')
+    for slot in _SLOTS:
+        evidence = report['writes'][slot]
+        claim = boot_candidate._verify_claim(
+            evidence.get('candidate'), 'write evidence %s' % slot)
+        if (evidence.get('sourceBootSha256') != old_sha[slot] or
+                evidence.get('bytesWritten') != claim['bytes'] or
+                claim['sha256'] != new_sha[slot] or
+                evidence.get('readbackSha256') != new_sha[slot]):
+            raise ValueError('mirrored boot write evidence mismatch for slot %s' % slot)
+    if not physical_slots.same_physical_identity(
+            physical_slots.inspect_physical_slots(), initial):
+        raise ValueError('physical slots changed after mirrored boot writes')
 
 
 def _run_transaction(*, mode, sysroot_path, work_dir,
@@ -157,11 +222,10 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
     with trial_confirmation._locked():
         work = Path(work_dir)
         created = False
-        activation_started = False
         status = {'schemaVersion': 1, 'component': 'system', 'state': 'failed',
                   'phase': 'preflight', 'requiresReboot': False,
-                  'bootWriteState': 'not_started', 'activationOutcome': 'not_attempted',
-                  'workDir': str(work)}
+                  'bootPolicy': BOOT_POLICY, 'slotControlState': 'not_issued',
+                  'bootWriteState': 'not_started', 'workDir': str(work)}
         if mode == 'rollback':
             status['operation'] = 'rollback'
         try:
@@ -201,12 +265,15 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     trial_confirmation.collect_boot_evidence(journal.record), journal.record
                 )
                 trial_confirmation._finalize_deployment(journal.record, boot, sysroot_path=root)
-                if physical_slots.inspect_physical_slots() != initial:
+                if not physical_slots.same_physical_identity(
+                        physical_slots.inspect_physical_slots(), initial):
                     raise ValueError('physical slots changed after confirmed trial finalization')
             tx = str(uuid.uuid4())
+            actual, inactive = initial['actualSlot'], initial['inactiveSlot']
             status.update(transactionId=tx, model=initial['model'],
-                          fromSlot=initial['actualSlot'], targetSlot=initial['inactiveSlot'],
-                          oldDeployment=initial['deployment'], phase='preparing', state='preparing')
+                          fromSlot=actual, targetSlot=inactive,
+                          oldDeployment=initial['deployment'],
+                          phase='preparing', state='preparing')
             if mode == 'rollback':
                 status['newDeployment'] = target_deployment
                 if target_version is not None:
@@ -229,14 +296,15 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     status.update(state='up_to_date', phase='complete', requiresReboot=False)
                     _save_json(work, 'status.json', status)
                     return status
-                if physical_slots.inspect_physical_slots() != initial:
+                if not physical_slots.same_physical_identity(
+                        physical_slots.inspect_physical_slots(), initial):
                     raise ValueError('physical slots changed after download')
 
             status['phase'] = 'capturing_boot_trust'
             _save_json(work, 'status.json', status)
             trust = boot_trust.capture_boot_trust(output_dir=work / 'trust',
                                                   boot_tool_path=boot_tool_path)
-            if trust['physical'] != initial:
+            if not physical_slots.same_physical_identity(trust['physical'], initial):
                 raise ValueError('boot trust physical report mismatch')
 
             if mode == 'online':
@@ -266,35 +334,31 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     materials['model'] != initial['model']):
                 raise ValueError('boot materials binding mismatch')
 
-            status['phase'] = 'preparing_candidate'
+            status['phase'] = 'preparing_candidates'
             _save_json(work, 'status.json', status)
-            target = initial['inactiveSlot']
-            candidate = boot_candidate.prepare_boot_candidate(
-                slot=target, slot_files=trust['sources']['slots'][target], materials=materials,
-                mode=trust['mode'], max_raw_bytes=trust['trust'][target]['maxRawBytes'],
-                output_dir=work / 'candidate', boot_tool_path=boot_tool_path)
-            if (candidate['phase'] != 'candidate_prepared' or candidate['slot'] != target or
-                    candidate['transactionUuid'] != tx or
-                    candidate['deployment'] != target_deployment):
-                raise ValueError('boot candidate binding mismatch')
-            old_claim = boot_candidate._verify_claim(
-                trust['sources']['slots'][initial['actualSlot']]['boot'], 'old boot')
-            new_claim = boot_candidate._verify_claim(candidate['candidate'], 'new boot')
+            candidates, old_sha, new_sha = _prepare_candidates(
+                trust=trust, materials=materials, tx=tx,
+                target_deployment=target_deployment, work=work,
+                boot_tool_path=boot_tool_path)
+            for slot in _SLOTS:
+                _save_json(work, 'candidate-%s.json' % slot, candidates[slot])
+
             if mode == 'online':
                 plan = {'schemaVersion': 1, 'transactionId': tx, 'model': initial['model'],
                         'channel': expected_channel, 'releaseId': package['releaseId'],
                         'version': package['version'], 'sourceRevision': package['sourceRevision'],
                         'ociDigest': package['ociDigest'], 'ostreeCommit': downloaded['commit'],
-                        'fromSlot': initial['actualSlot'], 'targetSlot': target,
+                        'bootPolicy': BOOT_POLICY,
+                        'fromSlot': actual, 'targetSlot': inactive,
                         'oldDeployment': initial['deployment'], 'newDeployment': target_deployment,
-                        'oldBootSha256': old_claim['sha256'], 'newBootSha256': new_claim['sha256']}
+                        'originalBootSha256': old_sha, 'mirroredBootSha256': new_sha}
             else:
                 plan = {'schemaVersion': 1, 'operation': 'rollback', 'transactionId': tx,
                         'model': initial['model'], 'channel': snapshot_channel,
-                        'ostreeCommit': new[1],
-                        'fromSlot': initial['actualSlot'], 'targetSlot': target,
+                        'ostreeCommit': new[1], 'bootPolicy': BOOT_POLICY,
+                        'fromSlot': actual, 'targetSlot': inactive,
                         'oldDeployment': initial['deployment'], 'newDeployment': target_deployment,
-                        'oldBootSha256': old_claim['sha256'], 'newBootSha256': new_claim['sha256']}
+                        'originalBootSha256': old_sha, 'mirroredBootSha256': new_sha}
                 if target_version is not None:
                     plan['targetVersion'] = target_version
             plan_bytes = _save_json(work, 'plan.json', plan)
@@ -305,16 +369,18 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 _recheck_rollback_snapshot(expected_checksum, new)
             status.update(phase='writing_boot', bootWriteState='writing')
             _save_json(work, 'status.json', status)
-            report = boot_writer.write_inactive_boot(trust, candidate)
+
+            def progress(event):
+                status['bootWriteEvent'] = event
+                _save_json(work, 'status.json', status)
+
+            report = offline_boot_writer.write_offline_boots(
+                trust, candidates, progress=progress)
+            status['bootWriteEvent'] = {'phase': 'complete', 'slotOrder': [inactive, actual]}
             status['bootWriteState'] = 'written'
-            if (report['phase'] != 'inactive_boot_written' or report['model'] != initial['model'] or
-                    report['physical'] != initial or
-                    report['bytesWritten'] != new_claim['bytes'] or
-                    report['fromSlot'] != initial['actualSlot'] or report['targetSlot'] != target or
-                    report['transactionUuid'] != tx or report['deployment'] != target_deployment or
-                    report['candidate']['sha256'] != plan['newBootSha256'] or
-                    report['readbackSha256'] != plan['newBootSha256']):
-                raise ValueError('inactive boot report mismatch')
+            _check_dual_write_report(
+                report, initial=initial, actual=actual, inactive=inactive, tx=tx,
+                target_deployment=target_deployment, old_sha=old_sha, new_sha=new_sha)
             _save_json(work, 'write-report.json', report)
             status['phase'] = 'preparing_trial'
             _save_json(work, 'status.json', status)
@@ -324,15 +390,18 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 sequence=sequence, partition_uuid=journal.layout.partition_uuid,
                 installation_uuid=journal.layout.installation_uuid,
                 transaction_uuid=uuid.UUID(tx).bytes, state=trial_record.PREPARED,
-                from_slot=0 if initial['actualSlot'] == 'a' else 1,
-                target_slot=0 if target == 'a' else 1, remaining=3, attempt_limit=3,
+                from_slot=0 if actual == 'a' else 1,
+                target_slot=0 if inactive == 'a' else 1, remaining=3, attempt_limit=3,
                 old_serial=old[2], new_serial=new[2], os_name=old[0],
                 old_commit=bytes.fromhex(old[1]), new_commit=bytes.fromhex(new[1]),
-                old_boot_sha256=bytes.fromhex(plan['oldBootSha256']),
-                new_boot_sha256=bytes.fromhex(plan['newBootSha256']),
-                plan_sha256=bytes.fromhex(plan_sha256))
+                old_boot_sha256=bytes.fromhex(old_sha[actual]),
+                new_boot_sha256=bytes.fromhex(new_sha[inactive]),
+                plan_sha256=bytes.fromhex(plan_sha256),
+                policy=trial_record.OFFLINE_DUAL,
+                other_boot_sha256=bytes.fromhex(new_sha[actual]))
             trial_record.encode_record(record)
-            if physical_slots.inspect_physical_slots() != initial:
+            if not physical_slots.same_physical_identity(
+                    physical_slots.inspect_physical_slots(), initial):
                 raise ValueError('physical slots changed before journal write')
             with recovery_device.open_recovery(writable=True) as (fd, partuuid, board):
                 if partuuid != initial['recoveryPartUuid'] or physical_slots._MODEL.get(board) != initial['model']:
@@ -342,22 +411,10 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 trial_store.save(fd, journal, record)
                 if trial_store.load(fd, partuuid, board).record != record:
                     raise ValueError('prepared journal readback mismatch')
-            status['phase'] = 'journal_prepared'
-            _save_json(work, 'status.json', status)
-
-            status.update(phase='activating', activationOutcome='attempting')
-            _save_json(work, 'status.json', status)
-            activation_started = True
-            activated = slot_activation.activate_prepared_slot(report)
-            if (activated['phase'] != 'slot_activated' or activated['model'] != initial['model'] or
-                    activated['fromSlot'] != initial['actualSlot'] or activated['targetSlot'] != target or
-                    activated['selectedSlot'] != target or activated['transactionUuid'] != tx or
-                    activated['deployment'] != target_deployment or
-                    activated['recordSequence'] != sequence or
-                    activated['readbackSha256'] != plan['newBootSha256']):
-                raise ValueError('slot activation report mismatch')
-            status.update(state='awaiting_reboot', phase='awaiting_reboot', requiresReboot=True,
-                          activationOutcome='activated', bootWriteState='written')
+            status.update(state='awaiting_reboot', phase='awaiting_reboot',
+                          requiresReboot=True, bootWriteState='written',
+                          slotControlState='not_issued',
+                          journalSequence=sequence)
             _save_json(work, 'status.json', status)
             return status
         except Exception as exc:
@@ -365,8 +422,8 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 raise
             status['state'] = 'failed'
             status['requiresReboot'] = False
-            status['activationOutcome'] = 'not_attempted'
-            if isinstance(exc, boot_writer.BootWriteError):
+            status['slotControlState'] = 'not_issued'
+            if isinstance(exc, offline_boot_writer.BootWriteError):
                 restore = exc.restore_status
                 status['bootRestoreState'] = restore
                 if restore == 'not_needed':
@@ -376,15 +433,12 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 else:
                     status['bootWriteState'] = 'uncertain'
                     status['state'] = 'uncertain'
-            if isinstance(exc, slot_activation.ActivationError):
-                status['activationOutcome'] = exc.outcome
-                if getattr(exc, 'native_result', None) is not None:
-                    status['nativeResult'] = exc.native_result
-                if exc.outcome == 'uncertain':
-                    status['state'] = 'uncertain'
-            elif activation_started:
-                status['activationOutcome'] = 'uncertain'
-                status['state'] = 'uncertain'
+                if getattr(exc, 'slot_results', None) is not None:
+                    status['slotResults'] = exc.slot_results
+            elif created and status.get('bootWriteState') == 'written':
+                # Mirrored boots are already durable; only journaling failed.
+                # Never report awaiting a restart without a prepared journal.
+                status['state'] = 'recovery_required'
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
             if created:
                 try:

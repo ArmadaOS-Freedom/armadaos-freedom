@@ -12,6 +12,7 @@ from . import (
     offline_completion,
     offline_execute,
     offline_session,
+    physical_slots,
     system_transaction,
     trial_status,
 )
@@ -61,7 +62,8 @@ class OfflineJobManager:
         return 'armada-offline-%s-%s' % (operation, session_id)
 
     def _recheck_submission_identity(self, receipt):
-        if self.store._physical_info() != receipt.get('physical'):
+        if not physical_slots.same_physical_identity(
+                self.store._physical_info(), receipt.get('physical')):
             raise offline_session.OfflineSessionError(
                 'physical identity changed since session submission')
         channel = system_transaction._snapshot_channel(armada_os.snapshot())

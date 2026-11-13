@@ -27,6 +27,11 @@ OS_NAME_MAX = 64
 ONLINE_SINGLE = 0
 OFFLINE_DUAL = 1
 
+# The one logical Linux deployment is mirrored into both physical boot slots.
+# Slot selection, retry counters, priority and boot-control writes stay owned
+# by Android; Linux only observes which slot the bootloader picked.
+BOOT_POLICY = "dual-boot-no-slot-control"
+
 PREPARED = 1
 TRIAL = 2
 CONFIRMED = 3
@@ -134,11 +139,11 @@ def expected_boot_sha256(record: TrialRecord, actual_slot: int) -> bytes:
         raise TrialRecordError("expected boot hash requires TRIAL or CONFIRMED")
     if actual_slot == record.target_slot:
         return record.new_boot_sha256
-    if (
-        actual_slot == record.from_slot
-        and record.policy == OFFLINE_DUAL
-        and record.state == CONFIRMED
-    ):
+    if actual_slot == record.from_slot and record.policy == OFFLINE_DUAL:
+        # Mirrored writes put the same logical deployment in both physical
+        # slots, each rebuilt from that slot's own material.  from_slot and
+        # target_slot only index the hashes and the write order, so a boot
+        # observed on either slot is valid evidence for this deployment.
         return record.other_boot_sha256
     raise TrialRecordError("actual slot is not valid for the trial record")
 

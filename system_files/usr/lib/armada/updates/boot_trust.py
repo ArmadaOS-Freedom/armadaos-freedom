@@ -27,6 +27,7 @@ from .boot_sources import (
 from .physical_slots import (
     PhysicalSlotsError,
     inspect_physical_slots,
+    same_physical_identity,
 )
 
 
@@ -81,7 +82,7 @@ def _normalize_snapshot(snapshot, initial, extra_labels):
         type(snapshot.get("schemaVersion")) is not int
         or snapshot["schemaVersion"] != 1
         or snapshot.get("phase") != "boot_sources_captured"
-        or snapshot.get("physical") != initial
+        or not same_physical_identity(snapshot.get("physical"), initial)
         or not isinstance(snapshot.get("partitions"), dict)
     ):
         raise BootTrustError("invalid boot-source snapshot header")
@@ -312,7 +313,7 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
         return _finalize_trust(
             tool_path, out, tmp, initial, initial_lock, request, snapshot,
             "boot_trust_checked",
-            lambda: inspect_physical_slots() == initial,
+            lambda: same_physical_identity(inspect_physical_slots(), initial),
         )
     except BootTrustError:
         raise

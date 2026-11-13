@@ -379,23 +379,29 @@ int kshim_update_trial_before_boot(const struct kshim_update_trial *record,
     if (!validate_logical_record(record, NULL))
         return KSHIM_STORAGE_FORMAT;
 
+    /* Android owns slot selection; neither policy may act on its boot. */
+    if (!internal_linux) {
+        decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
+        decision->next = *record;
+        return KSHIM_STORAGE_OK;
+    }
+
     if (record->policy == KSHIM_UPDATE_POLICY_OFFLINE_DUAL) {
-        if (!internal_linux) {
-            decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
-            decision->next = *record;
-            return KSHIM_STORAGE_OK;
-        }
+        /*
+         * Mirrored writes put the same logical deployment in both physical
+         * slots, so either slot is valid evidence for this transaction and
+         * draws from the same attempt budget.  There is no Android slot
+         * control: exhaustion refuses handoff and confirmation only
+         * continues.
+         */
         if (!new_deployment_matches(record, os_name, commit, serial))
             return KSHIM_STORAGE_CONFLICT;
         if (record->state == KSHIM_UPDATE_TRIAL_CONFIRMED) {
-            if (actual_slot != record->from_slot &&
-                actual_slot != record->target_slot)
-                return KSHIM_STORAGE_CONFLICT;
             decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
             decision->next = *record;
             return KSHIM_STORAGE_OK;
         }
-        if (actual_slot != record->target_slot || record->remaining == 0u)
+        if (record->remaining == 0u)
             return KSHIM_STORAGE_CONFLICT;
         rc = start_mutation(record, &next);
         if (rc != KSHIM_STORAGE_OK)
@@ -407,6 +413,11 @@ int kshim_update_trial_before_boot(const struct kshim_update_trial *record,
         return KSHIM_STORAGE_OK;
     }
 
+    /*
+     * Legacy single-slot records are not resumed or rolled back by the Linux
+     * hook: doing either would require Android slot controls that this path
+     * must not issue.  Terminal legacy records are inert and simply continue.
+     */
     if (record->state == KSHIM_UPDATE_TRIAL_CONFIRMED ||
         record->state == KSHIM_UPDATE_TRIAL_ROLLED_BACK) {
         decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
@@ -414,44 +425,7 @@ int kshim_update_trial_before_boot(const struct kshim_update_trial *record,
         return KSHIM_STORAGE_OK;
     }
 
-    if (actual_slot == record->from_slot) {
-        if (record->state == KSHIM_UPDATE_TRIAL_PREPARED) {
-            decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
-            decision->next = *record;
-            return KSHIM_STORAGE_OK;
-        }
-        rc = start_mutation(record, &next);
-        if (rc != KSHIM_STORAGE_OK)
-            return rc;
-        next.state = KSHIM_UPDATE_TRIAL_ROLLED_BACK;
-        decision->action = KSHIM_UPDATE_TRIAL_PERSIST;
-        decision->next = next;
-        return KSHIM_STORAGE_OK;
-    }
-
-    if (!internal_linux) {
-        decision->action = KSHIM_UPDATE_TRIAL_CONTINUE;
-        decision->next = *record;
-        return KSHIM_STORAGE_OK;
-    }
-
-    if (record->remaining == 0u) {
-        decision->action = KSHIM_UPDATE_TRIAL_SWITCH_OLD;
-        decision->next = *record;
-        return KSHIM_STORAGE_OK;
-    }
-
-    if (!new_deployment_matches(record, os_name, commit, serial))
-        return KSHIM_STORAGE_CONFLICT;
-
-    rc = start_mutation(record, &next);
-    if (rc != KSHIM_STORAGE_OK)
-        return rc;
-    next.state = KSHIM_UPDATE_TRIAL_TRIAL;
-    --next.remaining;
-    decision->action = KSHIM_UPDATE_TRIAL_PERSIST;
-    decision->next = next;
-    return KSHIM_STORAGE_OK;
+    return KSHIM_STORAGE_CONFLICT;
 }
 
 int kshim_update_trial_confirm(const struct kshim_update_trial *record,

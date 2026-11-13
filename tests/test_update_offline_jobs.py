@@ -412,6 +412,15 @@ class OfflineJobTests(unittest.TestCase):
                 self.manager().run_job('execute', sid)
             execute.assert_called_once()
 
+    def test_android_telemetry_drift_does_not_block_submission(self):
+        sid = self.session()
+        self.inspect.return_value = dict(
+            PHYSICAL, selectedSlot='b',
+            bootableSlots={'a': True, 'b': False})
+        result = self.manager().submit_prepare(sid)
+        self.assertEqual(result['state'], 'prepare_queued')
+        self.runner.assert_called_once()
+
     def test_identity_drift_submission_and_worker(self):
         for kind in ('physical', 'channel'):
             with self.subTest(kind=kind):

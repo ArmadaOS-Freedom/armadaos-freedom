@@ -74,7 +74,8 @@ def main(argv=None, client=None):
         complete = result.get("state") == "up_to_date"
         if _awaiting_reboot(result):
             complete = (result.get("bootWriteState") == "written"
-                        and result.get("activationOutcome") == "activated")
+                        and result.get("bootPolicy") == "dual-boot-no-slot-control"
+                        and result.get("slotControlState") == "not_issued")
         if complete:
             print("100%", flush=True)
             return 0

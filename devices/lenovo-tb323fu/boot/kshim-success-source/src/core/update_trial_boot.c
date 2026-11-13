@@ -9,6 +9,17 @@
 #include "update_binding.h"
 #include "update_trial.h"
 
+/*
+ * Stable runtime compatibility marker for the new-system TB322FC/TB323FU
+ * mirrored policy. Package tooling requires this exact literal in the runtime
+ * bytes before accepting an online, offline or rollback target. The marker is
+ * read below through a volatile lvalue from the used gate path, so the linked
+ * binary retains it even with -ffunction-sections/-fdata-sections/
+ * --gc-sections. It carries no boot decision and does not control Android.
+ */
+const char kshim_update_trial_boot_compat_marker[] =
+    "ARMADA_LINUX_MIRROR_V1";
+
 static bool uuid_all_zero(const uint8_t *uuid, size_t bytes)
 {
     size_t i;
@@ -19,12 +30,6 @@ static bool uuid_all_zero(const uint8_t *uuid, size_t bytes)
         }
     }
     return true;
-}
-
-static bool state_terminal(uint32_t state)
-{
-    return state == KSHIM_UPDATE_TRIAL_CONFIRMED ||
-           state == KSHIM_UPDATE_TRIAL_ROLLED_BACK;
 }
 
 static bool state_pending(uint32_t state)
@@ -39,13 +44,12 @@ int kshim_update_trial_boot(int actual_slot, bool internal_linux,
 {
     struct kshim_settings_session *session;
     struct kshim_update_trial record;
-    struct kshim_update_binding binding;
-    const uint8_t *expected_commit;
-    uint32_t expected_serial;
     unsigned selected = 0u;
     bool required;
-    bool from;
     int rc;
+
+    /* Retain the compatibility marker in every runtime that links this gate. */
+    (void)*(const volatile char *)kshim_update_trial_boot_compat_marker;
 
     if (!internal_linux) {
         return 0;
@@ -104,97 +108,16 @@ int kshim_update_trial_boot(int actual_slot, bool internal_linux,
                                                       &decision.next,
                                                       &written);
         }
-        if (decision.action == KSHIM_UPDATE_TRIAL_CONTINUE &&
-            record.state == KSHIM_UPDATE_TRIAL_CONFIRMED) {
-            return storage_settings_native_ab_mark_success(
-                (unsigned)actual_slot);
-        }
-        return KSHIM_STORAGE_CONFLICT;
-    }
-
-    if (actual_slot == (int)record.target_slot && state_pending(record.state) &&
-        record.remaining == 0u) {
-        struct kshim_ab_status status;
-
-        rc = storage_settings_native_ab_status(&status);
-        if (rc != 0) {
-            return rc;
-        }
-        if (status.current == record.from_slot) {
-            return KSHIM_UPDATE_BOOT_RESTART_REQUIRED;
-        }
-        if (status.current != (unsigned)actual_slot) {
-            return KSHIM_STORAGE_CONFLICT;
-        }
-        rc = storage_settings_native_ab_select(record.from_slot,
-                                               (unsigned)actual_slot);
-        if (rc != 0) {
-            return rc;
-        }
-        return KSHIM_UPDATE_BOOT_RESTART_REQUIRED;
-    }
-
-    rc = kshim_update_binding_parse(cmdline, bytes, &binding);
-    if (rc != 0) {
-        return rc;
-    }
-    from = actual_slot == (int)record.from_slot;
-    expected_commit = from ? record.old_commit : record.new_commit;
-    expected_serial = from ? record.old_serial : record.new_serial;
-    if (strcmp(binding.os_name, record.os_name) != 0 ||
-        memcmp(binding.commit, expected_commit, 32u) != 0 ||
-        binding.serial != expected_serial) {
-        return KSHIM_STORAGE_CONFLICT;
-    }
-
-    if (actual_slot == (int)record.target_slot) {
-        if (!required ||
-            memcmp(transaction, record.transaction_uuid, 16u) != 0) {
-            return KSHIM_STORAGE_CONFLICT;
-        }
-        if (record.state == KSHIM_UPDATE_TRIAL_ROLLED_BACK) {
-            return KSHIM_STORAGE_CONFLICT;
-        }
-        if (record.state == KSHIM_UPDATE_TRIAL_CONFIRMED) {
-            return storage_settings_native_ab_mark_success(
-                (unsigned)actual_slot);
-        }
-    } else if (from && state_terminal(record.state)) {
-        if (record.state == KSHIM_UPDATE_TRIAL_ROLLED_BACK) {
-            return storage_settings_native_ab_mark_success(
-                (unsigned)actual_slot);
-        }
-        return 0;
-    }
-
-    if (state_pending(record.state)) {
-        struct kshim_update_trial_decision decision;
-        unsigned written = 0u;
-
-        rc = kshim_update_trial_before_boot(&record, (uint32_t)actual_slot, 1u,
-                                            binding.os_name, binding.commit,
-                                            binding.serial, &decision);
-        if (rc != 0) {
-            return rc;
-        }
-        if (decision.action == KSHIM_UPDATE_TRIAL_PERSIST) {
-            rc = storage_settings_native_trial_save(record.sequence,
-                                                    &decision.next, &written);
-            if (rc != 0) {
-                return rc;
-            }
-            if (from &&
-                decision.next.state == KSHIM_UPDATE_TRIAL_ROLLED_BACK) {
-                return storage_settings_native_ab_mark_success(
-                    (unsigned)actual_slot);
-            }
-            return 0;
-        }
         if (decision.action == KSHIM_UPDATE_TRIAL_CONTINUE) {
             return 0;
         }
-        return KSHIM_STORAGE_FORMAT;
+        return KSHIM_STORAGE_CONFLICT;
     }
 
-    return KSHIM_STORAGE_FORMAT;
+    /*
+     * Legacy single-slot records: never issue Android slot controls from the
+     * Linux update hook.  Refuse an in-flight old transaction instead of
+     * fabricating a rollback; terminal records are inert.
+     */
+    return state_pending(record.state) ? KSHIM_STORAGE_CONFLICT : 0;
 }

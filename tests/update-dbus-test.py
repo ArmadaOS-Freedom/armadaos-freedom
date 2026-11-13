@@ -106,7 +106,8 @@ class FakeManager:
         result.update(
             requiresReboot=True,
             bootWriteState="written",
-            activationOutcome="activated",
+            bootPolicy="dual-boot-no-slot-control",
+            slotControlState="not_issued",
         )
         self.rollback_checksums.append(checksum)
         return result
@@ -555,7 +556,8 @@ class UpdateDBusTest(unittest.TestCase):
         def completed():
             result = self.system_mgr._run("apply", "awaiting_reboot", "update", "1.1.0")
             result.update(requiresReboot=True, bootWriteState="written",
-                          activationOutcome="activated")
+                          bootPolicy="dual-boot-no-slot-control",
+                          slotControlState="not_issued")
             return result
 
         stdout = io.StringIO()
@@ -569,7 +571,8 @@ class UpdateDBusTest(unittest.TestCase):
         def uncertain():
             result = self.system_mgr._run("apply", "awaiting_reboot", "update", "1.1.0")
             result.update(requiresReboot=True, bootWriteState="written",
-                          activationOutcome="pending")
+                          bootPolicy="legacy-single-slot",
+                          slotControlState="not_issued")
             return result
 
         stdout = io.StringIO()
@@ -617,7 +620,8 @@ class UpdateDBusTest(unittest.TestCase):
         self.assertEqual(comp["result"]["phase"], "awaiting_reboot")
         self.assertTrue(comp["result"]["requiresReboot"])
         self.assertEqual(comp["result"]["bootWriteState"], "written")
-        self.assertEqual(comp["result"]["activationOutcome"], "activated")
+        self.assertEqual(comp["result"]["bootPolicy"], "dual-boot-no-slot-control")
+        self.assertEqual(comp["result"]["slotControlState"], "not_issued")
         self.assertEqual(self.system_mgr.calls, ["rollback"])
         self.assertEqual(self.system_mgr.rollback_checksums, [checksum])
         self.assertEqual(len(self.policy.requests), 1)
