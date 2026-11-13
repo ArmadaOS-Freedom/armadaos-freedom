@@ -7,6 +7,8 @@ transaction; this module also acquires and releases the OSTree Sysroot try_lock.
 """
 import json
 import re
+import sys
+import uuid
 from pathlib import Path
 
 from .boot_context import _read_regular
@@ -24,6 +26,11 @@ _ORIGIN_RE = re.compile(
     r"ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:"
     r"(stable|beta|testing)@(sha256:[0-9a-f]{64})"
 )
+# Updater-owned namespace for the temporary ref that keeps a freshly imported
+# target commit alive while the sysroot is mutated.  Nothing else writes here,
+# and every name carries a fresh random UUID, so an existing ref is never
+# replaced.  libostree stores local refs under refs/ itself.
+_TEMP_REF_PREFIX = "armada-update/pending"
 
 
 class DeploymentError(Exception):
@@ -42,6 +49,55 @@ def _gi():
     gi.require_version("OSTree", "1.0")
     from gi.repository import Gio, GLib, OSTree
     return Gio, GLib, OSTree
+
+
+def _new_temp_ref():
+    """Return a fresh, unpredictable ref name in the updater-owned namespace."""
+    return f"{_TEMP_REF_PREFIX}/{uuid.uuid4().hex}"
+
+
+def _hold_target_ref(repo, commit):
+    """Keep an imported but not yet registered commit reachable.
+
+    OSTree repository cleanup prunes every object that no ref and no
+    deployment reaches.  A freshly imported target commit only becomes
+    reachable once its deployment is registered, so any sysroot mutation in
+    between (``deployment_set_kargs``, ``deploy_tree``) can discard it.
+    ``Repo.set_ref_immediate`` is the documented GI way to create a local ref
+    atomically.  The name is a fresh random UUID in an updater-owned
+    namespace, so it cannot collide with an existing ref and nothing is ever
+    overwritten: a name that unexpectedly resolves is refused.  The caller
+    removes exactly the returned ref.
+    """
+    name = _new_temp_ref()
+    try:
+        ok, resolved = repo.resolve_rev(name, True)
+    except Exception as exc:
+        raise DeploymentError(f"failed checking temporary ref {name}: {exc}") from exc
+    # libostree reports a missing ref as (TRUE, NULL) because allow_noent is
+    # set; FALSE means the lookup itself failed.
+    if not ok:
+        raise DeploymentError(f"failed checking temporary ref {name}")
+    if resolved is not None:
+        raise DeploymentError(f"temporary ref {name} already exists")
+    try:
+        created = repo.set_ref_immediate(None, name, commit, None)
+    except Exception as exc:
+        raise DeploymentError(f"failed holding target commit via {name}: {exc}") from exc
+    if not created:
+        raise DeploymentError(f"failed holding target commit via {name}")
+    return name
+
+
+def _release_target_ref(repo, name):
+    if repo is None or name is None:
+        return
+    try:
+        removed = repo.set_ref_immediate(None, name, None, None)
+    except Exception as exc:
+        raise DeploymentError(f"failed removing temporary ref {name}: {exc}") from exc
+    if not removed:
+        raise DeploymentError(f"failed removing temporary ref {name}")
 
 
 def _require_str(value, name):
@@ -424,6 +480,8 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
     ok, acquired = sysroot.try_lock()
     if not (ok and acquired):
         raise DeploymentError("sysroot busy: try_lock not acquired")
+    repo = None
+    temp_ref = None
     try:
         if not sysroot.load(None):
             raise DeploymentError("sysroot load failed")
@@ -454,6 +512,17 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
             raise DeploymentError("current deployment unlocked")
         _candidate_path(sysroot, root, current, osname, cur_commit)
         original_bindings = [_binding_of(d) for d in deployments]
+
+        # The authenticated target commit has been imported but is not
+        # reachable from a deployment yet.  The first mutation below (the
+        # first-install kargs write, then deploy_tree) runs repository cleanup
+        # and can prune it before it is registered.  Hold it with an
+        # updater-owned ref until write_deployments registers the candidate;
+        # the finally block removes exactly that ref.  An existing deployment
+        # of the target commit already keeps it alive, so no ref is needed.
+        if not any(d.get_csum() == target_commit and d.get_osname() == osname
+                   for d in deployments):
+            temp_ref = _hold_target_ref(repo, target_commit)
 
         # A first-install deployment predates the per-deployment
         # armada.deployment token.  Persist the running deployment's own
@@ -554,7 +623,17 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
                 "kernelRelease": verified["kernelRelease"], "model": model,
                 "reused": False, "retainedDeployments": original_bindings}
     finally:
-        sysroot.unlock()
+        # Release the temporary ref under the same sysroot lock.  A cleanup
+        # failure must not replace the operation error that is already
+        # propagating; it only surfaces when the transaction succeeded.
+        pending_error = sys.exc_info()[1]
+        try:
+            _release_target_ref(repo, temp_ref)
+        except Exception:
+            if pending_error is None:
+                raise
+        finally:
+            sysroot.unlock()
 
 
 def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_binding):

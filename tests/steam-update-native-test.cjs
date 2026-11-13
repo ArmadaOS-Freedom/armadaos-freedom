@@ -333,6 +333,44 @@ test('late client apply failure after awaiting status becomes failed', async () 
   assert.equal(snap.requiresClientRestart, false);
 });
 
+test('accepted apply with unpublished status awaits and later restart evidence surfaces', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  const snap = await adapter.apply();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.error, null);
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.equal(snap.requiresReboot, false);
+  assert.deepEqual(h.data.calls.restart, []);
+  await assert.rejects(adapter.apply(), /required/);
+  assert.equal(h.data.calls.apply.length, 1);
+
+  h.data.apply = { type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false };
+  assert.equal(adapter.snapshot().state, 'restart_required');
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('accepted apply with unpublished status awaits, so a late rejection is still shown', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+  assert.deepEqual(h.data.calls.restart, []);
+
+  h.data.apply = { type: 1, eresult: 2, requires_client_restart: false, requires_system_restart: false };
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'failed');
+  assert.match(snap.error, /Client apply failed \(2\)/);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.equal(snap.requiresReboot, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
 test('explicit native apply failure ignores later successful client restart evidence', async () => {
   const h = host();
   const adapter = createAdapter(h);
