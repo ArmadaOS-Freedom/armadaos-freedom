@@ -1,0 +1,18 @@
+[Unit]
+Description=Loopback ownership guard for the Steam update bridge
+# The bridge injects a privileged update binding into the Steam CEF page and
+# must never run before this guard is in the kernel. The target kernel has
+# NF_TABLES_INET built in; the helper fails closed if the table cannot be
+# installed, so only the UI bridge is disabled rather than the machine.
+After=local-fs.target systemd-sysusers.service nftables.service
+Before=systemd-user-sessions.service user@1000.service graphical.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/armada/armada-steam-bridge-guard install
+ExecStop=/usr/libexec/armada/armada-steam-bridge-guard remove
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

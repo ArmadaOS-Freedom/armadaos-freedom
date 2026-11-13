@@ -20,6 +20,7 @@ dnf5 -y install --setopt=install_weak_deps=False \
     atheros-firmware \
     NetworkManager \
     NetworkManager-wifi \
+    nftables \
     wpa_supplicant \
     bluez \
     dbus-broker \

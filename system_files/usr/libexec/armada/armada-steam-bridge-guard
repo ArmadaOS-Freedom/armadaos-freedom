@@ -1,0 +1,154 @@
+#!/bin/bash
+# Root-side lifecycle for the loopback guard that protects the Steam CEF
+# debugging port. The guard is installed as one atomic nftables transaction and
+# a readiness proof is published only after the kernel rules are verified.
+# Every failure is fatal: no proof is written and the bridge stays disabled.
+set -euo pipefail
+
+readonly GAME_USER="armada"
+readonly GAME_UID="1000"
+readonly TABLE="inet armada_steam_guard"
+readonly CHAIN="loopback_bridge"
+readonly RULESET="/usr/lib/armada/steam_bridge_guard.nft"
+# The reject reason is stored as a kernel enum, so the numeric listing prints
+# NFT_REJECT_ICMPX_ADMIN_PROHIBITED as "3". Matching that code keeps the check
+# independent of the localized symbolic pretty-print of `nft list`.
+readonly REJECT_CODE="3"
+readonly PROOF_DIR="/run/armada-steam-guard"
+readonly PROOF_FILE="${PROOF_DIR}/ready"
+readonly BOOT_ID_FILE="/proc/sys/kernel/random/boot_id"
+
+proof_tmp=""
+
+die() {
+    echo "armada-steam-bridge-guard: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "${proof_tmp}" ]; then
+        rm -f -- "${proof_tmp}" 2>/dev/null || true
+    fi
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "must run as root"
+}
+
+require_tooling() {
+    command -v nft >/dev/null 2>&1 || die "nft tool is missing"
+    [ -r "${RULESET}" ] || die "guard ruleset ${RULESET} is missing"
+}
+
+require_game_identity() {
+    local uid
+    uid="$(id -u "${GAME_USER}")" || die "game user ${GAME_USER} is missing"
+    [ "${uid}" = "${GAME_UID}" ] \
+        || die "game user ${GAME_USER} has uid ${uid}, expected ${GAME_UID}"
+}
+
+count_matches() {
+    local count
+    count="$(grep -c -F -- "$1" <<<"$2" || true)"
+    printf '%s' "${count}"
+}
+
+# Require exactly one rule that starts with the given loopback selector and
+# ends in the numeric admin-prohibited reject. Tying the verdict to the rule
+# itself is stricter than counting a pretty-printed string, and the numeric
+# form ("reject with icmpx 3") is identical on every nft release and locale.
+verify_reject_rule() {
+    local listing="$1" selector="$2" label="$3" count
+    count="$(grep -E -c -- \
+        "${selector}.*reject with icmpx( type)? ${REJECT_CODE}([^0-9]|$)" \
+        <<<"${listing}" || true)"
+    [ "${count}" -eq 1 ] || die "unexpected ${label} reject rule count"
+}
+
+verify_rules() {
+    local listing
+    listing="$(nft -n list table ${TABLE})" || die "guard table is missing after install"
+
+    grep -Fq -- "chain ${CHAIN} {" <<<"${listing}" || die "guard output chain missing"
+    grep -Fq -- 'hook output' <<<"${listing}" || die "guard output hook missing"
+    grep -Fq -- 'policy accept' <<<"${listing}" || die "guard output policy changed"
+    grep -Fq -- '127.0.0.0/8' <<<"${listing}" || die "IPv4 loopback rule missing"
+    grep -Fq -- '::1 ' <<<"${listing}" || die "IPv6 loopback rule missing"
+    grep -Eq -- 'ip6 daddr (::ffff:127\.0\.0\.0/104|::ffff:7f00:0/104)' <<<"${listing}" \
+        || die "IPv4-mapped loopback rule missing"
+
+    [ "$(count_matches 'tcp dport 8080' "${listing}")" -eq 3 ] \
+        || die "unexpected debug-port rule count"
+    [ "$(count_matches 'meta skuid != 1000' "${listing}")" -eq 3 ] \
+        || die "unexpected game-uid rule count"
+    [ "$(count_matches 'meta skuid != 0' "${listing}")" -eq 3 ] \
+        || die "unexpected root-exemption rule count"
+    [ "$(count_matches 'reject with icmpx' "${listing}")" -eq 3 ] \
+        || die "unexpected reject rule count"
+
+    verify_reject_rule "${listing}" \
+        'ip daddr 127\.0\.0\.0/8 tcp dport 8080 meta skuid != 1000 meta skuid != 0' \
+        "IPv4 loopback"
+    verify_reject_rule "${listing}" \
+        'ip6 daddr ::1 tcp dport 8080 meta skuid != 1000 meta skuid != 0' \
+        "IPv6 loopback"
+    verify_reject_rule "${listing}" \
+        'ip6 daddr (::ffff:127\.0\.0\.0/104|::ffff:7f00:0/104) tcp dport 8080 meta skuid != 1000 meta skuid != 0' \
+        "IPv4-mapped loopback"
+}
+
+publish_proof() {
+    local boot_id
+    boot_id="$(cat "${BOOT_ID_FILE}")" || die "boot id unavailable"
+    case "${boot_id}" in
+        ''|*[!0-9a-fA-F-]*) die "malformed boot id" ;;
+    esac
+
+    install -d -m 0755 -o root -g root "${PROOF_DIR}" \
+        || die "cannot create proof directory"
+    proof_tmp="$(mktemp "${PROOF_DIR}/.ready.XXXXXX")" || die "cannot stage proof"
+    printf 'version=1\nguard=armada-steam-bridge-guard\ntable=%s\ngame_uid=%s\nboot_id=%s\n' \
+        "${TABLE}" "${GAME_UID}" "${boot_id}" >"${proof_tmp}" || die "cannot write proof"
+    chmod 0644 "${proof_tmp}" || die "cannot set proof mode"
+    chown root:root "${proof_tmp}" || die "cannot set proof owner"
+    mv -f -- "${proof_tmp}" "${PROOF_FILE}" || die "cannot publish proof"
+    proof_tmp=""
+}
+
+install_guard() {
+    require_root
+    require_tooling
+    require_game_identity
+
+    # Replace our own dedicated table in a single netlink batch. The delete is
+    # conditional so a first install and a restart are both idempotent, and the
+    # batch is atomic, so there is no interval without the reject rules. No
+    # other table or chain is touched and no default policy is changed.
+    {
+        if nft list table ${TABLE} >/dev/null 2>&1; then
+            echo "delete table ${TABLE}"
+        fi
+        cat "${RULESET}"
+    } | nft -f - || die "failed to install the nftables guard (NF_TABLES_INET?)"
+
+    verify_rules
+    publish_proof
+}
+
+remove_guard() {
+    require_root
+    # Drop the proof so the bridge is disabled, but leave the dedicated table in
+    # the kernel. Keeping the rules on stop is fail-safe, and it means a guard
+    # restart replaces the table atomically without an unprotected interval.
+    # The table lives in kernel memory and is gone after the next reboot.
+    rm -f -- "${PROOF_FILE}"
+    rmdir -- "${PROOF_DIR}" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+
+case "${1:-}" in
+    install) install_guard ;;
+    remove) remove_guard ;;
+    *) die "usage: $0 install|remove" ;;
+esac

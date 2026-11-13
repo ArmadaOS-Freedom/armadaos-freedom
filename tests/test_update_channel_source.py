@@ -3,6 +3,7 @@
 Real cryptographic signing/verification; only the HTTP opener is replaced.
 """
 
+import errno
 import io
 import json
 import sys
@@ -54,9 +55,15 @@ class FakeSocket:
 
     def __init__(self):
         self.timeouts = []
+        self.closed = False
 
     def settimeout(self, value):
+        if self.closed:
+            raise OSError(errno.EBADF, "Bad file descriptor")
         self.timeouts.append(value)
+
+    def close(self):
+        self.closed = True
 
 
 class FakeResponse:
@@ -76,6 +83,7 @@ class FakeResponse:
         self._closed = closed
         self._chunk = chunk
         self._on_read = on_read
+        self._sock = sock
         self.fp = (
             SimpleNamespace(raw=SimpleNamespace(_sock=sock))
             if sock is not None
@@ -121,6 +129,24 @@ class FakeResponse:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+class CloseAfterFinalReadResponse(FakeResponse):
+    """Fixed-length body whose last data read closes fp and its socket.
+
+    ``http.client`` can call ``_close_conn()`` from inside a ``read1`` that
+    still returns the final body bytes, which unsets ``response.fp`` and
+    closes the descriptor while those bytes are already handed back. This
+    mock reproduces that ordering with an in-memory body only.
+    """
+
+    def read1(self, n=-1):
+        data = super().read1(n)
+        if data and self._buf.tell() >= len(self._buf.getvalue()):
+            self.fp = None
+            if self._sock is not None:
+                self._sock.close()
+        return data
 
 
 class FakeOpener:
@@ -373,6 +399,25 @@ class ChannelSourceTests(unittest.TestCase):
         self.assertTrue(
             all(a > b for a, b in zip(sock.timeouts, sock.timeouts[1:]))
         )
+
+    def test_socket_closed_by_final_read_still_returns_whole_body(self):
+        # The last read hands back the remaining bytes and closes the body
+        # socket, so response.fp is gone by the next iteration. The loop must
+        # look the socket up again and skip settimeout on the closed object
+        # instead of failing an otherwise complete fetch with EBADF.
+        sock = FakeSocket()
+        body = b"payload"
+        response = CloseAfterFinalReadResponse(
+            body, CH_URL, chunk=len(body), sock=sock,
+            on_read=lambda _response: self.clock.advance(0.5),
+        )
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 64, 5), body)
+        self.assertTrue(sock.closed)
+        self.assertIsNone(response.fp)
+        self.assertEqual(response.bytes_read, len(body))
+        self.assertEqual(len(sock.timeouts), 1)
+        self.assertAlmostEqual(sock.timeouts[0], 5.0)
 
     def test_chunked_reads_progress_before_deadline_and_respect_cap(self):
         body = b"z" * 40

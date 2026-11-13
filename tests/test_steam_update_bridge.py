@@ -1,6 +1,8 @@
 import json
 import ipaddress
 from pathlib import Path
+import re
+import stat
 import sys
 import tempfile
 import unittest
@@ -470,6 +472,199 @@ class PeerOwnershipTests(unittest.TestCase):
             sb._verify_ws_peer(mock.Mock(sock=None))
         with self.assertRaises(sb.BridgeError):
             sb._verify_ws_peer(mock.Mock(sock=Broken()))
+
+
+GUARD_BOOT = "01234567-89ab-cdef-0123-456789abcdef"
+GUARD_PROOF = (
+    "version=1\n"
+    "guard=armada-steam-bridge-guard\n"
+    "table=inet armada_steam_guard\n"
+    "game_uid=1000\n"
+    "boot_id=%s\n" % GUARD_BOOT
+)
+
+
+class GuardProofTests(unittest.TestCase):
+    """Readiness proof parsing and the ownership/mode trust boundary."""
+
+    def run_guard(self, euid=1000, data=None, boot=GUARD_BOOT,
+                  parent_uid=0, parent_mode=0o755, parent_type=stat.S_IFDIR,
+                  file_uid=0, file_mode=0o644, file_type=stat.S_IFREG,
+                  open_exc=None, read_exc=None):
+        if data is None:
+            data = GUARD_PROOF.encode("utf-8")
+        parent_info = mock.Mock(st_mode=parent_type | parent_mode, st_uid=parent_uid)
+        file_info = mock.Mock(st_mode=file_type | file_mode, st_uid=file_uid)
+        opener = mock.Mock(side_effect=open_exc) if open_exc else mock.Mock(return_value=9)
+        reader = mock.Mock(side_effect=read_exc) if read_exc else mock.Mock(return_value=data)
+        with mock.patch.object(sb.os, "lstat", return_value=parent_info), \
+                mock.patch.object(sb.os, "open", opener), \
+                mock.patch.object(sb.os, "fstat", return_value=file_info), \
+                mock.patch.object(sb.os, "read", reader), \
+                mock.patch.object(sb.os, "close"), \
+                mock.patch.object(sb, "_boot_id", return_value=boot):
+            return sb._verify_guard(euid)
+
+    def test_valid_proof_accepted(self):
+        self.assertIsNone(self.run_guard())
+        self.assertIsNone(self.run_guard(data=GUARD_PROOF.replace("\n", "\r\n").encode()))
+
+    def test_identity_and_boot_mismatch_rejected(self):
+        for kwargs in ({"euid": 1001}, {"euid": 0},
+                       {"boot": "ffffffff-ffff-ffff-ffff-ffffffffffff"}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(sb.BridgeError):
+                    self.run_guard(**kwargs)
+
+    def test_file_ownership_and_mode_rejected(self):
+        for kwargs in ({"file_uid": 1000}, {"file_mode": 0o664},
+                       {"file_mode": 0o646}, {"file_type": stat.S_IFDIR},
+                       {"file_type": stat.S_IFLNK}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(sb.BridgeError):
+                    self.run_guard(**kwargs)
+
+    def test_directory_ownership_and_mode_rejected(self):
+        for kwargs in ({"parent_uid": 1000}, {"parent_mode": 0o775},
+                       {"parent_mode": 0o757}, {"parent_type": stat.S_IFLNK}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(sb.BridgeError):
+                    self.run_guard(**kwargs)
+
+    def test_missing_or_unreadable_proof_rejected(self):
+        for kwargs in ({"open_exc": FileNotFoundError()},
+                       {"open_exc": PermissionError()},
+                       {"read_exc": OSError("read failed")}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(sb.BridgeError):
+                    self.run_guard(**kwargs)
+
+    def test_oversized_and_non_utf8_proof_rejected(self):
+        with self.assertRaises(sb.BridgeError):
+            self.run_guard(data=b"x" * (sb.GUARD_PROOF_MAX_BYTES + 1))
+        with self.assertRaises(sb.BridgeError):
+            self.run_guard(data=b"version=1\n\xff\n")
+
+    def test_malformed_and_unexpected_fields_rejected(self):
+        bad = [
+            "",
+            "version=1\n",
+            GUARD_PROOF + "extra=1\n",
+            GUARD_PROOF.replace("version=1", "version=2"),
+            GUARD_PROOF.replace("guard=armada-steam-bridge-guard", "guard=other"),
+            GUARD_PROOF.replace("table=inet armada_steam_guard", "table=inet other"),
+            GUARD_PROOF.replace("game_uid=1000", "game_uid=abc"),
+            GUARD_PROOF.replace("game_uid=1000", "game_uid=1001"),
+            GUARD_PROOF.replace("version=", "Version="),
+            "version=1\n\nguard=armada-steam-bridge-guard\n",
+            "version=1\ngame_uid=1000\ngame_uid=1000\n",
+        ]
+        for text in bad:
+            with self.subTest(text=text):
+                with self.assertRaises(sb.BridgeError):
+                    self.run_guard(data=text.encode("utf-8"))
+
+    def test_boot_id_is_validated(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="  ABC-123  \n")):
+            self.assertEqual(sb._boot_id(), "abc-123")
+        with mock.patch("builtins.open", mock.mock_open(read_data="not a boot id")):
+            with self.assertRaises(sb.BridgeError):
+                sb._boot_id()
+        with mock.patch("builtins.open", side_effect=OSError("no boot id")):
+            with self.assertRaises(sb.BridgeError):
+                sb._boot_id()
+
+
+class GuardGatingTests(unittest.TestCase):
+    """The bridge must not touch discovery or updates without a trusted proof."""
+
+    def test_root_is_refused_before_guard(self):
+        with mock.patch.object(sb.os, "geteuid", return_value=0):
+            self.assertEqual(sb.main(), 1)
+
+    def test_missing_guard_disables_only_the_bridge(self):
+        with mock.patch.object(sb.os, "geteuid", return_value=1000), \
+                mock.patch.object(sb, "_verify_guard",
+                                  side_effect=sb.BridgeError("no proof")) as verify, \
+                mock.patch.object(sb, "discover_target") as discover, \
+                mock.patch.object(sb, "load_js_sources") as load:
+            self.assertEqual(sb.main(), 1)
+        verify.assert_called_once_with(1000)
+        discover.assert_not_called()
+        load.assert_not_called()
+
+
+class GuardConfigTests(unittest.TestCase):
+    """Static checks over the inert policy, units and packaging wiring."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def read(self, relative):
+        return (self.ROOT / relative).read_text(encoding="utf-8")
+
+    def test_nft_policy_is_dedicated_and_narrow(self):
+        text = self.read("system_files/usr/lib/armada/steam_bridge_guard.nft")
+        self.assertIn("table inet armada_steam_guard", text)
+        self.assertIn("hook output", text)
+        self.assertIn("policy accept", text)
+        self.assertEqual(set(re.findall(r"dport\s+(\d+)", text)), {"8080"})
+        self.assertEqual(text.count("ip daddr 127.0.0.0/8"), 1)
+        self.assertEqual(text.count("ip6 daddr ::1 "), 1)
+        self.assertEqual(text.count("ip6 daddr ::ffff:127.0.0.0/104"), 1)
+        self.assertEqual(text.count("meta skuid != 1000"), 3)
+        self.assertEqual(text.count("meta skuid != 0"), 3)
+        self.assertEqual(text.count("reject with icmpx type admin-prohibited"), 3)
+        for forbidden in ("flush ruleset", "flush table", "policy drop",
+                          "hook input", "hook forward", "hook prerouting",
+                          "hook postrouting", "0.0.0.0/0", "::/0"):
+            self.assertNotIn(forbidden, text)
+
+    def test_helper_fails_closed(self):
+        helper = self.read("system_files/usr/libexec/armada/armada-steam-bridge-guard")
+        self.assertIn("command -v nft", helper)
+        self.assertIn("nft -f -", helper)
+        self.assertIn("NF_TABLES_INET", helper)
+        self.assertIn("delete table", helper)
+        self.assertIn("mktemp", helper)
+        self.assertIn("chown root:root", helper)
+        self.assertIn("id -u \"${GAME_USER}\"", helper)
+
+    def test_verification_is_numeric_not_localized(self):
+        """`nft list` pretty-prints the reject verdict with a localized symbolic
+        name, so the check must read the numeric listing and bind the verdict to
+        each loopback rule instead of counting pretty-printed text."""
+        helper = self.read("system_files/usr/libexec/armada/armada-steam-bridge-guard")
+        self.assertIn("nft -n list table", helper)
+        self.assertIn('REJECT_CODE="3"', helper)
+        self.assertIn("verify_reject_rule", helper)
+        self.assertEqual(
+            helper.count("reject with icmpx( type)? ${REJECT_CODE}"), 1)
+        self.assertNotIn("reject with icmpx type admin-prohibited", helper)
+
+    def test_units_gate_the_bridge(self):
+        system = self.read(
+            "system_files/usr/lib/systemd/system/armada-steam-bridge-guard.service")
+        self.assertIn("Type=oneshot", system)
+        self.assertIn("RemainAfterExit=yes", system)
+        self.assertIn("Before=systemd-user-sessions.service user@1000.service", system)
+        self.assertIn(
+            "ExecStart=/usr/libexec/armada/armada-steam-bridge-guard install", system)
+        self.assertIn(
+            "ExecStop=/usr/libexec/armada/armada-steam-bridge-guard remove", system)
+        user = self.read(
+            "system_files/usr/lib/systemd/user/armada-steam-updates.service")
+        self.assertIn("ConditionPathExists=/run/armada-steam-guard/ready", user)
+
+    def test_build_checks_tool_and_enables_guard(self):
+        build = self.read("build_files/40-vendor-system-files.sh")
+        self.assertIn("command -v nft", build)
+        self.assertIn("systemctl enable armada-steam-bridge-guard.service", build)
+
+    def test_bridge_uses_the_same_proof_identity(self):
+        bridge = self.read("system_files/usr/lib/armada/updates/steam_bridge.py")
+        self.assertIn('GUARD_PROOF_PATH = "/run/armada-steam-guard/ready"', bridge)
+        self.assertIn('GUARD_PROOF_TABLE = "inet armada_steam_guard"', bridge)
+        self.assertIn("_verify_guard(os.geteuid())", bridge)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,29 @@
+# Host-level isolation for the Steam CEF debugging listener.
+#
+# The Steam client exposes CDP on 127.0.0.1:8080. The update bridge injects a
+# privileged request binding into that trusted page, so any other local user
+# that can reach the port could drive updates without the Armada UI. This
+# dedicated inet output chain rejects those connections at the kernel while
+# leaving root and the shipped game user (UID 1000) untouched.
+#
+# Scope is deliberately narrow: only loopback destinations on TCP 8080 are
+# matched, the output policy stays accept, and no other table, chain, port or
+# non-loopback destination is modified. `meta skuid` is the kernel socket
+# owner, not a userspace claim, so an unprivileged process cannot opt out.
+table inet armada_steam_guard {
+	chain loopback_bridge {
+		type filter hook output priority filter; policy accept;
+
+		# IPv4 loopback. A socket connected through an IPv4-mapped IPv6
+		# address is presented as an ordinary IPv4 packet at this hook, so
+		# this rule covers ::ffff:127.0.0.1 as well.
+		ip daddr 127.0.0.0/8 tcp dport 8080 meta skuid != 1000 meta skuid != 0 reject with icmpx type admin-prohibited
+
+		# Native IPv6 loopback.
+		ip6 daddr ::1 tcp dport 8080 meta skuid != 1000 meta skuid != 0 reject with icmpx type admin-prohibited
+
+		# Defense in depth for kernels that leave an IPv4-mapped loopback
+		# destination visible as IPv6 at the inet output hook.
+		ip6 daddr ::ffff:127.0.0.0/104 tcp dport 8080 meta skuid != 1000 meta skuid != 0 reject with icmpx type admin-prohibited
+	}
+}

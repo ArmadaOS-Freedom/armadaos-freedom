@@ -29,7 +29,12 @@ class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
 
 
 def _body_socket(response):
-    """Return the connected body socket CPython exposes, if any."""
+    """Return the connected body socket CPython exposes right now, if any.
+
+    ``http.client`` drops ``response.fp`` once the body is complete, so the
+    answer changes over the life of the response and must be re-read rather
+    than captured once.
+    """
     stream = getattr(response, "fp", None)
     raw = getattr(stream, "raw", None)
     return getattr(raw, "_sock", None)
@@ -44,7 +49,11 @@ def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
     The check also runs after the EOF read, so a body that only finishes
     after the deadline is rejected rather than accepted as complete. When
     CPython exposes the connected socket, each read is additionally bounded
-    by the remaining budget so one read cannot block past the deadline.
+    by the remaining budget so one read cannot block past the deadline. The
+    socket is looked up again before every read because a read that still
+    returns body bytes may already have closed ``response.fp`` and the
+    descriptor; reusing the object captured earlier would make the next
+    ``settimeout`` raise EBADF on a response that is otherwise complete.
     """
     _url(url, "fetch URL")
     request = Request(
@@ -70,13 +79,13 @@ def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
                 raise CatalogError(
                     f"fetch of {url} response does not support bounded reads"
                 )
-            sock = _body_socket(response)
             while True:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise CatalogError(
                         f"fetch of {url} timed out after {timeout} seconds"
                     )
+                sock = _body_socket(response)
                 if sock is not None:
                     sock.settimeout(remaining)
                 chunk = read1(min(_READ_SIZE, limit + 1 - total))
