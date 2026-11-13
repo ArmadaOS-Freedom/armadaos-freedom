@@ -339,8 +339,9 @@ class SystemApplyWorkerTests(unittest.TestCase):
                 self.assertIn(err_match, result["error"])
 
     def test_existing_job_directory_preserved_and_rejected(self):
+        self.state_dir.mkdir(parents=True, mode=0o700)
         job_dir = self.state_dir / VALID_JOB
-        job_dir.mkdir(parents=True, mode=0o700)
+        job_dir.mkdir(mode=0o700)
         marker = job_dir / "existing.json"
         marker.write_text("{\"keep\": true}")
 

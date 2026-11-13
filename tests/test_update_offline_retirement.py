@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -470,21 +471,22 @@ class OfflineRetirementTest(unittest.TestCase):
 
     def test_record_identity_mismatches_are_refused(self):
         cases = (
-            ("other transaction", make_record(
-                transaction_uuid=uuid.UUID(OTHER_TX).bytes)),
-            ("other plan", make_record(plan_sha256=bytes.fromhex("77" * 32))),
-            ("other deployment", make_record(new_serial=3)),
-            ("other installation", make_record(
-                installation_uuid=uuid.UUID(
-                    "55555555-5555-4555-8555-555555555555").bytes)),
-            ("other partition", make_record(
-                partition_uuid=uuid.UUID(
-                    "66666666-6666-4666-8666-666666666666").bytes)),
-            ("other slots", make_record(from_slot=1, target_slot=0)),
+            ("other transaction",
+             {"transaction_uuid": uuid.UUID(OTHER_TX).bytes}),
+            ("other plan", {"plan_sha256": bytes.fromhex("77" * 32)}),
+            ("other deployment", {"new_serial": 3}),
+            ("other installation",
+             {"installation_uuid": uuid.UUID(
+                 "55555555-5555-4555-8555-555555555555").bytes}),
+            ("other partition",
+             {"partition_uuid": uuid.UUID(
+                 "66666666-6666-4666-8666-666666666666").bytes}),
+            ("other slots", {"from_slot": 1, "target_slot": 0}),
         )
-        for name, record in cases:
+        for name, changes in cases:
             with self.subTest(case=name):
                 self.fresh()
+                record = replace(self.record, **changes)
                 self.assertFalse(self.retire(record=record))
                 self.assert_retained()
 

@@ -443,6 +443,51 @@ test('explicit native apply failure ignores later successful client restart evid
   assert.deepEqual(h.data.calls.restart, []);
 });
 
+test('explicit apply rejection ignores later stale native restart evidence and can retry', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  h.data.applyReturn = { result: 2, message: 'disk full' };
+  h.data.applyImpl = () => h.data.applyReturn;
+  const rejected = await adapter.apply();
+  assert.equal(rejected.state, 'failed');
+  assert.match(rejected.error, /disk full/);
+  assert.equal(rejected.requiresClientRestart, false);
+
+  // A native restart flag shows up afterwards; it is stale evidence for a
+  // failed apply and must never authorize a restart or keep blocking.
+  h.data.apply.requires_client_restart = true;
+  assert.equal(h.data.apply.requires_client_restart, true);
+  assert.equal(adapter.snapshot().state, 'failed');
+  assert.equal(adapter.snapshot().requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  // The same stale flag is still published, yet a retry check must succeed.
+  h.data.checkImpl = () => {
+    h.data.check = {
+      type: 1, eresult: 1, available: true,
+      rtime_checked: h.data.check.rtime_checked + 1
+    };
+    return { result: 1, message: '' };
+  };
+  const checked = await adapter.check();
+  assert.equal(checked.state, 'available');
+  assert.equal(checked.requiresClientRestart, false);
+
+  // A retry apply may proceed after that available check.
+  h.data.applyImpl = null;
+  h.data.applyReturn = { result: 1, message: '' };
+  assert.equal(h.data.apply.requires_client_restart, true);
+  const applied = await adapter.apply();
+  assert.equal(h.data.calls.check, 2);
+  assert.equal(h.data.calls.apply.length, 2);
+  assert.equal(applied.state, 'awaiting_status');
+  assert.equal(applied.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
 test('late OS-only restart evidence leaves awaiting status unchanged', async () => {
   const h = host();
   const adapter = createAdapter(h);

@@ -29,6 +29,10 @@ from .deployment_store import _parse_binding
 
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _CHUNK = 1024 * 1024
+# devices/lenovo-tb323fu/boot/kshim-success-source/src/dt/boot_witness.c
+# BOOT_WITNESS_MAX_BOOTARGS: the /chosen bootargs property length, terminating
+# NUL included.  Anything larger makes the witness reject the evidence.
+_MAX_BOOTARGS_BYTES = 65536
 
 
 class BootMaterialsError(RuntimeError):
@@ -37,6 +41,30 @@ class BootMaterialsError(RuntimeError):
 
 def _sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _bootargs_bytes(value, label):
+    """Return the byte image the DT bootargs property would carry."""
+    if not isinstance(value, str):
+        raise BootMaterialsError(
+            f"{label} must be str, got {type(value).__name__}")
+    try:
+        return value.encode("ascii")
+    except UnicodeEncodeError:
+        raise BootMaterialsError(f"{label} contain non-ASCII characters") from None
+
+
+def _check_bootargs_bound(normal_args, diagnostic_args):
+    """Reject bootargs the boot witness would refuse before any DT work."""
+    for label, value in (
+        ("normal bootargs", normal_args),
+        ("diagnostic bootargs", diagnostic_args),
+    ):
+        total = len(_bootargs_bytes(value, label)) + 1
+        if total > _MAX_BOOTARGS_BYTES:
+            raise BootMaterialsError(
+                f"{label} are {total} bytes including NUL, "
+                f"limit {_MAX_BOOTARGS_BYTES}")
 
 
 def _write_new(path, data):
@@ -273,6 +301,9 @@ def prepare_boot_materials(
 
         normal_args = model_boot_args(options["options"], profile)
         diagnostic_args = diagnostic_boot_args(normal_args, profile)
+        # Both assembled command lines are measured exactly as the witness will
+        # read them, before the DT helper or any candidate is generated.
+        _check_bootargs_bound(normal_args, diagnostic_args)
 
         helper = _load_helper(helper_path)
         work, logs, tmp, env = _prepare_helper_env(out)

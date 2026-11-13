@@ -538,7 +538,24 @@ with tempfile.TemporaryDirectory() as directory, \
     updates.render(resolved)
     assert updates.watch_id is None
 
-    window.close()
-    assert not window.get_visible()
+    # A watcher-driven read may still be in flight when the user closes the
+    # window: allow the close, stop the watcher, and ignore the late result
+    # instead of touching the destroyed widgets or restarting the watch.
+    with patch.object(updates.window, "background") as background:
+        updates.render(busy_watch)
+        assert updates.watch_id is not None
+        assert updates.watch_tick() == ui.GLib.SOURCE_CONTINUE
+        assert updates.loading and updates.watching
+        late = background.call_args[0][1]
+        with patch.object(updates, "render") as render:
+            window.close()
+            assert not window.get_visible()
+            assert updates.closed
+            assert updates.watch_id is None
+            late(busy_watch, None)
+            render.assert_not_called()
+        assert not updates.loading
+        assert not updates.watching
+        assert updates.watch_id is None
     assert updates.watch_id is None
-print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update and awaiting-confirmation watch, request-error precedence and narrow layout checks passed")
+print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update and awaiting-confirmation watch, request-error precedence, close during background watch and narrow layout checks passed")

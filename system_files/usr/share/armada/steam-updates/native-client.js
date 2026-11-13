@@ -116,9 +116,19 @@
         local = { state: 'restart_required', phase: 'refresh', error: message, restart: true };
       else failed('refresh', message);
     }
-    function pendingRestart() {
+    // One evidence rule for every reader: a native "client restart required"
+    // flag is authoritative only while no local outcome exists, or while the
+    // local outcome itself is a restart recorded from fresh evidence. A flag
+    // left behind by an explicit failure or a newer check is stale and must
+    // not keep blocking checks, applies or authorize a restart.
+    function restartEvidence() {
       var result = applyResult();
-      return !!(result && result.requires_client_restart === true);
+      if (!result || result.requires_client_restart !== true) return null;
+      if (local && (local.state !== 'restart_required' || !local.restart)) return null;
+      return result;
+    }
+    function pendingRestart() {
+      return restartEvidence() !== null;
     }
     function guard() {
       if (!available()) throw new Error('Steam client update adapter is unavailable');
@@ -146,8 +156,8 @@
         state = local.state; phase = local.phase; error = local.error || null;
         restart = !!local.restart;
       } else {
-        var apply = applyResult(), check = checkResult();
-        if (apply && apply.requires_client_restart) { state = 'restart_required'; restart = true; }
+        var apply = restartEvidence(), check = checkResult();
+        if (apply) { state = 'restart_required'; restart = true; }
         else if (check) state = check.available ? 'available' : 'up_to_date';
       }
       return {
@@ -237,11 +247,8 @@
     async function restartClient() {
       guard();
       syncLateApply();
-      var result = applyResult();
-      var permitted = (local && local.state === 'restart_required' && local.restart) ||
-        (!local && result && result.requires_client_restart);
-      if (!permitted || !result || !result.requires_client_restart)
-        throw new Error('Client-specific restart evidence is required');
+      var result = restartEvidence();
+      if (!result) throw new Error('Client-specific restart evidence is required');
       operation = 'restart';
       try {
         await parts().steam.User.StartRestart(false);

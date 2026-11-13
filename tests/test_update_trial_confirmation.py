@@ -479,7 +479,7 @@ class TrialConfirmationTest(unittest.TestCase):
         (job / "status.json").write_text(json.dumps(body))
         for name in ("download", "trust", "materials",
                      "candidate-a", "candidate-b"):
-            (job / name).mkdir()
+            (job / name).mkdir(mode=0o700)
             (job / name / "blob.bin").write_bytes(b"x" * 32)
         return state_root, job
 

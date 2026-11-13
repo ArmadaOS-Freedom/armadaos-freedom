@@ -75,8 +75,10 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.window = window
         self.state = None
         self.loading = False
+        self.watching = False
         self.requesting = False
         self.updating = False
+        self.closed = False
         self.job = backend.CommandJob()
         self.result = ""
         self.error = ""
@@ -127,7 +129,7 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.channel.set_sensitive(enabled)
 
     def start_watch(self):
-        if self.watch_id is None and self.window.get_visible():
+        if self.watch_id is None and not self.closed and self.window.get_visible():
             self.watch_id = GLib.timeout_add(UPDATE_WATCH_MS, self.watch_tick)
 
     def stop_watch(self):
@@ -136,22 +138,29 @@ class UpdatesGroup(Adw.PreferencesGroup):
             self.watch_id = None
 
     def watch_tick(self):
-        if not self.window.get_visible():
+        if self.closed or not self.window.get_visible():
             self.watch_id = None
             return GLib.SOURCE_REMOVE
         if self.requesting or self.loading:
             return GLib.SOURCE_CONTINUE
-        self.refresh()
+        self.refresh(automatic=True)
         return GLib.SOURCE_CONTINUE
 
-    def refresh(self):
-        if self.loading or self.requesting:
+    def refresh(self, automatic=False):
+        if self.closed or self.loading or self.requesting:
             return
         self.loading = True
+        self.watching = automatic
         self.controls(False)
 
         def completed(state, error):
             self.loading = False
+            self.watching = False
+            if self.closed:
+                # The window may close while an automatic background read is
+                # still in flight. The destroyed widgets must not be touched
+                # and the watch must not be reopened by this late callback.
+                return GLib.SOURCE_REMOVE
             if error:
                 self.controls(False)
                 self.show_message(self.result + "\nCould not read OS state: " + error)
@@ -535,13 +544,14 @@ class ToolsWindow(Adw.ApplicationWindow):
         if self.repair_running:
             self.repair_dialog.present()
             return True
-        if self.updates.requesting or self.updates.loading:
+        if self.updates.requesting or (self.updates.loading and not self.updates.watching):
             if self.updates.operation and self.updates.operation.running:
                 self.updates.operation.present()
             return True
         if self.ssh_busy:
             self.ssh_row.set_subtitle("Please wait for SSH settings to finish updating.")
             return True
+        self.updates.closed = True
         self.updates.stop_watch()
         self.get_application().window = None
         return False
