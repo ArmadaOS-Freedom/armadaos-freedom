@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""Boundary tests for assembled bootargs against the boot witness limit.
+"""Boundary tests for assembled bootargs against the ARM64 kernel buffer.
 
-devices/lenovo-tb323fu/boot/kshim-success-source/src/dt/boot_witness.c caps
-/chosen bootargs at BOOT_WITNESS_MAX_BOOTARGS = 65536 bytes including the
-terminating NUL.  boot_materials must refuse both assembled command lines at
-that boundary before any DT helper or candidate is generated.
+ARM64 Linux defines COMMAND_LINE_SIZE = 2048 bytes including the terminating
+NUL.  That is stricter than the 65536-byte device-tree witness limit in
+devices/lenovo-tb323fu/boot/kshim-success-source/src/dt/boot_witness.c, so
+boot_materials must refuse both assembled command lines at the kernel boundary
+before any DT helper or candidate is generated.
 """
 
 import hashlib
@@ -21,7 +22,7 @@ sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates import boot_materials, boot_recipe  # noqa: E402
 
-WITNESS_LIMIT = 65536
+COMMAND_LINE_LIMIT = 2048
 VERBOSE_TAIL = " ".join(boot_recipe.DIAGNOSTIC_VERBOSE_TAIL)
 RD_BREAK_TAIL = "rd.break=pre-mount"
 ORIGIN = "armada"
@@ -39,21 +40,21 @@ ARTIFACTS = (
 
 class BootargsBoundUnitTest(unittest.TestCase):
     def test_exact_limit_including_nul_is_accepted_for_both_lines(self):
-        boot_materials._check_bootargs_bound(
-            "n" * (WITNESS_LIMIT - 1), "d" * (WITNESS_LIMIT - 1))
+        boot_materials._check_command_line_bound(
+            "n" * (COMMAND_LINE_LIMIT - 1), "d" * (COMMAND_LINE_LIMIT - 1))
 
     def test_one_byte_over_is_refused_for_each_line(self):
         for label, normal, diagnostic in (
-            ("normal bootargs", "n" * WITNESS_LIMIT, "d"),
-            ("diagnostic bootargs", "n", "d" * WITNESS_LIMIT),
+            ("normal bootargs", "n" * COMMAND_LINE_LIMIT, "d"),
+            ("diagnostic bootargs", "n", "d" * COMMAND_LINE_LIMIT),
         ):
             with self.subTest(label=label):
                 with self.assertRaises(boot_materials.BootMaterialsError) as raised:
-                    boot_materials._check_bootargs_bound(normal, diagnostic)
+                    boot_materials._check_command_line_bound(normal, diagnostic)
                 message = str(raised.exception)
                 self.assertIn(label, message)
-                self.assertIn(str(WITNESS_LIMIT + 1), message)
-                self.assertIn(str(WITNESS_LIMIT), message)
+                self.assertIn(str(COMMAND_LINE_LIMIT + 1), message)
+                self.assertIn(str(COMMAND_LINE_LIMIT), message)
 
     def test_non_str_and_non_ascii_values_are_refused(self):
         for value, expected in (
@@ -63,9 +64,15 @@ class BootargsBoundUnitTest(unittest.TestCase):
         ):
             with self.subTest(value=repr(value)):
                 with self.assertRaises(boot_materials.BootMaterialsError) as raised:
-                    boot_materials._check_bootargs_bound(value, "console=ttyS0")
+                    boot_materials._check_command_line_bound(value, "console=ttyS0")
                 self.assertIn("normal bootargs", str(raised.exception))
                 self.assertIn(expected, str(raised.exception))
+
+    def test_non_ascii_diagnostic_is_refused(self):
+        with self.assertRaises(boot_materials.BootMaterialsError) as raised:
+            boot_materials._check_command_line_bound("console=ttyS0", "caf\u00e9")
+        self.assertIn("diagnostic bootargs", str(raised.exception))
+        self.assertIn("non-ASCII", str(raised.exception))
 
 
 class BootargsBoundMaterialsTest(unittest.TestCase):
@@ -173,61 +180,61 @@ class BootargsBoundMaterialsTest(unittest.TestCase):
             self.assertEqual((self.target / name).read_bytes(), data, name)
 
     def test_verbose_diagnostic_exactly_at_limit_is_staged(self):
-        normal_chars = WITNESS_LIMIT - 2 - len(VERBOSE_TAIL)
+        normal_chars = COMMAND_LINE_LIMIT - 2 - len(VERBOSE_TAIL)
         report = self._prepare(mode="verbose", options="x" * normal_chars)
 
         self.assertEqual(len(report["normalBootArgs"]), normal_chars)
-        self.assertEqual(len(report["diagnosticBootArgs"]), WITNESS_LIMIT - 1)
+        self.assertEqual(len(report["diagnosticBootArgs"]), COMMAND_LINE_LIMIT - 1)
         self.assertEqual(report["diagnosticBootArgs"],
                          report["normalBootArgs"] + " " + VERBOSE_TAIL)
         self.load_helper.assert_called_once()
         self._assert_staged_only(report)
 
     def test_verbose_diagnostic_one_byte_over_is_refused_before_dt_work(self):
-        normal_chars = WITNESS_LIMIT - 1 - len(VERBOSE_TAIL)
+        normal_chars = COMMAND_LINE_LIMIT - 1 - len(VERBOSE_TAIL)
         with self.assertRaises(boot_materials.BootMaterialsError) as raised:
             self._prepare(mode="verbose", options="x" * normal_chars)
 
         message = str(raised.exception)
         self.assertIn("diagnostic bootargs", message)
-        self.assertIn(str(WITNESS_LIMIT + 1), message)
-        self.assertIn(str(WITNESS_LIMIT), message)
+        self.assertIn(str(COMMAND_LINE_LIMIT + 1), message)
+        self.assertIn(str(COMMAND_LINE_LIMIT), message)
         self._assert_no_dt_work()
 
     def test_rd_break_normal_exactly_at_limit_blames_the_longer_diagnostic(self):
         with self.assertRaises(boot_materials.BootMaterialsError) as raised:
-            self._prepare(mode="rd-break", options="x" * (WITNESS_LIMIT - 1))
+            self._prepare(mode="rd-break", options="x" * (COMMAND_LINE_LIMIT - 1))
 
         message = str(raised.exception)
         self.assertIn("diagnostic bootargs", message)
         self.assertNotIn("normal bootargs", message)
-        self.assertIn(str(WITNESS_LIMIT + 1 + len(RD_BREAK_TAIL)), message)
+        self.assertIn(str(COMMAND_LINE_LIMIT + 1 + len(RD_BREAK_TAIL)), message)
         self._assert_no_dt_work()
 
     def test_rd_break_diagnostic_exactly_at_limit_is_staged(self):
-        normal_chars = WITNESS_LIMIT - 2 - len(RD_BREAK_TAIL)
+        normal_chars = COMMAND_LINE_LIMIT - 2 - len(RD_BREAK_TAIL)
         report = self._prepare(mode="rd-break", options="x" * normal_chars)
 
         self.assertEqual(len(report["normalBootArgs"]), normal_chars)
-        self.assertEqual(len(report["diagnosticBootArgs"]), WITNESS_LIMIT - 1)
+        self.assertEqual(len(report["diagnosticBootArgs"]), COMMAND_LINE_LIMIT - 1)
         self.assertEqual(report["diagnosticBootArgs"],
                          report["normalBootArgs"] + " " + RD_BREAK_TAIL)
         self.load_helper.assert_called_once()
         self._assert_staged_only(report)
 
     def test_rd_break_diagnostic_one_byte_over_is_refused(self):
-        normal_chars = WITNESS_LIMIT - 1 - len(RD_BREAK_TAIL)
+        normal_chars = COMMAND_LINE_LIMIT - 1 - len(RD_BREAK_TAIL)
         with self.assertRaises(boot_materials.BootMaterialsError) as raised:
             self._prepare(mode="rd-break", options="x" * normal_chars)
         self.assertIn("diagnostic bootargs", str(raised.exception))
-        self.assertIn(str(WITNESS_LIMIT + 1), str(raised.exception))
+        self.assertIn(str(COMMAND_LINE_LIMIT + 1), str(raised.exception))
         self._assert_no_dt_work()
 
     def test_rd_break_normal_one_byte_over_is_refused(self):
         with self.assertRaises(boot_materials.BootMaterialsError) as raised:
-            self._prepare(mode="rd-break", options="x" * WITNESS_LIMIT)
+            self._prepare(mode="rd-break", options="x" * COMMAND_LINE_LIMIT)
         self.assertIn("normal bootargs", str(raised.exception))
-        self.assertIn(str(WITNESS_LIMIT + 1), str(raised.exception))
+        self.assertIn(str(COMMAND_LINE_LIMIT + 1), str(raised.exception))
         self._assert_no_dt_work()
 
 

@@ -268,8 +268,10 @@ def main():
     service = None
     try:
         service = UpdateDBusService(connection)
-        service.coordinator.start("system", "status")
-        service.coordinator.start("decky", "status")
+        # Activation must not enqueue synthetic status jobs. A component has a
+        # single job slot, so a fabricated status job would race the first
+        # caller-driven RefreshStatus/check/apply and make it fail with Busy.
+        # Status is populated only when a client asks for it.
 
         loop = GLib.MainLoop()
 

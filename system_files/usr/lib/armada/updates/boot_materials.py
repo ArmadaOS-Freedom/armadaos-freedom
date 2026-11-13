@@ -29,10 +29,10 @@ from .deployment_store import _parse_binding
 
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _CHUNK = 1024 * 1024
-# devices/lenovo-tb323fu/boot/kshim-success-source/src/dt/boot_witness.c
-# BOOT_WITNESS_MAX_BOOTARGS: the /chosen bootargs property length, terminating
-# NUL included.  Anything larger makes the witness reject the evidence.
-_MAX_BOOTARGS_BYTES = 65536
+# ARM64 Linux COMMAND_LINE_SIZE is 2048 bytes including the terminating NUL.
+# The kernel copies /chosen bootargs into that fixed buffer, so a longer line
+# is unusable even though the device-tree witness accepts up to 64 KiB.
+_MAX_COMMAND_LINE_BYTES = 2048
 
 
 class BootMaterialsError(RuntimeError):
@@ -44,7 +44,7 @@ def _sha256_hex(data):
 
 
 def _bootargs_bytes(value, label):
-    """Return the byte image the DT bootargs property would carry."""
+    """Return the canonical ASCII byte image the DT property would carry."""
     if not isinstance(value, str):
         raise BootMaterialsError(
             f"{label} must be str, got {type(value).__name__}")
@@ -54,17 +54,17 @@ def _bootargs_bytes(value, label):
         raise BootMaterialsError(f"{label} contain non-ASCII characters") from None
 
 
-def _check_bootargs_bound(normal_args, diagnostic_args):
-    """Reject bootargs the boot witness would refuse before any DT work."""
+def _check_command_line_bound(normal_args, diagnostic_args):
+    """Reject command lines the ARM64 kernel buffer cannot hold as-is."""
     for label, value in (
         ("normal bootargs", normal_args),
         ("diagnostic bootargs", diagnostic_args),
     ):
         total = len(_bootargs_bytes(value, label)) + 1
-        if total > _MAX_BOOTARGS_BYTES:
+        if total > _MAX_COMMAND_LINE_BYTES:
             raise BootMaterialsError(
-                f"{label} are {total} bytes including NUL, "
-                f"limit {_MAX_BOOTARGS_BYTES}")
+                f"{label} are {total} bytes including NUL, ARM64 kernel "
+                f"COMMAND_LINE_SIZE limit {_MAX_COMMAND_LINE_BYTES}")
 
 
 def _write_new(path, data):
@@ -301,9 +301,9 @@ def prepare_boot_materials(
 
         normal_args = model_boot_args(options["options"], profile)
         diagnostic_args = diagnostic_boot_args(normal_args, profile)
-        # Both assembled command lines are measured exactly as the witness will
-        # read them, before the DT helper or any candidate is generated.
-        _check_bootargs_bound(normal_args, diagnostic_args)
+        # Both assembled command lines are measured exactly as the ARM64 kernel
+        # buffer will hold them, before the DT helper or any candidate is made.
+        _check_command_line_bound(normal_args, diagnostic_args)
 
         helper = _load_helper(helper_path)
         work, logs, tmp, env = _prepare_helper_env(out)

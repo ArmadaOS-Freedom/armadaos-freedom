@@ -118,14 +118,20 @@
     }
     // One evidence rule for every reader: a native "client restart required"
     // flag is authoritative only while no local outcome exists, or while the
-    // local outcome itself is a restart recorded from fresh evidence. A flag
-    // left behind by an explicit failure or a newer check is stale and must
-    // not keep blocking checks, applies or authorize a restart.
+    // local outcome itself is a restart recorded from fresh evidence. Once
+    // fresh evidence has promoted local status to restart_required, that
+    // requirement is durable: a later missing or throwing native read cannot
+    // erase it. A flag left behind by an explicit failure or a newer check is
+    // stale and must not keep blocking checks, applies or authorize a restart.
     function restartEvidence() {
+      if (local) {
+        // Only a restart recorded from fresh evidence may stand without a
+        // current native read; failed, awaiting and completed outcomes must
+        // never fall back to a stale native flag.
+        return local.state === 'restart_required' && local.restart ? true : null;
+      }
       var result = applyResult();
-      if (!result || result.requires_client_restart !== true) return null;
-      if (local && (local.state !== 'restart_required' || !local.restart)) return null;
-      return result;
+      return result && result.requires_client_restart === true ? result : null;
     }
     function pendingRestart() {
       return restartEvidence() !== null;

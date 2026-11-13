@@ -311,6 +311,50 @@ test('late client restart evidence after awaiting status authorizes explicit res
   assert.deepEqual(h.data.calls.restart, [false]);
 });
 
+test('accepted client restart evidence survives a later absent native read', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  assert.equal((await adapter.apply()).state, 'restart_required');
+
+  h.data.apply = null;
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  assert.equal(snap.busy, false);
+  await assert.rejects(adapter.check(), /pending client restart/);
+  await assert.rejects(adapter.apply(), /pending client restart/);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('accepted client restart evidence survives a throwing native read', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  assert.equal((await adapter.apply()).state, 'restart_required');
+
+  h.UpdateStore.m_updater.GetApplyResult = () => {
+    throw new Error('native read failed');
+  };
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  assert.equal(snap.busy, false);
+  await assert.rejects(adapter.check(), /pending client restart/);
+  await assert.rejects(adapter.apply(), /pending client restart/);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
 test('restartClient directly reconciles late client restart evidence', async () => {
   const h = host();
   const adapter = createAdapter(h);
