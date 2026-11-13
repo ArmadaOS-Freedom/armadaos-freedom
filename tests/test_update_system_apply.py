@@ -137,6 +137,67 @@ class SystemApplyWorkerTests(unittest.TestCase):
             work_dir=self.state_dir / VALID_JOB,
         )
 
+    def test_state_root_ancestors_flushed_before_transaction(self):
+        events = []
+        real_flush = system_apply._durable_ancestors
+
+        def flush(path):
+            events.append(("flush", path))
+            return real_flush(path)
+
+        def transaction(**kwargs):
+            events.append(("transaction", kwargs["work_dir"]))
+            return {"state": "awaiting_reboot"}
+
+        with patch.object(system_apply, "_durable_ancestors", side_effect=flush), \
+             patch("armada_os.snapshot", return_value=snapshot(channel="beta")), \
+             patch.object(
+                 system_apply, "run_online_transaction", side_effect=transaction):
+            result = system_apply.execute("beta", VALID_JOB)
+
+        self.assertEqual(result["state"], "awaiting_reboot")
+        self.assertEqual(events[0], ("flush", self.state_dir))
+        self.assertEqual(events[1][0], "transaction")
+        self.assertEqual(events[1][1], self.state_dir / VALID_JOB)
+
+    def test_state_root_flush_failure_stops_job_and_retries_existing_path(self):
+        calls = []
+
+        def fail_first(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError("simulated ancestor flush failure")
+            return None
+
+        with patch.object(
+                system_apply, "_durable_ancestors", side_effect=fail_first), \
+             patch("armada_os.snapshot", return_value=snapshot()), \
+             patch.object(system_apply, "run_online_transaction") as run_tx:
+            failed = system_apply.execute("stable", VALID_JOB)
+
+        run_tx.assert_not_called()
+        self.assertEqual(calls, [self.state_dir])
+        self.assertTrue(self.state_dir.is_dir())
+        self.assertFalse((self.state_dir / VALID_JOB).exists())
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["phase"], "preflight")
+        self.assertIn("flush failure", failed["error"])
+
+        # The retry re-flushes the already existing path before proceeding.
+        retry_calls = []
+        with patch.object(
+                system_apply, "_durable_ancestors",
+                side_effect=retry_calls.append), \
+             patch("armada_os.snapshot", return_value=snapshot()), \
+             patch.object(
+                 system_apply, "run_online_transaction",
+                 return_value={"state": "awaiting_reboot"}) as retry_tx:
+            retried = system_apply.execute("stable", VALID_JOB)
+
+        self.assertEqual(retried["state"], "awaiting_reboot")
+        self.assertEqual(retry_calls, [self.state_dir])
+        retry_tx.assert_called_once()
+
     def test_transaction_error_returns_detailed_failed_report(self):
         detailed = {
             "schemaVersion": 1,
@@ -308,10 +369,12 @@ class SystemApplyWorkerTests(unittest.TestCase):
         ):
             with self.subTest(case=name), \
                  patch.object(system_apply, "STATE_DIR", bad_root), \
+                 patch.object(system_apply, "_durable_ancestors") as flush, \
                  patch("armada_os.snapshot", return_value=snapshot()), \
                  patch.object(system_apply, "run_online_transaction") as run_tx:
                 result = system_apply.execute("stable", VALID_JOB)
                 run_tx.assert_not_called()
+                flush.assert_not_called()
                 self.assertEqual(result["state"], "failed")
                 self.assertEqual(result["phase"], "preflight")
                 self.assertIn(match, result["error"])

@@ -19,12 +19,39 @@ _SLOT_KEYS = {
     'boot': 'boot', 'vendorBoot': 'vendor_boot', 'initBoot': 'init_boot',
     'abl': 'abl', 'xblConfig': 'xbl_config', 'vbmeta': 'vbmeta',
 }
+_HEX64 = frozenset('0123456789abcdef')
 
 
 class BootWriteError(RuntimeError):
     def __init__(self, message, restore_status='not_needed'):
         super().__init__(message)
         self.restore_status = restore_status
+
+
+def _hex64(value):
+    if not isinstance(value, str) or len(value) != 64:
+        return None
+    normalized = value.lower()
+    if any(ch not in _HEX64 for ch in normalized):
+        return None
+    return normalized
+
+
+def _require_matching_metadata_hash(slot, report_sha256, trusted_sha256):
+    """Bind gbl-preserve-metadata candidates to the trusted target metadata.
+
+    Mirrors the offline writer rule: the candidate's metadata digest must be a
+    valid 64-hex value and equal the authenticated per-target value before any
+    partition writer is opened.
+    """
+    trusted = _hex64(trusted_sha256)
+    if trusted is None:
+        raise BootWriteError(f'authenticated metadataSha256 is invalid for slot {slot}')
+    candidate = _hex64(report_sha256)
+    if candidate is None:
+        raise BootWriteError(f'candidate metadataSha256 is missing or invalid for slot {slot}')
+    if candidate != trusted:
+        raise BootWriteError(f'candidate metadataSha256 mismatch for slot {slot}')
 
 
 def _projection(found):
@@ -127,6 +154,10 @@ def write_inactive_boot(trust_report, candidate_report):
             extras.append('efisp')
         snapshot = _normalize_snapshot(trust_report['sources'], initial, extras)
         trusted = trust_report['trust'][target]
+        if mode == 'gbl-preserve-metadata':
+            _require_matching_metadata_hash(
+                target, candidate_report.get('metadataSha256'),
+                trusted.get('metadataSha256'))
         material = trusted['material']
         _require_positive_int(candidate_report['maxRawBytes'], 'candidate.maxRawBytes')
         if candidate_report['maxRawBytes'] > trusted['maxRawBytes']:

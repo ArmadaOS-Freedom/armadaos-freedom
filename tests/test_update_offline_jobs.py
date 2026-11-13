@@ -523,6 +523,104 @@ class OfflineJobTests(unittest.TestCase):
                 self.assertTrue(result['attentionRequired'])
                 self.reboot.assert_not_called()
 
+    def confirmed_evidence(self, sid, **overrides):
+        """Trial evidence for a transaction already booted and finalized."""
+        confirmed = {'recordState': 'confirmed', 'runningDeployment': 'new',
+                     'bootConfirmed': True,
+                     'finalization': {'state': 'complete'}}
+        confirmed.update(overrides)
+        return self.evidence(sid, **confirmed)
+
+    def test_stale_executing_receipt_is_repaired_after_physical_confirmation(self):
+        # The worker saved status.json and the write report, then the power
+        # cut before the receipt was updated.  The device has since booted the
+        # new deployment and finalization is complete.
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.confirmed_evidence(sid)
+        mgr = self.manager()
+        launches = len(self.launches())
+
+        receipt = mgr.status(sid)
+        self.assertEqual(receipt['state'], 'awaiting_reboot')
+        self.assertEqual(receipt['result']['state'], 'awaiting_reboot')
+        self.assertNotIn('jobInterrupted', receipt)
+        self.assertNotIn('attentionRequired', receipt)
+        self.assertEqual(receipt['completion']['state'], 'confirmed')
+        self.assertEqual(receipt['completion']['transactionId'], TX)
+        self.assertFalse(receipt['completion']['restartEligible'])
+        self.assertEqual(len(self.launches()), launches)
+        self.reboot.assert_not_called()
+
+        recorded = self.receipt_bytes(sid)
+        with self.store.session_lock(sid) as session:
+            persisted = self.store.read_receipt(session)
+        self.assertEqual(persisted['state'], 'awaiting_reboot')
+        self.assertEqual(persisted['result']['state'], 'awaiting_reboot')
+        self.assertNotIn('restart', persisted)
+
+        again = mgr.status(sid)
+        self.assertEqual(again['completion']['state'], 'confirmed')
+        self.assertEqual(self.receipt_bytes(sid), recorded)
+        self.assertEqual(len(self.launches()), launches)
+
+        # A confirmed transaction is never restarted by the repair path.
+        with self.assertRaises(offline_session.OfflineSessionError):
+            mgr.request_restart(sid)
+        self.reboot.assert_not_called()
+        self.assertEqual(self.receipt_bytes(sid), recorded)
+
+    def test_stale_executing_receipt_refuses_unfinalized_or_foreign_record(self):
+        cases = (
+            ('finalization pending',
+             {'finalization': {'state': 'pending', 'error': 'journal busy'}}),
+            ('other transaction', {'transactionId': OTHER_TX}),
+            ('running old deployment', {'runningDeployment': 'old'}),
+            ('boot evidence missing',
+             {'runningDeployment': None, 'bootConfirmed': False}),
+        )
+        for name, overrides in cases:
+            with self.subTest(case=name):
+                sid = self.interrupted_execute()
+                self.trial.return_value = self.confirmed_evidence(sid, **overrides)
+                before = self.receipt_bytes(sid)
+
+                receipt = self.manager().status(sid)
+                self.assertEqual(receipt['state'], 'executing')
+                self.assertTrue(receipt['jobInterrupted'])
+                self.assertTrue(receipt['attentionRequired'])
+                self.assertEqual(self.receipt_bytes(sid), before)
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    self.manager().request_restart(sid)
+                self.assertEqual(self.receipt_bytes(sid), before)
+                self.reboot.assert_not_called()
+
+    def test_stale_executing_receipt_requires_complete_durable_evidence(self):
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.confirmed_evidence(sid)
+        with self.store.session_lock(sid) as session:
+            (session / 'transaction/write-report.json').unlink()
+        before = self.receipt_bytes(sid)
+
+        receipt = self.manager().status(sid)
+        self.assertEqual(receipt['state'], 'executing')
+        self.assertTrue(receipt['jobInterrupted'])
+        self.assertTrue(receipt['attentionRequired'])
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.reboot.assert_not_called()
+
+    def test_stale_executing_receipt_is_not_repaired_while_worker_is_active(self):
+        sid = self.interrupted_execute()
+        self.trial.return_value = self.confirmed_evidence(sid)
+        self.runner.return_value.returncode = 0
+        before = self.receipt_bytes(sid)
+
+        receipt = self.manager().status(sid)
+        self.assertEqual(receipt['state'], 'executing')
+        self.assertTrue(receipt['jobActive'])
+        self.assertNotIn('jobInterrupted', receipt)
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.reboot.assert_not_called()
+
     def test_completion_pointer_is_keyed_by_transaction(self):
         first = self.submitted_session(TX)
         second = self.submitted_session(OTHER_TX)

@@ -124,10 +124,19 @@ class DesktopCompatibilityTest(unittest.TestCase):
         )
         selector = self.install("usr/libexec/armada/armada-select-branch", [
             ("source /usr/lib/armada/update-lib", f"source {libdir / 'update-lib'}"),
-            ('PYTHONPATH=/usr/lib/armada exec /usr/bin/python3 -m updates.channel_selection "$channel"',
-             f'exec /usr/bin/python3 {writer} "$channel"'),
+            ('PYTHONPATH=/usr/lib/armada exec /usr/bin/python3 -P -m updates.channel_selection "$channel"',
+             f'exec /usr/bin/python3 -P {writer} "$channel"'),
         ])
         return selector, channel
+
+    def test_selector_uses_isolated_python_module_path(self):
+        source = (FILES / "usr/libexec/armada/armada-select-branch").read_text()
+        invocation = (
+            'PYTHONPATH=/usr/lib/armada exec /usr/bin/python3 -P '
+            '-m updates.channel_selection "$channel"'
+        )
+        self.assertEqual(source.count(invocation), 1)
+        self.assertNotIn("python3 -m updates.channel_selection", source)
 
     def test_channel_listing_and_fallback(self):
         selector, _ = self.make_selector()

@@ -341,17 +341,77 @@ test('accepted apply with unpublished status awaits and later restart evidence s
   const snap = await adapter.apply();
   assert.equal(snap.state, 'awaiting_status');
   assert.equal(snap.error, null);
-  assert.equal(snap.busy, false);
+  assert.equal(snap.busy, true);
   assert.equal(snap.requiresClientRestart, false);
   assert.equal(snap.requiresReboot, false);
   assert.deepEqual(h.data.calls.restart, []);
-  await assert.rejects(adapter.apply(), /required/);
+  await assert.rejects(adapter.apply(), /awaiting|required/);
   assert.equal(h.data.calls.apply.length, 1);
 
   h.data.apply = { type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false };
   assert.equal(adapter.snapshot().state, 'restart_required');
   await adapter.restartClient();
   assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('awaiting unpublished apply blocks check and apply until late restart evidence permits explicit restart', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  const checksBefore = h.data.calls.check;
+  const awaiting = await adapter.apply();
+  assert.equal(awaiting.state, 'awaiting_status');
+  assert.equal(awaiting.busy, true);
+  assert.equal(awaiting.requiresClientRestart, false);
+  assert.equal(h.data.calls.apply.length, 1);
+
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  assert.equal(h.data.calls.check, checksBefore);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  assert.deepEqual(h.data.calls.restart, []);
+
+  h.data.apply = { type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false };
+  const ready = adapter.snapshot();
+  assert.equal(ready.state, 'restart_required');
+  assert.equal(ready.busy, false);
+  assert.equal(ready.requiresClientRestart, true);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('late completed nonrestart apply settles awaiting and unblocks an explicit check', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+  h.data.apply = { type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false };
+  const settled = adapter.snapshot();
+  assert.equal(settled.state, 'up_to_date');
+  assert.equal(settled.busy, false);
+  assert.equal(settled.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+  const snap = await adapter.check();
+  assert.equal(snap.state, 'available');
+  assert.equal(snap.busy, false);
+});
+
+test('unchanged false apply result stays awaiting and never authorizes restart', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
 });
 
 test('accepted apply with unpublished status awaits, so a late rejection is still shown', async () => {
@@ -411,4 +471,103 @@ test('malformed check timestamps cannot authorize snapshot or apply', async () =
     await assert.rejects(adapter.apply(), /required/);
     assert.equal(h.data.calls.apply.length, 0);
   }
+});
+
+test('an equivalent cloned historical apply result is not new evidence', async () => {
+  const h = host();
+  const cloned = () => (h.data.apply ? Object.assign({}, h.data.apply) : null);
+  h.UpdateStore.m_updater.GetApplyResult = (type) =>
+    type === 1 ? cloned() : { type, eresult: 2 };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('identical values republished after an observed gap are accepted as new evidence', async () => {
+  const h = host();
+  h.UpdateStore.m_updater.GetApplyResult = (type) =>
+    type === 1 ? (h.data.apply ? Object.assign({}, h.data.apply) : null) : { type, eresult: 2 };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  h.data.apply = null;
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  const settled = adapter.snapshot();
+  assert.equal(settled.state, 'up_to_date');
+  assert.equal(settled.busy, false);
+  assert.equal(settled.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('failed refresh while a client apply awaits preserves awaiting status and its error', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  h.data.infoError = new Error('system info unavailable');
+  const snap = await adapter.refresh();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.match(snap.error, /system info unavailable/);
+  await assert.rejects(adapter.check(), /awaiting/);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
+  };
+  const ready = adapter.snapshot();
+  assert.equal(ready.state, 'restart_required');
+  assert.equal(ready.requiresClientRestart, true);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('malformed refresh while a client apply awaits does not destroy awaiting status', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+
+  h.data.info = { nSteamVersion: 0 };
+  const snap = await adapter.refresh();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.match(snap.error, /Malformed Steam version/);
+});
+
+test('late OS-only apply evidence keeps awaiting busy and blocks new checks', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+
+  h.data.apply.requires_system_restart = true;
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresReboot, false);
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
 });

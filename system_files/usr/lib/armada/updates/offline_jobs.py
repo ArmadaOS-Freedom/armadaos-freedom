@@ -192,6 +192,14 @@ class OfflineJobManager:
         accepted.  Missing or contradictory evidence is refused rather than
         repaired, so an interrupted worker can never be turned into a success
         claim it did not earn.
+
+        A worker saves ``status.json`` and the write report before it records
+        its result on the receipt, so a power cut can leave the receipt at
+        ``executing`` after the transaction is already durable.  The live
+        journal then decides: an ``awaiting_reboot`` verdict still has to be
+        restart-eligible, while a fully finalized matching transaction that is
+        already booting the new deployment is accepted as confirmation.  No
+        restart is scheduled here; that verdict only denies one.
         """
         transaction = session / 'transaction'
         if transaction.is_symlink() or not transaction.is_dir():
@@ -214,8 +222,10 @@ class OfflineJobManager:
         verdict = offline_completion.evaluate(
             {'state': 'awaiting_reboot', 'result': status},
             _read_trial_evidence(), identity)
-        if (verdict.get('state') != offline_completion.AWAITING_REBOOT or
-                verdict.get('restartEligible') is not True):
+        if verdict.get('state') == offline_completion.AWAITING_REBOOT:
+            if verdict.get('restartEligible') is not True:
+                return None
+        elif verdict.get('state') != offline_completion.CONFIRMED:
             return None
         return status
 

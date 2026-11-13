@@ -8,6 +8,8 @@
     var currentVersion = null;
     var operation = null;
     var local = null;
+    var applyEvidenceToken = null;
+    var applyEvidenceAbsent = false;
 
     function parts() {
       var steam = host && host.SteamClient;
@@ -47,6 +49,30 @@
         typeof r.requires_client_restart === 'boolean' &&
         typeof r.requires_system_restart === 'boolean' ? r : null;
     }
+    function applyResultToken(r) {
+      return r ? r.eresult + ':' + String(r.requires_client_restart) + ':' +
+        String(r.requires_system_restart) : null;
+    }
+    // GetApplyResult may hand back a fresh object on every read carrying the
+    // same flags, so evidence is the semantic token, never object identity.
+    // An actually observed gap (no result) is remembered so identical values
+    // republished after the gap count as new evidence.
+    function recordApplyBaseline() {
+      applyEvidenceToken = applyResultToken(rawApplyResult());
+      applyEvidenceAbsent = !applyEvidenceToken;
+    }
+    function observeApplyResult() {
+      var raw = rawApplyResult();
+      var token = applyResultToken(raw);
+      if (!token) { applyEvidenceAbsent = true; return null; }
+      if (!applyEvidenceAbsent && token === applyEvidenceToken) return null;
+      applyEvidenceToken = token;
+      applyEvidenceAbsent = false;
+      return raw;
+    }
+    function awaitingApply() {
+      return !!(local && local.state === 'awaiting_status');
+    }
     function nativeBusy() {
       try {
         var state = parts().updater.m_updateState.state;
@@ -58,13 +84,37 @@
     }
     function syncLateApply() {
       if (operation || !local || local.state !== 'awaiting_status') return;
-      var raw = rawApplyResult();
-      if (raw && raw.eresult !== 1)
+      var priorError = local.error || null;
+      var raw = observeApplyResult();
+      if (!raw) return;
+      if (raw.eresult !== 1)
         failed('apply', 'Client apply failed (' + raw.eresult + ')');
-      else if (raw && raw.eresult === 1 &&
-        typeof raw.requires_client_restart === 'boolean' &&
-        typeof raw.requires_system_restart === 'boolean' && raw.requires_client_restart)
-        local = { state: 'restart_required', phase: 'apply', error: null, restart: true };
+      else if (typeof raw.requires_client_restart === 'boolean' &&
+        typeof raw.requires_system_restart === 'boolean') {
+        if (raw.requires_client_restart)
+          local = { state: 'restart_required', phase: 'apply', error: priorError, restart: true };
+        else if (!raw.requires_system_restart)
+          // A completed client-only apply needs no restart. Settle it so an
+          // unresolved awaiting status cannot keep checks/applies blocked. An
+          // OS-only restart requirement is not a completed client apply, so it
+          // leaves awaiting status (and its busy lock) in place.
+          local = { state: 'up_to_date', phase: 'apply', error: priorError, restart: false };
+      }
+    }
+    function refreshFailure(message) {
+      // A failed version read says nothing about an already accepted client
+      // apply, so keep awaiting status busy/blocking and only surface the
+      // error. A pending client restart likewise stays reachable.
+      if (local && local.state === 'awaiting_status')
+        local = {
+          state: 'awaiting_status', phase: local.phase || 'apply',
+          error: message, restart: false
+        };
+      else if (local && local.state === 'restart_required' && local.restart)
+        local = { state: 'restart_required', phase: 'refresh', error: message, restart: true };
+      else if (!local && pendingRestart())
+        local = { state: 'restart_required', phase: 'refresh', error: message, restart: true };
+      else failed('refresh', message);
     }
     function pendingRestart() {
       var result = applyResult();
@@ -85,12 +135,13 @@
     function snapshot() {
       syncLateApply();
       var state = 'unknown', phase = 'idle', error = null, restart = false;
-      var busy = !!operation || (available() && nativeBusy());
+      var nativeActive = available() && nativeBusy();
+      var busy = !!operation || nativeActive || awaitingApply();
       if (!available()) state = 'adapter_unavailable';
       else if (operation === 'check') { state = 'checking'; phase = 'check'; }
       else if (operation === 'apply') { state = 'applying'; phase = 'apply'; }
       else if (operation === 'restart') { state = 'restart_required'; phase = 'restart'; restart = true; }
-      else if (busy) { state = 'native_busy'; phase = 'native'; }
+      else if (nativeActive) { state = 'native_busy'; phase = 'native'; }
       else if (local) {
         state = local.state; phase = local.phase; error = local.error || null;
         restart = !!local.restart;
@@ -113,26 +164,16 @@
         var info = await parts().steam.System.GetSystemInfo();
         if (info && Number.isSafeInteger(info.nSteamVersion) && info.nSteamVersion > 0)
           currentVersion = String(info.nSteamVersion);
-        else if (!operation) failed('refresh', 'Malformed Steam version in system info');
+        else if (!operation) refreshFailure('Malformed Steam version in system info');
       } catch (error) {
-        if (!operation) {
-          if (pendingRestart()) {
-            // Failing to read the client version says nothing about the
-            // native restart evidence: keep it (and the failure text) so the
-            // user can still see the error and perform the restart.
-            local = {
-              state: 'restart_required', phase: 'refresh',
-              error: errorText(error), restart: true
-            };
-          } else {
-            failed('refresh', error);
-          }
-        }
+        if (!operation) refreshFailure(errorText(error));
       }
       return snapshot();
     }
     async function check() {
       guard();
+      syncLateApply();
+      if (awaitingApply()) throw new Error('A client apply is awaiting its native result');
       if (pendingRestart()) throw new Error('A pending client restart blocks new client update checks');
       var previous = checkResult();
       var oldTime = previous && Number.isInteger(previous.rtime_checked) &&
@@ -160,10 +201,13 @@
     }
     async function apply() {
       guard();
+      syncLateApply();
+      if (awaitingApply()) throw new Error('A client apply is awaiting its native result');
       if (pendingRestart()) throw new Error('A pending client restart blocks new client applies');
       var check = checkResult();
       if (!check || !check.available || (local && local.state !== 'available'))
         throw new Error('A successful client check with an available update is required');
+      recordApplyBaseline();
       operation = 'apply';
       local = { state: 'applying', phase: 'apply', error: null, restart: false };
       try {
@@ -178,13 +222,13 @@
         else {
           // The native call only reports that the apply was accepted; its
           // status may not be published yet, so GetApplyResult can still be
-          // null here. Await it rather than inventing a failure, and never
-          // claim success or a restart from a missing result: syncLateApply()
-          // promotes a later rejection or client restart requirement.
-          var result = applyResult();
-          if (result && result.requires_client_restart)
-            local = { state: 'restart_required', phase: 'apply', error: null, restart: true };
-          else local = { state: 'awaiting_status', phase: 'apply', error: null, restart: false };
+          // null or unchanged here. Await new semantic evidence rather than
+          // inventing a failure, and never claim success or a restart from a
+          // reboxed or pre-existing result: syncLateApply() promotes a later
+          // rejection, completion or client restart requirement, including
+          // identical values republished after an observed gap. The snapshot
+          // below samples the ephemeral result once, for reconciliation only.
+          local = { state: 'awaiting_status', phase: 'apply', error: null, restart: false };
         }
       } catch (error) { failed('apply', error); }
       finally { operation = null; }

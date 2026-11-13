@@ -31,9 +31,13 @@ status, receipt and recovery export path only reads the compact documents
 beside them.  ``retire_confirmed_offline_session`` follows the transaction's
 own pending pointer -- never a directory scan -- and re-proves the receipt,
 plan, prepared documents, write report and recovery manifest against the
-confirmed record before unlinking exactly those named regular files.  No tree
-is walked or removed: directories, logs, candidate and material reports,
-acknowledgements, receipts and every recovery export stay in place.
+confirmed record before unlinking exactly those named regular files.  A
+receipt that still says ``executing`` is accepted only because the execute
+worker saves ``status.json`` after the write report; a power cut before the
+receipt update leaves that state behind while every document below it is
+already terminal and matches the confirmed journal.  No tree is walked or
+removed: directories, logs, candidate and material reports, acknowledgements,
+receipts and every recovery export stay in place.
 """
 
 from __future__ import annotations
@@ -62,7 +66,12 @@ _MAX_TREE_DEPTH = 8
 # Every other entry, including every directory, is retained.
 _OFFLINE_POINTER_MAX = 8 * 1024
 _OFFLINE_SLOTS = ('a', 'b')
-_OFFLINE_CONFIRMED_STATE = 'awaiting_reboot'
+# An execute worker writes the terminal status and write report before it
+# records its result on the receipt.  ``awaiting_reboot`` is the normal
+# recorded outcome; ``executing`` is that same session after a power cut
+# between the status save and the receipt update.  Both are still only proof
+# together with the complete documents checked by ``_offline_proof``.
+_OFFLINE_EXECUTED_STATES = frozenset({'awaiting_reboot', 'executing'})
 _OFFLINE_MATERIAL_FILES = (
     'kernel.img', 'initramfs.img', 'runtime.bin', 'source.dtb',
     'dtb-normal.img', 'dtb-diagnostic.img')
@@ -298,15 +307,19 @@ def _offline_proof(session, receipt, bounds):
     ``offline_completion.execute_completion`` already validates the prepared,
     plan, acknowledgement, final status and verified write report chain.  This
     only adds the live-record binding, the manifest digest bound to that plan,
-    the recovery identity and the recovery-export exclusion.  The materials
-    and candidate reports are not parsed: their bulky file names are fixed.
+    the recovery identity and the recovery-export exclusion.  The receipt must
+    name this execute operation and either its recorded terminal state or the
+    ``executing`` state a power cut leaves before the receipt is updated; the
+    documents alone decide whether that state is complete and matches the
+    confirmed record.  The materials and candidate reports are not parsed:
+    their bulky file names are fixed.
     """
     from . import offline_completion, offline_execute, offline_session
 
     transaction = session / 'transaction'
     try:
         offline_session._check_dir(transaction)
-        if (receipt.get('state') != _OFFLINE_CONFIRMED_STATE or
+        if (receipt.get('state') not in _OFFLINE_EXECUTED_STATES or
                 receipt.get('jobOperation') != 'execute'):
             return None
         model = receipt.get('model')
@@ -462,12 +475,13 @@ def retire_confirmed_offline_session(record, *, base=None):
     The session is resolved from its own per-transaction pending pointer and
     locked with the store's session lock; no directory is scanned.  ``True``
     means at least one file was removed.  ``False`` covers every unproven case
-    -- absent pointer, foreign or duplicate identity, an unconfirmed or
-    still-active session, a symlinked or untrusted path, a corrupt document,
-    a recovery manifest member or an unresolvable mount identity -- and leaves
-    everything untouched.  Cleanup failures are swallowed: the durable
-    finalization receipt already proved the transaction complete, so a space
-    saving must never turn a confirmed update into a failure.
+    -- absent pointer, foreign or duplicate identity, an unconfirmed session,
+    a receipt that is not a complete execute, a symlinked or untrusted path, a
+    corrupt document, a recovery manifest member or an unresolvable mount
+    identity -- and leaves everything untouched.  Cleanup failures are
+    swallowed: the durable finalization receipt already proved the transaction
+    complete, so a space saving must never turn a confirmed update into a
+    failure.
     """
     bounds = _record_bounds(record)
     if bounds is None:

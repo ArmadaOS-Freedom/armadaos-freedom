@@ -19,11 +19,11 @@ from .boot_writer import (
     _inventory,
     _pwrite_all,
     _read_private,
+    _require_matching_metadata_hash,
 )
 from .deployment_store import _parse_binding
 
 _SLOTS = ('a', 'b')
-_HEX64 = frozenset('0123456789abcdef')
 
 
 class JournalCommitError(RuntimeError):
@@ -41,26 +41,6 @@ class JournalCommitError(RuntimeError):
             raise ValueError('invalid journal commit state')
         super().__init__(message)
         self.commit_state = commit_state
-
-
-def _hex64(value):
-    if not isinstance(value, str) or len(value) != 64:
-        return None
-    normalized = value.lower()
-    if any(ch not in _HEX64 for ch in normalized):
-        return None
-    return normalized
-
-
-def _require_matching_metadata_hash(slot, report_sha256, trusted_sha256):
-    trusted = _hex64(trusted_sha256)
-    if trusted is None:
-        raise BootWriteError(f'authenticated metadataSha256 is invalid for slot {slot}')
-    candidate = _hex64(report_sha256)
-    if candidate is None:
-        raise BootWriteError(f'candidate metadataSha256 is missing or invalid for slot {slot}')
-    if candidate != trusted:
-        raise BootWriteError(f'candidate metadataSha256 mismatch for slot {slot}')
 
 
 def _error_with_results(message, restore_status, slot_results):
