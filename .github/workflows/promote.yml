@@ -2,8 +2,9 @@
 name: Promote release
 
 # Promotes the exact digest a published signed update channel describes. The
-# source tag must resolve to that digest, the package descriptor must verify,
-# and the source revision must match the image before anything is tagged.
+# channel and descriptor signatures are verified first, the image is inspected
+# at that immutable digest, and its revision label must match before anything
+# is tagged. The moving :source tag is never consulted.
 
 on:
   workflow_dispatch:
@@ -130,10 +131,41 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: printf '%s' "${GHCR_TOKEN}" | skopeo login ghcr.io -u "${ACTOR}" --password-stdin
 
-      - name: Verify source container signature
+      # Promotion starts from the signed publication, not from the moving
+      # :source tag. A newer independent build may have re-pointed :source
+      # after this release was published and must not block promoting the
+      # release the channel still names. The channel and descriptor
+      # signatures bind an immutable digest, which everything below uses.
+      - name: Verify the published source channel
+        id: channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE: ${{ inputs.source }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # A source channel without a valid signed publication must fail
+          # here, before any tag is written.
+          python3 .github/scripts/update-publication.py fetch-channel \
+            --repository "${REPOSITORY}" \
+            --channel "${SOURCE}" \
+            --branch "${ARMADA_CHANNEL_BRANCH}" \
+            --trusted-key "${ARMADA_SIGNING_PUBLIC_KEY}" \
+            --workdir "${SCRATCH}/channel-source" \
+            --out "${SCRATCH}/channel-source.json"
+          digest="$(jq -er '.ociDigest' "${SCRATCH}/channel-source.json")"
+          revision="$(jq -er '.sourceRevision' "${SCRATCH}/channel-source.json")"
+          {
+            echo "digest=${digest}"
+            echo "revision=${revision}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the source image by digest
         id: resolve
         env:
-          SOURCE_TAG: ${{ inputs.source }}
+          DIGEST: ${{ steps.channel.outputs.digest }}
+          REVISION: ${{ steps.channel.outputs.revision }}
         run: |
           set -euo pipefail
           REPO="${IMAGE_REGISTRY}/${IMAGE_NAME}"
@@ -145,39 +177,23 @@ jobs:
             echo "::error::Freedom signing public key missing or empty: ${ARMADA_SIGNING_PUBLIC_KEY}"
             exit 1
           fi
-          # Pin to the digest so verification, the channel check, and the retag
-          # below all act on the same image even if a concurrent build re-points
-          # the source tag in between.
-          DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${REPO}:${SOURCE_TAG}")
+          # Inspect the digest the signed channel names, never :source, so a
+          # concurrent or independent build cannot substitute another image.
           INSPECTION=$(skopeo inspect "docker://${REPO}@${DIGEST}")
-          REVISION=$(jq -er '.Labels["org.opencontainers.image.revision"]' <<<"${INSPECTION}")
+          RESOLVED=$(jq -er '.Digest' <<<"${INSPECTION}")
+          if [ "${RESOLVED}" != "${DIGEST}" ]; then
+            echo "::error::The published channel digest does not resolve to the same immutable manifest."
+            exit 1
+          fi
+          LABEL_REVISION=$(jq -er '.Labels["org.opencontainers.image.revision"]' <<<"${INSPECTION}")
+          if [ "${LABEL_REVISION}" != "${REVISION}" ]; then
+            echo "::error::The published channel revision does not match the image labels."
+            exit 1
+          fi
           # Fail closed: never promote an unsigned build into beta/stable.
           cosign verify --key "${ARMADA_SIGNING_PUBLIC_KEY}" "${REPO}@${DIGEST}"
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
           echo "revision=${REVISION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Verify the published source channel
-        id: channel
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          SOURCE: ${{ inputs.source }}
-          DIGEST: ${{ steps.resolve.outputs.digest }}
-          REVISION: ${{ steps.resolve.outputs.revision }}
-          SCRATCH: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          # A source tag without a valid signed channel publication must fail
-          # here, before any tag is written.
-          python3 .github/scripts/update-publication.py fetch-channel \
-            --repository "${REPOSITORY}" \
-            --channel "${SOURCE}" \
-            --branch "${ARMADA_CHANNEL_BRANCH}" \
-            --trusted-key "${ARMADA_SIGNING_PUBLIC_KEY}" \
-            --expected-oci-digest "${DIGEST}" \
-            --expected-source-revision "${REVISION}" \
-            --workdir "${SCRATCH}/channel-source" \
-            --out "${SCRATCH}/channel-source.json"
 
       - name: Publish release tags
         env:

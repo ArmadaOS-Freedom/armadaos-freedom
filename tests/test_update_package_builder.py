@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates.package_contract import (
-    AUTHORIZED_MODELS, PackageError, validate_package,
+    AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, validate_package,
 )
 
 CONFIG_PATH = ROOT / "build_files" / "edl-devices.json"
@@ -341,11 +341,11 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                     install_models=(CUSTOM_MODEL,),
                 )
 
-    def test_default_models_keep_offline_upgrade(self):
+    def test_upgrade_capable_models_keep_offline_upgrade(self):
         def offline_capable(bundle, docs, members):
             bundle["offlineUpgrade"] = True
 
-        models = ("TB322FC", "TB323FU", "TB710FU")
+        models = ("TB322FC", "TB323FU")
         with tempfile.TemporaryDirectory() as tmp:
             archive = self._make_bundle(
                 Path(tmp), models=models, mutate=offline_capable
@@ -356,6 +356,92 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             self.assertEqual(desc["supportedModels"], list(models))
             self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
             self.assertEqual(validate_package(desc), desc)
+
+    def test_single_upgrade_model_keeps_offline_upgrade(self):
+        # The descriptor declares operations per package, so a per-model build
+        # of either compatible model may still advertise upgrade.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        for model in sorted(OFFLINE_UPGRADE_MODELS):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as tmp:
+                archive = self._make_bundle(
+                    Path(tmp), models=(model,), mutate=offline_capable
+                )
+                desc = build_descriptor(
+                    archive, release_id="rel-single", enable_offline_upgrade=True
+                )
+                self.assertEqual(desc["supportedModels"], [model])
+                self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
+                self.assertEqual(validate_package(desc), desc)
+
+    def test_tb710fu_is_install_only_even_with_offline_capable_bundle(self):
+        # TB710FU installs but the offline updater rejects it before any slot
+        # work, so its package must never advertise upgrade.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=("TB710FU",), mutate=offline_capable
+            )
+            desc = build_descriptor(archive, release_id="rel-gt")
+            self.assertEqual(desc["supportedModels"], ["TB710FU"])
+            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(desc["recoveryManifests"], {})
+            self.assertEqual(validate_package(desc), desc)
+            with self.assertRaisesRegex(
+                PackageError, "offline-upgrade is restricted"
+            ):
+                build_descriptor(
+                    archive, release_id="rel-gt", enable_offline_upgrade=True
+                )
+
+    def test_mixed_tb710fu_package_stays_install_only(self):
+        # A package-level operations list cannot exempt one model, so including
+        # TB710FU suppresses the upgrade claim for the whole archive.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=("TB322FC", "TB710FU"), mutate=offline_capable
+            )
+            desc = build_descriptor(archive, release_id="rel-mixed")
+            self.assertEqual(desc["supportedModels"], ["TB322FC", "TB710FU"])
+            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(validate_package(desc), desc)
+            with self.assertRaisesRegex(
+                PackageError, "offline-upgrade is restricted"
+            ):
+                build_descriptor(
+                    archive, release_id="rel-mixed", enable_offline_upgrade=True
+                )
+
+    def test_configured_default_selection_is_install_only(self):
+        # The devices config also registers TB710FU, so the default multi-model
+        # build must keep every install model and advertise no upgrade.
+        models = tuple(json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
+        self.assertEqual(set(models), set(AUTHORIZED_MODELS))
+
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=models, mutate=offline_capable
+            )
+            desc = build_descriptor(archive, release_id="rel-default")
+            self.assertEqual(desc["supportedModels"], list(models))
+            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(desc["recoveryManifests"], {})
+            self.assertEqual(validate_package(desc), desc)
+            with self.assertRaisesRegex(
+                PackageError, "offline-upgrade is restricted"
+            ):
+                build_descriptor(
+                    archive, release_id="rel-default", enable_offline_upgrade=True
+                )
 
 
 if __name__ == "__main__":

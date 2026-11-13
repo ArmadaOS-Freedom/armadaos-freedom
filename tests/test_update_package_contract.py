@@ -9,6 +9,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "system_files/usr/lib/armada"))
 
 from updates.package_contract import (  # noqa: E402
+    AUTHORIZED_MODELS,
+    OFFLINE_UPGRADE_MODELS,
     PackageError,
     load_package,
     require_operation,
@@ -80,7 +82,7 @@ class PackageContractTests(unittest.TestCase):
         validated = validate_package(pkg)
         self.assertEqual(validated, pkg)
         self.assertIsNot(validated, pkg)
-        validated["supportedModels"].append("TB710FU")
+        validated["supportedModels"].append("UNKNOWN")
         validated["files"][0]["path"] = "mutated.json"
         self.assertEqual(pkg["supportedModels"], ["TB322FC", "TB323FU"])
         self.assertEqual(pkg["files"][0]["path"], "bundle.json")
@@ -233,7 +235,7 @@ class PackageContractTests(unittest.TestCase):
                          {"TB322FC": "recovery/tb322fc.json"})
 
         unknown = deepcopy(pkg)
-        unknown["recoveryManifests"] = {"TB710FU": "recovery/tb322fc.json"}
+        unknown["recoveryManifests"] = {"UNKNOWN": "recovery/tb322fc.json"}
         with self.assertRaisesRegex(PackageError, "subset"):
             validate_package(unknown)
 
@@ -241,6 +243,30 @@ class PackageContractTests(unittest.TestCase):
         missing["recoveryManifests"] = {"TB322FC": "recovery/missing.json"}
         with self.assertRaisesRegex(PackageError, "indexed file"):
             validate_package(missing)
+
+    def test_tb710fu_is_authorized_for_install_only(self):
+        # TB710FU is a registered install target but has no dual-slot upgrade
+        # backend, so it is supported for install and nothing else.
+        self.assertIn("TB710FU", AUTHORIZED_MODELS)
+        self.assertNotIn("TB710FU", OFFLINE_UPGRADE_MODELS)
+
+        pkg = _base_package()
+        pkg["supportedModels"].append("TB710FU")
+        pkg["modelManifests"]["TB710FU"] = "manifests/tb710fu.json"
+        pkg["files"].append(_file_record("manifests/tb710fu.json", "manifest", 512, 54))
+        self.assertEqual(validate_package(pkg)["operations"], ["install"])
+        require_operation(pkg, "TB710FU", "install", installer_version="0.10.0")
+
+        upgrade = deepcopy(pkg)
+        upgrade["operations"].append("offline-upgrade")
+        with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
+            validate_package(upgrade)
+
+        recovery = deepcopy(pkg)
+        recovery["files"].append(_file_record("recovery/tb710fu.json", "manifest", 512, 55))
+        recovery["recoveryManifests"] = {"TB710FU": "recovery/tb710fu.json"}
+        with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
+            validate_package(recovery)
 
     def test_install_only_allowance_is_explicit_and_narrow(self):
         def custom_package():
@@ -275,7 +301,7 @@ class PackageContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
             validate_package(mixed_recovery, install_models=("THIRD",))
 
-        for bad in (["TB322FC"], ["THIRD", "THIRD"], ["bad/id"], "THIRD", [1]):
+        for bad in (["TB322FC"], ["TB710FU"], ["THIRD", "THIRD"], ["bad/id"], "THIRD", [1]):
             with self.subTest(install_models=bad), self.assertRaises(PackageError):
                 validate_package(custom_package(), install_models=bad)
 
@@ -287,7 +313,7 @@ class PackageContractTests(unittest.TestCase):
         checks = [
             ({"installer_version": "0.8.9"}, "older than minimumInstallerVersion"),
             ({"updater_version": "0.8.10"}, "older than minimumUpdaterVersion"),
-            ({"model": "TB710FU", "installer_version": "0.10.0"}, "model is not supported"),
+            ({"model": "UNKNOWN", "installer_version": "0.10.0"}, "model is not supported"),
             ({"operation": "offline-upgrade", "updater_version": "0.10.0"},
              "operation is not declared"),
             ({}, "at least one"),

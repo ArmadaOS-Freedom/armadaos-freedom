@@ -25,7 +25,7 @@ import test_update_channel_release as cr_fixture  # noqa: E402
 import test_update_package_contract as pkg_fixture  # noqa: E402
 from updates import system_manager  # noqa: E402
 from updates.channel_release import make_channel  # noqa: E402
-from updates.package_contract import validate_package  # noqa: E402
+from updates.package_contract import load_package, validate_package  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location(
     "update_publication", ROOT / ".github/scripts/update-publication.py")
@@ -293,6 +293,28 @@ def _release_entry(tag, *, release_id=4242, draft=True, assets=()):
     }
 
 
+def _json_response(payload, status=200):
+    return status, json.dumps(payload).encode("utf-8")
+
+
+class RefTransport:
+    """Stand-in for the GitHub transport serving git refs and tag objects.
+
+    Unknown paths are the API's genuine 404, so a test can return an auth or
+    server status for a known path and prove it is not read as a missing tag.
+    """
+
+    def __init__(self, responses=None):
+        self.responses = dict(responses or {})
+        self.requests = []
+
+    def __call__(self, method, url, payload=None,
+                 accept="application/vnd.github+json", authenticated=True):
+        self.requests.append((method, url))
+        path = urllib.parse.urlsplit(url).path
+        return self.responses.get(path, (404, b'{"message": "Not Found"}'))
+
+
 class PublicationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -403,6 +425,21 @@ class PublicationTest(unittest.TestCase):
         artifact = self.artifact()
         with self.assertRaisesRegex(publication.PublicationError, "verification failed"):
             publication.verify_package_directory(artifact.root, trusted_key=self.other_pub)
+
+    def test_signed_install_only_artifact_is_not_publishable(self):
+        # The install variant signs the same descriptor class as the release
+        # variant, but its operations stay install-only. Publication must
+        # reject it even though the signature itself verifies.
+        artifact = self.artifact(upgrade=False)
+        package = load_package(
+            artifact.document,
+            artifact.signature.read_bytes(),
+            trusted_key=self.pub,
+        )
+        self.assertEqual(package["operations"], ["install"])
+        with self.assertRaisesRegex(publication.PublicationError, "offline-upgrade"):
+            publication.verify_package_directory(
+                artifact.root, trusted_key=self.pub)
 
     def test_release_tag_safety(self):
         self.assertEqual(publication.release_tag("2026.04.19-rc1"), "2026.04.19-rc1")
@@ -761,11 +798,23 @@ class PublicationTest(unittest.TestCase):
             "path": ".github/workflows/build.yml@refs/heads/main",
         }
         artifacts = {"artifacts": [
-            {"name": "edl-package-7", "expired": False, "size_in_bytes": 4096}]}
+            {"name": "edl-package-7", "expired": False, "size_in_bytes": 4096},
+            {"name": "edl-install-package-7", "expired": False,
+             "size_in_bytes": 8192},
+        ]}
         verified = publication.verify_package_run(
             run, artifacts, run_id=7, repository=REPOSITORY)
         self.assertEqual(verified["artifact"], "edl-package-7")
         self.assertEqual(verified["workflow"], ".github/workflows/build.yml")
+
+        # The install-only artifact never substitutes for the release package.
+        with self.assertRaises(publication.PublicationError):
+            publication.verify_package_run(
+                run,
+                {"artifacts": [
+                    {"name": "edl-install-package-7", "expired": False,
+                     "size_in_bytes": 8192}]},
+                run_id=7, repository=REPOSITORY)
 
         mutations = [
             ("conclusion", "failure"),
@@ -936,6 +985,36 @@ class PublicationTest(unittest.TestCase):
                 workdir=workdir,
             )
 
+    def test_fetch_channel_returns_the_signed_digest_without_a_tag_reference(self):
+        # Promotion of published A must still work after a later build B
+        # re-points the source tag: the signed channel, not the tag, selects
+        # the digest. No expected value is supplied here, exactly as promotion
+        # calls it, so nothing from a moving tag can enter the decision.
+        artifact = self.artifact()
+        source, descriptor_url, signature_url = self._published_channel(artifact)
+        workdir = Path(artifact.root) / "promote-signed"
+        result = publication.fetch_published_channel(
+            source,
+            channel="testing",
+            trusted_key=self.pub,
+            workdir=workdir,
+        )
+        self.assertEqual(result["ociDigest"], artifact.package["ociDigest"])
+        self.assertEqual(result["sourceRevision"], artifact.package["sourceRevision"])
+        self.assertEqual(result["descriptorUrl"], descriptor_url)
+        self.assertEqual(result["signatureUrl"], signature_url)
+
+        # An explicitly supplied tag-derived digest is still checked, which is
+        # why promotion must not pass one: here B's digest rejects signed A.
+        with self.assertRaisesRegex(publication.PublicationError, "resolved source digest"):
+            publication.fetch_published_channel(
+                source,
+                channel="testing",
+                trusted_key=self.pub,
+                expected_digest="sha256:" + "1" * 64,
+                workdir=Path(artifact.root) / "promote-other",
+            )
+
     def test_fetch_channel_rejects_a_withdrawn_channel_before_downloading(self):
         artifact = self.artifact()
         for channel in ("testing", "beta"):
@@ -1048,7 +1127,150 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual([entry[0] for entry in github.ref_writes], ["create"])
 
 
+class ReleaseBindingTest(unittest.TestCase):
+    """Offline checks that a release target is the verified source revision."""
+
+    SOURCE = "a" * 40
+    OTHER = "b" * 40
+    TAG_OBJECT = "c" * 40
+
+    def _ref_path(self, ref):
+        return f"/repos/{REPOSITORY}/git/ref/{ref}"
+
+    def _tag_path(self, sha):
+        return f"/repos/{REPOSITORY}/git/tags/{sha}"
+
+    def _binding(self, responses, release, *, source=SOURCE, tag=RELEASE_TAG):
+        transport = RefTransport(responses)
+        github = publication.GitHub(REPOSITORY, "fixture")
+        with mock.patch.object(publication.GitHub, "_request", transport):
+            result = publication.release_binding(
+                github, tag=tag, release=release, source_revision=source)
+        return result, transport
+
+    def _tag_ref(self, sha, *, kind="commit"):
+        return {self._ref_path(f"tags/{RELEASE_TAG}"): _json_response(
+            {"object": {"type": kind, "sha": sha}})}
+
+    def test_matching_annotated_tag_is_peeled_to_its_commit(self):
+        responses = self._tag_ref(self.TAG_OBJECT, kind="tag")
+        responses[self._tag_path(self.TAG_OBJECT)] = _json_response(
+            {"object": {"type": "commit", "sha": self.SOURCE}})
+        result, transport = self._binding(
+            responses,
+            {"present": True, "isDraft": True, "targetCommitish": self.OTHER},
+        )
+        self.assertTrue(result["tagExists"])
+        self.assertEqual(result["tagCommit"], self.SOURCE)
+        self.assertEqual(result["targetCommit"], self.SOURCE)
+        self.assertEqual(len(transport.requests), 2)
+
+    def test_matching_lightweight_tag_is_its_commit(self):
+        result, _ = self._binding(
+            self._tag_ref(self.SOURCE),
+            {"present": True, "isDraft": False},
+        )
+        self.assertTrue(result["tagExists"])
+        self.assertEqual(result["tagCommit"], self.SOURCE)
+
+    def test_an_existing_tag_at_another_commit_is_never_retargeted(self):
+        for index, release in enumerate((
+            {"present": False},
+            {"present": True, "isDraft": True, "targetCommitish": self.SOURCE},
+            {"present": True, "isDraft": False},
+        )):
+            with self.subTest(case=index):
+                with self.assertRaisesRegex(
+                        publication.PublicationError, "refusing to retarget"):
+                    self._binding(self._tag_ref(self.OTHER), release)
+
+    def test_a_draft_without_a_tag_is_bound_through_target_commitish(self):
+        result, _ = self._binding(
+            {self._ref_path("heads/main"): _json_response(
+                {"object": {"type": "commit", "sha": self.SOURCE}})},
+            {"present": True, "isDraft": True, "targetCommitish": "main"},
+        )
+        self.assertFalse(result["tagExists"])
+        self.assertEqual(result["draftTarget"], "main")
+        self.assertEqual(result["targetCommit"], self.SOURCE)
+
+        # A full SHA needs no ref lookup and must match exactly.
+        exact, transport = self._binding(
+            {},
+            {"present": True, "isDraft": True, "targetCommitish": self.SOURCE},
+        )
+        self.assertEqual(exact["targetCommit"], self.SOURCE)
+        self.assertEqual(
+            [url for _, url in transport.requests],
+            [f"https://api.github.com/repos/{REPOSITORY}/git/ref/tags/{RELEASE_TAG}"],
+        )
+
+        with self.assertRaisesRegex(
+                publication.PublicationError, "draft release"):
+            self._binding(
+                {},
+                {"present": True, "isDraft": True,
+                 "targetCommitish": self.OTHER},
+            )
+        with self.assertRaisesRegex(
+                publication.PublicationError, "target_commitish"):
+            self._binding(
+                {}, {"present": True, "isDraft": True, "targetCommitish": ""})
+
+    def test_missing_tag_is_only_a_genuine_404(self):
+        result, _ = self._binding({}, {"present": False})
+        self.assertEqual(result, {
+            "tag": RELEASE_TAG,
+            "tagExists": False,
+            "tagCommit": None,
+            "targetCommit": None,
+            "sourceRevision": self.SOURCE,
+        })
+        # A permission or server failure is never "the tag does not exist".
+        for status in (401, 403, 500, 502):
+            with self.subTest(status=status):
+                responses = {
+                    self._ref_path(f"tags/{RELEASE_TAG}"):
+                        (status, b'{"message": "denied"}'),
+                }
+                with self.assertRaisesRegex(
+                        publication.PublicationError,
+                        f"failed with HTTP {status}"):
+                    self._binding(responses, {"present": False})
+
+    def test_a_published_release_without_a_tag_is_rejected(self):
+        with self.assertRaisesRegex(publication.PublicationError, "has no git tag"):
+            self._binding({}, {"present": True, "isDraft": False})
+
+    def test_the_source_revision_must_be_an_exact_commit_sha(self):
+        for value in ("a" * 39, "A" * 40, "main", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                        publication.PublicationError, "exact lowercase commit SHA"):
+                    self._binding({}, {"present": False}, source=value)
+
+
 class WorkflowConsistencyTest(unittest.TestCase):
+    def test_edl_package_workflow_builds_two_signed_variants(self):
+        text = (ROOT / ".github/workflows/build-edl-package.yml").read_text(
+            encoding="utf-8")
+        # Both variants must run even if one fails, each on its own runner.
+        self.assertIn("fail-fast: false", text)
+        self.assertIn("matrix:", text)
+        self.assertIn("variant: release", text)
+        self.assertIn("variant: install", text)
+        self.assertIn("artifact: edl-package", text)
+        self.assertIn("artifact: edl-install-package", text)
+        self.assertIn("name: ${{ matrix.artifact }}-${{ github.run_id }}", text)
+        self.assertIn(
+            "group: edl-package-${{ matrix.variant }}-${{ github.ref }}", text)
+        # The selected profile and the expected operation set travel with the
+        # variant; the signing step signs and verifies once per runner.
+        self.assertIn("EDL_PACKAGE_PROFILE: ${{ matrix.profile }}", text)
+        self.assertIn("EXPECT_OFFLINE_UPGRADE: ${{ matrix.offline_upgrade }}", text)
+        self.assertEqual(text.count("cosign sign-blob"), 1)
+        self.assertIn("the signed descriptor is not the expected", text)
+
     def test_publication_workflow_uses_the_package_artifact(self):
         text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
             encoding="utf-8")
@@ -1060,6 +1282,8 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("update-channels", text)
         self.assertNotIn("force: true", text)
         self.assertNotIn("--force", text)
+        # The install-only variant is never consumed by publication.
+        self.assertNotIn("edl-install-package-", text)
 
     def test_promotion_verifies_the_channel_before_tagging(self):
         text = (ROOT / ".github/workflows/promote.yml").read_text(encoding="utf-8")
@@ -1068,6 +1292,21 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn(".github/scripts/publish-signed-channel.sh", text)
         self.assertIn("update-channels", text)
         self.assertIn("target", text)
+
+    def test_promotion_uses_the_signed_digest_not_the_moving_source_tag(self):
+        text = (ROOT / ".github/workflows/promote.yml").read_text(encoding="utf-8")
+        channel = text.index("Verify the published source channel")
+        image = text.index("Verify the source image by digest")
+        tags = text.index("Publish release tags")
+        # The signed channel is read first and supplies the digest; the image
+        # is then inspected by that digest before any tag is written.
+        self.assertLess(channel, image)
+        self.assertLess(image, tags)
+        self.assertNotIn("SOURCE_TAG", text)
+        self.assertNotIn('"docker://${REPO}:${', text)
+        self.assertNotIn("--expected-oci-digest", text)
+        self.assertIn('skopeo inspect "docker://${REPO}@${DIGEST}"', text)
+        self.assertIn('cosign verify --key "${ARMADA_SIGNING_PUBLIC_KEY}" "${REPO}@${DIGEST}"', text)
 
     @staticmethod
     def _step_text(text, name):
@@ -1162,18 +1401,25 @@ class WorkflowConsistencyTest(unittest.TestCase):
             encoding="utf-8")
         # The dedicated credential is optional: a historical build first tries
         # the built-in token, and the dedicated token is supplied to release
-        # creation only when it exists and the build is historical.
+        # creation and draft publication only when it exists and the build is
+        # historical.
         self.assertIn("historical=false", text)
         self.assertIn(
             'if [ "${historical}" = true ] && [ -n "${ARMADA_RELEASE_TOKEN:-}" ]',
             text)
         self.assertIn('create_token="${ARMADA_RELEASE_TOKEN}"', text)
         self.assertIn('GH_TOKEN="${create_token}" gh release create', text)
-        # No pre-emptive requirement to hold the privileged secret, and later
-        # release and channel operations keep the default token.
+        # GitHub's REST update-a-release docs require Workflows write when the
+        # existing target differs in workflow files, so both draft-publication
+        # edits use the same scoped token.
+        self.assertEqual(
+            text.count('GH_TOKEN="${create_token}" gh release edit'), 2)
+        self.assertIn("update-a-release", text)
+        # No pre-emptive requirement to hold the privileged secret; asset
+        # upload, reads, and channel publication keep the default token.
         self.assertNotIn('if [ -z "${ARMADA_RELEASE_TOKEN:-}" ]; then', text)
-        self.assertNotIn('GH_TOKEN="${create_token}" gh release edit', text)
         self.assertNotIn('GH_TOKEN="${create_token}" gh release upload', text)
+        self.assertNotIn('GH_TOKEN="${create_token}" GITHUB_TOKEN=', text)
         # The tag target stays the verified build revision; main is never a
         # fallback target.
         self.assertIn('--target "${SOURCE_REVISION}"', text)
@@ -1226,6 +1472,47 @@ class WorkflowConsistencyTest(unittest.TestCase):
             text.index("Verify the published release"),
             "the public release must be re-verified before the channel moves",
         )
+
+    def test_release_reconciliation_binds_the_tag_before_any_mutation(self):
+        text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
+            encoding="utf-8")
+        view = text.index("release-view")
+        binding = text.index("release-binding")
+        self.assertLess(view, binding)
+        for mutation in (
+            "gh release create",
+            "gh release upload",
+            "gh release edit",
+        ):
+            self.assertLess(
+                binding, text.index(mutation),
+                f"{mutation} must not run before the tag/draft target is bound")
+        # The public release is bound again after publication, before the
+        # channel document is written.
+        verify = text.index("Verify the published release before the channel changes")
+        second = text.index("release-binding", verify)
+        self.assertLess(second, text.index("Publish signed update channel"))
+
+    def test_docs_describe_the_release_binding_and_token_scope(self):
+        english = (ROOT / "docs/edl-package.md").read_text(encoding="utf-8")
+        chinese = (ROOT / "docs/edl-package.zh-CN.md").read_text(encoding="utf-8")
+        for text in (english, chinese):
+            self.assertIn("target_commitish", text)
+            self.assertIn("SOURCE_REVISION", text)
+            self.assertIn("404", text)
+        self.assertIn("update-a-release", english)
+        self.assertIn("`gh release edit --draft=false` paths", english)
+        self.assertIn("两个公开草稿的 `gh release edit --draft=false` 路径", chinese)
+
+    def test_docs_distinguish_release_and_install_only_artifacts(self):
+        english = (ROOT / "docs/edl-package.md").read_text(encoding="utf-8")
+        chinese = (ROOT / "docs/edl-package.zh-CN.md").read_text(encoding="utf-8")
+        for text in (english, chinese):
+            self.assertIn("edl-package-", text)
+            self.assertIn("edl-install-package-", text)
+            self.assertIn("EDL_PACKAGE_PROFILE", text)
+        self.assertIn("install-only", english)
+        self.assertIn("仅首次安装", chinese)
 
     def test_no_shell_interpolation_of_workflow_expressions(self):
         for name in ("promote.yml", "publish-update-channel.yml"):

@@ -39,6 +39,7 @@ BUILD_FILES = REPO_ROOT / "build_files"
 REAL_WRAPPER = BUILD_FILES / "build-edl-package.sh"
 REAL_HELPER = BUILD_FILES / "edl_device_config.py"
 REAL_DEVICES_CONFIG = BUILD_FILES / "edl-devices.json"
+REAL_JUSTFILE = REPO_ROOT / "Justfile"
 
 # An arbitrary ID the copied config is extended with, never shipped by it.
 THIRD_MODEL = "THIRD-DEVICE"
@@ -247,22 +248,86 @@ def _diagnostics(result):
 
 
 class WrapperPreflightTests(unittest.TestCase):
-    def test_authorized_model_list_matches_the_package_contract(self):
-        # The wrapper decides install-only from this list, so it must stay the
-        # same closed set the shipped descriptor contract enforces by default.
+    @staticmethod
+    def _wrapper_models(name):
         match = re.search(
-            r'^readonly AUTHORIZED_MODELS="([^"]*)"$',
+            r'^readonly %s="([^"]*)"$' % name,
             REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n"),
             re.MULTILINE,
         )
-        self.assertIsNotNone(match, "the wrapper must name its authorized models")
+        if match is None:
+            raise AssertionError("the wrapper must define %s" % name)
+        return set(match.group(1).split())
+
+    @staticmethod
+    def _contract_models():
         module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
         sys.path.insert(0, module_root)
         try:
-            from updates.package_contract import AUTHORIZED_MODELS
+            from updates import package_contract
         finally:
             sys.path.remove(module_root)
-        self.assertEqual(set(match.group(1).split()), set(AUTHORIZED_MODELS))
+        return package_contract
+
+    def test_authorized_model_list_matches_the_package_contract(self):
+        # The wrapper passes custom profiles to the descriptor as explicit
+        # install models, so this list must stay the same closed set the
+        # shipped descriptor contract accepts by default.
+        contract = self._contract_models()
+        self.assertEqual(
+            self._wrapper_models("AUTHORIZED_MODELS"),
+            set(contract.AUTHORIZED_MODELS),
+        )
+
+    def test_offline_upgrade_model_list_matches_the_package_contract(self):
+        # The wrapper decides the package-level upgrade claim from this list.
+        contract = self._contract_models()
+        self.assertEqual(
+            self._wrapper_models("OFFLINE_UPGRADE_MODELS"),
+            set(contract.OFFLINE_UPGRADE_MODELS),
+        )
+
+    def test_tb710fu_is_authorized_for_install_only(self):
+        authorized = self._wrapper_models("AUTHORIZED_MODELS")
+        upgrade = self._wrapper_models("OFFLINE_UPGRADE_MODELS")
+        self.assertIn("TB710FU", authorized)
+        self.assertNotIn("TB710FU", upgrade)
+        self.assertEqual(upgrade, {"TB322FC", "TB323FU"})
+        self.assertLessEqual(upgrade, authorized)
+
+    def test_wrapper_gates_both_upgrade_flags_on_the_upgrade_models(self):
+        # Neither the producer bundle flag nor the descriptor flag may depend on
+        # the wider install set: TB710FU is installed but never upgraded.
+        text = REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        for flag in ("producer_args", "descriptor_args"):
+            self.assertIn(
+                "if ((${#upgrade_blocked_models[@]} == 0)); then\n"
+                "    %s+=(--offline-upgrade)" % flag,
+                text,
+            )
+
+    def test_recipe_release_profile_matches_the_wrapper_upgrade_models(self):
+        # The release variant selects exactly the models the wrapper and the
+        # shipped contract allow to advertise offline-upgrade. The universal
+        # default carries no --model, so every configured profile stays in the
+        # install-only artifact.
+        text = REAL_JUSTFILE.read_text(encoding="utf-8").replace("\r\n", "\n")
+        match = re.search(
+            r"^build-edl-package [^\n]*:\n(?P<body>(?:(?:[ \t]+.*)?\n)*)",
+            text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "the Justfile must define build-edl-package")
+        body = match.group("body")
+        models = set(
+            re.findall(r"--model ([A-Za-z0-9][A-Za-z0-9._-]*)", body)
+        )
+        self.assertEqual(models, self._wrapper_models("OFFLINE_UPGRADE_MODELS"))
+        self.assertEqual(
+            models, set(self._contract_models().OFFLINE_UPGRADE_MODELS)
+        )
+        self.assertIn("universal) model_args=()", body)
+        self.assertIn('${model_args[@]+"${model_args[@]}"}', body)
 
     def _assert_stopped_at_docker_preflight(self, fixture, result):
         self.assertEqual(1, result.returncode, _diagnostics(result))

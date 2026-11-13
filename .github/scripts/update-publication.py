@@ -55,6 +55,7 @@ _GITHUB_HOSTS = frozenset((
     "objects.githubusercontent.com",
 ))
 _SAFE_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
+_HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _RESERVED_TAGS = frozenset(("latest",) + CHANNELS)
 _DESCRIPTOR_SUFFIX = ".zip.update.json"
 _PACKAGE_SIDECARS = ("SHA256SUMS",)
@@ -759,9 +760,16 @@ def commit_channel_files(github, files: dict, message: str, *,
     raise PublicationError("the channel branch kept moving; rerun publication")
 
 
-def fetch_published_channel(github, *, channel, trusted_key, expected_digest,
-                            expected_revision, workdir, branch=CHANNEL_BRANCH) -> dict:
-    """Authenticate the published channel and its signed package descriptor."""
+def fetch_published_channel(github, *, channel, trusted_key, workdir,
+                            expected_digest=None, expected_revision=None,
+                            branch=CHANNEL_BRANCH) -> dict:
+    """Authenticate the published channel and its signed package descriptor.
+
+    The signed channel is the source of truth: when ``expected_digest`` or
+    ``expected_revision`` is omitted its recorded values are returned without
+    being compared to a moving image tag.  Promotion uses that digest to
+    inspect the immutable image afterwards.
+    """
     channel = _require_channel(channel)
     # Resolve the branch once so the document and its signature are read from
     # the same immutable commit; two branch reads could pair a new document
@@ -802,11 +810,11 @@ def fetch_published_channel(github, *, channel, trusted_key, expected_digest,
     except CatalogError as exc:
         raise PublicationError(f"package binding failed: {exc}") from exc
 
-    if channel_doc["ociDigest"] != expected_digest:
+    if expected_digest is not None and channel_doc["ociDigest"] != expected_digest:
         raise PublicationError(
             "the published channel does not describe the resolved source digest"
         )
-    if package["sourceRevision"] != expected_revision:
+    if expected_revision is not None and package["sourceRevision"] != expected_revision:
         raise PublicationError(
             "the published channel revision does not match the source image"
         )
@@ -926,6 +934,142 @@ def find_release(github, tag: str):
         page += 1
 
 
+def _require_commit(value, label: str) -> str:
+    if not isinstance(value, str) or not _HEX_COMMIT.fullmatch(value):
+        raise PublicationError(f"{label} is not an exact lowercase commit SHA")
+    return value
+
+
+def _ref_object(github, ref: str, label: str):
+    """Return the object a git ref points at, or None on a genuine 404."""
+    payload = github.get_optional_json(
+        f"/repos/{github.repository}/git/ref/{ref}")
+    if payload is None:
+        return None
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    if not isinstance(obj, dict):
+        raise PublicationError(f"{label} has no target object")
+    return obj
+
+
+def resolve_tag_commit(github, tag: str):
+    """Return the commit an existing tag peels to, or None when it is absent.
+
+    An annotated tag is peeled through ``/git/tags/{sha}`` until a commit is
+    reached, and a lightweight tag is its commit directly.  Only the API's
+    genuine 404 means "no tag": authentication, permission, and server errors
+    propagate instead of being mistaken for a missing tag.
+    """
+    release_tag(tag)
+    obj = _ref_object(github, f"tags/{tag}", f"the {tag} tag")
+    for _ in range(5):
+        if obj is None:
+            return None
+        kind = obj.get("type")
+        sha = obj.get("sha")
+        if kind == "commit":
+            return _require_commit(sha, f"the {tag} tag")
+        if kind != "tag":
+            raise PublicationError(f"the {tag} tag does not point at a commit")
+        _require_commit(sha, f"the {tag} tag object")
+        annotated = github.get_json(
+            f"/repos/{github.repository}/git/tags/{sha}")
+        obj = annotated.get("object") if isinstance(annotated, dict) else None
+        if not isinstance(obj, dict):
+            raise PublicationError(f"the {tag} tag object has no target")
+    raise PublicationError(f"the {tag} tag is nested too deeply to resolve")
+
+
+def _is_tag_name(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and _SAFE_TAG.fullmatch(value) is not None
+        and value not in _RESERVED_TAGS
+        and ".." not in value
+        and not value.endswith((".", ".lock"))
+    )
+
+
+def resolve_draft_target(github, commitish) -> str:
+    """Resolve a draft ``target_commitish`` to one exact commit SHA."""
+    if not isinstance(commitish, str) or not commitish:
+        raise PublicationError("the draft release has no target_commitish")
+    if _HEX_COMMIT.fullmatch(commitish):
+        return commitish
+    # A branch name is the normal target for a draft created in the UI.  An
+    # abbreviated SHA is never accepted as an exact revision.
+    obj = _ref_object(github, f"heads/{commitish}", "the draft target branch")
+    if obj is not None:
+        if obj.get("type") != "commit":
+            raise PublicationError("the draft target branch is not a commit")
+        return _require_commit(obj.get("sha"), "the draft target branch")
+    if _is_tag_name(commitish):
+        peeled = resolve_tag_commit(github, commitish)
+        if peeled is not None:
+            return peeled
+    raise PublicationError(
+        f"the draft target_commitish {commitish!r} does not resolve to a commit")
+
+
+def release_binding(github, *, tag, release, source_revision) -> dict:
+    """Bind a release's Git tag or draft target to the verified revision.
+
+    This performs reads only.  An existing tag must peel to exactly
+    ``source_revision``.  A draft that has no tag yet is bound through its
+    ``target_commitish``, resolved to an exact commit SHA.  Any mismatch raises
+    before an asset or the release itself can be written, so the tag target is
+    never moved.
+    """
+    tag = release_tag(tag)
+    source_revision = _require_commit(
+        source_revision, "the verified source revision")
+    if not isinstance(release, dict) or not isinstance(release.get("present"), bool):
+        raise PublicationError("release metadata must state whether the release exists")
+    if release["present"] and not isinstance(release.get("isDraft"), bool):
+        raise PublicationError(
+            "release metadata must state whether the release is a draft")
+
+    tag_commit = resolve_tag_commit(github, tag)
+    if tag_commit is not None:
+        if tag_commit != source_revision:
+            raise PublicationError(
+                f"the {tag} tag points at {tag_commit}, not the verified source "
+                f"revision {source_revision}; refusing to retarget it")
+        return {
+            "tag": tag,
+            "tagExists": True,
+            "tagCommit": tag_commit,
+            "targetCommit": tag_commit,
+            "sourceRevision": source_revision,
+        }
+
+    if not release["present"]:
+        return {
+            "tag": tag,
+            "tagExists": False,
+            "tagCommit": None,
+            "targetCommit": None,
+            "sourceRevision": source_revision,
+        }
+
+    if release.get("isDraft") is not True:
+        raise PublicationError(f"the published release {tag} has no git tag")
+    commitish = release.get("targetCommitish")
+    target = resolve_draft_target(github, commitish)
+    if target != source_revision:
+        raise PublicationError(
+            f"the draft release {tag} targets {target}, not the verified source "
+            f"revision {source_revision}; refusing to retarget it")
+    return {
+        "tag": tag,
+        "tagExists": False,
+        "tagCommit": None,
+        "draftTarget": commitish,
+        "targetCommit": target,
+        "sourceRevision": source_revision,
+    }
+
+
 def command_release_view(args) -> int:
     tag = release_tag(args.tag)
     github = GitHub(args.repository, _token())
@@ -959,6 +1103,18 @@ def command_release_view(args) -> int:
             "assets": listed,
         }
     _write_json(args.out, result)
+    return 0
+
+
+def command_release_binding(args) -> int:
+    release = _load_json(args.release, "release metadata")
+    github = GitHub(args.repository, _token())
+    _write_json(args.out, release_binding(
+        github,
+        tag=args.tag,
+        release=release,
+        source_revision=args.source_revision,
+    ))
     return 0
 
 
@@ -1068,6 +1224,16 @@ def parser() -> argparse.ArgumentParser:
     view.add_argument("--out", type=Path, default=None)
     view.set_defaults(handler=command_release_view)
 
+    binding = commands.add_parser(
+        "release-binding",
+        help="bind an existing tag or draft target to the verified source revision")
+    binding.add_argument("--repository", required=True)
+    binding.add_argument("--tag", required=True)
+    binding.add_argument("--release", type=Path, required=True)
+    binding.add_argument("--source-revision", required=True)
+    binding.add_argument("--out", type=Path, default=None)
+    binding.set_defaults(handler=command_release_binding)
+
     state = commands.add_parser(
         "release-state", help="compare a verified package with an existing release")
     state.add_argument("--plan", type=Path, required=True)
@@ -1083,8 +1249,8 @@ def parser() -> argparse.ArgumentParser:
     fetch.add_argument("--channel", required=True, choices=CHANNELS)
     fetch.add_argument("--branch", default=CHANNEL_BRANCH)
     fetch.add_argument("--trusted-key", type=Path, default=DEFAULT_TRUSTED_KEY)
-    fetch.add_argument("--expected-oci-digest", required=True)
-    fetch.add_argument("--expected-source-revision", required=True)
+    fetch.add_argument("--expected-oci-digest", default=None)
+    fetch.add_argument("--expected-source-revision", default=None)
     fetch.add_argument("--workdir", type=Path, required=True)
     fetch.add_argument("--out", type=Path, default=None)
     fetch.set_defaults(handler=command_fetch_channel)

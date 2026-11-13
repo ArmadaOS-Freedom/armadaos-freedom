@@ -197,6 +197,17 @@ jobs:
             --repository "${REPOSITORY}" \
             --tag "${TAG}" \
             --out "${SCRATCH}/release.json"
+          # Bind the existing tag, or a draft's target_commitish when the tag
+          # does not exist yet, to the verified build revision before any
+          # asset or release write. An annotated tag is peeled to its commit,
+          # and only a genuine 404 means "no tag"; authentication, permission,
+          # and server failures abort instead. The tag target is never moved.
+          python3 .github/scripts/update-publication.py release-binding \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --release "${SCRATCH}/release.json" \
+            --source-revision "${SOURCE_REVISION}" \
+            --out "${SCRATCH}/release-binding.json"
           # Only assets that actually exist are hashed; missing ones are listed.
           python3 .github/scripts/update-publication.py release-state \
             --plan "${SCRATCH}/plan.json" \
@@ -210,12 +221,14 @@ jobs:
           # GitHub's create-release documentation: the default GITHUB_TOKEN
           # cannot create a release whose tag targets a commit that differs
           # from this workflow run in .github/workflows, because that needs
-          # Workflows write. Historical builds can still succeed with the
-          # built-in token whenever that permission is not required, so the
-          # dedicated token is optional: when present, it is used for release
-          # creation only. It is never used for checkout or artifact
-          # processing, and all later release and channel operations keep the
-          # default token. The tag target is always the verified
+          # Workflows write. The REST update-a-release documentation imposes
+          # the same requirement when publishing an existing historical draft.
+          # Historical builds can still succeed with the built-in token
+          # whenever that permission is not required, so the dedicated token is
+          # optional: when present, it is used for release creation and for
+          # both draft-publication edits below. It is never used for checkout,
+          # artifact processing, asset upload, or channel publication, which
+          # keep the default token. The tag target is always the verified
           # SOURCE_REVISION, never the current branch head.
           historical=false
           if [ "${SOURCE_REVISION}" != "${GITHUB_SHA}" ]; then
@@ -248,7 +261,7 @@ jobs:
               ;;
             matching)
               if [ "$(jq -r '.isDraft' "${SCRATCH}/release.json")" = "true" ]; then
-                gh release edit "${TAG}" \
+                GH_TOKEN="${create_token}" gh release edit "${TAG}" \
                   --repo "${REPOSITORY}" --draft=false
               fi
               ;;
@@ -269,7 +282,7 @@ jobs:
               exit 1
             fi
             gh release upload "${TAG}" --repo "${REPOSITORY}" "${uploads[@]}"
-            gh release edit "${TAG}" \
+            GH_TOKEN="${create_token}" gh release edit "${TAG}" \
               --repo "${REPOSITORY}" --draft=false
           fi
 
@@ -278,6 +291,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.package.outputs.tag }}
+          SOURCE_REVISION: ${{ steps.package.outputs.revision }}
           SCRATCH: ${{ runner.temp }}
         run: |
           set -euo pipefail
@@ -288,6 +302,15 @@ jobs:
             --repository "${REPOSITORY}" \
             --tag "${TAG}" \
             --out "${SCRATCH}/published.json"
+          # The published release's tag must now peel to the verified build
+          # revision as well, so a tag created or moved by anything else is
+          # rejected before the channel moves.
+          python3 .github/scripts/update-publication.py release-binding \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --release "${SCRATCH}/published.json" \
+            --source-revision "${SOURCE_REVISION}" \
+            --out "${SCRATCH}/published-binding.json"
           if [ "$(jq -r '.present' "${SCRATCH}/published.json")" != "true" ]; then
             echo "::error::Release ${TAG} disappeared before the channel update."
             exit 1

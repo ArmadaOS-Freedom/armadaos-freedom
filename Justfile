@@ -403,16 +403,34 @@ build-armada-image $target_image=("localhost/" + image_name) $tag=default_tag: (
 # Build the 9008/EDL package from IMAGE (OCI ref with channel, or an absolute
 # OCI layout directory), DIGEST, REVISION and VERSION; ORIGIN is required for a
 # layout directory. Output: ./output/edl/<version>/
+# EDL_PACKAGE_PROFILE=universal (the default) packages every registered profile;
+# EDL_PACKAGE_PROFILE=release selects only the closed TB322FC/TB323FU pair that
+# may declare offline-upgrade.
 [group('Armada')]
 build-edl-package $image $digest $revision $version $origin="":
     #!/usr/bin/env bash
     set -euo pipefail
 
     source="$(git rev-parse --show-toplevel)"
+    output="${source}/output/edl/${version}"
+
+    # The release profile is the closed, validated set whose models have the
+    # dual-slot offline-upgrade backend. The universal default forwards no
+    # --model, so every registered profile keeps being packaged exactly as
+    # before; any other value fails instead of silently widening the release.
+    profile="${EDL_PACKAGE_PROFILE:-universal}"
+    case "${profile}" in
+        universal) model_args=() ;;
+        release) model_args=(--model TB322FC --model TB323FU) ;;
+        *)
+            echo "Unsupported EDL_PACKAGE_PROFILE '${profile}': expected universal or release." >&2
+            exit 1
+            ;;
+    esac
+
     # The wrapper needs a fresh work path that does not exist yet, so create
     # only the parent; both names are covered by the _build* ignore rule.
     build_parent="$(mktemp -d "${source}/_build-edl.XXXXXX")"
-    output="${source}/output/edl/${version}"
 
     # The wrapper owns Docker, its tools/runtime images, the OCI pull and the
     # volume split; the recipe only supplies the source, work and output paths.
@@ -424,7 +442,8 @@ build-edl-package $image $digest $revision $version $origin="":
         ${origin:+--origin "${origin}"} \
         --source "${source}" \
         --work "${build_parent}/work" \
-        --output "${output}"
+        --output "${output}" \
+        ${model_args[@]+"${model_args[@]}"}
 
 # Build the 9008/EDL package from a locally built image (just build), using the
 # image's own version and revision labels. ORIGIN is the signed origin the

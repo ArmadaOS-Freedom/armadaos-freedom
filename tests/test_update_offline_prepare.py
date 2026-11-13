@@ -331,6 +331,15 @@ class OfflinePrepareTest(unittest.TestCase):
                         self.assertNotEqual(plan["originalBootSha256"][s], plan["newBootSha256"][s])
                     env.assert_untouched()
 
+    def test_tb710fu_physical_model_is_rejected_before_package_use(self) -> None:
+        # TB710FU installs but has no dual-slot backend, so preparation refuses
+        # it even when the package descriptor is otherwise well formed.
+        with self._case(model="TB710FU") as env:
+            with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                env.run()
+            self.assertEqual(str(ctx.exception), "unsupported physical model")
+            env.assert_untouched()
+
     def test_package_authentication_and_up_to_date_gates(self) -> None:
         bad_doc, bad_sig, _ = self._signed_package(priv_key=self.other_priv)
         unsup_doc, unsup_sig, _ = self._signed_package(operations=["install"])

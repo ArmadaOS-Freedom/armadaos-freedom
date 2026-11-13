@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates.package_contract import (
-    AUTHORIZED_MODELS, PackageError, _portable_path, validate_package,
+    AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, _portable_path,
+    validate_package,
 )
 from updates.package_media import _check_unchanged, _open_regular, verify_archive, verify_parts
 from updates.recovery_manifest import validate_recovery_manifest
@@ -287,10 +288,13 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                 raise PackageError(
                     "install_models must name exactly the non-default package models"
                 )
-            if enable_offline_upgrade and custom_models:
+            upgrade_models = tuple(
+                model for model in models if model not in OFFLINE_UPGRADE_MODELS
+            )
+            if enable_offline_upgrade and upgrade_models:
                 raise PackageError(
-                    "offline-upgrade is restricted to the authorized models; "
-                    "build this package install-only"
+                    "offline-upgrade is restricted to the models with the dual-slot "
+                    "backend; build this package install-only"
                 )
 
             if "recoveryManifests" in bundle and not isinstance(bundle["recoveryManifests"], dict):

@@ -4,8 +4,9 @@
 # Builds the tools task image, resolves the OCI input and its embedded EDL
 # runtimes, runs the raw producer with only the loop devices it needs, then
 # splits the archive and publishes the part checksums plus a short bilingual
-# readme. A selected profile outside the shipped package contract is packaged
-# install-only. The source tree is only ever mounted read-only. The tools image
+# readme. A selected profile outside the shipped package contract, or without
+# the dual-slot upgrade backend, is packaged install-only. The source tree is
+# only ever mounted read-only. The tools image
 # tag is task-temporary and is removed again when the wrapper exits.
 set -euo pipefail
 umask 022
@@ -13,12 +14,18 @@ umask 022
 readonly TASK_PREFIX="freedom-edl-package"
 readonly SIGNED_ORIGIN_RE='^ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:(stable|beta|testing)(@sha256:[0-9a-f]{64})?$'
 readonly GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-# Models the shipped package contract accepts. Any other profile registered in
-# the devices config is packaged install-only, and the package-level upgrade
-# capability is requested only when every selected model is in this set.
-# Keep this list in sync with
+# Models the shipped package contract accepts for installation. Any other
+# profile registered in the devices config is packaged install-only and is
+# passed to the descriptor builder as an explicit install model. Keep this
+# list in sync with
 # system_files/usr/lib/armada/updates/package_contract.py.
 readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
+# Models whose installed systems have the physical dual-slot backend the
+# offline upgrade drives. The descriptor carries one package-level operations
+# list, so upgrade is advertised only when every selected model is in this
+# set; TB710FU and any custom model are always install-only. Keep this list in
+# sync with package_contract.py OFFLINE_UPGRADE_MODELS.
+readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -51,8 +58,9 @@ Options:
                             (default: SOURCE/build_files/edl-devices.json)
   --model ID                package only this device profile; repeatable
                             (default: every profile registered in the config;
-                            a profile outside the shipped contract is packaged
-                            install-only)
+                            a profile outside the shipped contract, and any
+                            model without the dual-slot upgrade backend, is
+                            packaged install-only)
   --origin ORIGIN           ostree-image-signed origin; required unless the OCI
                             input is ghcr.io/armadaos-freedom/armadaos-freedom:stable|beta|testing
   --boot-uuid GUID          boot filesystem UUID (default: generated)
@@ -216,12 +224,18 @@ done
 # A profile outside the shipped contract may be packaged for first installation
 # only; it never gains offline-upgrade or recovery. The extra identifiers are
 # passed explicitly to the descriptor builder so the default contract stays
-# closed on devices.
+# closed on devices. A contract model without the dual-slot backend (TB710FU)
+# needs no allowance but still blocks the package-level upgrade claim.
 install_only_models=()
+upgrade_blocked_models=()
 for model_id in "${selected_models[@]}"; do
     case " $AUTHORIZED_MODELS " in
         *" $model_id "*) ;;
         *) install_only_models+=("$model_id") ;;
+    esac
+    case " $OFFLINE_UPGRADE_MODELS " in
+        *" $model_id "*) ;;
+        *) upgrade_blocked_models+=("$model_id") ;;
     esac
 done
 
@@ -517,7 +531,7 @@ producer_args=(
     --work /work/producer
     --out /work/archive
 )
-if ((${#install_only_models[@]} == 0)); then
+if ((${#upgrade_blocked_models[@]} == 0)); then
     producer_args+=(--offline-upgrade)
 fi
 for model_id in "${selected_models[@]}"; do
@@ -525,10 +539,10 @@ for model_id in "${selected_models[@]}"; do
 done
 producer_args+=("${producer_runtime_args[@]}")
 
-if ((${#install_only_models[@]} == 0)); then
+if ((${#upgrade_blocked_models[@]} == 0)); then
     note "producing the raw EDL package for ${selected_models[*]}"
 else
-    note "producing the install-only raw EDL package for ${selected_models[*]}"
+    note "producing the install-only raw EDL package for ${selected_models[*]} (no offline upgrade for ${upgrade_blocked_models[*]})"
 fi
 run_container "$TASK_PREFIX-producer-$run_id" \
     --cpus 4 \
@@ -581,12 +595,14 @@ parts_manifest="$output_dir/$zip_name.parts.json"
 
 update_descriptor="$output_dir/$zip_name.update.json"
 note "producing the unsigned update descriptor $zip_name.update.json"
-# The producer already verified the deployed image carries the normal-Linux
-# updater, so a default-model package may declare both install and
-# offline-upgrade. A package containing a configured custom model is built
-# install-only: the custom identifiers are passed explicitly as trusted
-# install models and the contract still keeps offline-upgrade and recovery
-# restricted to its authorized set.
+# When upgrade is requested, the producer has already verified the deployed
+# image carries the normal-Linux updater. The descriptor format declares
+# operations once per package, so a package may declare install and
+# offline-upgrade only when every selected model has the dual-slot upgrade
+# backend. A package containing TB710FU, or a configured custom model, is built
+# install-only: custom identifiers are passed explicitly as trusted install
+# models and the contract still keeps offline-upgrade and recovery restricted
+# to its authorized set.
 descriptor_args=(
     python3 -B /source/build_files/make-universal-update-descriptor.py make
     --archive "/work/archive/$zip_name"
@@ -594,7 +610,7 @@ descriptor_args=(
     --release-id "$version"
     --output "/output/$zip_name.update.json"
 )
-if ((${#install_only_models[@]} == 0)); then
+if ((${#upgrade_blocked_models[@]} == 0)); then
     descriptor_args+=(--offline-upgrade)
 else
     for model_id in "${install_only_models[@]}"; do
@@ -629,7 +645,7 @@ sys.stdout.write("".join(lines))
 PY
 mv -f -- "$output_dir/.SHA256SUMS.part" "$output_dir/SHA256SUMS"
 
-if ((${#install_only_models[@]} == 0)); then
+if ((${#upgrade_blocked_models[@]} == 0)); then
     descriptor_identity="unsigned install and upgrade identity"
     descriptor_scope_en="The descriptor declares first installation and a normal-Linux offline upgrade
 that keeps user data and both boot slots. That upgrade runs from an installed
@@ -637,10 +653,10 @@ system; memory-rescue tools are not part of this package."
     descriptor_scope_zh="描述文件同时声明首次安装与保留用户数据及两个启动槽的正常 Linux 离线升级；该升级在已安装系统中执行，本包不包含内存救援工具。"
 else
     descriptor_identity="unsigned install-only identity"
-    descriptor_scope_en="The descriptor declares first installation only. The configured custom models
-are outside the authorized offline-upgrade set, so this package advertises no
-upgrade capability and carries no rescue tools."
-    descriptor_scope_zh="描述文件仅声明首次安装。配置的自定义机型不在授权的离线升级范围内，因此本包不声明升级能力，也不包含内存救援工具。"
+    descriptor_scope_en="The descriptor declares first installation only. One or more packaged models
+are outside this package's offline-upgrade support, so this package advertises
+no upgrade capability and carries no rescue tools."
+    descriptor_scope_zh="描述文件仅声明首次安装。本包中至少一个机型不在本包的离线升级支持范围内，因此本包不声明升级能力，也不包含内存救援工具。"
 fi
 
 cat > "$output_dir/README.zh-en.txt" <<EOF

@@ -10,7 +10,14 @@ from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 
 # The shipped package contract. Consumers validate against this closed set by
 # default; only the build host may explicitly add install-only model names.
+# TB710FU installs but has no dual-slot upgrade backend yet, so it is listed
+# here for installation only and never for offline-upgrade or recovery.
 AUTHORIZED_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
+
+# Models whose installed systems have the physical dual-slot backend the
+# offline upgrade drives. A package may advertise offline-upgrade, and carry
+# recovery manifests, only when every supported model is in this set.
+OFFLINE_UPGRADE_MODELS = frozenset(("TB322FC", "TB323FU"))
 _OPERATIONS = frozenset(("install", "offline-upgrade", "decky-repair"))
 _ROLES = frozenset((
     "manifest", "linux-root", "linux-boot", "kernel", "initramfs", "runtime",
@@ -101,11 +108,11 @@ def _manifest_paths(package: dict, files_by_path: dict) -> None:
     recovery = package["recoveryManifests"]
     if not isinstance(recovery, dict) or not set(recovery).issubset(models):
         raise PackageError("recoveryManifests must be an object keyed by a subset of supportedModels")
-    if recovery and not set(models) <= AUTHORIZED_MODELS:
+    if recovery and not set(models) <= OFFLINE_UPGRADE_MODELS:
         raise PackageError(
-            "recoveryManifests are restricted to packages of authorized models"
+            "recoveryManifests are restricted to packages with offline-upgrade support"
         )
-    if not set(recovery) <= AUTHORIZED_MODELS:
+    if not set(recovery) <= OFFLINE_UPGRADE_MODELS:
         raise PackageError("recoveryManifests are restricted to the authorized models")
     model_paths = list(manifests.values())
     recovery_paths = list(recovery.values())
@@ -201,8 +208,8 @@ def _validate(data: dict, install_models=frozenset()) -> None:
     supported = set(data["supportedModels"])
     if not extra_models <= supported:
         raise PackageError("install_models must be listed in supportedModels")
-    if "offline-upgrade" in data["operations"] and not supported <= AUTHORIZED_MODELS:
-        raise PackageError("offline-upgrade is restricted to the authorized models")
+    if "offline-upgrade" in data["operations"] and not supported <= OFFLINE_UPGRADE_MODELS:
+        raise PackageError("offline-upgrade is restricted to models with dual-slot support")
 
     archive = data["archive"]
     _archive_member(archive, "archive", None)

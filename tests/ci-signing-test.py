@@ -92,6 +92,8 @@ def _expr_values():
         "steps.metadata.outputs.tags": "testing",
         "steps.channel.outputs.tag": "testing",
         "steps.channel.outputs.channel": "preview",
+        "steps.channel.outputs.digest": SHA256_DIGEST,
+        "steps.channel.outputs.revision": "0" * 40,
         "steps.chunkah_output.outputs.ref": "oci:/tmp/fixture-runner-temp/chunked",
         "steps.chunkah_config.outputs.base_image": "quay.io/fedora/fedora-bootc@sha256:" + "0" * 64,
         "steps.chunkah_config.outputs.config": "{}",
@@ -281,8 +283,19 @@ JQ_STUB = """#!/usr/bin/env bash
 set -u
 log="${STUB_LOG:?STUB_LOG is required}"
 printf 'jq\\n' >> "$log"
+filter=""
+for arg in "$@"; do
+  case "$arg" in
+    .*) filter="$arg"; break ;;
+  esac
+done
 cat > /dev/null 2>&1 || true
-printf 'true\\n'
+case "$filter" in
+  *.Digest*) printf '%s\\n' "${STUB_DIGEST:?STUB_DIGEST is required}" ;;
+  *org.opencontainers.image.revision*)
+    printf '%s\\n' "${STUB_REVISION:?STUB_REVISION is required}" ;;
+  *) printf 'true\\n' ;;
+esac
 exit 0
 """
 
@@ -396,6 +409,7 @@ class Harness(unittest.TestCase):
         env.update({
             "STUB_LOG": str(self.log),
             "STUB_DIGEST": SHA256_DIGEST,
+            "STUB_REVISION": "0" * 40,
             "STUB_IDENTITY": CANONICAL_IMAGE,
             "STUB_VERIFY_FAIL": "0",
             "COSIGN_PASSWORD": "fixture-password",
@@ -426,7 +440,13 @@ class Harness(unittest.TestCase):
         across steps, so a failing sign or verify aborts before the later
         publish/promotion step can run -- exactly like GitHub's per-step
         shells.
+
+        Step ``env:`` values override the workflow-level ``env:`` defaults, as
+        they do on a runner.  Only keys the caller passed in ``extra_env`` are
+        protected: those simulated secrets and fixture values win over the
+        step, so a case that withholds a value is not undone by the workflow.
         """
+        protected = set(extra_env or {})
         lines = self._dispatch_prelude()
         lines += self._dispatch_assertions()
         lines.append("set -eo pipefail")
@@ -434,12 +454,12 @@ class Harness(unittest.TestCase):
             lines.append(f"# ---- step: {name} ----")
             for key, value in self.workflow.step_env(name).items():
                 rendered = shlex.quote(render(value, overrides))
-                # A variable already supplied by the fixture (a simulated
-                # secret, for instance) wins: those cases test a missing value,
-                # which a rendered step ``env:`` would otherwise restore.
-                lines.append(
-                    f'if [ -z "${{{key}+x}}" ]; then export {key}={rendered}; fi'
-                )
+                if key in protected:
+                    lines.append(
+                        f'if [ -z "${{{key}+x}}" ]; then export {key}={rendered}; fi'
+                    )
+                else:
+                    lines.append(f"export {key}={rendered}")
             lines.append(render(self.workflow.step_script(name), overrides))
         script = "\n".join(lines) + "\n"
         return subprocess.run(
@@ -451,8 +471,59 @@ class Harness(unittest.TestCase):
             stdin=subprocess.DEVNULL,
         )
 
+    def run_step(self, name, overrides=None, extra_env=None):
+        """Run one real step with the same environment rules as run_chain."""
+        return self.run_chain([name], overrides=overrides, extra_env=extra_env)
+
     def commands(self):
         return [line.split() for line in self.log.read_text().splitlines() if line.strip()]
+
+
+WORKFLOW_ENV_FIXTURE = """\
+---
+name: Step env fixture
+on: workflow_dispatch
+env:
+  IMAGE_REGISTRY: ghcr.io/Fixture-Owner
+  IMAGE_NAME: Fixture-Repo
+  WORKFLOW_DEFAULT: workflow-default
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report step env
+        env:
+          WORKFLOW_DEFAULT: step-value
+          STEP_ONLY: step-only
+        run: |
+          printf '%s\\n' "$WORKFLOW_DEFAULT" > "$GITHUB_OUTPUT"
+          printf '%s\\n' "$STEP_ONLY" >> "$GITHUB_OUTPUT"
+"""
+
+
+class StepEnvPrecedenceTest(Harness):
+    """A step ``env:`` value is a runner override, not a default to preserve."""
+
+    def setUp(self):
+        super().setUp()
+        path = self.tmp / "workflow.yml"
+        path.write_text(WORKFLOW_ENV_FIXTURE, encoding="utf-8")
+        self.workflow = Workflow(path)
+
+    def _outputs(self):
+        return (self.tmp / "github_output").read_text().splitlines()
+
+    def test_step_env_overrides_workflow_level_defaults(self):
+        result = self.run_step("Report step env")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._outputs(), ["step-value", "step-only"])
+
+    def test_explicit_extra_env_wins_over_step_env(self):
+        result = self.run_step(
+            "Report step env", extra_env={"WORKFLOW_DEFAULT": "explicit"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._outputs(), ["explicit", "step-only"])
 
 
 # --------------------------------------------------------------------------
@@ -619,7 +690,7 @@ class BuildRepositoryGuardTest(Harness):
 class PromoteGuardTest(Harness):
     workflow = PROMOTE
 
-    CHAIN = ["Prepare environment", "Verify source container signature", "Publish release tags"]
+    CHAIN = ["Prepare environment", "Verify the source image by digest", "Publish release tags"]
 
     def promote_env(self, extra=None):
         env = {"COSIGN_PRIVATE_KEY": PRIVATE_VALUE}
@@ -654,7 +725,7 @@ class PromoteGuardTest(Harness):
         self.assertNotEqual(result.returncode, 0)
         commands = self.commands()
         self.assertNotEqual(first_index(commands, lambda c: c[:2] == ["skopeo", "inspect"]), -1,
-                            "the source digest should have been resolved before verifying")
+                            "the immutable channel digest should have been inspected before verifying")
         verifies = [c for c in tool_calls(commands, "cosign") if c[1:2] == ["verify"]]
         self.assertTrue(verifies)
         self.assertTrue(all(arg_value(v, "--key") == SIGNING_PUBLIC_KEY for v in verifies),

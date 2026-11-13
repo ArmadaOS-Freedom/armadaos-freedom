@@ -99,28 +99,48 @@ def _rebind(desc, model, doc):
 
 
 class BuilderRecoveryTests(unittest.TestCase):
-    def test_valid_two_and_three_models_enable(self):
-        for models in (("TB322FC", "TB323FU"), ("TB322FC", "TB323FU", "TB710FU")):
-            with self.subTest(models=models), tempfile.TemporaryDirectory() as tmp:
-                tmp_dir = Path(tmp)
-                archive, desc = _recovery_archive(tmp_dir, models, enable=True)
-                self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
-                self.assertEqual(desc["supportedModels"], list(models))
-                self.assertEqual(set(desc["recoveryManifests"]), set(models))
-                self.assertEqual(validate_package(desc), desc)
-                by_path = {f["path"]: f for f in desc["files"]}
-                # shared recovery initramfs indexed exactly once
-                matches = [f for f in desc["files"] if f["path"] == "recovery/common/initramfs.img"]
-                self.assertEqual(len(matches), 1)
-                self.assertEqual(matches[0]["role"], "recovery")
-                self.assertEqual(matches[0]["sha256"], _sha256(REC_INITRAMFS))
-                for model in models:
-                    dtb = by_path[f"recovery/{model}/recovery.dtb"]
-                    self.assertEqual(dtb["role"], "recovery")
-                    self.assertEqual(dtb["sha256"], _sha256(f"recovery-dtb-{model}".encode()))
-                    self.assertEqual(by_path[f"recovery/{model}/recovery.json"]["role"], "manifest")
-                    self.assertEqual(by_path[f"packages/{model}/runtime/runtime.img"]["role"], "runtime")
-                    self.assertEqual(by_path["common/boot/Image"]["role"], "kernel")
+    def test_valid_two_models_enable(self):
+        models = ("TB322FC", "TB323FU")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            archive, desc = _recovery_archive(tmp_dir, models, enable=True)
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
+            self.assertEqual(desc["supportedModels"], list(models))
+            self.assertEqual(set(desc["recoveryManifests"]), set(models))
+            self.assertEqual(validate_package(desc), desc)
+            by_path = {f["path"]: f for f in desc["files"]}
+            # shared recovery initramfs indexed exactly once
+            matches = [f for f in desc["files"] if f["path"] == "recovery/common/initramfs.img"]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["role"], "recovery")
+            self.assertEqual(matches[0]["sha256"], _sha256(REC_INITRAMFS))
+            for model in models:
+                dtb = by_path[f"recovery/{model}/recovery.dtb"]
+                self.assertEqual(dtb["role"], "recovery")
+                self.assertEqual(dtb["sha256"], _sha256(f"recovery-dtb-{model}".encode()))
+                self.assertEqual(by_path[f"recovery/{model}/recovery.json"]["role"], "manifest")
+                self.assertEqual(by_path[f"packages/{model}/runtime/runtime.img"]["role"], "runtime")
+                self.assertEqual(by_path["common/boot/Image"]["role"], "kernel")
+
+    def test_tb710fu_recovery_materials_are_rejected(self):
+        # TB710FU has no RAM rescue backend; recovery manifests are restricted
+        # to the models whose physical slots support the upgrade.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = BASE._make_bundle(
+                Path(tmp),
+                models=("TB322FC", "TB710FU"),
+                mutate=make_recovery_mutate(("TB322FC", "TB710FU")),
+            )
+            with self.assertRaisesRegex(
+                PackageError, "recoveryManifests are restricted"
+            ):
+                builder.build_descriptor(archive, release_id="rel-gt")
+            with self.assertRaisesRegex(
+                PackageError, "offline-upgrade is restricted"
+            ):
+                builder.build_descriptor(
+                    archive, release_id="rel-gt", enable_offline_upgrade=True
+                )
 
     def test_positive_noop_hook_with_enable(self):
         def noop_hook(bundle, members, docs, rec_map):
@@ -223,7 +243,7 @@ class BuilderRecoveryTests(unittest.TestCase):
 
     def test_invalid_recovery_manifests_maps(self):
         def unknown_model(b, z, d, r):
-            r["TB710FU"] = "recovery/TB710FU/recovery.json"
+            r["UNKNOWN"] = "recovery/UNKNOWN/recovery.json"
 
         def duplicate_path(b, z, d, r):
             r["TB323FU"] = r["TB322FC"]
@@ -409,7 +429,7 @@ class DirectValidateTests(unittest.TestCase):
                 with self.subTest(doc=type(bad_doc).__name__):
                     with self.assertRaises(PackageError):
                         validate_recovery_manifest(bad_doc, desc, "TB322FC")
-            for bad_model in (None, 1, b"TB322FC", "TB710FU"):
+            for bad_model in (None, 1, b"TB322FC", "UNKNOWN"):
                 with self.subTest(model=bad_model):
                     with self.assertRaises(PackageError):
                         validate_recovery_manifest(doc, desc, bad_model)

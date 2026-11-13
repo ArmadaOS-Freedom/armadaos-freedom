@@ -45,11 +45,23 @@ labels must match `REVISION` and `VERSION`. The build stops on a mismatch.
 A channel name or tag is not a version, and an older commit may not be paired
 with a newer image.
 
-The recipe takes exactly these four positional arguments and forwards no model
-or configuration options, so it packages every profile registered in
-`build_files/edl-devices.json`. It writes the package to `output/edl/<version>/`
-and uses a fresh `_build-edl.*` work directory under the checkout, which is
-ignored by Git.
+The recipe takes these four positional arguments and, by default, forwards no
+model or configuration options, so it packages every profile registered in
+`build_files/edl-devices.json` exactly as before. Because that set includes
+`TB710FU`, the default package is install-only. Setting
+`EDL_PACKAGE_PROFILE=release` selects the closed, validated pair `TB322FC` and
+`TB323FU` instead; that is the only profile that may declare offline-upgrade.
+Any other value fails before the build starts. It writes the package to
+`output/edl/<version>/` and uses a fresh `_build-edl.*` work directory under
+the checkout, which is ignored by Git.
+
+```console
+$ EDL_PACKAGE_PROFILE=release just build-edl-package \
+    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
+    sha256:DIGEST \
+    FULL_SOURCE_COMMIT \
+    EXACT_OCI_VERSION
+```
 
 To package a subset, or to use another configuration file, call the wrapper
 directly with the same four values:
@@ -192,18 +204,31 @@ does not silently refresh the bundled contents later.
 
 The build also runs automatically. On `main`, the `build_edl_package` job in
 [`Build images`](../.github/workflows/build.yml) follows the container image
-job and builds the EDL package from the image it just pushed, using the
-`testing` channel, that image's digest, its actual source revision, and its
-`org.opencontainers.image.version` label. The package is uploaded as the
-`edl-package-<run id>` workflow artifact and stays there until an operator
-publishes it; no release and no update channel changes automatically. The SD
-image path remains available; its automatic R2 publication is enabled
-separately as described below.
+job and builds two EDL package variants from the image it just pushed, using
+the `testing` channel, that image's digest, its actual source revision, and its
+`org.opencontainers.image.version` label. The two variants run on separate
+runners with independent checkouts, work directories, output directories, and
+signatures:
+
+- `edl-package-<run id>` is built with `EDL_PACKAGE_PROFILE=release`, so it
+  contains only `TB322FC` and `TB323FU`. Its signed descriptor declares both
+  `install` and `offline-upgrade`. This is the official multi-model update
+  artifact and the only artifact **Publish update channel** accepts.
+- `edl-install-package-<run id>` is built with the universal default, so it
+  contains every registered profile, including `TB710FU`. Its signed descriptor
+  declares `install` only. Use it for first installation with the Windows
+  installer; it is never published to an update channel.
+
+Both artifacts stay in the workflow run until an operator publishes the release
+artifact; no release and no update channel changes automatically. The SD image
+path remains available; its automatic R2 publication is enabled separately as
+described below.
 
 [`Build EDL package`](../.github/workflows/build-edl-package.yml) can also be
 started by hand. It takes the same four values as the recipe, checks out the
-requested revision with submodules, and uploads the split volumes, `parts.json`,
-`SHA256SUMS`, and the package README as a workflow artifact.
+requested revision with submodules, and runs the same two variants, uploading
+each split package, `parts.json`, `SHA256SUMS`, and the package README under its
+own artifact name.
 
 ## Publish an update channel
 
@@ -220,8 +245,10 @@ The flow is build, publish testing, then promote.
 1. Build the package: `Build images` on `main`, or `Build EDL package` by hand.
 2. Run **Publish update channel** with the completed run ID and `testing`. It
    checks that the run belongs to this repository, that it completed
-   successfully, and that it produced `edl-package-<run id>`. It then verifies
-   the descriptor signature, the split parts, the parts manifest, the
+   successfully, and that it produced `edl-package-<run id>`. The install-only
+   `edl-install-package-<run id>` artifact is not accepted, even though its
+   descriptor is signed, because it does not declare `offline-upgrade`. It then
+   verifies the descriptor signature, the split parts, the parts manifest, the
    `offline-upgrade` capability, and that the OCI digest resolves to the signed
    image built from the descriptor's source revision. It creates the draft
    release `<releaseId>`, uploads the split parts, the parts manifest, the
@@ -229,11 +256,15 @@ The flow is build, publish testing, then promote.
    every asset is present, and only then signs and commits `testing.json` with
    `testing.json.sig`.
 3. Run **Promote release** with `source: testing` and `target: beta` or
-   `stable`. Promotion reads the same signed channel, requires the source tag to
-   resolve to that exact digest and to that image revision, and publishes the
-   target channel pointing at the same release assets. Nothing is rebuilt, and
-   a source tag without a matching signed channel publication fails before any
-   tag is written.
+   `stable`. Promotion first verifies the published source channel and its
+   descriptor signature, then takes the immutable OCI digest recorded in that
+   channel, inspects the image at that digest, and requires its revision label
+   and Cosign signature to match before writing any tag. The moving `:testing`
+   tag is never read, so a newer build that re-pointed the source tag does not
+   block promoting the older release the channel still names. The target
+   channel then points at the same release assets. Nothing is rebuilt, and a
+   source channel without a valid signed publication fails before any tag is
+   written.
 
 Nothing is replaced in place. A published release must match the verified
 package exactly, while an existing draft — even an empty one — is completed:
@@ -243,20 +274,30 @@ differs fails the run. The channel document and its signature reach the
 `update-channels` branch as one commit per channel; updates are serialized and
 never force-pushed.
 
+Before a release is created, resumed, or published, its Git tag is bound to the
+verified `SOURCE_REVISION`. An existing tag is resolved to the commit it peels
+to, including an annotated tag; a missing tag counts as absent only when GitHub
+returns a genuine 404, never on an authentication, permission, or server error.
+A draft that has no tag yet is bound through its `target_commitish`, resolved
+to an exact commit SHA. Any mismatch stops the run before an asset or the
+release is written, and the tag target is never changed.
+
 Publishing a build from the current commit keeps using the workflow's
 `GITHUB_TOKEN`. For a historical build the release tag targets a commit that
 can differ from the workflow run; GitHub's create-release documentation states
 that `GITHUB_TOKEN` cannot create such a release when that commit changes
-`.github/workflows`, because it never holds Workflows write. The optional
-`ARMADA_RELEASE_TOKEN` secret is used only for that historical
-`gh release create`. When it is configured, that step uses it; when it is not,
-the step attempts `GITHUB_TOKEN`, which may succeed where GitHub permits it.
-If GitHub denies that permission and the workflow contents differ between the
-tag target and the run, a dedicated token with **Contents** and **Workflows**
-write is required. Publishing the draft release afterwards, and checkout,
-artifact download, verification, asset upload, and channel publication, all
-keep `GITHUB_TOKEN` without retargeting. The tag target is always the verified
-build revision — never the current branch head.
+`.github/workflows`, because it never holds Workflows write. The official REST
+update-a-release documentation imposes the same requirement when an existing
+historical draft is published. The optional `ARMADA_RELEASE_TOKEN` secret is
+used for that historical `gh release create` and for both
+`gh release edit --draft=false` paths that publish a draft. When it is
+configured, those steps use it; when it is not, they attempt `GITHUB_TOKEN`,
+which may succeed where GitHub permits it. If GitHub denies that permission and
+the workflow contents differ between the tag target and the run, a dedicated
+token with **Contents** and **Workflows** write is required. Checkout, artifact
+download, verification, release reads, asset upload, and channel publication
+all keep `GITHUB_TOKEN` without retargeting. The tag target is always the
+verified build revision — never the current branch head.
 
 ## Package layout
 
@@ -332,7 +373,9 @@ GHCR packages must be public and grant this repository Actions access. The
 workflow checks anonymous image access before publishing channel tags. A
 built package stays in its `edl-package-<run-id>` artifact until **Publish
 update channel** turns it into a release and a signed `testing` channel; beta
-and stable follow only through **Promote release**. The shipped
+and stable follow only through **Promote release**. The install-only
+`edl-install-package-<run-id>` artifact is kept for first installation only and
+never becomes a channel document. The shipped
 `system_files/etc/armada/updates/channels.json` names all three channels, and
 each becomes usable only once its document exists on the `update-channels`
 branch. Legacy disk-image publication to R2 is opt-in: set the repository
@@ -355,8 +398,11 @@ and SHA-256 digests. Shared system files are listed once.
 The local wrapper leaves this descriptor unsigned. The EDL Actions workflow
 signs its original UTF-8 bytes with the release key, verifies the result with
 the fixed public key, and uploads .zip.update.json.sig alongside the volumes.
-SHA256SUMS and parts.json do not replace this signature. A downloaded public
-key supplied by the package cannot establish trust in that package.
+Each matrix variant signs its own descriptor on its own runner: the release
+variant must verify as install and offline-upgrade, and the install variant as
+install-only, before either artifact is uploaded. SHA256SUMS and parts.json do
+not replace this signature. A downloaded public key supplied by the package
+cannot establish trust in that package.
 
 The producer checks that the deployed image carries the normal-Linux updater and
 then declares both install and offline-upgrade; a package built from an image
