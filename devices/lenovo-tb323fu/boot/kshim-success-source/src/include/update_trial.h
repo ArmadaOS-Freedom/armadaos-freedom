@@ -40,7 +40,9 @@
  * byte EMPTY_MARKER_OFFSET == EMPTY_MARKER_BYTE.  The marker can never be
  * decoded as a record (its stored CRC stays zero while the computed CRC over
  * the marked body is not) and is only recognised in copy B, only after a real
- * record failed to select, and only when copy A is blank or CRC-damaged.  A
+ * record failed to select, and only when copy A is blank or CRC-damaged.  An
+ * exact marker in copy A is itself an error: the sentinel belongs to copy B
+ * alone, so a marker pair is never treated as empty.  A
  * complete CRC-valid image, a foreign/incompatible record, a conflicting pair
  * or any other non-marker pair stays an error.  The marker exists only in the
  * window between the initial anchor write and the second journal write, so it
