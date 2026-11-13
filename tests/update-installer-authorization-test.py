@@ -270,6 +270,44 @@ class AuthorizationTests(unittest.TestCase):
             self.authorize()
         self.assertFalse(os.path.exists(self.ssh_dir))
 
+    def test_existing_exact_entry_repairs_mode_and_flushes_file_and_dir_on_retry(self):
+        self.make_ssh()
+        ssh_ino = os.lstat(self.ssh_dir).st_ino
+        real_fsync = os.fsync
+        events = []
+        armed = {"fail_dir": True}
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                if st.st_ino == ssh_ino:
+                    events.append("dir")
+                    if armed["fail_dir"]:
+                        raise OSError(5, "simulated ssh directory flush failure")
+            else:
+                events.append("file")
+            return real_fsync(fd)
+
+        with mock.patch.object(auth.os, "fsync", side_effect=fsync):
+            # The rename lands but the .ssh flush fails, so the entry is
+            # visible without being durable and the attempt must fail.
+            with self.assertRaisesRegex(auth.AuthorizationError, "flush"):
+                self.authorize()
+            with open(self.auth_path, "rb") as stream:
+                self.assertEqual(stream.read(), (EXPECTED_ENTRY + "\n").encode("ascii"))
+
+            os.chmod(self.auth_path, 0o644)
+            events.clear()
+            armed["fail_dir"] = False
+            # The retry finds the exact entry and must still fix the mode and
+            # flush both the file and .ssh before reporting success.
+            self.authorize()
+
+        self.assertEqual(events, ["file", "dir"])
+        self.assertEqual(stat.S_IMODE(os.lstat(self.auth_path).st_mode), 0o600)
+        with open(self.auth_path, "rb") as stream:
+            self.assertEqual(stream.read(), (EXPECTED_ENTRY + "\n").encode("ascii"))
+
     def test_ssh_directory_home_flush_failure_propagates_and_retries_flush_again(self):
         home_ino = os.lstat(self.home).st_ino
         real_fsync = os.fsync

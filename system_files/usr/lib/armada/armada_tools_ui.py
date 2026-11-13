@@ -79,6 +79,7 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.updating = False
         self.job = backend.CommandJob()
         self.result = ""
+        self.error = ""
         self.channels = []
         self.confirmation = None
         self.watch_id = None
@@ -189,10 +190,12 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.update.set_tooltip_text("Restart to apply the queued OS changes" if reboot_ready
                                      else "Install the latest OS version from the selected channel")
         self.update.set_sensitive(idle and (reboot_ready or update_allowed))
-        if state.get("update_message"):
+        if self.error:
+            # A failed request stays visible until the next request, even while
+            # the service keeps reporting its previous outcome.
+            self.show_message(self.error)
+        elif state.get("update_message"):
             self.show_message(state["update_message"])
-        elif self.result:
-            self.show_message(self.result)
         elif state["rollback_queued"]:
             self.show_message("A rollback may be pending, but it is unverified. Repair or verify the OS state before restarting.")
         elif state.get("update_target"):
@@ -206,19 +209,29 @@ class UpdatesGroup(Adw.PreferencesGroup):
             else:
                 self.show_message(
                     f"Unsupported pending update from {state['staged']['image']}.")
+        elif self.result:
+            # Informational results never displace newer state from the service.
+            self.show_message(self.result)
         else:
             self.show_message("")
         if hasattr(self.window, "repair_button"):
             self.window.set_steam_sensitive(idle and not self.window.repair_running)
-        if state.get("update_busy", False):
+        if state.get("update_busy", False) or self.awaiting_confirmation(state):
             self.start_watch()
         else:
             self.stop_watch()
+
+    @staticmethod
+    def awaiting_confirmation(state):
+        # An update trial confirmed outside this window only becomes reboot
+        # ready later, so keep polling until that state resolves.
+        return (state.get("update") or {}).get("state") == "awaiting_confirmation"
 
     def request(self, action, *arguments):
         if self.state is None or self.requesting or self.loading or self.window.repair_running:
             return
         self.result = ""
+        self.error = ""
         if action in {"update-os", "rollback-os"}:
             self.operation = OperationDialog(self.window, "OS Update" if action == "update-os" else "OS Rollback",
                                              on_restart=self.confirm_restart)
@@ -232,7 +245,7 @@ class UpdatesGroup(Adw.PreferencesGroup):
         else:
             def completed(result, error):
                 self.requesting = False
-                self.result = error or ""
+                self.error = error or ""
                 self.refresh()
                 return GLib.SOURCE_REMOVE
             self.window.background(lambda: backend.privileged_request(action, *arguments), completed)

@@ -791,6 +791,35 @@
       return compData;
     }
 
+    function completedResult(comp, compData, jobId) {
+      var completed = compData.completed;
+      if (!completed || typeof completed !== 'object' || Array.isArray(completed)) return null;
+      var result = completed[jobId];
+      if (!result || typeof result !== 'object' || Array.isArray(result) ||
+          result.component !== comp || typeof result.state !== 'string' || result.state.length === 0) {
+        return null;
+      }
+      return result;
+    }
+
+    function setComponentState(comp, compData, result) {
+      state[comp] = {
+        component: comp,
+        busy: compData.busy === true,
+        jobId: compData.jobId,
+        operation: compData.operation,
+        state: result.state,
+        phase: result.phase,
+        currentVersion: result.currentVersion,
+        targetVersion: result.targetVersion,
+        requiresReboot: result.requiresReboot,
+        channel: result.channel,
+        error: result.error,
+        progressPercent: result.progressPercent,
+        localError: false
+      };
+    }
+
     function handleBackendComponent(comp, compData) {
       try {
         validateComponent(comp, compData);
@@ -799,31 +828,31 @@
         return;
       }
       var expected = pendingJob[comp];
-      if (!expected && state[comp] && state[comp].localError) return;
-      var matched = false;
-      if (expected) {
-        if (compData.jobId !== expected.id) return;
-        matched = true;
-        if (compData.busy === false) pendingJob[comp] = null;
-      } else if (pendingAction[comp]) {
+      if (!expected) {
+        if (state[comp] && state[comp].localError) return;
+        if (pendingAction[comp]) return;
+      } else if (compData.jobId !== expected.id) {
+        // The expected job is no longer current. Its own outcome can only be
+        // read from the retained history, never from the job that replaced it.
+        // Consume it as soon as it appears, even while a newer job is running,
+        // so evicting it from history later cannot leave it pending forever.
+        var finished = completedResult(comp, compData, expected.id);
+        if (finished) pendingJob[comp] = null;
+        if (compData.busy === true) {
+          // A newer job owns the component now: keep it visibly busy without
+          // presenting its result as the expected job's outcome.
+          setComponentState(comp, compData, {
+            component: comp, state: 'running', phase: compData.operation, requiresReboot: false
+          });
+          return;
+        }
+        if (!finished) return;
+        setComponentState(comp, compData, finished);
         return;
+      } else if (compData.busy === false) {
+        pendingJob[comp] = null;
       }
-      var res = compData.result;
-      state[comp] = {
-        component: comp,
-        busy: compData.busy,
-        jobId: compData.jobId,
-        operation: compData.operation,
-        state: res.state,
-        phase: res.phase,
-        currentVersion: res.currentVersion,
-        targetVersion: res.targetVersion,
-        requiresReboot: res.requiresReboot,
-        channel: res.channel,
-        error: res.error,
-        progressPercent: res.progressPercent,
-        localError: false
-      };
+      setComponentState(comp, compData, compData.result);
     }
 
     function checkReadOnlyInitial() {

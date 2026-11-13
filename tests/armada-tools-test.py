@@ -139,6 +139,14 @@ class ToolsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Unit sshd.service is masked"):
                 bridge.request(["enable-ssh"])
 
+    def test_channel_request_outlasts_the_service_wait(self):
+        with patch.object(backend.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, stdout="{}")) as run:
+            backend.privileged_request("channel-beta")
+            self.assertTrue(120 < run.call_args.kwargs["timeout"] <= 180)
+            backend.privileged_request("get-os")
+            self.assertEqual(run.call_args.kwargs["timeout"], 90)
+
     def test_ssh_toggle_is_persistent(self):
         with patch.object(bridge.armada_os, "command") as command, \
                 patch.object(bridge.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):

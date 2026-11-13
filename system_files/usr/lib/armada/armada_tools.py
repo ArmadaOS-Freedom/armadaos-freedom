@@ -10,6 +10,10 @@ import sys
 
 PRIVILEGED_HELPER = "/usr/libexec/armada/armada-tools-priv"
 TOOLS = "/usr/bin/armada-tools"
+PRIVILEGED_TIMEOUT = 90
+# The helper waits up to 120 s for the update service to finish a channel
+# change, so the desktop side must outlast that wait.
+CHANNEL_TIMEOUT = 150
 
 
 def privileged_command(action, *arguments):
@@ -21,8 +25,9 @@ def privileged_operation(action, *arguments):
 
 
 def privileged_request(action, *arguments):
+    timeout = CHANNEL_TIMEOUT if action.startswith("channel-") else PRIVILEGED_TIMEOUT
     result = subprocess.run(privileged_command(action, *arguments),
-                            capture_output=True, text=True, timeout=90, check=False)
+                            capture_output=True, text=True, timeout=timeout, check=False)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Armada Tools operation failed")
     return json.loads(result.stdout)

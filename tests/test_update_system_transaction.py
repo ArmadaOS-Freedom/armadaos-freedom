@@ -522,31 +522,57 @@ class SystemTransactionTests(unittest.TestCase):
             running = 'ab'[case.current]
             inactive = 'ab'[1 - case.current]
             running_before = self._boot_bytes(case, running, 512)
+            running_part = case.trust['sources']['partitions']['boot_%s' % running]
+            inactive_part = case.trust['sources']['partitions']['boot_%s' % inactive]
+            running_offset = running_part['firstLba'] * 512
+            inactive_offset = inactive_part['firstLba'] * 512
+            candidate = Path(candidates[running]['candidate']['path']).read_bytes()
             real_pwrite = offline_boot_writer._pwrite_all
-            calls = {'n': 0}
+            attempts = []
 
             def failing_pwrite(fd, data, offset):
-                calls['n'] += 1
-                if calls['n'] == 2:
+                attempts.append((offset, bytes(data)))
+                # The writer retries a running-extent failure exactly once
+                # after the durable journal commit.  Fail both the initial
+                # attempt and that sole retry so the failure stays permanent.
+                if len(attempts) in (2, 3):
                     raise offline_boot_writer.BootWriteError(
                         'simulated running-slot failure')
                 return real_pwrite(fd, data, offset)
 
             stack.enter_context(mock.patch.object(
                 offline_boot_writer, '_pwrite_all', side_effect=failing_pwrite))
-            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+            with self.assertRaisesRegex(
+                    tx_mod.SystemTransactionError,
+                    'failed twice after the durable journal commit') as ctx:
                 self._run(sysroot, work)
             res = ctx.exception.result
             self.assertEqual(res['state'], 'recovery_required')
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'written')
             self.assertEqual(res['journalCommitState'], 'committed')
+            self.assertEqual(res['slotControlState'], 'not_issued')
             self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(res['slotResults'][inactive]['readbackSha256'],
+                             candidates[inactive]['candidate']['sha256'])
             self.assertEqual(res['slotResults'][running]['status'], 'writing')
             self.assertEqual(self._boot_bytes(case, running, 512), running_before)
             self.assertEqual(
                 self._boot_bytes(case, inactive, 512),
                 Path(candidates[inactive]['candidate']['path']).read_bytes())
+
+            # One write to the alternate extent, then at most two attempts on
+            # the running extent: the initial one and its single retry, with
+            # identical bytes at the same offset.
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(attempts[0][0], inactive_offset)
+            self.assertEqual([attempt[0] for attempt in attempts[1:]],
+                             [running_offset, running_offset])
+            self.assertEqual(attempts[1][1], candidate)
+            self.assertEqual(attempts[2], attempts[1])
+
+            # No Android slot selection, success marking or restart request.
+            self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
             record = store.load(
                 case.journal.fd, case.journal.part, case.board).record
             self.assertEqual(record.state, rec.PREPARED)
@@ -754,19 +780,28 @@ class SystemTransactionTests(unittest.TestCase):
             running = 'ab'[case.current]
             inactive = 'ab'[1 - case.current]
             running_before = self._boot_bytes(case, running, 512)
+            running_part = case.trust['sources']['partitions']['boot_%s' % running]
+            inactive_part = case.trust['sources']['partitions']['boot_%s' % inactive]
+            running_offset = running_part['firstLba'] * 512
+            inactive_offset = inactive_part['firstLba'] * 512
+            candidate = Path(candidates[running]['candidate']['path']).read_bytes()
             real_pwrite = offline_boot_writer._pwrite_all
-            calls = {'n': 0}
+            attempts = []
 
             def failing_pwrite(fd, data, offset):
-                calls['n'] += 1
-                if calls['n'] == 2:
+                attempts.append((offset, bytes(data)))
+                # Same bounded retry as the online path: fail the initial
+                # running-extent attempt and its sole retry.
+                if len(attempts) in (2, 3):
                     raise offline_boot_writer.BootWriteError(
                         'simulated rollback running-slot failure')
                 return real_pwrite(fd, data, offset)
 
             stack.enter_context(mock.patch.object(
                 offline_boot_writer, '_pwrite_all', side_effect=failing_pwrite))
-            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+            with self.assertRaisesRegex(
+                    tx_mod.SystemTransactionError,
+                    'failed twice after the durable journal commit') as ctx:
                 tx_mod.run_rollback_transaction(
                     expected_checksum='a' * 64, sysroot_path=sysroot, work_dir=work)
             res = ctx.exception.result
@@ -774,11 +809,28 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'written')
             self.assertEqual(res['journalCommitState'], 'committed')
+            self.assertEqual(res['slotControlState'], 'not_issued')
             self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(res['slotResults'][inactive]['readbackSha256'],
+                             candidates[inactive]['candidate']['sha256'])
+            self.assertEqual(res['slotResults'][running]['status'], 'writing')
             self.assertEqual(self._boot_bytes(case, running, 512), running_before)
             self.assertEqual(
                 self._boot_bytes(case, inactive, 512),
                 Path(candidates[inactive]['candidate']['path']).read_bytes())
+
+            # One write to the alternate extent, then at most two attempts on
+            # the running extent: the initial one and its single retry, with
+            # identical bytes at the same offset.
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(attempts[0][0], inactive_offset)
+            self.assertEqual([attempt[0] for attempt in attempts[1:]],
+                             [running_offset, running_offset])
+            self.assertEqual(attempts[1][1], candidate)
+            self.assertEqual(attempts[2], attempts[1])
+
+            # No Android slot selection, success marking or restart request.
+            self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
             record = store.load(case.journal.fd, case.journal.part, case.board).record
             self.assertEqual(record.state, rec.PREPARED)
             self.assertEqual(record.old_commit, bytes.fromhex('b' * 64))
@@ -828,6 +880,54 @@ class SystemTransactionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 trial_confirmation, '_finalize_deployment', return_value={}))
 
+            # Each deployment must repack its own candidate bytes from the
+            # boot images that are live at that step, with a claim that
+            # matches the written file exactly.  Reusing one static fixture
+            # per slot would let a stale image pass as the new deployment.
+            initial_boot = {slot: self._boot_bytes(case, slot, 512) for slot in SLOTS}
+            builds = {}
+
+            def build_candidate(**kw):
+                slot = kw['slot']
+                deployment = kw['materials']['deployment']
+                source = self._boot_bytes(case, slot, 512)
+                buf = bytearray(source)
+                seed = hashlib.sha256(
+                    ('%s/%s' % (deployment, slot)).encode('ascii')).digest()
+                # The fixture boot image has a fixed size and the native slot
+                # inspection derives the bootability witness from its header
+                # magic.  Only the tail payload may vary: XORing the leading
+                # bytes would leave the next inspection reporting no bootable
+                # slot, even though the boot write itself succeeded.
+                self.assertEqual(bytes(buf[:8]), b'ANDROID!')
+                self.assertGreaterEqual(len(buf), len(seed))
+                tail = len(buf) - len(seed)
+                for index in range(len(seed)):
+                    buf[tail + index] ^= seed[index]
+                self.assertEqual(bytes(buf[:tail]), source[:tail])
+                self.assertNotEqual(bytes(buf), source)
+                digest = hashlib.sha256(bytes(buf)).hexdigest()
+                path = sysroot.parent / (
+                    'candidate_%s_%s.img' % (
+                        hashlib.sha256(
+                            ('%s@%s' % (deployment, kw['slot_files']['boot']['sha256']))
+                            .encode('ascii')).hexdigest()[:12],
+                        slot))
+                path.write_bytes(bytes(buf))
+                report = copy.deepcopy(candidates[slot])
+                report.update({
+                    'deployment': deployment,
+                    'transactionUuid': kw['materials']['transactionUuid'],
+                    'sourceBootSha256': kw['slot_files']['boot']['sha256'],
+                    'candidate': {'path': str(path), 'bytes': len(buf),
+                                  'sha256': digest},
+                })
+                builds[(deployment, slot)] = {'bytes': bytes(buf), 'sha256': digest}
+                return report
+
+            stack.enter_context(mock.patch.object(
+                boot_candidate, 'prepare_boot_candidate', side_effect=build_candidate))
+
             def evidence(record):
                 actual = 0 if case.env.context['actualSlot'] == 'a' else 1
                 return boot_health.BootEvidence(
@@ -869,16 +969,35 @@ class SystemTransactionTests(unittest.TestCase):
             first = run_update('b' * 64, wf.TARGET_DEP, work)
             self.assertEqual(first['state'], 'awaiting_reboot')
             self.assertEqual(first['bootWriteState'], 'written')
+            first_plan = json.loads((work / 'plan.json').read_bytes())
+            first_expected = {slot: builds[(wf.TARGET_DEP, slot)] for slot in SLOTS}
+            for slot in SLOTS:
+                self.assertEqual(first_plan['originalBootSha256'][slot],
+                                 hashlib.sha256(initial_boot[slot]).hexdigest())
+                self.assertEqual(first_plan['mirroredBootSha256'][slot],
+                                 first_expected[slot]['sha256'])
+                self.assertEqual(self._boot_bytes(case, slot, 512),
+                                 first_expected[slot]['bytes'])
             reboot(self._confirm_record(case))
 
+            second_deployment = 'armada/%s.0' % ('c' * 64)
             second_work = work.parent / 'tx_work_second'
-            second = run_update(
-                'c' * 64, 'armada/%s.0' % ('c' * 64), second_work)
+            second = run_update('c' * 64, second_deployment, second_work)
             self.assertEqual(second['state'], 'awaiting_reboot')
             self.assertEqual(second['bootWriteState'], 'written')
             second_plan = json.loads((second_work / 'plan.json').read_bytes())
             self.assertEqual(second_plan['fromSlot'], 'b')
             self.assertEqual(second_plan['targetSlot'], 'a')
+            second_expected = {slot: builds[(second_deployment, slot)] for slot in SLOTS}
+            for slot in SLOTS:
+                self.assertEqual(second_plan['originalBootSha256'][slot],
+                                 first_expected[slot]['sha256'])
+                self.assertEqual(second_plan['mirroredBootSha256'][slot],
+                                 second_expected[slot]['sha256'])
+                self.assertEqual(self._boot_bytes(case, slot, 512),
+                                 second_expected[slot]['bytes'])
+                self.assertNotEqual(second_expected[slot]['bytes'],
+                                    first_expected[slot]['bytes'])
             reboot(self._confirm_record(case))
 
             repo_snapshot = dict(armada_os.snapshot())
@@ -918,13 +1037,20 @@ class SystemTransactionTests(unittest.TestCase):
 
             # Every consecutive transaction mirrors both physical boot slots
             # and never asks the Android slot-control shim to select a slot.
+            # The rollback repacks the retained deployment from the images
+            # that are live now, so its mirrored bytes differ from the
+            # second update even though both target the same slots.
             self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
+            rollback_expected = {slot: builds[(wf.TARGET_DEP, slot)] for slot in SLOTS}
             for slot in SLOTS:
-                expected = Path(
-                    candidates[slot]['candidate']['path']).read_bytes()
-                self.assertEqual(self._boot_bytes(case, slot, 512), expected)
+                self.assertEqual(rollback_plan['originalBootSha256'][slot],
+                                 second_expected[slot]['sha256'])
                 self.assertEqual(rollback_plan['mirroredBootSha256'][slot],
-                                 candidates[slot]['candidate']['sha256'])
+                                 rollback_expected[slot]['sha256'])
+                self.assertEqual(self._boot_bytes(case, slot, 512),
+                                 rollback_expected[slot]['bytes'])
+                self.assertNotEqual(rollback_expected[slot]['bytes'],
+                                    second_expected[slot]['bytes'])
 
             record = store.load(
                 case.journal.fd, case.journal.part, case.board).record

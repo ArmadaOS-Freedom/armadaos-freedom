@@ -88,6 +88,7 @@ os_state = {
 os_calls = []
 operation_script = None
 fail_operation = False
+fail_channel = False
 
 
 def os_command(action, *arguments):
@@ -102,6 +103,8 @@ def os_request(action, *arguments):
     if action == "get-os":
         return copy.deepcopy(os_state)
     if action.startswith("channel-"):
+        if fail_channel:
+            raise RuntimeError("Could not change the update channel")
         os_state["channel"] = action.removeprefix("channel-")
         return {"ok": True}
     if action == "update-os":
@@ -392,6 +395,7 @@ with tempfile.TemporaryDirectory() as directory, \
 
     original_operation = updates.operation
     original_result = updates.result
+    original_error = updates.error
     original_os_state = os_state.copy()
     updates.operation = None
     try:
@@ -464,9 +468,28 @@ with tempfile.TemporaryDirectory() as directory, \
         assert not updates.rollback.get_sensitive()
         assert updates.message.get_visible()
         assert updates.message.get_text() == uncertain["update_message"]
+
+        updates.result = ""
+        updates.error = ""
+        fail_channel = True
+        updates.render(confirmed)
+        updates.channel.set_selected(0)
+        wait_for(lambda: not updates.requesting and not updates.loading)
+        assert "Could not change the update channel" in updates.message.get_text()
+        assert updates.message.get_text() != confirmed["update_message"]
+
+        updates.error = ""
+        updates.result = "No new image was needed."
+        ready = confirmed.copy()
+        ready.update(update_target="20261001.restart", update_message=None, reboot_ready=True)
+        updates.render(ready)
+        assert updates.message.get_text() == "Update installed. Restart to apply."
+        fail_channel = False
     finally:
+        fail_channel = False
         updates.operation = original_operation
         updates.result = original_result
+        updates.error = original_error
         os_state.clear()
         os_state.update(original_os_state)
         updates.render(os_state.copy())
@@ -503,7 +526,19 @@ with tempfile.TemporaryDirectory() as directory, \
     os_state["reboot_ready"] = False
     updates.result = ""
 
+    assert updates.watch_id is None
+    confirming = os_state.copy()
+    confirming.update(update_busy=False, update={"state": "awaiting_confirmation", "requiresReboot": False},
+                      update_message="Update is awaiting confirmation.")
+    updates.render(confirming)
+    assert updates.watch_id is not None
+    resolved = confirming.copy()
+    resolved.update(update={"state": "installed", "requiresReboot": False},
+                    update_message="Update confirmed.")
+    updates.render(resolved)
+    assert updates.watch_id is None
+
     window.close()
     assert not window.get_visible()
     assert updates.watch_id is None
-print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update watch and narrow layout checks passed")
+print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update and awaiting-confirmation watch, request-error precedence and narrow layout checks passed")

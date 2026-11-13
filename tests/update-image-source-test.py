@@ -311,7 +311,12 @@ class ImageSourceIntegrationTests(unittest.TestCase):
                 def pull(repo, origin, w, value=value):
                     (w / "pull.log").write_bytes(b"success\n")
                     if value == "symlink":
-                        os.symlink(commit, w / "commit")
+                        # A real target with a valid digest line makes the
+                        # symlink itself, not a dangling reference, the
+                        # reason the pull digest is rejected.
+                        target = w / "digest-target"
+                        target.write_text(commit + "\n", encoding="ascii")
+                        os.symlink(target.name, w / "commit")
                     elif value is not None:
                         (w / "commit").write_text(value + "\n", encoding="ascii")
                     return w / "pull.log"
@@ -537,7 +542,10 @@ class PullCommandTests(unittest.TestCase):
         with self.assertRaises(image_source.ImageSourceError):
             image_source._read_commit(self.work)
         (self.work / "commit").unlink()
-        os.symlink(good, self.work / "commit")
+        # Symlinked digest whose target holds a valid digest newline: only
+        # the symlink itself can be the reason the digest is rejected.
+        (self.work / "digest-target").write_text(good + "\n", encoding="ascii")
+        os.symlink("digest-target", self.work / "commit")
         with self.assertRaises(image_source.ImageSourceError):
             image_source._read_commit(self.work)
         (self.work / "commit").unlink()

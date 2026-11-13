@@ -105,9 +105,12 @@ def load_signed_json(document, signature_b64, *, trusted_key=DEFAULT_TRUSTED_KEY
     Only document bytes and JSON shape are authenticated here; no semantic
     update-readiness claim is made.
     """
-    verify_document(document, signature_b64, trusted_key=trusted_key)
+    # Snapshot once before verification: the bytes that were verified are the
+    # exact immutable bytes that are parsed below, so a caller holding a
+    # mutable bytearray cannot change the document between the two steps.
     if isinstance(document, bytearray):
         document = bytes(document)
+    verify_document(document, signature_b64, trusted_key=trusted_key)
     if document.startswith(b'\xef\xbb\xbf'):
         raise SignatureError('UTF-8 BOM not allowed')
     try:

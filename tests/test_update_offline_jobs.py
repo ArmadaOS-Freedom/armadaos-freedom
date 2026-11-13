@@ -20,7 +20,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'system_files/usr/lib/armada'))
 sys.path.insert(0, str(ROOT / 'tests'))
-from updates import offline_jobs, offline_session, system_transaction
+from updates import (
+    offline_jobs, offline_session, system_transaction, trial_confirmation,
+)
 from test_update_channel_release import (
     _generate_keypair, _sign_bytes, _upgrade_package_dict,
 )
@@ -1029,6 +1031,108 @@ class OfflineJobTests(unittest.TestCase):
             result = self.manager().run_job('execute', sid2)
             self.assertEqual(result['result']['state'], 'execution_uncertain')
             self.assertNotIn('bootWriteState', result['result'])
+
+    def test_prepare_lock_contention_restores_queue_for_explicit_retry(self):
+        sid = self.session()
+        self.manager().submit_prepare(sid)
+        launches = len(self.launches())
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=trial_confirmation.UpdateLockBusyError(
+                            'update lock is busy')):
+            result = self.manager().run_job('prepare', sid)
+        self.assertEqual(result['state'], 'prepare_queued')
+        self.assertEqual(result['jobOperation'], 'prepare')
+        self.assertNotIn('error', result)
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            self.assertEqual(receipt['state'], 'prepare_queued')
+            self.assertNotIn('error', receipt)
+            self.assertNotIn('result', receipt)
+        # The locked-out worker must not have created the transaction.
+        self.assertFalse((self.store.base / sid / 'transaction').exists())
+
+        # Polling status never dispatches the contended job by itself.
+        self.runner.return_value.returncode = 3
+        status = self.manager().status(sid)
+        self.assertEqual(status['state'], 'prepare_queued')
+        self.assertEqual(len(self.launches()), launches)
+
+        # Only the explicit resubmission of the same session relaunches it.
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        retried = self.manager().submit_prepare(sid)
+        self.assertEqual(retried['state'], 'prepare_queued')
+        self.assertEqual(len(self.launches()), launches + 1)
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=self.prepared) as prepare:
+            self.assertEqual(self.manager().run_job('prepare', sid)['state'],
+                             'prepared')
+            prepare.assert_called_once()
+
+    def test_execute_lock_contention_restores_queue_for_explicit_retry(self):
+        sid = self.submitted_session()
+        ack = self.ack(sid)
+        pointer = self.store.base / 'pending' / (TX + '.json')
+        pointer_before = pointer.read_bytes()
+        launches = len(self.launches())
+        # The prepared session's receipt already carries the preparation result.
+        # Contention must preserve that evidence verbatim instead of replacing
+        # it with an execution result of its own.
+        with self.store.session_lock(sid) as session:
+            result_before = self.store.read_receipt(session).get('result')
+        with mock.patch('updates.offline_execute.execute_offline_update',
+                        side_effect=trial_confirmation.UpdateLockBusyError(
+                            'update lock is busy')):
+            result = self.manager().run_job('execute', sid)
+        self.assertEqual(result['state'], 'execute_queued')
+        self.assertEqual(result['jobOperation'], 'execute')
+        self.assertNotIn('error', result)
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            self.assertEqual(receipt['state'], 'execute_queued')
+            self.assertNotIn('error', receipt)
+            self.assertEqual(receipt.get('result'), result_before)
+            self.assertFalse(
+                (session / 'transaction/write-report.json').exists())
+        self.assertEqual(pointer.read_bytes(), pointer_before)
+
+        self.runner.return_value.returncode = 3
+        status = self.manager().status(sid)
+        self.assertEqual(status['state'], 'execute_queued')
+        self.assertEqual(len(self.launches()), launches)
+
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        retried = self.manager().submit_execute(sid, ack)
+        self.assertEqual(retried['state'], 'execute_queued')
+        self.assertEqual(len(self.launches()), launches + 1)
+        expected = {'state': 'awaiting_reboot', 'bootWriteState': 'written',
+                    'requiresReboot': True}
+        with mock.patch('updates.offline_execute.execute_offline_update',
+                        return_value=expected):
+            result = self.manager().run_job('execute', sid)
+        self.assertEqual(result['state'], 'awaiting_reboot')
+
+    def test_only_update_lock_contention_restores_the_queue(self):
+        # Any other confirmation failure may follow a mutation and must stay
+        # terminal instead of being turned back into a queued submission.
+        sid = self.session()
+        self.manager().submit_prepare(sid)
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=trial_confirmation.ConfirmationError(
+                            'update lock is busy')):
+            result = self.manager().run_job('prepare', sid)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['result']['state'], 'failed')
+
+        sid = self.session()
+        self.manager().submit_prepare(sid)
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=RuntimeError('prepare failed after mutation')):
+            failed = self.manager().run_job('prepare', sid)
+        self.assertEqual(failed['state'], 'failed')
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        launches = len(self.launches())
+        self.assertEqual(self.manager().submit_prepare(sid)['state'], 'failed')
+        self.assertEqual(len(self.launches()), launches)
 
     def test_terminal_prepare_and_invalid_invocations(self):
         for returned, expected in (({'state': 'up_to_date'}, 'up_to_date'),

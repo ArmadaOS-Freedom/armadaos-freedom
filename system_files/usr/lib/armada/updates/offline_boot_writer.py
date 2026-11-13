@@ -69,6 +69,21 @@ def _error_with_results(message, restore_status, slot_results):
     return err
 
 
+def _write_candidate(fd, data, offset, claim, slot):
+    """Write, fsync and read back one already verified candidate image.
+
+    The readback pins this image for the running kernel.  It does not make the
+    pwrite atomic across a power interruption; the journal commit boundary and
+    the other complete image are what remain safe.
+    """
+    _pwrite_all(fd, data, offset)
+    os.fsync(fd)
+    readback = _rehash_region(fd, offset, len(data))
+    if readback != claim['sha256']:
+        raise BootWriteError(f'boot_{slot} readback digest mismatch')
+    return readback
+
+
 def _validate_candidate_report(slot, report, trust_report, snapshot, initial, *, current_binding):
     if not isinstance(report, dict) \
             or type(report.get('schemaVersion')) is not int \
@@ -127,6 +142,14 @@ def write_offline_boots(trust_report, candidates, *, commit=None, progress=None)
     for writing.  It must durably save, validate and read back the new
     PREPARED trial journal and return normally only after that readback.  A
     failure raises :class:`JournalCommitError` with an explicit commit state.
+
+    A candidate write, fsync or readback failure on the running extent after
+    that commit is retried exactly once with the same verified bytes, claim and
+    open descriptor.  Before the retry the physical identity, lock state,
+    recovery partition, extent geometry and every protected digest are
+    revalidated without comparing the torn running image; the retry is
+    abandoned when they no longer hold.  No other failure is retried, and an
+    inactive-slot or pre-commit failure keeps the original recovery behaviour.
     Caller holds the transaction/global lock.
     """
     return _write_offline_boots(
@@ -215,7 +238,15 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
                   for slot in _SLOTS for key, name in _SLOT_KEYS.items()}
         claims.update(snapshot['extraFiles'])
 
-        def verify_extents():
+        def verify_extents(skip_digest=None):
+            """Recheck every captured extent's identity, geometry and digest.
+
+            ``skip_digest`` names the single label whose content is not
+            compared.  It is used only for the running slot after a failed
+            candidate write, where the extent may be torn, so neither its
+            bytes nor its digest can be trusted; its identity, geometry and
+            size are still checked.
+            """
             extents = {}
             for label, claim in claims.items():
                 info = _locate(locator, ro_fds, luns, found, enabled, label)
@@ -226,6 +257,9 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
                             captured['partitionUuid'])
                 if identity != expected or info['bytes'] != claim['bytes']:
                     raise BootWriteError(f'native extent mismatch for {label}')
+                extents[label] = info
+                if label == skip_digest:
+                    continue
                 if label == 'boot_a':
                     exp_sha = expected_boot_sha['a']
                 elif label == 'boot_b':
@@ -235,7 +269,6 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
                 if _rehash_region(info['fd'], info['firstLba'] * info['blockSize'],
                                   info['bytes']) != exp_sha:
                     raise BootWriteError(f'live source digest mismatch for {label}')
-                extents[label] = info
             return extents
 
         extents = verify_extents()
@@ -284,14 +317,34 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
 
             started_slots.append(slot)
             slot_results[slot]['status'] = 'writing'
-            _pwrite_all(rw_fd, cand_data, offset)
-            # The readback pins this image for the running kernel.  It does not
-            # make the pwrite atomic across a power interruption; the journal
-            # commit boundary and the other complete image are what remain safe.
-            os.fsync(rw_fd)
-            readback = _rehash_region(rw_fd, offset, len(cand_data))
-            if readback != cand_claim['sha256']:
-                raise BootWriteError(f'boot_{slot} readback digest mismatch')
+            try:
+                readback = _write_candidate(
+                    rw_fd, cand_data, offset, cand_claim, slot)
+            except (OSError, BootWriteError) as write_error:
+                if not committed or slot != actual:
+                    # Only the running slot is retried, and only after the
+                    # PREPARED journal commit definitely succeeded.  Every
+                    # other candidate I/O failure keeps the original
+                    # permanent-failure recovery behaviour.
+                    raise
+                # The failed attempt may have torn the running image, so its
+                # digest is not compared.  Device identity, lock state,
+                # recovery identity, extent geometry and every other
+                # protected digest must still hold, or the retry is abandoned
+                # with no image restored.  The durable PREPARED record already
+                # binds the running slot to this candidate hash
+                # (other_boot_sha256), so rewriting the same verified bytes
+                # keeps that binding true.
+                check_context()
+                verify_extents(skip_digest=f'boot_{slot}')
+                try:
+                    readback = _write_candidate(
+                        rw_fd, cand_data, offset, cand_claim, slot)
+                except (OSError, BootWriteError) as retry_error:
+                    raise BootWriteError(
+                        f'boot_{slot} candidate write failed twice after the '
+                        f'durable journal commit ({write_error}); retry failed: '
+                        f'{retry_error}') from retry_error
             expected_boot_sha[slot] = cand_claim['sha256']
             verify_extents()
             check_context()
