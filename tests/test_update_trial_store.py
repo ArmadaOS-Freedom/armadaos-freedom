@@ -104,14 +104,21 @@ class TrialStoreTest(unittest.TestCase):
 
         with mock.patch("os.pwrite", wraps=os.pwrite) as pw:
             target = store.save(self.fd, snap, self.sample())
-        pw.assert_called_once()
-        self.assertEqual(pw.call_args.args[2], REGION_OFFSET + rec.TAIL_OFFSET_A)
-        self.assertEqual(len(pw.call_args.args[1]), rec.RECORD_BYTES)
+        calls = pw.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[1], rec.EMPTY_MARKER)
+        self.assertEqual(calls[0].args[2], REGION_OFFSET + rec.TAIL_OFFSET_B)
+        self.assertEqual(calls[1].args[2], REGION_OFFSET + rec.TAIL_OFFSET_A)
+        self.assertEqual(len(calls[1].args[1]), rec.RECORD_BYTES)
         self.assertEqual(target, 0)
 
         after = os.pread(self.fd, REGION_BYTES, REGION_OFFSET)
-        keep = rec.TAIL_OFFSET_A + rec.RECORD_BYTES
+        keep = rec.TAIL_OFFSET_B + rec.RECORD_BYTES
         self.assertEqual(after[: rec.TAIL_OFFSET_A], before[: rec.TAIL_OFFSET_A])
+        self.assertEqual(
+            after[rec.TAIL_OFFSET_B : rec.TAIL_OFFSET_B + rec.RECORD_BYTES],
+            rec.EMPTY_MARKER,
+        )
         self.assertEqual(after[keep:], before[keep:])
         self.assertEqual(os.pread(self.fd, HEADER_BYTES, 0), before_header)
         self.assertEqual(os.pread(self.fd, 14, HEADER_BYTES), before_archive)
@@ -159,6 +166,208 @@ class TrialStoreTest(unittest.TestCase):
         with self.assertRaises(rec.TrialRecordError):
             store.load(self.fd, self.part, 1)
 
+
+    def test_logical_empty_sentinel_is_exact_and_copy_b_only(self):
+        zero = bytes(rec.RECORD_BYTES)
+        marker = rec.EMPTY_MARKER
+        self.assertEqual(len(marker), rec.RECORD_BYTES)
+        self.assertEqual(rec.EMPTY_MARKER_COPY, 1)
+        self.assertEqual(
+            [i for i, value in enumerate(marker) if value],
+            [rec.EMPTY_MARKER_OFFSET],
+        )
+
+        # The marker is never a record: zero CRC field, nonzero computed CRC.
+        with self.assertRaises(rec.TrialRecordError) as ctx:
+            rec.decode_record(marker, uuid_bytes(self.part), uuid_bytes(self.inst))
+        self.assertNotIsInstance(ctx.exception, rec.EmptyTrialJournal)
+
+        # B marker + blank A is the logical empty journal.
+        os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_B)
+        snap = store.load(self.fd, self.part, 1)
+        self.assertIsNone(snap.record)
+        self.assertIsNone(snap.selected)
+
+        # A real record always wins over the marker.
+        record = self.sample()
+        os.pwrite(self.fd, rec.encode_record(record), REGION_OFFSET + rec.TAIL_OFFSET_A)
+        snap = store.load(self.fd, self.part, 1)
+        self.assertEqual((snap.record, snap.selected), (record, 0))
+
+        # A near-marker is not a marker.
+        altered = bytearray(marker)
+        altered[100] = 1
+        os.pwrite(self.fd, bytes(altered), REGION_OFFSET + rec.TAIL_OFFSET_B)
+        os.pwrite(self.fd, zero, REGION_OFFSET + rec.TAIL_OFFSET_A)
+        with self.assertRaises(rec.TrialRecordError):
+            store.load(self.fd, self.part, 1)
+
+        # The marker is only recognised in copy B.
+        os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_A)
+        os.pwrite(self.fd, zero, REGION_OFFSET + rec.TAIL_OFFSET_B)
+        with self.assertRaises(rec.TrialRecordError):
+            store.load(self.fd, self.part, 1)
+
+        # CRC damage next to a zeroed copy stays ordinary corruption.
+        torn = bytearray(rec.encode_record(record))
+        torn[300] ^= 1
+        os.pwrite(self.fd, bytes(torn), REGION_OFFSET + rec.TAIL_OFFSET_A)
+        with self.assertRaises(rec.TrialRecordError):
+            store.load(self.fd, self.part, 1)
+
+        # The same damage next to the exact marker is the torn initial write.
+        os.pwrite(self.fd, marker, REGION_OFFSET + rec.TAIL_OFFSET_B)
+        self.assertIsNone(store.load(self.fd, self.part, 1).record)
+
+        # A complete foreign record with a valid CRC is refused, not empty.
+        foreign = replace(
+            record,
+            partition_uuid=uuid_bytes("99999999-9999-4999-8999-999999999999"),
+        )
+        os.pwrite(self.fd, rec.encode_record(foreign), REGION_OFFSET + rec.TAIL_OFFSET_A)
+        with self.assertRaises(rec.TrialRecordError):
+            store.load(self.fd, self.part, 1)
+
+    def test_initial_anchor_torn_record_recovers_and_retries(self):
+        snap = store.load(self.fd, self.part, 1)
+        self.assertIsNone(snap.record)
+        wire = rec.encode_record(self.sample())
+        real_pwrite = os.pwrite
+
+        def torn_record(fd, data, offset):
+            if offset == REGION_OFFSET + rec.TAIL_OFFSET_A and data == wire:
+                return real_pwrite(fd, data[:1024], offset)
+            return real_pwrite(fd, data, offset)
+
+        with mock.patch.object(store.os, "pwrite", side_effect=torn_record):
+            with self.assertRaisesRegex(store.TrialStoreError, "short trial record write"):
+                store.save(self.fd, snap, self.sample())
+
+        self.assertEqual(
+            os.pread(self.fd, 1024, REGION_OFFSET + rec.TAIL_OFFSET_A), wire[:1024])
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_B),
+            rec.EMPTY_MARKER,
+        )
+
+        recovered = store.load(self.fd, self.part, 1)
+        self.assertIsNone(recovered.record)
+        self.assertIsNone(recovered.selected)
+        with mock.patch.object(store.os, "pwrite", wraps=os.pwrite) as pw:
+            self.assertEqual(store.save(self.fd, recovered, self.sample()), 0)
+        pw.assert_called_once()
+        self.assertEqual(pw.call_args.args[2], REGION_OFFSET + rec.TAIL_OFFSET_A)
+        self.assertEqual(store.load(self.fd, self.part, 1).record, self.sample())
+
+        # Once the record exists, a stale blank snapshot loses the CAS.
+        with mock.patch.object(store.os, "pwrite") as pw:
+            with self.assertRaisesRegex(store.TrialStoreError, "concurrent modification"):
+                store.save(self.fd, snap, self.sample())
+            pw.assert_not_called()
+
+    def test_initial_anchor_write_interrupted_leaves_plain_empty(self):
+        snap = store.load(self.fd, self.part, 1)
+        real_pwrite = os.pwrite
+
+        def lost_marker(fd, data, offset):
+            if data == rec.EMPTY_MARKER:
+                return real_pwrite(fd, b"", offset)
+            return real_pwrite(fd, data, offset)
+
+        with mock.patch.object(store.os, "pwrite", side_effect=lost_marker):
+            with self.assertRaisesRegex(
+                    store.TrialStoreError, "short empty-journal marker write"):
+                store.save(self.fd, snap, self.sample())
+
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_A),
+            bytes(rec.RECORD_BYTES),
+        )
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_B),
+            bytes(rec.RECORD_BYTES),
+        )
+        recovered = store.load(self.fd, self.part, 1)
+        self.assertIsNone(recovered.record)
+        self.assertEqual(store.save(self.fd, recovered, self.sample()), 0)
+        self.assertEqual(store.load(self.fd, self.part, 1).record, self.sample())
+
+    def test_initial_anchor_fsync_failure_is_retryable(self):
+        snap = store.load(self.fd, self.part, 1)
+        real_fsync = os.fsync
+        calls = {"n": 0}
+
+        def fail_first_fsync(fd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("flush failed")
+            return real_fsync(fd)
+
+        with mock.patch.object(store.os, "fsync", side_effect=fail_first_fsync):
+            with self.assertRaisesRegex(store.TrialStoreError, "marker fsync failed"):
+                store.save(self.fd, snap, self.sample())
+
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_A),
+            bytes(rec.RECORD_BYTES),
+        )
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_B),
+            rec.EMPTY_MARKER,
+        )
+        recovered = store.load(self.fd, self.part, 1)
+        self.assertIsNone(recovered.record)
+        self.assertEqual(store.save(self.fd, recovered, self.sample()), 0)
+        self.assertEqual(store.load(self.fd, self.part, 1).record, self.sample())
+
+    def test_initial_anchor_repeated_flush_failure_keeps_slot_a_blank(self):
+        snap = store.load(self.fd, self.part, 1)
+
+        def always_fail(fd):
+            raise OSError("flush failed")
+
+        # First attempt writes the marker bytes but the flush fails, so their
+        # presence in the cache proves nothing about durability.
+        with mock.patch.object(store.os, "fsync", side_effect=always_fail):
+            with self.assertRaisesRegex(store.TrialStoreError, "marker fsync failed"):
+                store.save(self.fd, snap, self.sample())
+
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_B),
+            rec.EMPTY_MARKER,
+        )
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES, REGION_OFFSET + rec.TAIL_OFFSET_A),
+            bytes(rec.RECORD_BYTES),
+        )
+
+        # Every retry sees the exact marker, must re-flush it, and must fail
+        # before copy A is written.  The marker is not rewritten.
+        for _ in range(3):
+            retry = store.load(self.fd, self.part, 1)
+            self.assertIsNone(retry.record)
+            with mock.patch.object(store.os, "pwrite", wraps=os.pwrite) as pw:
+                with mock.patch.object(store.os, "fsync", side_effect=always_fail):
+                    with self.assertRaisesRegex(
+                            store.TrialStoreError, "marker fsync failed"):
+                        store.save(self.fd, retry, self.sample())
+            pw.assert_not_called()
+            self.assertEqual(
+                os.pread(self.fd, rec.RECORD_BYTES,
+                         REGION_OFFSET + rec.TAIL_OFFSET_A),
+                bytes(rec.RECORD_BYTES),
+            )
+            self.assertEqual(
+                os.pread(self.fd, rec.RECORD_BYTES,
+                         REGION_OFFSET + rec.TAIL_OFFSET_B),
+                rec.EMPTY_MARKER,
+            )
+
+        recovered = store.load(self.fd, self.part, 1)
+        self.assertIsNone(recovered.record)
+        self.assertIsNone(recovered.selected)
+        self.assertEqual(store.save(self.fd, recovered, self.sample()), 0)
+        self.assertEqual(store.load(self.fd, self.part, 1).record, self.sample())
 
     def test_write_failures_preserve_previous_and_unlock(self):
         snapshot = store.load(self.fd, self.part, 1)
@@ -287,15 +496,18 @@ class TrialStoreTest(unittest.TestCase):
         self.assertIsNone(snap.selected)
         untouched_b = os.pread(
             self.fd, rec.RECORD_BYTES, store.REGION_OFFSET + rec.TAIL_OFFSET_B)
+        self.assertEqual(untouched_b, bytes(rec.RECORD_BYTES))
         self.assertEqual(store.save(self.fd, snap, self.sample()), 0)
         self.assertEqual(
             os.pread(self.fd, rec.RECORD_BYTES,
                      store.REGION_OFFSET + rec.TAIL_OFFSET_A),
             rec.encode_record(self.sample()))
+        # The initial anchor replaced only the untouched copy with the exact
+        # logical-empty marker; it was flushed before copy A was written.
         self.assertEqual(
             os.pread(self.fd, rec.RECORD_BYTES,
                      store.REGION_OFFSET + rec.TAIL_OFFSET_B),
-            untouched_b)
+            rec.EMPTY_MARKER)
 
         snap2 = store.load(self.fd, self.part, 1)
         self.assertEqual(snap2.selected, 0)

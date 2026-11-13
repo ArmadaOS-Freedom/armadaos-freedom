@@ -116,6 +116,12 @@ class UpdateTrialRecordTest(unittest.TestCase):
             ctypes.c_void_p, ctypes.POINTER(CRecord), ctypes.POINTER(ctypes.c_uint)]
         for name in ("encode", "decode", "select"):
             getattr(cls.lib, "kshim_update_trial_" + name).restype = ctypes.c_int
+        cls.lib.kshim_update_trial_empty_marker.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t]
+        cls.lib.kshim_update_trial_empty_marker.restype = ctypes.c_int
+        cls.lib.kshim_update_trial_is_empty_marker.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t]
+        cls.lib.kshim_update_trial_is_empty_marker.restype = ctypes.c_int
 
     def c_encode(self, record):
         source, output = c_record(record), ctypes.create_string_buffer(4096)
@@ -235,6 +241,32 @@ class UpdateTrialRecordTest(unittest.TestCase):
         self.assert_select(offline, old, 0)
         self.assert_select(bytes(4096), bytes(4096), error=tr.EmptyTrialJournal)
         self.assert_select(bytes(torn), bytes(4096), error=tr.TrialRecordError)
+
+    def test_logical_empty_marker_parity(self):
+        zero = bytes(4096)
+        marker = tr.EMPTY_MARKER
+        self.assertEqual(len(marker), 4096)
+        buf = ctypes.create_string_buffer(4096)
+        self.assertEqual(self.lib.kshim_update_trial_empty_marker(buf, 4096), 0)
+        self.assertEqual(buf.raw, marker)
+        self.assertEqual(self.lib.kshim_update_trial_is_empty_marker(marker, 4096), 1)
+        self.assertEqual(self.lib.kshim_update_trial_is_empty_marker(zero, 4096), 0)
+        self.assert_both_reject(marker)
+        self.assert_select(zero, marker, error=tr.EmptyTrialJournal)
+        with self.assertRaises(tr.LogicalEmptyTrialJournal):
+            tr.select_record(zero, marker, PART, INST)
+        torn = bytearray(tr.encode_record(sample()))
+        torn[300] ^= 1
+        self.assert_select(bytes(torn), marker, error=tr.EmptyTrialJournal)
+        self.assert_select(marker, zero, error=tr.TrialRecordError)
+        self.assert_select(marker, marker, error=tr.EmptyTrialJournal)
+        old = tr.encode_record(sample())
+        self.assert_select(old, marker, 0)
+        # A complete CRC-valid image next to the marker is never empty.
+        foreign = resealed(old, 40, "<16s", bytes(range(48, 64)))
+        self.assert_select(foreign, marker, error=tr.TrialRecordError)
+        unknown = resealed(old, 8, "<I", 3)
+        self.assert_select(unknown, marker, error=tr.TrialRecordError)
 
     def test_python_strict_arguments(self):
         base = sample()

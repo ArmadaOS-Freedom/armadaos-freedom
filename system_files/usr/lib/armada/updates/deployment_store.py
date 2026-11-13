@@ -14,6 +14,11 @@ from .boot_payload import verify_manifest
 
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _UINT32_MAX = 0xFFFFFFFF
+_MANAGED_GROUP = "origin"
+_MANAGED_KEY = "armada-managed"
+_MANAGED_VALUE = "1"
+_MANAGED_BINDING_KEY = "armada-managed-binding"
+_RETIRE_AFTER_KEY = "armada-retire-after"
 _BINDING_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9_.-]{0,63})/([0-9a-f]{64})\.(0|[1-9][0-9]{0,9})")
 _ORIGIN_RE = re.compile(
     r"ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:"
@@ -51,6 +56,66 @@ def _parse_binding(binding):
 
 def _binding_of(dep):
     return f"{dep.get_osname()}/{dep.get_csum()}.{dep.get_deployserial()}"
+
+
+def _origin_string(dep, key):
+    origin = dep.get_origin()
+    if origin is None:
+        return None
+    try:
+        return origin.get_string(_MANAGED_GROUP, key)
+    except Exception:
+        return None
+
+
+def _is_updater_created(dep):
+    """True only when this deployment carries a marker bound to itself.
+
+    Legacy deployments, admin-created deployments and reused targets have no
+    marker and are therefore never eligible for automatic removal.  The marker
+    also records the deployment's own binding, so an origin file copied from a
+    different updater deployment cannot be mistaken for updater ownership.
+    """
+    if _origin_string(dep, _MANAGED_KEY) != _MANAGED_VALUE:
+        return False
+    return _origin_string(dep, _MANAGED_BINDING_KEY) == _binding_of(dep)
+
+
+def _retire_after(dep):
+    value = _origin_string(dep, _RETIRE_AFTER_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def _write_origin(sysroot, dep):
+    origin = dep.get_origin()
+    if origin is None:
+        raise DeploymentError("deployment origin missing")
+    if not sysroot.write_origin_file(dep, origin, None):
+        raise DeploymentError("write_origin_file failed")
+
+
+def _mark_managed(sysroot, dep):
+    origin = dep.get_origin()
+    if origin is None:
+        raise DeploymentError("candidate origin missing")
+    origin.set_string(_MANAGED_GROUP, _MANAGED_KEY, _MANAGED_VALUE)
+    origin.set_string(_MANAGED_GROUP, _MANAGED_BINDING_KEY, _binding_of(dep))
+    _write_origin(sysroot, dep)
+
+
+def _mark_retiring(sysroot, dep, confirmed_binding):
+    origin = dep.get_origin()
+    if origin is None:
+        raise DeploymentError("deployment origin missing")
+    origin.set_string(_MANAGED_GROUP, _RETIRE_AFTER_KEY, confirmed_binding)
+    _write_origin(sysroot, dep)
+
+
+def _managed_origin(GLib, origin_ref):
+    origin = GLib.KeyFile()
+    origin.set_string("origin", "container-image-reference", origin_ref)
+    origin.set_string(_MANAGED_GROUP, _MANAGED_KEY, _MANAGED_VALUE)
+    return origin
 
 
 def _validate_origin(origin_ref, oci_digest):
@@ -141,9 +206,34 @@ def _validate_commit_metadata(commit_variant, oci_digest, source_revision, versi
 
 
 def _ensure_pinned(sysroot, dep, label):
-    if not dep.is_pinned():
-        if not sysroot.deployment_set_pinned(dep, True):
-            raise DeploymentError(f"failed pinning {label} deployment")
+    if dep.is_pinned():
+        return
+    # A deployment released earlier still carries retire-after.  Reusing it as
+    # current/candidate/rollback and pinning it again must first clear that
+    # marker: otherwise a later staleness pass sees a pinned deployment that
+    # still records a retirement and mistakes this updater re-pin for an
+    # administrator take-over, leaking the deployment indefinitely.
+    if _is_updater_created(dep) and _retire_after(dep) is not None:
+        origin = dep.get_origin()
+        if origin is None:
+            raise DeploymentError(f"{label} deployment origin missing")
+        try:
+            removed = origin.remove_key(_MANAGED_GROUP, _RETIRE_AFTER_KEY)
+        except Exception as exc:
+            raise DeploymentError(
+                f"failed clearing {label} deployment retirement marker: {exc}") from exc
+        if not removed:
+            raise DeploymentError(
+                f"failed clearing {label} deployment retirement marker")
+        _write_origin(sysroot, dep)
+    if not sysroot.deployment_set_pinned(dep, True):
+        raise DeploymentError(f"failed pinning {label} deployment")
+
+
+def _ensure_unpinned(sysroot, dep, label):
+    if dep.is_pinned():
+        if not sysroot.deployment_set_pinned(dep, False):
+            raise DeploymentError(f"failed unpinning {label} deployment")
 
 
 def _candidate_options(dep):
@@ -298,14 +388,16 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
                     "reused": True, "retainedDeployments": original_bindings}
 
         _ensure_pinned(sysroot, current, "current")
-        origin = GLib.KeyFile()
-        origin.set_string("origin", "container-image-reference", origin_ref)
+        origin = _managed_origin(GLib, origin_ref)
         ok, cand = sysroot.deploy_tree(osname, target_commit, origin, current, None, None)
         if not ok or cand is None:
             raise DeploymentError("deploy_tree failed")
         cpath = _candidate_path(sysroot, root, cand, osname, target_commit)
         verified = _load_manifest(cpath, model)
         cand_binding = _binding_of(cand)
+        # Persist the self-bound marker before registration so a copied origin
+        # file can never be mistaken for updater ownership.
+        _mark_managed(sysroot, cand)
         expected = original_bindings + [cand_binding]
         if not sysroot.write_deployments(deployments + [cand], None):
             raise DeploymentError("write_deployments failed")
@@ -327,6 +419,8 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
         by_binding = {_binding_of(d): d for d in final_deps}
         if not by_binding[current_binding].is_pinned() or not by_binding[cand_binding].is_pinned():
             raise DeploymentError("pinned state not persisted")
+        if not _is_updater_created(by_binding[cand_binding]):
+            raise DeploymentError("candidate origin marker not persisted")
         _check_candidate_binding(by_binding[cand_binding], cand_binding)
         return {"deployment": cand_binding, "path": cpath,
                 "kernelRelease": verified["kernelRelease"], "model": model,
@@ -367,10 +461,14 @@ def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_bind
     try:
         if not sysroot.load(None):
             raise DeploymentError("sysroot load failed")
-        if sysroot.get_staged_deployment() is not None:
-            raise DeploymentError("staged deployment present in sysroot")
+        staged = sysroot.get_staged_deployment()
+        if staged is not None:
+            raise DeploymentError("staged deployment present")
 
         deployments = list(sysroot.get_deployments() or [])
+        bindings = [_binding_of(d) for d in deployments]
+        if len(set(bindings)) != len(bindings):
+            raise DeploymentError("duplicate deployment bindings in sysroot")
         cur_matches = [d for d in deployments if _binding_of(d) == current_binding]
         if len(cur_matches) != 1:
             raise DeploymentError("current deployment not found uniquely")
@@ -392,18 +490,77 @@ def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_bind
         _ensure_pinned(sysroot, current, "current")
         _ensure_pinned(sysroot, previous, "previous")
 
-        expected_deps = [current] + [d for d in deployments if _binding_of(d) != current_binding]
-        expected_bindings = [_binding_of(d) for d in expected_deps]
-        changed = [_binding_of(d) for d in deployments] != expected_bindings
+        booted = sysroot.get_booted_deployment()
+        booted_binding = _binding_of(booted) if booted is not None else None
+
+        # Deployments held for any reason outside proven updater ownership are
+        # never removed or unpinned: the confirmed current, the required
+        # rollback target, the actually booted deployment, anything staged
+        # (refused above), foreign stateroots, unlocked deployments, and every
+        # unmarked (legacy/admin) deployment.
+        protected = {current_binding, previous_binding}
+        if booted_binding is not None:
+            protected.add(booted_binding)
+
+        # Two-step release.  Every append pins the new candidate, so stale
+        # updater deployments are pinned by design.  Release them here by
+        # recording retire-after=<this confirmed binding> and only then
+        # unpinning; a later and distinct confirmed promotion removes them.  A
+        # released deployment that is pinned again while still carrying
+        # retire-after was explicitly taken over by an administrator: it is
+        # never unpinned or removed again.  A released deployment re-pinned by
+        # the updater itself has that marker cleared in _ensure_pinned, so it
+        # is released again normally.  Unmarked deployments and explicit stale
+        # pins are never touched.
+        release = []
+        removable = []
+        for dep in deployments:
+            dep_binding = _binding_of(dep)
+            if dep_binding in protected:
+                continue
+            if dep.get_osname() != osname:
+                continue
+            if dep.get_unlocked() != OSTree.DeploymentUnlockedState.NONE:
+                continue
+            if not _is_updater_created(dep):
+                continue
+            retire_after = _retire_after(dep)
+            if retire_after is None:
+                if dep.is_pinned():
+                    release.append(dep)
+                continue
+            if dep.is_pinned():
+                continue
+            if retire_after != current_binding:
+                removable.append(dep_binding)
+
+        for dep in release:
+            _mark_retiring(sysroot, dep, current_binding)
+            _ensure_unpinned(sysroot, dep, "stale")
+
+        removable_set = set(removable)
+        kept = [current] + [
+            d for d in deployments
+            if _binding_of(d) != current_binding and _binding_of(d) not in removable_set
+        ]
+        expected_bindings = [_binding_of(d) for d in kept]
+        changed = bindings != expected_bindings
         if changed:
-            if not sysroot.write_deployments(expected_deps, None):
+            # One atomic deployment-list update under the existing sysroot lock.
+            # This is not a global object prune: repository content is untouched.
+            if not sysroot.write_deployments(kept, None):
                 raise DeploymentError("write_deployments failed")
 
         if not sysroot.load(None):
             raise DeploymentError("sysroot reload failed")
         final_deps = list(sysroot.get_deployments() or [])
-        if [_binding_of(d) for d in final_deps] != expected_bindings:
+        final_bindings = [_binding_of(d) for d in final_deps]
+        if final_bindings != expected_bindings:
             raise DeploymentError("post-promotion deployment order mismatch")
+        final_set = set(final_bindings)
+        for binding in protected:
+            if binding in set(bindings) and binding not in final_set:
+                raise DeploymentError("protected deployment was removed")
         final_cur = [d for d in final_deps if _binding_of(d) == current_binding]
         final_prev = [d for d in final_deps if _binding_of(d) == previous_binding]
         if len(final_cur) != 1 or len(final_prev) != 1:
@@ -411,6 +568,15 @@ def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_bind
         if not final_cur[0].is_pinned() or not final_prev[0].is_pinned():
             raise DeploymentError("pinned state not persisted")
         _check_candidate_binding(final_cur[0], current_binding)
+        for dep in release:
+            dep_binding = _binding_of(dep)
+            released = [d for d in final_deps if _binding_of(d) == dep_binding]
+            if len(released) != 1:
+                raise DeploymentError("released deployment vanished")
+            if released[0].is_pinned():
+                raise DeploymentError("stale deployment was not unpinned")
+            if _retire_after(released[0]) != current_binding:
+                raise DeploymentError("stale deployment retirement marker not persisted")
         return {
             "deployment": current_binding,
             "previousDeployment": previous_binding,
