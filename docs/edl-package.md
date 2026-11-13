@@ -159,6 +159,10 @@ Packaging an adapted device still requires working Linux kernel support and a
 matching device tree in the deployed image, a runtime profile in the runtime
 snapshot, and a matching model registration in the Windows installer. A
 configuration entry alone does not make arbitrary Android hardware supported.
+A profile outside the shipped package contract can be packaged for first
+installation only; the build never advertises offline-upgrade or recovery for
+it, and selecting such a profile together with the default models makes the
+whole package install-only.
 
 ## Bundled plugin sources
 
@@ -238,6 +242,21 @@ hashed against the signed plan rather than replaced. A release whose content
 differs fails the run. The channel document and its signature reach the
 `update-channels` branch as one commit per channel; updates are serialized and
 never force-pushed.
+
+Publishing a build from the current commit keeps using the workflow's
+`GITHUB_TOKEN`. For a historical build the release tag targets a commit that
+can differ from the workflow run; GitHub's create-release documentation states
+that `GITHUB_TOKEN` cannot create such a release when that commit changes
+`.github/workflows`, because it never holds Workflows write. The optional
+`ARMADA_RELEASE_TOKEN` secret is used only for that historical
+`gh release create`. When it is configured, that step uses it; when it is not,
+the step attempts `GITHUB_TOKEN`, which may succeed where GitHub permits it.
+If GitHub denies that permission and the workflow contents differ between the
+tag target and the run, a dedicated token with **Contents** and **Workflows**
+write is required. Publishing the draft release afterwards, and checkout,
+artifact download, verification, asset upload, and channel publication, all
+keep `GITHUB_TOKEN` without retargeting. The tag target is always the verified
+build revision — never the current branch head.
 
 ## Package layout
 
@@ -341,7 +360,11 @@ key supplied by the package cannot establish trust in that package.
 
 The producer checks that the deployed image carries the normal-Linux updater and
 then declares both install and offline-upgrade; a package built from an image
-without that updater fails the build instead of being relabeled. The offline
+without that updater fails the build instead of being relabeled. A package whose
+selected models include a profile outside the shipped contract is built
+install-only: the wrapper never requests offline-upgrade for it, and it passes
+that configured model identifier explicitly so validation accepts the install
+package while still rejecting offline-upgrade and recovery for it. The offline
 upgrade keeps user data and writes both boot slots from the verified payload;
 the online OCI update instead rotates only the non-current slot. A signature
 alone does not make a package upgrade-capable: the descriptor must declare

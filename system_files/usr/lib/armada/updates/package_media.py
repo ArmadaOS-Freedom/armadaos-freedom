@@ -63,13 +63,13 @@ def _check_unchanged(f, st_before, label: str) -> None:
         raise PackageError(f"{label} changed during read")
 
 
-def _revalidate(descriptor: dict) -> dict:
+def _revalidate(descriptor: dict, install_models=()) -> dict:
     if not isinstance(descriptor, dict):
         raise PackageError("descriptor must be a dict")
-    return validate_package(descriptor)
+    return validate_package(descriptor, install_models=install_models)
 
 
-def verify_parts(directory: Path, descriptor: dict) -> dict:
+def verify_parts(directory: Path, descriptor: dict, *, install_models=()) -> dict:
     """Verify split parts in *directory* against an authenticated descriptor.
 
     Each part is opened read-only (O_NOFOLLOW, regular files only), size-checked,
@@ -77,7 +77,7 @@ def verify_parts(directory: Path, descriptor: dict) -> dict:
     reordered-but-individually-valid split always fails.  No merge or writes.
     """
     try:
-        desc = _revalidate(descriptor)
+        desc = _revalidate(descriptor, install_models)
         archive = desc["archive"]
         parts = desc.get("parts") or []
         if not parts:
@@ -157,10 +157,11 @@ def _verify_zip_entry(zf: zipfile.ZipFile, info: zipfile.ZipInfo, entry: dict,
             raise PackageError(f"entry {info.filename!r} expanded hash/size mismatch")
 
 
-def verify_archive(path: Path, descriptor: dict, *, verify_expanded: bool = True) -> dict:
+def verify_archive(path: Path, descriptor: dict, *, verify_expanded: bool = True,
+                   install_models=()) -> dict:
     """Verify a ZIP archive file against an authenticated descriptor."""
     try:
-        desc = _revalidate(descriptor)
+        desc = _revalidate(descriptor, install_models)
         archive = desc["archive"]
         entries = {f["path"]: f for f in desc["files"]}
 

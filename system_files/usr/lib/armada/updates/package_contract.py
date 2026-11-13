@@ -8,7 +8,9 @@ from .catalog import CatalogError, _identity, _updater_tuple
 from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 
 
-_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
+# The shipped package contract. Consumers validate against this closed set by
+# default; only the build host may explicitly add install-only model names.
+AUTHORIZED_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
 _OPERATIONS = frozenset(("install", "offline-upgrade", "decky-repair"))
 _ROLES = frozenset((
     "manifest", "linux-root", "linux-boot", "kernel", "initramfs", "runtime",
@@ -29,6 +31,7 @@ _DECKY_KEYS = frozenset((
 ))
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 _RESERVED = frozenset(
     ["CON", "PRN", "AUX", "NUL"]
     + [f"COM{number}" for number in range(1, 10)]
@@ -98,6 +101,12 @@ def _manifest_paths(package: dict, files_by_path: dict) -> None:
     recovery = package["recoveryManifests"]
     if not isinstance(recovery, dict) or not set(recovery).issubset(models):
         raise PackageError("recoveryManifests must be an object keyed by a subset of supportedModels")
+    if recovery and not set(models) <= AUTHORIZED_MODELS:
+        raise PackageError(
+            "recoveryManifests are restricted to packages of authorized models"
+        )
+    if not set(recovery) <= AUTHORIZED_MODELS:
+        raise PackageError("recoveryManifests are restricted to the authorized models")
     model_paths = list(manifests.values())
     recovery_paths = list(recovery.values())
     for field, paths in (("modelManifests", model_paths), ("recoveryManifests", recovery_paths)):
@@ -128,7 +137,38 @@ def _decky_snapshot(value) -> None:
     _hash(value["sha256"], "deckySnapshot.sha256")
 
 
-def _validate(data: dict) -> None:
+def _install_models(value) -> frozenset:
+    """Normalise the builder-only install-only model allowance.
+
+    Package consumers never pass this: the default empty allowance keeps the
+    shipped model list closed. A build host may name the configured, non-default
+    models it packaged so the builder can validate its own product; those extra
+    models stay install-only, because ``_validate`` rejects them together with
+    offline-upgrade or recovery manifests.
+    """
+    if isinstance(value, (str, bytes)):
+        raise PackageError("install_models must be a sequence of model identifiers")
+    try:
+        items = tuple(value)
+    except TypeError as exc:
+        raise PackageError(
+            "install_models must be a sequence of model identifiers"
+        ) from exc
+    selected = set()
+    for item in items:
+        if not isinstance(item, str) or not _MODEL_ID.fullmatch(item):
+            raise PackageError("install_models entries must be simple model identifiers")
+        if item in AUTHORIZED_MODELS:
+            raise PackageError(
+                f"install_models must not name the authorized model {item!r}"
+            )
+        if item in selected:
+            raise PackageError(f"install model {item!r} is duplicated")
+        selected.add(item)
+    return frozenset(selected)
+
+
+def _validate(data: dict, install_models=frozenset()) -> None:
     if not isinstance(data, dict) or set(data) != _TOP_KEYS:
         raise PackageError("package must contain exactly the schema 1 top-level keys")
     if type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1:
@@ -146,7 +186,11 @@ def _validate(data: dict) -> None:
     _hash(data["ostreeCommit"], "ostreeCommit")
     _updater_tuple(data["minimumInstallerVersion"], "minimumInstallerVersion")
     _updater_tuple(data["minimumUpdaterVersion"], "minimumUpdaterVersion")
-    for field, allowed in (("supportedModels", _MODELS), ("operations", _OPERATIONS)):
+    extra_models = _install_models(install_models)
+    for field, allowed in (
+        ("supportedModels", AUTHORIZED_MODELS | extra_models),
+        ("operations", _OPERATIONS),
+    ):
         values = data[field]
         if not isinstance(values, list) or not values or any(
             type(value) is not str or value not in allowed for value in values
@@ -154,6 +198,11 @@ def _validate(data: dict) -> None:
             raise PackageError(f"{field} must be a nonempty list of supported values")
         if len(set(values)) != len(values):
             raise PackageError(f"{field} must not contain duplicates")
+    supported = set(data["supportedModels"])
+    if not extra_models <= supported:
+        raise PackageError("install_models must be listed in supportedModels")
+    if "offline-upgrade" in data["operations"] and not supported <= AUTHORIZED_MODELS:
+        raise PackageError("offline-upgrade is restricted to the authorized models")
 
     archive = data["archive"]
     _archive_member(archive, "archive", None)
@@ -222,10 +271,16 @@ def _validate(data: dict) -> None:
         raise PackageError("decky-repair requires deckySnapshot metadata")
 
 
-def validate_package(data: dict) -> dict:
-    """Validate descriptor metadata and return an independent copy."""
+def validate_package(data: dict, *, install_models=()) -> dict:
+    """Validate descriptor metadata and return an independent copy.
+
+    ``install_models`` is a builder-only allowance for the explicit, trusted
+    models a host packaged from its devices configuration. Package consumers
+    omit it, so the shipped model list stays closed and the extra models remain
+    install-only.
+    """
     try:
-        _validate(data)
+        _validate(data, install_models)
     except PackageError:
         raise
     except (CatalogError, TypeError, ValueError) as exc:

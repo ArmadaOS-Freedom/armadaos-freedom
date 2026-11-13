@@ -12,7 +12,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
-from updates.package_contract import PackageError, _portable_path, validate_package
+from updates.package_contract import (
+    AUTHORIZED_MODELS, PackageError, _portable_path, validate_package,
+)
 from updates.package_media import _check_unchanged, _open_regular, verify_archive, verify_parts
 from updates.recovery_manifest import validate_recovery_manifest
 
@@ -175,9 +177,21 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                      minimum_installer_version="0.8.0",
                      minimum_updater_version="0.8.0",
                      parts_manifest: Path | None = None,
-                     enable_offline_upgrade: bool = False) -> dict:
+                     enable_offline_upgrade: bool = False,
+                     install_models=()) -> dict:
     if type(enable_offline_upgrade) is not bool:
         raise PackageError("enable_offline_upgrade must be a boolean")
+    if isinstance(install_models, (str, bytes)):
+        raise PackageError("install_models must be a sequence of model identifiers")
+    try:
+        install_models = tuple(install_models)
+    except TypeError as exc:
+        raise PackageError(
+            "install_models must be a sequence of model identifiers"
+        ) from exc
+    for model in install_models:
+        if not isinstance(model, str):
+            raise PackageError("install_models entries must be model identifiers")
     archive_path = Path(archive_path)
     archive_size, archive_sha = _file_digest(archive_path)
     try:
@@ -263,6 +277,21 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                 manifests[model] = manifest_path
             if any(len(paths) != 1 for paths in common_paths.values()):
                 raise PackageError("root, boot, kernel, and initramfs must each be shared")
+
+            custom_models = tuple(
+                model for model in models if model not in AUTHORIZED_MODELS
+            )
+            if len(set(install_models)) != len(install_models):
+                raise PackageError("install_models must not contain duplicates")
+            if set(install_models) != set(custom_models):
+                raise PackageError(
+                    "install_models must name exactly the non-default package models"
+                )
+            if enable_offline_upgrade and custom_models:
+                raise PackageError(
+                    "offline-upgrade is restricted to the authorized models; "
+                    "build this package install-only"
+                )
 
             if "recoveryManifests" in bundle and not isinstance(bundle["recoveryManifests"], dict):
                 raise PackageError("bundle.recoveryManifests must be an object")
@@ -396,7 +425,7 @@ def build_descriptor(archive_path: Path, *, release_id: str,
         "parts": parts, "files": files, "modelManifests": manifests,
         "recoveryManifests": recovery_manifests, "deckySnapshot": None,
     }
-    result = validate_package(descriptor)
+    result = validate_package(descriptor, install_models=install_models)
     if raw_recovery_docs:
         for model, (norm_path, doc_bytes) in raw_recovery_docs.items():
             rec_doc = validate_recovery_manifest(doc_bytes, result, model)
@@ -405,7 +434,8 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                 raise PackageError(f"{model} recovery kernel does not match install kernel")
             if artifacts["runtime"] != model_install_artifacts[model]["runtime"]:
                 raise PackageError(f"{model} recovery runtime does not match install runtime")
-    verify_archive(archive_path, result, verify_expanded=True)
+    verify_archive(archive_path, result, verify_expanded=True,
+                   install_models=install_models)
     if parts_manifest is not None:
-        verify_parts(parts_manifest.parent, result)
+        verify_parts(parts_manifest.parent, result, install_models=install_models)
     return result

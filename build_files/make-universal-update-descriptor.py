@@ -27,6 +27,7 @@ def make(args: argparse.Namespace) -> int:
         minimum_updater_version=args.minimum_updater_version,
         parts_manifest=args.parts_manifest,
         enable_offline_upgrade=args.offline_upgrade,
+        install_models=args.install_model,
     )
     document = (
         json.dumps(descriptor, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
@@ -85,6 +86,11 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--offline-upgrade", action="store_true", default=False,
                         help="declare offline-upgrade for normal-Linux installs; requires the "
                              "bundle to record a verified normal updater, recovery manifests optional")
+    create.add_argument("--install-model", action="append", default=[],
+                        metavar="ID",
+                        help="registered non-default model packaged install-only; repeat once "
+                             "for every custom model in the archive; never combines with "
+                             "--offline-upgrade")
     create.set_defaults(handler=make)
 
     check = commands.add_parser("verify", help="verify a signed descriptor")

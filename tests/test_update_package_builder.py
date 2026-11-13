@@ -11,7 +11,12 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
-from updates.package_contract import PackageError, validate_package
+from updates.package_contract import (
+    AUTHORIZED_MODELS, PackageError, validate_package,
+)
+
+CONFIG_PATH = ROOT / "build_files" / "edl-devices.json"
+CUSTOM_MODEL = "THIRD"
 
 
 def _load_module(name: str, rel_path: str):
@@ -283,6 +288,74 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                 archive = self._make_bundle(Path(tmp), mutate=mutator)
                 with self.assertRaisesRegex(PackageError, pattern):
                     build_descriptor(archive, release_id="rel-1")
+
+
+    def test_configured_custom_model_is_an_install_only_descriptor(self):
+        registered = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"]
+        self.assertEqual(set(registered), set(AUTHORIZED_MODELS))
+        self.assertNotIn(CUSTOM_MODEL, registered)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            archive = self._make_bundle(tmp_dir, models=("TB322FC", CUSTOM_MODEL))
+            manifest_path, _split_doc = _split_to_manifest(
+                archive, tmp_dir / "split", part_bytes=300
+            )
+            desc = build_descriptor(
+                archive,
+                release_id="rel-third",
+                parts_manifest=manifest_path,
+                install_models=(CUSTOM_MODEL,),
+            )
+            self.assertEqual(desc["supportedModels"], ["TB322FC", CUSTOM_MODEL])
+            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(desc["recoveryManifests"], {})
+            self.assertTrue(desc["parts"])
+            self.assertEqual(
+                validate_package(desc, install_models=(CUSTOM_MODEL,)), desc
+            )
+            # Package consumers keep the shipped, closed model list.
+            with self.assertRaisesRegex(PackageError, "supported values"):
+                validate_package(desc)
+
+    def test_unregistered_custom_model_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(Path(tmp), models=("TB322FC", CUSTOM_MODEL))
+            with self.assertRaisesRegex(PackageError, "non-default package models"):
+                build_descriptor(archive, release_id="rel-third")
+
+    def test_custom_model_cannot_declare_offline_upgrade(self):
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=("TB322FC", CUSTOM_MODEL), mutate=offline_capable
+            )
+            with self.assertRaisesRegex(
+                PackageError, "offline-upgrade is restricted"
+            ):
+                build_descriptor(
+                    archive,
+                    release_id="rel-third",
+                    enable_offline_upgrade=True,
+                    install_models=(CUSTOM_MODEL,),
+                )
+
+    def test_default_models_keep_offline_upgrade(self):
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        models = ("TB322FC", "TB323FU", "TB710FU")
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=models, mutate=offline_capable
+            )
+            desc = build_descriptor(
+                archive, release_id="rel-default", enable_offline_upgrade=True
+            )
+            self.assertEqual(desc["supportedModels"], list(models))
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
+            self.assertEqual(validate_package(desc), desc)
 
 
 if __name__ == "__main__":

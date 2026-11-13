@@ -85,6 +85,16 @@ jobs:
         with:
           cosign-release: 'v2.6.3'
 
+      # Prove the private key is the counterpart of the key devices trust
+      # before any release is written. The shared helper compares the derived
+      # and trusted public keys locally; no signature, transparency-log entry,
+      # registry, or release is touched, and no secret is printed.
+      - name: Prove the signing key matches the trusted public key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: bash .github/scripts/verify-signing-key.sh
+
       - name: Install registry tools
         run: |
           set -euo pipefail
@@ -170,6 +180,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARMADA_RELEASE_TOKEN: ${{ secrets.ARMADA_RELEASE_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.package.outputs.tag }}
           RELEASE_ID: ${{ steps.package.outputs.release_id }}
@@ -196,21 +207,49 @@ jobs:
           state="$(jq -r '.state' "${SCRATCH}/release-state.json")"
           echo "state=${state}" >> "${GITHUB_OUTPUT}"
 
+          # GitHub's create-release documentation: the default GITHUB_TOKEN
+          # cannot create a release whose tag targets a commit that differs
+          # from this workflow run in .github/workflows, because that needs
+          # Workflows write. Historical builds can still succeed with the
+          # built-in token whenever that permission is not required, so the
+          # dedicated token is optional: when present, it is used for release
+          # creation only. It is never used for checkout or artifact
+          # processing, and all later release and channel operations keep the
+          # default token. The tag target is always the verified
+          # SOURCE_REVISION, never the current branch head.
+          historical=false
+          if [ "${SOURCE_REVISION}" != "${GITHUB_SHA}" ]; then
+            historical=true
+          fi
+          create_token="${GH_TOKEN}"
+          if [ "${historical}" = true ] && [ -n "${ARMADA_RELEASE_TOKEN:-}" ]; then
+            create_token="${ARMADA_RELEASE_TOKEN}"
+          fi
+
           case "${state}" in
             absent)
-              gh release create "${TAG}" \
+              if ! GH_TOKEN="${create_token}" gh release create "${TAG}" \
                 --repo "${REPOSITORY}" \
                 --draft \
                 --target "${SOURCE_REVISION}" \
                 --title "ArmadaOS Freedom ${RELEASE_ID}" \
-                --notes "Signed Freedom update package ${RELEASE_ID}."
+                --notes "Signed Freedom update package ${RELEASE_ID}."; then
+                echo "::error::Creating release ${TAG} at ${SOURCE_REVISION} failed. No release was published and the channel was not updated."
+                if [ "${historical}" = true ]; then
+                  echo "::error::If this was a permissions error, GITHUB_TOKEN cannot create a historical release whose tag target changes .github/workflows. Add the optional ARMADA_RELEASE_TOKEN secret with Contents and Workflows write and rerun; see docs/edl-package.md. This workflow never changes the tag target or modifies secrets."
+                else
+                  echo "::error::Check that GITHUB_TOKEN has Contents write for ${REPOSITORY}."
+                fi
+                exit 1
+              fi
               ;;
             incomplete)
               echo "Resuming draft release ${TAG}; existing assets are kept."
               ;;
             matching)
               if [ "$(jq -r '.isDraft' "${SCRATCH}/release.json")" = "true" ]; then
-                gh release edit "${TAG}" --repo "${REPOSITORY}" --draft=false
+                gh release edit "${TAG}" \
+                  --repo "${REPOSITORY}" --draft=false
               fi
               ;;
             *)
@@ -230,7 +269,8 @@ jobs:
               exit 1
             fi
             gh release upload "${TAG}" --repo "${REPOSITORY}" "${uploads[@]}"
-            gh release edit "${TAG}" --repo "${REPOSITORY}" --draft=false
+            gh release edit "${TAG}" \
+              --repo "${REPOSITORY}" --draft=false
           fi
 
       - name: Verify the published release before the channel changes

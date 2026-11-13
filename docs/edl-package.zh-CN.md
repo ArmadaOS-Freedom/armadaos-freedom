@@ -93,7 +93,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 | `bootPartitionBytes` | 写入机型清单的声明启动分区大小。 |
 | `diagnosticMode` | `rd-break` 或 `verbose`。 |
 
-适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。
+适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。不在随附约定机型列表中的配置只能构建首次安装包；构建不会为它声明离线升级或恢复能力，且当它与默认机型一同选中时，整个包只声明首次安装。
 
 ## 内置插件来源
 
@@ -124,6 +124,8 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 3. 运行 **Promote release**，`source: testing`，`target: beta` 或 `stable`。晋升读取同一份签名渠道，要求源标签解析到完全相同的摘要和镜像修订，再把目标渠道指向同一批 Release 资产。全程不重新构建；没有匹配的签名渠道发布时，源标签会在打任何标签之前就失败。
 
 不会就地替换：已公开的 Release 必须与校验过的部署包完全一致；草稿 Release 即使是空的也会就地补全——只上传缺失的资产，已存在的资产按签名计划做哈希校验而不是覆盖；内容不一致的 Release 会直接失败。渠道文档与签名以一次提交写入 `update-channels` 分支的对应文件，更新串行执行，绝不强制推送。
+
+从当前提交发布构建时始终使用工作流的 `GITHUB_TOKEN`。历史构建的 Release 标签指向的提交可能与工作流运行不同；GitHub 创建 Release 的文档说明，当该提交改动了 `.github/workflows` 时 `GITHUB_TOKEN` 无法创建该 Release，因为它从不具备 Workflows 写权限。可选的 `ARMADA_RELEASE_TOKEN` 密钥只用于这一步历史 `gh release create`：已配置时该步骤使用它，未配置时该步骤尝试 `GITHUB_TOKEN`，在 GitHub 允许的情况下可以成功；若权限被拒绝且标签提交与本次运行的工作流内容不同，则需要具备 **Contents** 与 **Workflows** 写权限的专用令牌。此后公开草稿 Release，以及检出、下载产物、校验、上传资产和发布渠道，均继续使用 `GITHUB_TOKEN`，不切换令牌。标签目标始终是已校验的构建修订，绝不是当前分支末端。
 
 ## 部署包结构
 
@@ -170,7 +172,7 @@ Windows 安装器 0.7.32 起识别组织地址，并继续兼容迁移前 `mydan
 
 本地封装脚本输出的描述尚未签名。EDL Actions 工作流对其原始 UTF-8 字节使用发行密钥签名，以固定公钥核验后，把 .zip.update.json.sig 与分卷一起上传。SHA256SUMS 和 parts.json 不能替代发行签名，也不能信任安装包自行提供的公钥。
 
-生成器先确认部署镜像带有正常 Linux 更新器，随后声明 install 与 offline-upgrade；镜像缺少该更新器时构建直接失败，不会被改标为可升级。离线升级保留用户数据，并用已校验的载荷写入两个启动槽；在线 OCI 更新只轮换非当前槽。签名本身不使包具备升级能力：描述必须声明 offline-upgrade，且已安装更新器版本不低于 `minimumUpdaterVersion`。
+生成器先确认部署镜像带有正常 Linux 更新器，随后声明 install 与 offline-upgrade；镜像缺少该更新器时构建直接失败，不会被改标为可升级。当所选机型包含随附约定之外的配置时，构建只生成首次安装包：封装脚本不会为它请求 offline-upgrade，而是把该已注册机型显式传给描述生成器，使构建产物通过校验，同时仍拒绝为它声明离线升级或恢复能力。离线升级保留用户数据，并用已校验的载荷写入两个启动槽；在线 OCI 更新只轮换非当前槽。签名本身不使包具备升级能力：描述必须声明 offline-upgrade，且已安装更新器版本不低于 `minimumUpdaterVersion`。
 
 离线升级目前仅支持联想 Legion Y700 四代（TB322FC）与五代（TB323FU）。联想小新 Pad Pro GT（TB710FU）仍可能出现在通用首次安装包中，但其更新槽后端尚未实现，因此出现在部署包的机型列表中并不代表该机型支持离线升级。
 

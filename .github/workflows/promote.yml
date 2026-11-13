@@ -54,7 +54,6 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TARGET: ${{ inputs.target }}
           SOURCE: ${{ inputs.source }}
-          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [ "${REPOSITORY}" != "${ARMADA_CANONICAL_REPOSITORY}" ]; then
@@ -77,12 +76,17 @@ jobs:
             echo "::error::source and target must differ."
             exit 1
           fi
-          case "${VERSION}" in
-            '') ;;
-            *[[:space:]]*|-*)
-              echo "::error::version must be a nonempty image tag without whitespace."
-              exit 1 ;;
-          esac
+
+      # The optional version becomes an immutable image tag, so it must be a
+      # real Docker tag and must not shadow a floating channel alias. This is
+      # checked before any registry or channel write.
+      - name: Validate release version tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/update-publication.py check-version \
+            --version "${VERSION}"
 
       - name: Check signing secrets
         env:
@@ -109,6 +113,16 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: 'v2.6.3'
+
+      # Prove the private key is the counterpart of the key devices trust
+      # before any tag is written. The shared helper compares the derived and
+      # trusted public keys locally; no signature, transparency-log entry,
+      # registry, or channel is touched, and no secret is printed.
+      - name: Prove the signing key matches the trusted public key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: bash .github/scripts/verify-signing-key.sh
 
       - name: Log in to GHCR
         env:

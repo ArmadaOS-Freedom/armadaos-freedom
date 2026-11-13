@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -35,15 +36,17 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         archive_before = archive.read_bytes()
 
         script = ROOT / "build_files" / "build-edl-package.sh"
-        marker = "/source/build_files/make-universal-update-descriptor.py"
-        lines = [
-            line
-            for line in script.read_text(encoding="utf-8").splitlines()
-            if "run_container" in line and marker in line
-        ]
-        self.assertEqual(len(lines), 1)
-        tokens = shlex.split(lines[0])
-        argv = tokens[tokens.index("python3"):]
+        script_text = script.read_text(encoding="utf-8").replace("\r\n", "\n")
+        match = re.search(
+            r"^descriptor_args=\(\n(?P<body>.*?)\n\)$", script_text, re.S | re.M
+        )
+        self.assertIsNotNone(match, "the wrapper must build the descriptor argv")
+        argv = shlex.split(match.group("body"))
+        self.assertIn("/source/build_files/make-universal-update-descriptor.py", argv)
+        self.assertIn('"${descriptor_args[@]}"', script_text)
+        # The default selection keeps the normal install-and-upgrade package.
+        self.assertIn("descriptor_args+=(--offline-upgrade)", script_text)
+        argv.append("--offline-upgrade")
 
         replacements = []
         for argument in argv:

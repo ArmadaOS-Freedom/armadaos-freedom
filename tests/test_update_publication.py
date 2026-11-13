@@ -413,6 +413,17 @@ class PublicationTest(unittest.TestCase):
             with self.assertRaises(publication.PublicationError, msg=repr(value)):
                 publication.release_tag(value)
 
+    def test_promotion_version_is_a_docker_tag_or_empty(self):
+        for value in ("", "1.0", "2026.04.19-1", "V1_0", "_internal", "x" * 128):
+            self.assertEqual(publication.promotion_tag(value), value, repr(value))
+        for value in (
+            "testing", "beta", "stable", "latest",
+            "1.0/2", "-1.0", ".1", "1 0", "1.0\n", "a" * 129, "1.0:2",
+            None, 5,
+        ):
+            with self.assertRaises(publication.PublicationError, msg=repr(value)):
+                publication.promotion_tag(value)
+
     def _plan_assets(self):
         return [
             {"name": "pkg.zip.001", "bytes": 10, "sha256": "a" * 64},
@@ -1057,6 +1068,127 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn(".github/scripts/publish-signed-channel.sh", text)
         self.assertIn("update-channels", text)
         self.assertIn("target", text)
+
+    @staticmethod
+    def _step_text(text, name):
+        marker = f"- name: {name}\n"
+        start = text.index(marker) + len(marker)
+        rest = text[start:]
+        end = rest.find("\n      - ")
+        return rest if end == -1 else rest[:end]
+
+    def test_removed_recovery_harnesses_are_not_invoked(self):
+        removed = (
+            "update-recovery-deployment-test.py",
+            "update-recovery-mounts-test.py",
+            "update-recovery-context-test.py",
+        )
+        for name in ("build.yml", "pr.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            for stale in removed:
+                self.assertNotIn(stale, text, f"{name} invokes removed {stale}")
+
+    def test_installed_runtime_offline_tests_run_through_discovery(self):
+        discovered = {
+            path.name for path in (ROOT / "tests").glob("test_update_*.py")
+        }
+        self.assertTrue(
+            {"test_update_offline_prepare.py", "test_update_offline_execute.py"}
+            <= discovered,
+            "the maintained installed-runtime offline tests must match discovery",
+        )
+        for name in ("build.yml", "pr.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.assertIn("-p 'test_update_*.py'", text, name)
+
+    def test_promotion_version_guard_runs_before_any_write(self):
+        text = (ROOT / ".github/workflows/promote.yml").read_text(encoding="utf-8")
+        guard = text.index("Validate release version tag")
+        self.assertIn("check-version", text)
+        self.assertIn('--version "${VERSION}"', text)
+        self.assertLess(guard, text.index("Publish release tags"))
+        self.assertLess(guard, text.index("Publish the target update channel"))
+
+    def test_signing_key_proof_precedes_every_mutation(self):
+        cases = (
+            ("build.yml", "Push container to GHCR"),
+            ("promote.yml", "Publish release tags"),
+            ("publish-update-channel.yml", "Reconcile the package release"),
+        )
+        for name, mutation in cases:
+            with self.subTest(workflow=name):
+                text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+                install = text.index("Install Cosign")
+                proof = text.index(
+                    "Prove the signing key matches the trusted public key")
+                self.assertLess(install, proof)
+                self.assertLess(proof, text.index(mutation))
+                self.assertIn("cosign-release: 'v2.6.3'", text)
+                self.assertIn(
+                    "run: bash .github/scripts/verify-signing-key.sh", text)
+                # sign-blob with --tlog-upload=false leaves no Rekor entry, so
+                # a default verify-blob then fails offline. The proof must not
+                # sign or verify a blob at all.
+                self.assertNotIn("sign-blob", text)
+                self.assertNotIn("verify-blob", text)
+
+    def test_signing_key_proof_compares_public_keys_locally(self):
+        text = (ROOT / ".github/scripts/verify-signing-key.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("set -euo pipefail", text)
+        # cosign derives the public half from the private key; nothing is
+        # signed, so no transparency-log entry is needed or expected.
+        self.assertIn(
+            "cosign public-key --key env://COSIGN_PRIVATE_KEY", text)
+        self.assertIn("--outfile", text)
+        self.assertIn("openssl pkey -pubin", text)
+        self.assertEqual(text.count("openssl pkey -pubin"), 2)
+        self.assertIn("-outform DER", text)
+        self.assertIn("cmp -s", text)
+        self.assertIn("workdir=\"$(mktemp -d", text)
+        self.assertIn("trap cleanup EXIT", text)
+        self.assertIn("umask 077", text)
+        self.assertIn("chmod 700", text)
+        self.assertIn("chmod 600", text)
+        # The private key is read from the environment, never written to a
+        # file or echoed.
+        self.assertNotIn('> "${COSIGN_PRIVATE_KEY}"', text)
+        self.assertNotIn('echo "${COSIGN_PRIVATE_KEY}', text)
+        self.assertNotIn("sign-blob", text)
+        self.assertNotIn("verify-blob", text)
+
+    def test_historical_release_creation_uses_a_scoped_token(self):
+        text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
+            encoding="utf-8")
+        # The dedicated credential is optional: a historical build first tries
+        # the built-in token, and the dedicated token is supplied to release
+        # creation only when it exists and the build is historical.
+        self.assertIn("historical=false", text)
+        self.assertIn(
+            'if [ "${historical}" = true ] && [ -n "${ARMADA_RELEASE_TOKEN:-}" ]',
+            text)
+        self.assertIn('create_token="${ARMADA_RELEASE_TOKEN}"', text)
+        self.assertIn('GH_TOKEN="${create_token}" gh release create', text)
+        # No pre-emptive requirement to hold the privileged secret, and later
+        # release and channel operations keep the default token.
+        self.assertNotIn('if [ -z "${ARMADA_RELEASE_TOKEN:-}" ]; then', text)
+        self.assertNotIn('GH_TOKEN="${create_token}" gh release edit', text)
+        self.assertNotIn('GH_TOKEN="${create_token}" gh release upload', text)
+        # The tag target stays the verified build revision; main is never a
+        # fallback target.
+        self.assertIn('--target "${SOURCE_REVISION}"', text)
+        self.assertNotIn("--target main", text)
+        # A permissions failure points at the documented remedy without
+        # retargeting or changing any secret.
+        self.assertIn("docs/edl-package.md", text)
+        self.assertIn("Contents and Workflows write", text)
+        for step in (
+            "Check out source",
+            "Verify package build run and artifact",
+            "Download package artifact",
+            "Verify signed package and parts",
+        ):
+            self.assertNotIn("ARMADA_RELEASE_TOKEN", self._step_text(text, step), step)
 
     def test_publication_and_promotion_share_one_concurrency_group(self):
         for name in ("publish-update-channel.yml", "promote.yml"):

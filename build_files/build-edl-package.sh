@@ -4,14 +4,21 @@
 # Builds the tools task image, resolves the OCI input and its embedded EDL
 # runtimes, runs the raw producer with only the loop devices it needs, then
 # splits the archive and publishes the part checksums plus a short bilingual
-# readme. The source tree is only ever mounted read-only. The tools image tag is
-# task-temporary and is removed again when the wrapper exits.
+# readme. A selected profile outside the shipped package contract is packaged
+# install-only. The source tree is only ever mounted read-only. The tools image
+# tag is task-temporary and is removed again when the wrapper exits.
 set -euo pipefail
 umask 022
 
 readonly TASK_PREFIX="freedom-edl-package"
 readonly SIGNED_ORIGIN_RE='^ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:(stable|beta|testing)(@sha256:[0-9a-f]{64})?$'
 readonly GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+# Models the shipped package contract accepts. Any other profile registered in
+# the devices config is packaged install-only, and the package-level upgrade
+# capability is requested only when every selected model is in this set.
+# Keep this list in sync with
+# system_files/usr/lib/armada/updates/package_contract.py.
+readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -43,7 +50,9 @@ Options:
   --devices-config PATH     device profile config
                             (default: SOURCE/build_files/edl-devices.json)
   --model ID                package only this device profile; repeatable
-                            (default: every profile registered in the config)
+                            (default: every profile registered in the config;
+                            a profile outside the shipped contract is packaged
+                            install-only)
   --origin ORIGIN           ostree-image-signed origin; required unless the OCI
                             input is ghcr.io/armadaos-freedom/armadaos-freedom:stable|beta|testing
   --boot-uuid GUID          boot filesystem UUID (default: generated)
@@ -202,6 +211,18 @@ for model_id in "${selected_models[@]}"; do
         || die "unusable model id in the devices config: $model_id"
     [[ -z ${selected_model_set[$model_id]:-} ]] || die "duplicate model id: $model_id"
     selected_model_set[$model_id]=1
+done
+
+# A profile outside the shipped contract may be packaged for first installation
+# only; it never gains offline-upgrade or recovery. The extra identifiers are
+# passed explicitly to the descriptor builder so the default contract stays
+# closed on devices.
+install_only_models=()
+for model_id in "${selected_models[@]}"; do
+    case " $AUTHORIZED_MODELS " in
+        *" $model_id "*) ;;
+        *) install_only_models+=("$model_id") ;;
+    esac
 done
 
 readme_output="$(python3 -B "$helper" --config "$devices_config" --format readme \
@@ -493,16 +514,22 @@ producer_args=(
     --root-uuid "$root_uuid"
     --root-image-gib "$root_image_gib"
     --version "$version"
-    --offline-upgrade
     --work /work/producer
     --out /work/archive
 )
+if ((${#install_only_models[@]} == 0)); then
+    producer_args+=(--offline-upgrade)
+fi
 for model_id in "${selected_models[@]}"; do
     producer_args+=(--model "$model_id")
 done
 producer_args+=("${producer_runtime_args[@]}")
 
-note "producing the raw EDL package for ${selected_models[*]}"
+if ((${#install_only_models[@]} == 0)); then
+    note "producing the raw EDL package for ${selected_models[*]}"
+else
+    note "producing the install-only raw EDL package for ${selected_models[*]}"
+fi
 run_container "$TASK_PREFIX-producer-$run_id" \
     --cpus 4 \
     --memory 6g \
@@ -555,10 +582,26 @@ parts_manifest="$output_dir/$zip_name.parts.json"
 update_descriptor="$output_dir/$zip_name.update.json"
 note "producing the unsigned update descriptor $zip_name.update.json"
 # The producer already verified the deployed image carries the normal-Linux
-# updater, so the descriptor may declare both install and offline-upgrade. A
-# package built from an image without that updater fails before this point and
-# can never be relabeled as upgrade-capable here.
-run_container "$TASK_PREFIX-descriptor-$run_id" --cpus 4 --memory 6g --network none --user "$host_uid:$host_gid" -v "$source_dir:/source:ro" -v "$work_dir:/work:ro" -v "$output_dir:/output" "$tools_image" python3 -B /source/build_files/make-universal-update-descriptor.py make --archive "/work/archive/$zip_name" --parts-manifest "/output/$zip_name.parts.json" --release-id "$version" --offline-upgrade --output "/output/$zip_name.update.json"
+# updater, so a default-model package may declare both install and
+# offline-upgrade. A package containing a configured custom model is built
+# install-only: the custom identifiers are passed explicitly as trusted
+# install models and the contract still keeps offline-upgrade and recovery
+# restricted to its authorized set.
+descriptor_args=(
+    python3 -B /source/build_files/make-universal-update-descriptor.py make
+    --archive "/work/archive/$zip_name"
+    --parts-manifest "/output/$zip_name.parts.json"
+    --release-id "$version"
+    --output "/output/$zip_name.update.json"
+)
+if ((${#install_only_models[@]} == 0)); then
+    descriptor_args+=(--offline-upgrade)
+else
+    for model_id in "${install_only_models[@]}"; do
+        descriptor_args+=(--install-model "$model_id")
+    done
+fi
+run_container "$TASK_PREFIX-descriptor-$run_id" --cpus 4 --memory 6g --network none --user "$host_uid:$host_gid" -v "$source_dir:/source:ro" -v "$work_dir:/work:ro" -v "$output_dir:/output" "$tools_image" "${descriptor_args[@]}"
 [[ -f $update_descriptor ]] || die "the descriptor tool did not write $update_descriptor"
 
 command -v python3 >/dev/null 2>&1 \
@@ -586,6 +629,20 @@ sys.stdout.write("".join(lines))
 PY
 mv -f -- "$output_dir/.SHA256SUMS.part" "$output_dir/SHA256SUMS"
 
+if ((${#install_only_models[@]} == 0)); then
+    descriptor_identity="unsigned install and upgrade identity"
+    descriptor_scope_en="The descriptor declares first installation and a normal-Linux offline upgrade
+that keeps user data and both boot slots. That upgrade runs from an installed
+system; memory-rescue tools are not part of this package."
+    descriptor_scope_zh="描述文件同时声明首次安装与保留用户数据及两个启动槽的正常 Linux 离线升级；该升级在已安装系统中执行，本包不包含内存救援工具。"
+else
+    descriptor_identity="unsigned install-only identity"
+    descriptor_scope_en="The descriptor declares first installation only. The configured custom models
+are outside the authorized offline-upgrade set, so this package advertises no
+upgrade capability and carries no rescue tools."
+    descriptor_scope_zh="描述文件仅声明首次安装。配置的自定义机型不在授权的离线升级范围内，因此本包不声明升级能力，也不包含内存救援工具。"
+fi
+
 cat > "$output_dir/README.zh-en.txt" <<EOF
 ArmadaOS Freedom - EDL raw package $version
 ============================================
@@ -597,7 +654,7 @@ $readme_output
 Files:
   ArmadaOS-Freedom-$version.zip.001 ...      split parts of one archive
   ArmadaOS-Freedom-$version.zip.parts.json   split metadata
-  ArmadaOS-Freedom-$version.zip.update.json  unsigned install and upgrade identity
+  ArmadaOS-Freedom-$version.zip.update.json  $descriptor_identity
   SHA256SUMS                                 checksums of the split parts
   README.zh-en.txt                           this file
 
@@ -606,9 +663,7 @@ packages additionally carry a .update.json.sig that installers verify against
 the trusted release public key; without that signature these files carry no
 authenticity.
 
-The descriptor declares first installation and a normal-Linux offline upgrade
-that keeps user data and both boot slots. That upgrade runs from an installed
-system; memory-rescue tools are not part of this package.
+$descriptor_scope_en
 
 Keep all parts in the same folder. SHA256SUMS checks the parts:
   sha256sum -c SHA256SUMS        (Linux)
@@ -621,7 +676,7 @@ No manual extraction, merging or recompression is needed.
 [中文]
 本包包含上方列出的机型配置。请将所有分卷放在同一文件夹内，SHA256SUMS 用于校验各分卷。
 在支持本包的 ArmadaOS Freedom 安装器中直接选择 .001 分卷，安装器会自动使用与所识别机型匹配的文件，无需手动解压、合并或重新压缩。
-描述文件同时声明首次安装与保留用户数据及两个启动槽的正常 Linux 离线升级；该升级在已安装系统中执行，本包不包含内存救援工具。
+$descriptor_scope_zh
 EOF
 
 # --- summary ----------------------------------------------------------------

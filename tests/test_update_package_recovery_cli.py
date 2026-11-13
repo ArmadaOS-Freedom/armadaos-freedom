@@ -17,7 +17,7 @@ MODEL_SETS = (("TB322FC", "TB323FU"), ("TB322FC", "TB323FU", "TB710FU"))
 
 
 class UpdateDescriptorCliTests(unittest.TestCase):
-    def _make(self, archive, output, offline=False):
+    def _make(self, archive, output, offline=False, install_models=()):
         command = [
             sys.executable, "-B", str(CLI), "make",
             "--archive", str(archive), "--release-id", "rel-1",
@@ -25,6 +25,8 @@ class UpdateDescriptorCliTests(unittest.TestCase):
         ]
         if offline:
             command.append("--offline-upgrade")
+        for model in install_models:
+            command.extend(("--install-model", model))
         return subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
 
     def test_full_recovery_default_install_and_explicit_upgrade(self):
@@ -65,6 +67,24 @@ class UpdateDescriptorCliTests(unittest.TestCase):
             document = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(document["operations"], ["install", "offline-upgrade"])
             self.assertEqual(document["recoveryManifests"], {})
+
+    def test_custom_model_requires_the_explicit_install_only_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            archive = fixtures.BASE._make_bundle(
+                directory, models=("TB322FC", "THIRD")
+            )
+            rejected = directory / "rejected.json"
+            result = self._make(archive, rejected)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(rejected.exists())
+
+            accepted = directory / "accepted.json"
+            result = self._make(archive, accepted, install_models=("THIRD",))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(accepted.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], ["TB322FC", "THIRD"])
+            self.assertEqual(document["operations"], ["install"])
 
     def test_legacy_archive_rejects_explicit_upgrade(self):
         for models in MODEL_SETS:

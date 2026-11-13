@@ -125,6 +125,32 @@ def release_tag(release_id) -> str:
     return release_id
 
 
+_DOCKER_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+
+
+def promotion_tag(version) -> str:
+    """Validate the optional promote ``version`` as an immutable image tag.
+
+    An empty value is allowed and means no extra tag is written. Anything else
+    must be valid Docker tag syntax and must not reuse a floating channel
+    alias, so a promotion can never shadow testing, beta, stable, or latest.
+    """
+    if not isinstance(version, str):
+        raise PublicationError("version must be a string")
+    if version == "":
+        return ""
+    if not _DOCKER_TAG.fullmatch(version):
+        raise PublicationError(
+            "version must match ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+        )
+    if version in _RESERVED_TAGS:
+        raise PublicationError(
+            "version must not reuse a floating channel alias "
+            "(testing, beta, stable, latest)"
+        )
+    return version
+
+
 def release_asset_names(package: dict) -> list:
     """Asset names in upload order: parts, parts manifest, descriptor, signature."""
     archive = package["archive"]["fileName"]
@@ -999,9 +1025,19 @@ def command_commit_channel(args) -> int:
     return 0
 
 
+def command_check_version(args) -> int:
+    promotion_tag(args.version)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
+
+    check_version = commands.add_parser(
+        "check-version", help="validate an optional promotion version tag")
+    check_version.add_argument("--version", required=True)
+    check_version.set_defaults(handler=command_check_version)
 
     verify = commands.add_parser(
         "verify-package", help="verify a downloaded package artifact")

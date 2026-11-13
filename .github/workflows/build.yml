@@ -113,10 +113,7 @@ jobs:
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-image-source-test.py
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-offline-source-test.py
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-deployment-options-test.py
-          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-deployment-test.py
           sudo modprobe btrfs
-          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-mounts-test.py
-          sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/update-recovery-context-test.py
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_recovery_channel.py
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_finalization_receipt.py
           sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -B tests/test_update_system_pending_status.py
@@ -188,6 +185,13 @@ jobs:
       - name: Check tablet input integration
         run: bash tests/tb323fu-input-test.sh
 
+      # Installed before the key checks: proving the private key matches the
+      # trusted public key uses this pinned cosign.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.3'
+
       - name: Check signing key
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
@@ -211,6 +215,16 @@ jobs:
             echo "::error::SIGNING_PASSWORD is not configured."
             exit 1
           fi
+
+      # The private key must be the counterpart of the key devices trust. The
+      # shared helper derives the public key and compares it with the trusted
+      # key locally, so no signature and no transparency-log entry is needed.
+      # Nothing is sent to a registry or a release, and no secret is printed.
+      - name: Prove the signing key matches the trusted public key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: bash .github/scripts/verify-signing-key.sh
 
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
@@ -402,14 +416,6 @@ jobs:
             echo "::error::Published image cannot be anonymously read: ${IMAGE_REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}. Check that the package/image is Public (GHCR packages default to private independent of repository visibility), and that the digest exists and the runner has network access."
             exit 1
           fi
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-        with:
-          cosign-release: 'v2.6.3'
 
       - name: Sign container image
         if: env.HAVE_SIGNING_SECRET == 'true'

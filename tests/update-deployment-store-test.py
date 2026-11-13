@@ -131,6 +131,9 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
     def _bindings(self) -> list[str]:
         return [binding(dep) for dep in self._deployments()]
 
+    def _pin_state(self) -> dict[str, bool]:
+        return {binding(dep): dep.is_pinned() for dep in self._deployments()}
+
     def _commit_tree(
         self,
         revision: str,
@@ -284,6 +287,130 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(reused["path"], third["path"])
         self.assertEqual(reused["retainedDeployments"], expected)
         self.assertEqual(self._bindings(), expected)
+        self._assert_user_data_unchanged()
+
+    def test_five_confirmed_updates_apply_promotion_grace(self) -> None:
+        commits = [
+            self._commit_tree(label, 1) for label in ("4", "5", "6", "7")
+        ]
+
+        def append_and_confirm(index: int, previous: str, **kw):
+            item = self._call(index, current_binding=previous, **kw)
+            deployment_store.promote_confirmed_deployment(
+                sysroot_path=self.root,
+                current_binding=item["deployment"],
+                previous_binding=previous,
+            )
+            return item
+
+        first = append_and_confirm(1, self.initial_binding)
+        self.assertEqual(
+            set(self._bindings()),
+            {self.initial_binding, first["deployment"]},
+        )
+        self._assert_pinned(self.initial_binding)
+        self._assert_pinned(first["deployment"])
+        self._assert_user_data_unchanged()
+
+        second = append_and_confirm(2, first["deployment"])
+        self.assertEqual(
+            set(self._bindings()),
+            {
+                self.initial_binding,
+                first["deployment"],
+                second["deployment"],
+            },
+        )
+        for item in self._bindings():
+            self._assert_pinned(item)
+        self._assert_user_data_unchanged()
+
+        # Round three exceeds the retention window, which only releases the
+        # pin of the oldest stale updater deployment. The unmarked initial
+        # admin deployment is never a candidate.
+        third = append_and_confirm(
+            1, second["deployment"], target_commit=commits[0]
+        )
+        pins = self._pin_state()
+        self.assertEqual(len(pins), 4)
+        self.assertIn(self.initial_binding, pins)
+        self.assertTrue(pins[third["deployment"]])
+        self.assertTrue(pins[second["deployment"]])
+        self.assertIn(first["deployment"], pins)
+        self.assertFalse(pins[first["deployment"]])
+        self._assert_user_data_unchanged()
+
+        # The same confirmation is not a distinct one: it must not advance
+        # the grace clock or delete the released candidate.
+        repeated = deployment_store.promote_confirmed_deployment(
+            sysroot_path=self.root,
+            current_binding=third["deployment"],
+            previous_binding=second["deployment"],
+        )
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(repeated["deployment"], third["deployment"])
+        self.assertEqual(self._pin_state(), pins)
+        self._assert_user_data_unchanged()
+
+        # Round four is distinct, so the still-unpinned eldest is removed and
+        # the next stale deployment inherits the released pin.
+        fourth = append_and_confirm(
+            1, third["deployment"], target_commit=commits[1]
+        )
+        pins = self._pin_state()
+        self.assertEqual(len(pins), 4)
+        self.assertIn(self.initial_binding, pins)
+        self.assertNotIn(first["deployment"], pins)
+        self.assertTrue(pins[fourth["deployment"]])
+        self.assertTrue(pins[third["deployment"]])
+        self.assertIn(second["deployment"], pins)
+        self.assertFalse(pins[second["deployment"]])
+        self._assert_user_data_unchanged()
+
+        fifth = append_and_confirm(
+            1, fourth["deployment"], target_commit=commits[2]
+        )
+        pins = self._pin_state()
+        self.assertEqual(len(pins), 4)
+        self.assertIn(self.initial_binding, pins)
+        self.assertNotIn(first["deployment"], pins)
+        self.assertNotIn(second["deployment"], pins)
+        self.assertTrue(pins[fifth["deployment"]])
+        self.assertTrue(pins[fourth["deployment"]])
+        self.assertIn(third["deployment"], pins)
+        self.assertFalse(pins[third["deployment"]])
+        self.assertEqual(
+            (Path(fifth["path"]) / "etc/custom.conf").read_text(
+                encoding="utf-8"
+            ),
+            "site=retained\n",
+        )
+        self._assert_user_data_unchanged()
+
+        # A real admin pin on the released candidate must survive a distinct
+        # confirmation. The new round uses a fresh commit, so the pinned
+        # deployment is stale rather than the protected current binding.
+        self.assertEqual(
+            [item for item, pinned in pins.items() if not pinned],
+            [third["deployment"]],
+        )
+        sysroot = self._sysroot()
+        released = [
+            dep for dep in sysroot.get_deployments()
+            if binding(dep) == third["deployment"]
+        ]
+        self.assertEqual(len(released), 1)
+        self.assertTrue(sysroot.deployment_set_pinned(released[0], True))
+        self.assertTrue(self._pin_state()[third["deployment"]])
+        sixth = append_and_confirm(
+            1, fifth["deployment"], target_commit=commits[3]
+        )
+        self.assertFalse(sixth["reused"])
+        self.assertNotEqual(sixth["deployment"], third["deployment"])
+        pins = self._pin_state()
+        self.assertIn(third["deployment"], pins)
+        self.assertTrue(pins[third["deployment"]])
+        self._assert_pinned(sixth["deployment"])
         self._assert_user_data_unchanged()
 
     def test_metadata_identity_and_binding_reject_without_registration(self) -> None:

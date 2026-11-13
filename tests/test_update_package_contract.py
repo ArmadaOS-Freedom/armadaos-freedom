@@ -242,6 +242,43 @@ class PackageContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PackageError, "indexed file"):
             validate_package(missing)
 
+    def test_install_only_allowance_is_explicit_and_narrow(self):
+        def custom_package():
+            pkg = _base_package()
+            pkg["supportedModels"] = ["TB322FC", "TB323FU", "THIRD"]
+            pkg["modelManifests"]["THIRD"] = "manifests/third.json"
+            pkg["files"].append(_file_record("manifests/third.json", "manifest", 512, 51))
+            return pkg
+
+        pkg = custom_package()
+        with self.assertRaisesRegex(PackageError, "supported values"):
+            validate_package(pkg)
+        validated = validate_package(pkg, install_models=("THIRD",))
+        self.assertEqual(validated["supportedModels"], ["TB322FC", "TB323FU", "THIRD"])
+
+        offline = custom_package()
+        offline["operations"].append("offline-upgrade")
+        with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
+            validate_package(offline, install_models=("THIRD",))
+
+        recovery = custom_package()
+        recovery["files"].append(_file_record("recovery/third.json", "manifest", 512, 52))
+        recovery["recoveryManifests"] = {"THIRD": "recovery/third.json"}
+        with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
+            validate_package(recovery, install_models=("THIRD",))
+
+        mixed_recovery = custom_package()
+        mixed_recovery["files"].append(
+            _file_record("recovery/tb322fc.json", "manifest", 512, 53)
+        )
+        mixed_recovery["recoveryManifests"] = {"TB322FC": "recovery/tb322fc.json"}
+        with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
+            validate_package(mixed_recovery, install_models=("THIRD",))
+
+        for bad in (["TB322FC"], ["THIRD", "THIRD"], ["bad/id"], "THIRD", [1]):
+            with self.subTest(install_models=bad), self.assertRaises(PackageError):
+                validate_package(custom_package(), install_models=bad)
+
     def test_require_operation_versions_and_errors(self):
         pkg = _base_package()
         require_operation(pkg, "TB322FC", "install", installer_version="0.10.0")

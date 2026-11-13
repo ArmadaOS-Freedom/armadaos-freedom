@@ -24,8 +24,10 @@ Standard library only; run with ``python3 -m unittest`` or directly.
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -245,6 +247,23 @@ def _diagnostics(result):
 
 
 class WrapperPreflightTests(unittest.TestCase):
+    def test_authorized_model_list_matches_the_package_contract(self):
+        # The wrapper decides install-only from this list, so it must stay the
+        # same closed set the shipped descriptor contract enforces by default.
+        match = re.search(
+            r'^readonly AUTHORIZED_MODELS="([^"]*)"$',
+            REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "the wrapper must name its authorized models")
+        module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
+        sys.path.insert(0, module_root)
+        try:
+            from updates.package_contract import AUTHORIZED_MODELS
+        finally:
+            sys.path.remove(module_root)
+        self.assertEqual(set(match.group(1).split()), set(AUTHORIZED_MODELS))
+
     def _assert_stopped_at_docker_preflight(self, fixture, result):
         self.assertEqual(1, result.returncode, _diagnostics(result))
         calls = read_docker_log(fixture)
