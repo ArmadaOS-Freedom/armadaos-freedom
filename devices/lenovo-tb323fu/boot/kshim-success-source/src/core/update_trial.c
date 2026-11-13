@@ -363,12 +363,17 @@ int kshim_update_trial_select(const void *a, const void *b, size_t size,
 
     /*
      * Logical-empty sentinel: exactly the fixed marker in copy B and copy A
-     * either blank or CRC-damaged (a torn initial write).  A complete
-     * CRC-valid image in A -- foreign identity, unsupported version, unknown
-     * policy -- decodes to FORMAT/CONFLICT and must stay a hard error; it is
-     * never downgraded to empty.  A marker anywhere else is ordinary junk.
+     * either blank or CRC-damaged (a torn initial write).  The sentinel only
+     * ever belongs in copy B, so an exact marker in A is a writer fault and
+     * stays a format error: accepting a marker pair as empty could otherwise
+     * hide that the record copy was overwritten with the sentinel.  A
+     * complete CRC-valid image in A -- foreign identity, unsupported version,
+     * unknown policy -- decodes to FORMAT/CONFLICT and must stay a hard
+     * error; it is never downgraded to empty.  A marker anywhere else is
+     * ordinary junk.
      */
     if (kshim_update_trial_is_empty_marker(b, size) &&
+        !kshim_update_trial_is_empty_marker(a, size) &&
         (rc_a == KSHIM_STORAGE_EMPTY || rc_a == KSHIM_STORAGE_CRC))
         return KSHIM_STORAGE_EMPTY;
 

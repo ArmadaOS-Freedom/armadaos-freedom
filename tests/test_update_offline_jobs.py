@@ -339,6 +339,49 @@ class OfflineJobTests(unittest.TestCase):
         self.runner.return_value.returncode = 3
         return sid
 
+    @staticmethod
+    def dispatch_runner(*, load_state='not-found', launch_ok=True):
+        """Simulate systemd-run and systemctl for the queued-resume paths."""
+        def run(argv, **_kwargs):
+            if argv[0] == 'systemd-run':
+                if not launch_ok:
+                    raise subprocess.TimeoutExpired('systemd-run', 30)
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout=b'', stderr=b'')
+            if argv[:2] == ['systemctl', 'show']:
+                if load_state is None:
+                    return subprocess.CompletedProcess(
+                        args=argv, returncode=1, stdout=b'', stderr=b'')
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0,
+                    stdout=('LoadState=%s\n' % load_state).encode(), stderr=b'')
+            raise AssertionError('unexpected command: %r' % (argv,))
+        return run
+
+    def launches(self):
+        return [call for call in self.runner.call_args_list
+                if call.args[0][0] == 'systemd-run']
+
+    def queued_prepare_session(self):
+        """Persist prepare_queued exactly like a submit that died before launch."""
+        sid = self.session()
+        with mock.patch.object(offline_jobs.OfflineJobManager, '_launch',
+                               side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.manager().submit_prepare(sid)
+        self.runner.reset_mock()
+        return sid
+
+    def queued_execute_session(self):
+        """Persist execute_queued with its ack, but never launch the worker."""
+        sid = self.prepared_session()
+        with mock.patch.object(offline_jobs.OfflineJobManager, '_launch',
+                               side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.manager().submit_execute(sid, self.ack(sid))
+        self.runner.reset_mock()
+        return sid
+
     def test_interrupted_execute_adopts_verified_completion_once(self):
         sid = self.interrupted_execute()
         self.trial.return_value = self.evidence(sid)
@@ -842,14 +885,16 @@ class OfflineJobTests(unittest.TestCase):
             first = self.manager().submit_prepare(sid)
             self.assertEqual(first['state'], 'prepare_queued')
             self.assertEqual(self.manager().submit_prepare(sid)['state'], 'prepare_queued')
-            self.assertEqual(self.runner.call_count, 1)
-            argv = self.runner.call_args.args[0]
+            launches = [call for call in self.runner.call_args_list
+                        if call.args[0][0] == 'systemd-run']
+            self.assertEqual(len(launches), 1)
+            argv = launches[0].args[0]
             self.assertEqual(argv[:3], ['systemd-run', '--quiet', '--collect'])
             self.assertIn('--property=Type=exec', argv)
             self.assertIn('/usr/libexec/armada/armada-offline-update', argv)
             self.assertEqual(argv[-3:], ['--worker', 'prepare', sid])
-            self.runner.assert_called_once_with(
-                argv, capture_output=True, check=True, timeout=30)
+            self.assertEqual(launches[0].kwargs,
+                             {'capture_output': True, 'check': True, 'timeout': 30})
             result = self.manager().run_job('prepare', sid)
             self.assertEqual(result['state'], 'prepared')
             self.assertEqual(result['transaction']['transactionId'], TX)
@@ -887,7 +932,9 @@ class OfflineJobTests(unittest.TestCase):
         queued = self.manager().submit_execute(sid, ack)
         self.assertEqual(queued['state'], 'execute_queued')
         self.assertEqual(self.manager().submit_execute(sid, ack)['state'], 'execute_queued')
-        self.assertEqual(self.runner.call_count, 2)
+        self.assertEqual(
+            sum(1 for call in self.runner.call_args_list
+                if call.args[0][0] == 'systemd-run'), 2)
         with self.assertRaises(ValueError):
             self.manager().submit_execute(sid, dict(ack, transactionId='changed'))
         expected = {'state': 'awaiting_reboot', 'bootWriteState': 'written',
@@ -942,7 +989,9 @@ class OfflineJobTests(unittest.TestCase):
         self.assertEqual(self.manager().submit_prepare(sid)['state'], 'dispatch_uncertain')
         self.runner.side_effect = None
         self.manager().submit_prepare(sid)
-        self.runner.assert_called_once()
+        self.assertEqual(
+            sum(1 for call in self.runner.call_args_list
+                if call.args[0][0] == 'systemd-run'), 1)
         for code, interrupted in ((3, True), (4, True), (0, False)):
             self.runner.return_value.returncode = code
             status = self.manager().status(sid)
@@ -1002,6 +1051,146 @@ class OfflineJobTests(unittest.TestCase):
             mgr.run_job('prepare', sid)
         with self.assertRaises(offline_session.OfflineSessionError):
             mgr.submit_execute(sid, {})
+
+
+    def test_never_started_prepare_is_relaunched_and_parallel_repeat_is_idempotent(self):
+        sid = self.queued_prepare_session()
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        first = self.manager().submit_prepare(sid)
+        self.assertEqual(first['state'], 'prepare_queued')
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(self.launches()[0].args[0][-3:],
+                         ['--worker', 'prepare', sid])
+
+        # The transient unit now exists: a parallel repeat must leave it alone
+        # and must never overwrite the queued receipt with a failure.
+        self.runner.side_effect = self.dispatch_runner(load_state='loaded')
+        second = self.manager().submit_prepare(sid)
+        self.assertEqual(second['state'], 'prepare_queued')
+        self.assertEqual(len(self.launches()), 1)
+        self.assertNotIn('error', second)
+        with self.store.session_lock(sid) as session:
+            self.assertNotIn('error', self.store.read_receipt(session))
+
+    def test_never_started_execute_is_relaunched_with_persisted_ack(self):
+        sid = self.queued_execute_session()
+        with self.store.session_lock(sid) as session:
+            ack_before = (session / 'ack.json').read_bytes()
+            self.assertEqual(self.store.read_receipt(session)['state'],
+                             'execute_queued')
+        pointer = self.store.base / 'pending' / (TX + '.json')
+        pointer_before = pointer.read_bytes()
+
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_execute(sid, self.ack(sid))
+        self.assertEqual(result['state'], 'execute_queued')
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(self.launches()[0].args[0][-3:],
+                         ['--worker', 'execute', sid])
+        with self.store.session_lock(sid) as session:
+            self.assertEqual((session / 'ack.json').read_bytes(), ack_before)
+        self.assertEqual(pointer.read_bytes(), pointer_before)
+        with mock.patch('updates.offline_execute.execute_offline_update',
+                        return_value={'state': 'awaiting_reboot'}) as execute:
+            self.manager().run_job('execute', sid)
+        self.assertEqual(execute.call_args.kwargs['recovery_ack'],
+                         json.loads(ack_before))
+
+    def test_queued_with_durable_result_is_adopted_without_dispatch(self):
+        sid = self.interrupted_prepare(receipt_state='prepare_queued')
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_prepare(sid)
+        self.assertEqual(result['state'], 'prepared')
+        self.assertEqual(result['result']['state'], 'awaiting_recovery_export')
+        self.assertFalse(self.launches())
+
+        sid = self.interrupted_execute(receipt_state='execute_queued')
+        self.runner.reset_mock()
+        self.trial.return_value = self.evidence(sid)
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_execute(sid, self.ack(sid))
+        self.assertEqual(result['state'], 'awaiting_reboot')
+        self.assertFalse(self.launches())
+        self.reboot.assert_not_called()
+
+    def test_partial_unknown_or_uncertain_queued_jobs_are_never_relaunched(self):
+        # A prepare that already created its transaction directory has started.
+        sid = self.queued_prepare_session()
+        with self.store.session_lock(sid) as session:
+            (session / 'transaction').mkdir()
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        before = self.receipt_bytes(sid)
+        receipt = self.manager().submit_prepare(sid)
+        self.assertEqual(receipt['state'], 'prepare_queued')
+        self.assertFalse(self.launches())
+        self.assertEqual(self.receipt_bytes(sid), before)
+
+        # An execute that already wrote its first artifact has started.
+        sid = self.queued_execute_session()
+        with self.store.session_lock(sid) as session:
+            (session / 'transaction/recovery-ack.json').write_bytes(b'{}')
+        self.runner.reset_mock()
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        before = self.receipt_bytes(sid)
+        receipt = self.manager().submit_execute(sid, self.ack(sid))
+        self.assertEqual(receipt['state'], 'execute_queued')
+        self.assertFalse(self.launches())
+        self.assertEqual(self.receipt_bytes(sid), before)
+
+        # A still-loaded unit may just not have claimed the receipt yet.
+        sid = self.queued_prepare_session()
+        self.runner.side_effect = self.dispatch_runner(load_state='loaded')
+        self.assertEqual(self.manager().submit_prepare(sid)['state'],
+                         'prepare_queued')
+        self.assertFalse(self.launches())
+
+        # An unreadable systemd answer is unknown, never "absent".
+        sid = self.queued_prepare_session()
+        self.runner.side_effect = self.dispatch_runner(load_state=None)
+        self.assertEqual(self.manager().submit_prepare(sid)['state'],
+                         'prepare_queued')
+        self.assertFalse(self.launches())
+
+        # dispatch_uncertain is never retried.
+        sid = self.queued_prepare_session()
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            receipt['state'] = 'dispatch_uncertain'
+            self.store.update_receipt(session, receipt)
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        self.assertEqual(self.manager().submit_prepare(sid)['state'],
+                         'dispatch_uncertain')
+        self.assertFalse(self.launches())
+
+    def test_duplicate_dispatch_of_a_running_unit_is_not_uncertain(self):
+        sid = self.session()
+        self.runner.side_effect = self.dispatch_runner(
+            load_state='loaded', launch_ok=False)
+        result = self.manager().submit_prepare(sid)
+        self.assertEqual(result['state'], 'prepare_queued')
+        self.assertNotIn('error', result)
+        with self.store.session_lock(sid) as session:
+            self.assertNotIn('error', self.store.read_receipt(session))
+
+        # A launch that fails with no owned unit is still uncertain.
+        sid = self.session()
+        self.runner.side_effect = self.dispatch_runner(
+            load_state='not-found', launch_ok=False)
+        self.assertEqual(self.manager().submit_prepare(sid)['state'],
+                         'dispatch_uncertain')
+
+    def test_status_never_relaunches_a_never_started_queue(self):
+        sid = self.queued_prepare_session()
+        self.runner.return_value = subprocess.CompletedProcess(
+            args=[], returncode=3, stdout=b'inactive\n', stderr=b'')
+        before = self.receipt_bytes(sid)
+        result = self.manager().status(sid)
+        self.assertEqual(result['state'], 'prepare_queued')
+        self.assertTrue(result['jobInterrupted'])
+        self.assertTrue(result['attentionRequired'])
+        self.assertFalse(self.launches())
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.reboot.assert_not_called()
 
 
 if __name__ == '__main__':

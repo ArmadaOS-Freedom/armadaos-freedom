@@ -24,6 +24,7 @@ from typing import Iterator
 from . import (
     deployment_store,
     finalization_receipt,
+    job_retirement,
     runtime_health,
     trial_store,
 )
@@ -134,6 +135,25 @@ def _finalize_deployment(record, boot: BootEvidence, *, sysroot_path=None) -> di
     return promoted
 
 
+def _retire_job_artifacts(record) -> None:
+    """Best-effort cleanup of the apply job that wrote this confirmed trial.
+
+    Runs only after ``finalization_receipt.write`` returned, so the durable
+    receipt already proves the transaction completed.  The job is resolved by
+    its own pointer and receipt rather than by scanning, and any failure is
+    ignored: retired artifacts are a space saving, never evidence, so a
+    cleanup problem must not turn a confirmed update into a failure or imply
+    that some other job was closed.
+    """
+    try:
+        job_retirement.retire_finalized_job(
+            str(uuid.UUID(bytes=bytes(record.transaction_uuid))),
+            plan_sha256=bytes(record.plan_sha256).hex(),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+
+
 def confirm_trial() -> dict:
     """Confirm the pending trial record after verified stability evidence."""
     with _locked():
@@ -145,6 +165,7 @@ def confirm_trial() -> dict:
             if record is not None and record.state == CONFIRMED:
                 boot = _check_boot_evidence(collect_boot_evidence(record), record)
                 _finalize_deployment(record, boot)
+                _retire_job_artifacts(record)
             return {
                 "state": "not_pending",
                 "recordState": None if record is None else record.state,
@@ -186,6 +207,7 @@ def confirm_trial() -> dict:
                 raise ConfirmationError("post-write journal verification failed")
 
         _finalize_deployment(next_record, boot_before)
+        _retire_job_artifacts(next_record)
 
         return {
             "state": "confirmed",

@@ -2,6 +2,7 @@
 """Tests for durable trial finalization receipts."""
 
 from dataclasses import replace
+import errno
 import json
 import os
 from pathlib import Path
@@ -153,6 +154,46 @@ class ReceiptFilesystemTests(unittest.TestCase):
         with mock.patch.object(receipt.os, "fsync", side_effect=fsync), mock.patch.object(receipt.os, "replace", side_effect=replace_file):
             receipt.write(self.record)
         self.assertEqual(events, ["fsync", "replace", "fsync"])
+
+    def test_directory_fsync_failure_invalidates_replaced_receipt(self):
+        self.target.parent.mkdir(mode=0o755)
+        unrelated = self.target.parent / "unrelated.json"
+        unrelated.write_text("other writer\n")
+        real_fsync = os.fsync
+
+        def fail_directory_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "simulated directory flush failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(receipt.os, "fsync", side_effect=fail_directory_fsync):
+            with self.assertRaises(OSError):
+                receipt.write(self.record)
+
+        # The rename landed but the directory entry is not durable, so the
+        # receipt it installed must not stay readable as complete evidence.
+        self.assertFalse(os.path.lexists(self.target))
+        self.assertEqual(unrelated.read_text(), "other writer\n")
+        self.assertEqual(
+            sorted(path.name for path in self.target.parent.iterdir()),
+            ["unrelated.json"])
+        self.assertEqual(receipt.read(self.record)["state"], "pending")
+
+        # A retry installs and flushes a fresh complete receipt.
+        doc = receipt.write(self.record)
+        self.assertEqual(receipt.read(self.record), {"state": "complete"})
+        self.assertEqual(
+            self.target.read_bytes(),
+            (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode())
+
+    def test_invalidation_never_removes_a_foreign_file(self):
+        self.target.parent.mkdir(mode=0o755)
+        self.target.write_text("other writer\n")
+        st = self.target.stat()
+        receipt._discard_installed(self.target, (st.st_dev, st.st_ino + 1))
+        self.assertEqual(self.target.read_text(), "other writer\n")
+        receipt._discard_installed(self.target, (st.st_dev, st.st_ino))
+        self.assertFalse(os.path.lexists(self.target))
 
 
 if __name__ == "__main__":

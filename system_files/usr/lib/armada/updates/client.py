@@ -7,6 +7,19 @@ import time
 BUS_NAME = "org.armada.Updates"
 PATH = "/org/armada/Updates"
 IFACE = "org.armada.Updates1"
+BUSY_ERROR = "org.armada.Updates.Error.Busy"
+
+
+def is_busy_error(error):
+    """Return True only for the service's own Busy D-Bus error."""
+    try:
+        from gi.repository import Gio
+        remote = Gio.DBusError.get_remote_error(error)
+    except Exception:
+        remote = None
+    if remote is not None:
+        return remote == BUSY_ERROR
+    return BUSY_ERROR in str(error)
 
 
 class UpdateClient:
@@ -101,15 +114,37 @@ class UpdateClient:
             record = self.snapshot()["components"].get(component)
             if not isinstance(record, dict) or type(record.get("busy")) is not bool:
                 raise RuntimeError("invalid component status")
-            if record.get("jobId") != job_id or record.get("operation") != operation:
-                raise RuntimeError("update job changed while waiting")
-            result = record.get("result")
-            if not isinstance(result, dict) or result.get("component") != component:
-                raise RuntimeError("invalid update result")
-            if on_progress is not None:
-                on_progress(result)
-            if not record["busy"]:
+            if record.get("jobId") == job_id:
+                if record.get("operation") != operation:
+                    raise RuntimeError("update job changed while waiting")
+                result = record.get("result")
+                if not isinstance(result, dict) or result.get("component") != component:
+                    raise RuntimeError("invalid update result")
+                if on_progress is not None:
+                    on_progress(result)
+                if not record["busy"]:
+                    return result
+            else:
+                result = self._completed_result(record, job_id, component)
+                if result is None:
+                    raise RuntimeError("update job result is no longer available")
+                if on_progress is not None:
+                    on_progress(result)
                 return result
             if deadline is not None and time.monotonic() >= deadline:
                 raise RuntimeError("timed out waiting for update job")
             time.sleep(self.poll_interval)
+
+    @staticmethod
+    def _completed_result(record, job_id, component):
+        completed = record.get("completed")
+        if completed is None:
+            return None
+        if not isinstance(completed, dict):
+            raise RuntimeError("update service returned invalid job history")
+        if job_id not in completed:
+            return None
+        result = completed[job_id]
+        if not isinstance(result, dict) or result.get("component") != component:
+            raise RuntimeError("invalid update result")
+        return result

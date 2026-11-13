@@ -7,6 +7,7 @@ import contextlib
 import errno
 from dataclasses import replace
 import fcntl
+import json
 import os
 from pathlib import Path
 import sys
@@ -61,6 +62,9 @@ class TrialConfirmationTest(unittest.TestCase):
             mock.patch.object(tc.deployment_store, "promote_confirmed_deployment", self.promote_mock),
             mock.patch.object(tc.finalization_receipt, "write", self.receipt_mock),
             mock.patch.object(tc.time, "sleep", self.sleep_mock),
+            mock.patch.object(
+                tc.job_retirement, "APPLY_STATE_ROOT",
+                self.fx.path.parent / "no-apply-state"),
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -447,6 +451,136 @@ class TrialConfirmationTest(unittest.TestCase):
         with self.assertRaises(Exception):
             tc.confirm_trial()
         self.receipt_mock.assert_not_called()
+
+    def _seed_apply_job(self, record, *, transaction_id=None, status=None):
+        state_root = self.fx.path.parent / "apply-state"
+        state_root.mkdir(mode=0o700)
+        job = state_root / str(uuid.uuid4())
+        job.mkdir(mode=0o700)
+        (state_root / "current.json").write_text(json.dumps(
+            {"schemaVersion": 1, "jobId": job.name}))
+        body = {
+            "schemaVersion": 1,
+            "component": "system",
+            "state": "awaiting_reboot",
+            "phase": "awaiting_reboot",
+            "requiresReboot": True,
+            "bootWriteState": "written",
+            "slotControlState": "not_issued",
+            "bootPolicy": rec.BOOT_POLICY,
+            "workDir": str(job),
+            "transactionId": (
+                transaction_id
+                if transaction_id is not None
+                else str(uuid.UUID(bytes=bytes(record.transaction_uuid)))),
+            "planSha256": bytes(record.plan_sha256).hex(),
+        }
+        body.update(status or {})
+        (job / "status.json").write_text(json.dumps(body))
+        for name in ("download", "trust", "materials",
+                     "candidate-a", "candidate-b"):
+            (job / name).mkdir()
+            (job / name / "blob.bin").write_bytes(b"x" * 32)
+        return state_root, job
+
+    @staticmethod
+    def _retirement_context(state_root):
+        return (
+            mock.patch.object(
+                tc.job_retirement, "APPLY_STATE_ROOT", state_root),
+            mock.patch.object(
+                tc.job_retirement, "_owned_by_root", return_value=True),
+        )
+
+    def test_confirmation_retires_only_the_finalized_jobs_artifacts(self) -> None:
+        record = self._seed_trial()
+        state_root, job = self._seed_apply_job(record)
+        root_patch, owner_patch = self._retirement_context(state_root)
+        with root_patch, owner_patch:
+            result = tc.confirm_trial()
+        self.assertEqual(result["state"], "confirmed")
+        for name in ("download", "trust", "materials",
+                     "candidate-a", "candidate-b"):
+            self.assertFalse((job / name).exists(), name)
+        self.assertTrue((job / "status.json").is_file())
+        self.assertTrue((state_root / "current.json").is_file())
+        self.assertTrue(job.is_dir())
+
+    def test_confirmed_retry_also_retires_artifacts(self) -> None:
+        record = self._seed_trial(state=rec.CONFIRMED)
+        state_root, job = self._seed_apply_job(record)
+        root_patch, owner_patch = self._retirement_context(state_root)
+        with root_patch, owner_patch:
+            self.assertEqual(
+                tc.confirm_trial(),
+                {"state": "not_pending", "recordState": rec.CONFIRMED},
+            )
+        self.assertFalse((job / "download").exists())
+
+    def test_unconfirmed_and_foreign_job_artifacts_are_retained(self) -> None:
+        for name, seed in (
+            ("other transaction",
+             lambda record: {"transaction_id": str(uuid.uuid4())}),
+            ("failed job",
+             lambda record: {"status": {
+                 "state": "failed", "requiresReboot": False,
+                 "bootWriteState": "restored"}}),
+            ("uncertain job",
+             lambda record: {"status": {
+                 "state": "uncertain", "requiresReboot": False,
+                 "bootWriteState": "uncertain"}}),
+        ):
+            with self.subTest(case=name):
+                self.doCleanups()
+                self.setUp()
+                record = self._seed_trial()
+                state_root, job = self._seed_apply_job(record, **seed(record))
+                root_patch, owner_patch = self._retirement_context(state_root)
+                with root_patch, owner_patch:
+                    self.assertEqual(
+                        tc.confirm_trial()["state"], "confirmed")
+                for artifact in ("download", "trust", "materials",
+                                 "candidate-a", "candidate-b"):
+                    self.assertTrue((job / artifact).is_dir(), artifact)
+
+    def test_durable_receipt_is_required_before_retirement(self) -> None:
+        record = self._seed_trial()
+        state_root, job = self._seed_apply_job(record)
+        self.receipt_mock.side_effect = OSError("receipt unavailable")
+        root_patch, owner_patch = self._retirement_context(state_root)
+        with root_patch, owner_patch, self.assertRaises(tc.ConfirmationError):
+            tc.confirm_trial()
+        self.assertTrue((job / "download").is_dir())
+
+    def test_retirement_failure_leaves_confirmed_outcome_intact(self) -> None:
+        for error in (OSError("busy"), RuntimeError("boom")):
+            with self.subTest(error=type(error).__name__):
+                self.doCleanups()
+                self.setUp()
+                record = self._seed_trial()
+                state_root, job = self._seed_apply_job(record)
+                root_patch, owner_patch = self._retirement_context(state_root)
+                with root_patch, owner_patch, mock.patch.object(
+                    tc.job_retirement, "retire_finalized_job",
+                    side_effect=error,
+                ):
+                    self.assertEqual(
+                        tc.confirm_trial()["state"], "confirmed")
+                self.assertTrue((job / "download").is_dir())
+
+    def test_retirement_runs_after_the_receipt_is_written(self) -> None:
+        self._seed_trial()
+        events = []
+        self.promote_mock.side_effect = (
+            lambda **kw: events.append("promotion")
+            or self._promotion_result(**kw))
+        self.receipt_mock.side_effect = lambda record: events.append("receipt")
+        with mock.patch.object(
+            tc.job_retirement, "retire_finalized_job",
+            side_effect=lambda *a, **k: events.append("retire"),
+        ):
+            tc.confirm_trial()
+        self.assertEqual(events, ["promotion", "receipt", "retire"])
 
     def test_promotion_failure_preserves_confirmed_journal_then_retries(self) -> None:
         r = self._seed_trial()

@@ -87,11 +87,17 @@ class OfflineExecuteTest(unittest.TestCase):
             self.assertTrue(writable)
             yield 73, env.physical["recoveryPartUuid"], env.journal.layout.board
 
+        # Every journal callback must read/write through the descriptor that
+        # open_recovery returned, not a path or a stale descriptor.
         def load(fd, partuuid, board):
+            self.assertEqual(fd, 73)
+            self.assertEqual(partuuid, env.physical["recoveryPartUuid"])
+            self.assertEqual(board, env.journal.layout.board)
             return SimpleNamespace(layout=env.journal.layout, header=env.journal.header,
                                    region=env.journal.region, record=env.journal.record)
 
         def save(fd, journal, record):
+            self.assertEqual(fd, 73)
             env.journal.record = record
 
         env.spies["trial_save"].side_effect = save

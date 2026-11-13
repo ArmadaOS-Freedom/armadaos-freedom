@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+import stat
 import uuid
 
 import armada_os
@@ -29,6 +31,44 @@ _JOURNAL_BYTES = 64 * 1024
 
 def _sha256(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _remove_owned_tree(path):
+    """Remove one private tree without following any symlink it contains."""
+    with os.scandir(path) as entries:
+        for entry in entries:
+            child = Path(entry.path)
+            info = os.lstat(child)
+            if stat.S_ISDIR(info.st_mode):
+                _remove_owned_tree(child)
+            else:
+                os.unlink(child)
+    os.rmdir(path)
+
+
+def _discard_import_workspace(work):
+    """Remove the transient import staging tree owned by this preparation.
+
+    ``import_offline_payload`` expands the full-size ``linux-root.img`` and
+    extracts the whole OSTree repository under ``<transaction>/import``.  Both
+    are reusable work products only until the imported deployment is committed
+    and its binding re-verified, after which they are dead weight.
+
+    Only that exact leaf is considered.  A symlink is never followed
+    (``lstat`` reports the link itself), and a directory that is not owned by
+    this process or is writable by group/other is left untouched, so nothing
+    outside the owned staging tree -- transaction documents, recovery exports,
+    trust material or candidates -- can be removed.  No other path is scanned.
+    """
+    staging = work / 'import'
+    try:
+        info = os.lstat(staging)
+    except OSError:
+        return
+    if (not stat.S_ISDIR(info.st_mode) or
+            info.st_uid != os.geteuid() or info.st_mode & 0o022):
+        return
+    _remove_owned_tree(staging)
 
 
 def _check_candidate(candidate, *, slot, tx, deployment, model, mode, source_sha):
@@ -190,6 +230,15 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                     new[1] != imported['commit'] or new == old):
                 raise ValueError('deployment does not match authenticated package')
             status['newDeployment'] = target_deployment
+
+            # The expanded image and extracted repository are no longer needed
+            # once the deployment is committed and its binding is verified.
+            # Reclaim only this step's owned staging tree; every transaction
+            # document and recovery export stays in place for execute/export.
+            try:
+                _discard_import_workspace(work)
+            except OSError:
+                pass
 
             status['phase'] = 'preparing_materials'
             system_transaction._save_json(work, 'status.json', status)

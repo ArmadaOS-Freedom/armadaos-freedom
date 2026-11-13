@@ -407,6 +407,76 @@ class CoordinatorTest(unittest.TestCase):
             self.assertEqual(len(sys_mgr.calls), 3)
             self.assertEqual(len(decky_mgr.calls), 3)
 
+    def test_completed_jobs_are_keyed_by_exact_job_id(self):
+        with self.env() as (coord, sys_mgr, _):
+            sys_mgr.result = {
+                "component": "system",
+                "state": "update_available",
+                "phase": "check",
+            }
+            check_job = coord.start("system", "check")
+            check_comp = self.wait_idle(coord, "system")
+            self.assertEqual(check_comp["jobId"], check_job)
+
+            sys_mgr.result = {
+                "component": "system",
+                "state": "up_to_date",
+                "phase": "status",
+            }
+            status_job = coord.start("system", "status")
+            status_comp = self.wait_idle(coord, "system")
+            self.assertEqual(status_comp["jobId"], status_job)
+            completed = status_comp["completed"]
+            self.assertEqual(set(completed), {check_job, status_job})
+            self.assertEqual(completed[check_job]["state"], "update_available")
+            self.assertEqual(completed[check_job]["phase"], "check")
+            self.assertEqual(completed[status_job]["state"], "up_to_date")
+            self.assertEqual(completed[status_job]["phase"], "status")
+            self.assertEqual(
+                coord.snapshot()["components"]["decky"]["completed"], {}
+            )
+
+    def test_failed_job_result_is_kept_for_its_exact_job(self):
+        with self.env() as (coord, sys_mgr, _):
+            sys_mgr.error = RuntimeError("boom")
+            job = coord.start("system", "check")
+            comp = self.wait_idle(coord, "system")
+            self.assertEqual(comp["result"]["state"], "failed")
+            self.assertEqual(comp["completed"][job]["state"], "failed")
+            self.assertIn("boom", comp["completed"][job]["error"])
+
+    def test_running_job_is_not_in_completed_history(self):
+        with self.env() as (coord, sys_mgr, _):
+            sys_mgr.block()
+            job = coord.start("system", "update")
+            self.wait_started(sys_mgr)
+            running = coord.snapshot()["components"]["system"]
+            self.assertTrue(running["busy"])
+            self.assertEqual(running["jobId"], job)
+            self.assertNotIn(job, running["completed"])
+            sys_mgr.gate.set()
+            done = self.wait_idle(coord, "system")
+            self.assertIn(job, done["completed"])
+            self.assertEqual(done["completed"][job], done["result"])
+
+    def test_completed_history_is_bounded_per_component_and_copy_isolated(self):
+        with self.env() as (coord, sys_mgr, _):
+            jobs = []
+            for _ in range(module.MAX_COMPLETED_RESULTS + 3):
+                jobs.append(coord.start("system", "status"))
+                self.wait_idle(coord, "system")
+            completed = coord.snapshot()["components"]["system"]["completed"]
+            self.assertEqual(len(completed), module.MAX_COMPLETED_RESULTS)
+            self.assertEqual(
+                list(completed), jobs[-module.MAX_COMPLETED_RESULTS:]
+            )
+            for job_id in jobs[:-module.MAX_COMPLETED_RESULTS]:
+                self.assertNotIn(job_id, completed)
+
+            completed[jobs[-1]]["state"] = "tampered"
+            fresh = coord.snapshot()["components"]["system"]["completed"]
+            self.assertEqual(fresh[jobs[-1]]["state"], "up_to_date")
+
 
 if __name__ == "__main__":
     unittest.main()

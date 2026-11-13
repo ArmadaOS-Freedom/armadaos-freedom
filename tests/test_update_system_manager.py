@@ -431,6 +431,21 @@ class OfflineCompletionStatusTests(unittest.TestCase):
         self.assertEqual(result["pendingFromSlot"], "a")
         self.assertEqual(result["pendingTargetSlot"], "b")
 
+    def test_plan_document_is_read_once_for_parsing_and_hashing(self):
+        reads = []
+        real_read = system_manager._read_regular
+
+        def counted(path, limit):
+            reads.append(Path(path).name)
+            return real_read(path, limit)
+
+        with patch.object(
+            system_manager, "_read_regular", side_effect=counted
+        ):
+            result = self.status()
+        self.assertEqual(result["state"], "awaiting_reboot")
+        self.assertEqual(reads.count("plan.json"), 1)
+
     def test_recorded_and_unrecorded_receipt_states_are_both_accepted(self):
         for state in ("execute_queued", "executing", "dispatch_uncertain",
                       "awaiting_reboot"):

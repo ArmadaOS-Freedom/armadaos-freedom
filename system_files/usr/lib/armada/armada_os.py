@@ -3,7 +3,7 @@ import json
 import re
 import subprocess
 
-from updates.client import UpdateClient
+from updates.client import UpdateClient, is_busy_error
 
 UPDATE = "/usr/libexec/armada/armada-update"
 SELECT = "/usr/libexec/armada/armada-select-branch"
@@ -104,18 +104,31 @@ def snapshot():
     return state
 
 
+def _system_record(client):
+    record = client.snapshot()["components"].get("system")
+    if (not isinstance(record, dict) or type(record.get("busy")) is not bool
+            or not isinstance(record.get("result"), dict)
+            or record["result"].get("component") != "system"):
+        raise RuntimeError("update service returned invalid system status")
+    return record
+
+
 def _service_status(client=None):
     if client is None:
         client = UpdateClient()
     try:
-        record = client.snapshot()["components"].get("system")
-        if (not isinstance(record, dict) or type(record.get("busy")) is not bool
-                or not isinstance(record.get("result"), dict)
-                or record["result"].get("component") != "system"):
-            raise RuntimeError("update service returned invalid system status")
+        record = _system_record(client)
         if record["busy"]:
             return copy.deepcopy(record["result"]), True
-        result = client.run("system", "status", timeout=120)
+        try:
+            result = client.run("system", "status", timeout=120)
+        except Exception as exc:
+            if not is_busy_error(exc):
+                raise
+            # Another client won the race and started its own job. A fresh
+            # snapshot reports its live result instead of a spurious failure.
+            record = _system_record(client)
+            return copy.deepcopy(record["result"]), record["busy"]
         if not isinstance(result, dict) or result.get("component") != "system":
             raise RuntimeError("update service returned invalid system result")
         return result, False

@@ -257,7 +257,8 @@ static void test_select(void)
 
     /* Logical-empty sentinel.  The exact marker is accepted only in copy B
      * and only when copy A is blank or CRC-damaged; it is still an error in
-     * copy A, next to any CRC-valid image, or when a real record selects. */
+     * copy A (alone or next to the same marker in B), next to any CRC-valid
+     * image, or when a real record selects. */
     assert(kshim_update_trial_empty_marker(marker, sizeof(marker)) == KSHIM_STORAGE_OK);
     selected = 99;
     assert(kshim_update_trial_select(zero, marker, 4096, r.partition_uuid,
@@ -268,7 +269,7 @@ static void test_select(void)
     assert(kshim_update_trial_select(marker, zero, 4096, r.partition_uuid,
                 r.installation_uuid, &out, &selected) == KSHIM_STORAGE_FORMAT);
     assert(kshim_update_trial_select(marker, marker, 4096, r.partition_uuid,
-                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_EMPTY);
+                r.installation_uuid, &out, &selected) == KSHIM_STORAGE_FORMAT);
     selected = 99;
     assert(kshim_update_trial_select(b, marker, 4096, r.partition_uuid,
                 r.installation_uuid, &out, &selected) == KSHIM_STORAGE_OK && selected == 0);

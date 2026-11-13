@@ -270,6 +270,44 @@ class AuthorizationTests(unittest.TestCase):
             self.authorize()
         self.assertFalse(os.path.exists(self.ssh_dir))
 
+    def test_ssh_directory_home_flush_failure_propagates_and_retries_flush_again(self):
+        home_ino = os.lstat(self.home).st_ino
+        real_fsync = os.fsync
+        armed = {"fail": True}
+        flushed = []
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode) and st.st_ino == home_ino:
+                flushed.append(st.st_ino)
+                if armed["fail"]:
+                    raise OSError(5, "simulated home directory flush failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(auth.os, "fsync", side_effect=fsync):
+            # Creating .ssh is not durable until the verified home directory
+            # holding the new entry has been flushed, so a failed flush is
+            # reported and nothing is written inside the directory.
+            with self.assertRaisesRegex(auth.AuthorizationError, "flush"):
+                self.authorize()
+            self.assertTrue(os.path.isdir(self.ssh_dir))
+            self.assertFalse(os.path.lexists(self.auth_path))
+            self.assertEqual(flushed, [home_ino])
+
+            # The retry must not treat the already-visible .ssh entry as
+            # durable: it flushes the same verified home directory again.
+            with self.assertRaisesRegex(auth.AuthorizationError, "flush"):
+                self.authorize()
+            self.assertFalse(os.path.lexists(self.auth_path))
+            self.assertEqual(flushed, [home_ino, home_ino])
+
+            armed["fail"] = False
+            self.authorize()
+
+        self.assertEqual(flushed, [home_ino, home_ino, home_ino])
+        with open(self.auth_path, "rb") as stream:
+            self.assertEqual(stream.read(), (EXPECTED_ENTRY + "\n").encode("ascii"))
+
 
 class MainTests(unittest.TestCase):
     def run_main(self, uid=1000, euid=1000, pw_entry=None, group=None):

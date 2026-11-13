@@ -259,7 +259,18 @@ class UpdateTrialRecordTest(unittest.TestCase):
         torn[300] ^= 1
         self.assert_select(bytes(torn), marker, error=tr.EmptyTrialJournal)
         self.assert_select(marker, zero, error=tr.TrialRecordError)
-        self.assert_select(marker, marker, error=tr.EmptyTrialJournal)
+        # The sentinel belongs to copy B only: a marker pair is a writer fault,
+        # never an empty journal, so a real record cannot be masked that way.
+        output, selected = CRecord(), ctypes.c_uint(99)
+        self.assertEqual(
+            self.lib.kshim_update_trial_select(
+                marker, marker, len(marker), PART, INST,
+                ctypes.byref(output), ctypes.byref(selected)),
+            -3)  # KSHIM_STORAGE_FORMAT, never KSHIM_STORAGE_EMPTY (-8)
+        self.assertEqual(selected.value, 99)
+        with self.assertRaises(tr.TrialRecordError) as ctx:
+            tr.select_record(marker, marker, PART, INST)
+        self.assertNotIsInstance(ctx.exception, tr.EmptyTrialJournal)
         old = tr.encode_record(sample())
         self.assert_select(old, marker, 0)
         # A complete CRC-valid image next to the marker is never empty.

@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 import armada_os as maintenance
+from updates.client import BUSY_ERROR
 REAL_SNAPSHOT = maintenance.snapshot
 
 
@@ -57,6 +58,8 @@ class OperationTests(unittest.TestCase):
         self.state = fixture()
         self.service_busy = False
         self.service_result = default_service_result()
+        self.busy_races = []
+        self.status_error = None
         patch.object(maintenance, "snapshot", side_effect=self.snapshot).start()
         self.command = patch.object(maintenance, "command", side_effect=self.fake_command).start()
         self.run = patch.object(maintenance.subprocess, "run", side_effect=self.fake_run).start()
@@ -94,6 +97,18 @@ class OperationTests(unittest.TestCase):
 
     def fake_client_run(self, component, operation, channel=None, checksum=None, on_progress=None, timeout=None):
         if component == "system" and operation == "status":
+            if self.busy_races:
+                busy = self.busy_races.pop(0)
+                if busy:
+                    self.service_busy = True
+                    self.service_result = {
+                        "component": "system",
+                        "state": "running",
+                        "phase": "check",
+                    }
+                raise RuntimeError(f"GDBus.Error:{BUSY_ERROR}: pending job")
+            if self.status_error is not None:
+                raise self.status_error
             return copy.deepcopy(self.service_result)
         if component == "system" and operation == "select_channel":
             self.state["channel"] = "preview" if channel == "testing" else channel
@@ -419,6 +434,35 @@ class OperationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "service offline"):
             self.perform("update")
         self.run.assert_not_called()
+
+    def test_busy_refresh_rereads_snapshot_and_reports_running_job(self):
+        self.busy_races = [True]
+        state = maintenance.status()
+        self.assertTrue(state["update_busy"])
+        self.assertEqual(state["update"]["state"], "running")
+        self.assertEqual(state["update_message"], "Update operation is running (check).")
+        self.assertEqual(self.client_snapshot.call_count, 2)
+        self.assertEqual(self.client_run.call_count, 1)
+
+    def test_busy_refresh_rereads_snapshot_and_uses_completed_result(self):
+        self.service_result = {
+            "component": "system",
+            "state": "up_to_date",
+            "requiresReboot": False,
+        }
+        self.busy_races = [False]
+        state = maintenance.status()
+        self.assertFalse(state["update_busy"])
+        self.assertEqual(state["update"]["state"], "up_to_date")
+        self.assertEqual(self.client_snapshot.call_count, 2)
+        self.assertEqual(self.client_run.call_count, 1)
+
+    def test_non_busy_refresh_errors_propagate_without_a_reread(self):
+        self.status_error = RuntimeError("status probe failed")
+        with self.assertRaisesRegex(RuntimeError, "status probe failed"):
+            maintenance.status()
+        self.assertEqual(self.client_snapshot.call_count, 1)
+        self.assertEqual(self.client_run.call_count, 1)
 
     def test_malformed_service_status_is_rejected(self):
         for record in (

@@ -10,6 +10,10 @@ import uuid
 from .decky_manager import DeckyManager
 from .system_manager import SystemManager
 
+# Finished job results are kept per component so that a client which started
+# a job still finds its exact outcome after another client refreshed status.
+MAX_COMPLETED_RESULTS = 8
+
 
 class BusyError(RuntimeError):
     """Raised when a component already has a pending job."""
@@ -43,6 +47,7 @@ class Coordinator:
                 "jobId": None,
                 "operation": None,
                 "result": self._initial_result(component),
+                "completed": {},
             }
             for component in self._OPERATIONS
         }
@@ -163,9 +168,13 @@ class Coordinator:
             with self._lock:
                 record = self._components[component]
                 if record["jobId"] == job_id:
+                    result = outcome if completed else copy.deepcopy(failure)
                     record["busy"] = False
-                    record["result"] = (
-                        outcome if completed else copy.deepcopy(failure))
+                    record["result"] = result
+                    completed_results = record["completed"]
+                    completed_results[job_id] = copy.deepcopy(result)
+                    while len(completed_results) > MAX_COMPLETED_RESULTS:
+                        del completed_results[next(iter(completed_results))]
                 current = threading.current_thread()
                 if self._workers.get(component) is current:
                     self._workers.pop(component, None)

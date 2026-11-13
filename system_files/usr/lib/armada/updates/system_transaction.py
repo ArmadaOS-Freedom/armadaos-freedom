@@ -311,6 +311,15 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             if mode == 'rollback':
                 target_deployment, new, target_version = _validate_rollback_target(
                     snapshot, expected_checksum, old, journal.record)
+                # The retained rollback target may predate the per-deployment
+                # armada.deployment token (for example the first installed
+                # deployment).  Persist its own canonical binding under the
+                # sysroot lock before any boot write so the rebooted deployment
+                # and every later promotion verify one identical binding.
+                ensured = deployment_store.ensure_deployment_binding(
+                    sysroot_path=root, binding=target_deployment)
+                if ensured.get('deployment') != target_deployment:
+                    raise ValueError('rollback target binding was not persisted')
             if journal.record is not None and journal.record.state == trial_record.CONFIRMED:
                 boot = trial_confirmation._check_boot_evidence(
                     trial_confirmation.collect_boot_evidence(journal.record), journal.record

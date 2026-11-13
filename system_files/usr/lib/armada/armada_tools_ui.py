@@ -10,6 +10,8 @@ from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 import armada_tools as backend
 
+UPDATE_WATCH_MS = 2000
+
 
 class OperationDialog(Adw.Window):
     def __init__(self, parent, title, on_restart=None):
@@ -79,6 +81,7 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.result = ""
         self.channels = []
         self.confirmation = None
+        self.watch_id = None
         self.current = Adw.ActionRow(title="Current Version", subtitle="Checking…")
         self.previous = Adw.ActionRow(title="Previous Version", subtitle="Checking…")
         for row in (self.current, self.previous):
@@ -121,6 +124,24 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.rollback.set_sensitive(enabled)
         self.update.set_sensitive(enabled)
         self.channel.set_sensitive(enabled)
+
+    def start_watch(self):
+        if self.watch_id is None and self.window.get_visible():
+            self.watch_id = GLib.timeout_add(UPDATE_WATCH_MS, self.watch_tick)
+
+    def stop_watch(self):
+        if self.watch_id is not None:
+            GLib.source_remove(self.watch_id)
+            self.watch_id = None
+
+    def watch_tick(self):
+        if not self.window.get_visible():
+            self.watch_id = None
+            return GLib.SOURCE_REMOVE
+        if self.requesting or self.loading:
+            return GLib.SOURCE_CONTINUE
+        self.refresh()
+        return GLib.SOURCE_CONTINUE
 
     def refresh(self):
         if self.loading or self.requesting:
@@ -189,6 +210,10 @@ class UpdatesGroup(Adw.PreferencesGroup):
             self.show_message("")
         if hasattr(self.window, "repair_button"):
             self.window.set_steam_sensitive(idle and not self.window.repair_running)
+        if state.get("update_busy", False):
+            self.start_watch()
+        else:
+            self.stop_watch()
 
     def request(self, action, *arguments):
         if self.state is None or self.requesting or self.loading or self.window.repair_running:
@@ -504,6 +529,7 @@ class ToolsWindow(Adw.ApplicationWindow):
         if self.ssh_busy:
             self.ssh_row.set_subtitle("Please wait for SSH settings to finish updating.")
             return True
+        self.updates.stop_watch()
         self.get_application().window = None
         return False
 
