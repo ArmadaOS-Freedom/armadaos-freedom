@@ -562,6 +562,15 @@
       return isBusy(comp) || !!(state[comp] && state[comp].localError) || isMutationLocked(comp);
     }
 
+    function clientRestartPending() {
+      var snap = null;
+      if (adapter && typeof adapter.snapshot === 'function') {
+        try { snap = adapter.snapshot(); } catch (e) { snap = null; }
+      }
+      if (!snap) snap = state.client;
+      return !!(snap && snap.state === 'restart_required' && snap.requiresClientRestart === true);
+    }
+
     function startJob(comp, method, arg) {
       var isRead = method === 'StartCheck' || method === 'RefreshStatus';
       if ((comp !== 'system' && comp !== 'decky') || isBusy(comp) || (!isRead && isMutationLocked(comp))) {
@@ -715,25 +724,34 @@
       if (dom.checkAllBtn) dom.checkAllBtn.disabled = true;
       var checks = [];
       if (adapter && typeof adapter.check === 'function' && !isBusy('client')) {
-        pendingAction.client = { method: 'check' };
-        state.client = adapter.snapshot();
-        if (state.client) {
-          state.client.localError = false;
-          state.client.error = null;
-        }
-        render();
-        checks.push(Promise.resolve().then(function() {
-          if (disposed) return;
-          return adapter.check();
-        }).catch(function(err) {
-          if (disposed) return;
-          markLocalError('client', err);
-        }).finally(function() {
-          if (disposed) return;
-          pendingAction.client = null;
+        if (clientRestartPending()) {
+          // The native adapter refuses new checks while its own restart
+          // evidence is pending. Keep that evidence and its error visible
+          // instead of reporting a synthetic client failure, and still check
+          // the system and Decky rows.
           syncClientSnapshot();
           render();
-        }));
+        } else {
+          pendingAction.client = { method: 'check' };
+          state.client = adapter.snapshot();
+          if (state.client) {
+            state.client.localError = false;
+            state.client.error = null;
+          }
+          render();
+          checks.push(Promise.resolve().then(function() {
+            if (disposed) return;
+            return adapter.check();
+          }).catch(function(err) {
+            if (disposed) return;
+            markLocalError('client', err);
+          }).finally(function() {
+            if (disposed) return;
+            pendingAction.client = null;
+            syncClientSnapshot();
+            render();
+          }));
+        }
       }
       checks.push(checkComponent('system'));
       checks.push(checkComponent('decky'));

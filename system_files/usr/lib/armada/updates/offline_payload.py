@@ -96,9 +96,14 @@ def _validate_and_resolve_paths(payload_directory, parts, sysroot_path, work_dir
     except OSError as exc:
         raise OfflineSourceError(f"cannot check free space on {work.parent}: {exc}") from exc
     free_bytes = vfs.f_bavail * vfs.f_frsize
-    if free_bytes < exp_bytes:
+    # The expanded image and the imported repository it is read from both
+    # live under work_dir at the same time, so preflight both copies before
+    # creating either of them.
+    required_bytes = exp_bytes * 2
+    if free_bytes < required_bytes:
         raise OfflineSourceError(
-            f"insufficient free space in {work.parent}: need {exp_bytes} bytes, have {free_bytes}"
+            f"insufficient free space in {work.parent}: need {required_bytes} bytes "
+            f"for the expanded image and repository, have {free_bytes}"
         )
     return payload_path, root, work
 

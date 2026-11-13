@@ -3,6 +3,7 @@
 from http.client import HTTPException
 from math import isfinite
 from numbers import Real
+from time import monotonic
 from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -16,6 +17,7 @@ from .signature import (
 
 
 _CHANNELS = frozenset(("stable", "beta", "testing"))
+_READ_SIZE = 64 * 1024
 
 
 class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
@@ -26,7 +28,24 @@ class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _body_socket(response):
+    """Return the connected body socket CPython exposes, if any."""
+    stream = getattr(response, "fp", None)
+    raw = getattr(stream, "raw", None)
+    return getattr(raw, "_sock", None)
+
+
 def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
+    """Fetch at most ``limit`` bytes, bounded by one monotonic deadline.
+
+    ``read1`` returns whatever has arrived so the deadline is re-checked
+    between chunks instead of after an unbounded ``read(limit + 1)``; a
+    slow trickle of bytes therefore cannot hold the fetch past ``timeout``.
+    The check also runs after the EOF read, so a body that only finishes
+    after the deadline is rejected rather than accepted as complete. When
+    CPython exposes the connected socket, each read is additionally bounded
+    by the remaining budget so one read cannot block past the deadline.
+    """
     _url(url, "fetch URL")
     request = Request(
         url,
@@ -37,22 +56,53 @@ def _fetch_bytes(url: str, limit: int, timeout) -> bytes:
         method="GET",
     )
     opener = build_opener(HTTPSOnlyRedirectHandler)
+    deadline = monotonic() + timeout
+    body = bytearray()
+    total = 0
     try:
         with opener.open(request, timeout=timeout) as response:
             _url(response.geturl(), "final response URL")
             status = response.getcode()
             if status != 200:
                 raise CatalogError(f"fetch of {url} returned HTTP status {status}")
-            document = response.read(limit + 1)
+            read1 = getattr(response, "read1", None)
+            if not callable(read1):
+                raise CatalogError(
+                    f"fetch of {url} response does not support bounded reads"
+                )
+            sock = _body_socket(response)
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise CatalogError(
+                        f"fetch of {url} timed out after {timeout} seconds"
+                    )
+                if sock is not None:
+                    sock.settimeout(remaining)
+                chunk = read1(min(_READ_SIZE, limit + 1 - total))
+                if not chunk:
+                    if deadline - monotonic() <= 0:
+                        raise CatalogError(
+                            f"fetch of {url} timed out after {timeout} seconds"
+                        )
+                    break
+                body.extend(chunk)
+                total += len(chunk)
+                if total > limit:
+                    raise CatalogError(
+                        f"document fetched from {url} exceeds {limit} bytes"
+                    )
+                if deadline - monotonic() <= 0:
+                    raise CatalogError(
+                        f"fetch of {url} timed out after {timeout} seconds"
+                    )
     except CatalogError:
         raise
     except (TypeError, URLError, HTTPException, OSError) as exc:
         raise CatalogError(
             f"failed to fetch {url}: {type(exc).__name__}: {exc}"
         ) from exc
-    if len(document) > limit:
-        raise CatalogError(f"document fetched from {url} exceeds {limit} bytes")
-    return document
+    return bytes(body)
 
 
 def _validate_timeout(timeout) -> float:

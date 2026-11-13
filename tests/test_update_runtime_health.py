@@ -207,6 +207,52 @@ class RuntimeHealthTests(unittest.TestCase):
                 for endpoint in bound:
                     endpoint.close()
 
+    def test_lock_sidecars_are_ignored_before_candidate_matching(self):
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_dir = root / str(uid)
+            runtime_dir.mkdir(mode=0o700)
+            (runtime_dir / "wayland-0.lock").write_text("lock")
+            (runtime_dir / "gamescope-0.lock").write_text("lock")
+
+            with mock.patch.object(runtime_health, "RUNTIME_USERS_ROOT", root):
+                with self.assertRaises(runtime_health.RuntimeNotReady):
+                    runtime_health._candidate_sockets(uid)
+
+                endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    endpoint.bind(str(runtime_dir / "wayland-0"))
+                    _, sockets = runtime_health._candidate_sockets(uid)
+                    self.assertEqual(sockets, [runtime_dir / "wayland-0"])
+                finally:
+                    endpoint.close()
+
+                # A wrong-owner candidate beside the sidecars is still unsafe,
+                # not merely early.
+                (runtime_dir / "wayland-0").unlink()
+                wrong_owner_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    wrong_owner_socket.bind(str(runtime_dir / "wayland-1"))
+                    real_lstat = os.lstat
+
+                    def wrong_owner(path):
+                        st = real_lstat(path)
+                        if Path(path) == runtime_dir / "wayland-1":
+                            return mock.Mock(st_mode=st.st_mode, st_uid=uid + 1)
+                        return st
+
+                    with mock.patch.object(
+                        runtime_health.os, "lstat", side_effect=wrong_owner
+                    ):
+                        with self.assertRaises(runtime_health.RuntimeHealthError) as refused:
+                            runtime_health._candidate_sockets(uid)
+                    self.assertNotIsInstance(
+                        refused.exception, runtime_health.RuntimeNotReady
+                    )
+                finally:
+                    wrong_owner_socket.close()
+
     def test_readiness_error_only_marks_absent_wayland_evidence(self):
         with mock.patch.object(runtime_health, "_run_cmd", return_value=""):
             with self.assertRaises(runtime_health.RuntimeNotReady):

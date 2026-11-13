@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib.error import URLError
 from urllib.request import Request
@@ -23,6 +24,7 @@ from updates.catalog import CatalogError  # noqa: E402
 from updates.channel_release import make_channel  # noqa: E402
 from updates.channel_source import (  # noqa: E402
     HTTPSOnlyRedirectHandler,
+    _READ_SIZE,
     _fetch_bytes,
     fetch_update,
 )
@@ -34,18 +36,71 @@ PKG_SIG_URL = "https://updates.example.invalid/rel/1.0.0/package.json.sig"
 PUBLISHED_AT = "2026-04-19T12:00:00Z"
 
 
+class FakeClock:
+    """Deterministic monotonic clock advanced by the fake reader."""
+
+    def __init__(self, start=1000.0):
+        self.now = float(start)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class FakeSocket:
+    """Record per-read socket timeouts without any network access."""
+
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+
 class FakeResponse:
-    def __init__(self, data, url, status=200, closed=None):
+    def __init__(
+        self,
+        data,
+        url,
+        status=200,
+        closed=None,
+        chunk=None,
+        on_read=None,
+        sock=None,
+    ):
         self._buf = io.BytesIO(data)
         self._url = url
         self._status = status
         self._closed = closed
+        self._chunk = chunk
+        self._on_read = on_read
+        self.fp = (
+            SimpleNamespace(raw=SimpleNamespace(_sock=sock))
+            if sock is not None
+            else None
+        )
         self.closed = False
         self.read_sizes = []
+        self.bytes_read = 0
+
+    def _record(self, n):
+        self.read_sizes.append(n)
+        if self._on_read is not None:
+            self._on_read(self)
 
     def read(self, n=-1):
-        self.read_sizes.append(n)
-        return self._buf.read(n)
+        self._record(n)
+        if self._chunk is not None and n is not None and n >= 0:
+            n = min(n, self._chunk)
+        data = self._buf.read(n)
+        self.bytes_read += len(data)
+        return data
+
+    def read1(self, n=-1):
+        # The production path only uses read1; delegate to the mock reader.
+        return self.read(n)
 
     def getcode(self):
         return self._status
@@ -132,11 +187,14 @@ class ChannelSourceTests(unittest.TestCase):
 
     def setUp(self):
         self.opener = FakeOpener(dict(self.base_routes))
-        patcher = mock.patch(
-            "updates.channel_source.build_opener", return_value=self.opener
+        self.clock = FakeClock()
+        patchers = (
+            mock.patch("updates.channel_source.build_opener", return_value=self.opener),
+            mock.patch("updates.channel_source.monotonic", new=self.clock),
         )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _fetch(self, **overrides):
         kwargs = dict(
@@ -274,6 +332,60 @@ class ChannelSourceTests(unittest.TestCase):
         )
         self.assertIsInstance(result, Request)
         self.assertTrue(result.full_url.startswith("https://"))
+
+    def test_slow_trickle_hits_monotonic_deadline(self):
+        # Each read makes progress, so the socket never times out, yet the
+        # whole fetch must still stop at the single elapsed deadline.
+        response = FakeResponse(
+            b"x" * 64, CH_URL, chunk=1,
+            on_read=lambda _response: self.clock.advance(4),
+        )
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "timed out after 5 seconds"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertTrue(response.closed)
+        self.assertLess(response.bytes_read, 64)
+        self.assertGreater(response.bytes_read, 0)
+        self.assertLessEqual(response.bytes_read, 2)
+
+    def test_eof_after_deadline_is_rejected(self):
+        # EOF itself must be deadline-checked: a body that only ends after
+        # the budget is spent is not a complete document.
+        response = FakeResponse(
+            b"", CH_URL, on_read=lambda _response: self.clock.advance(6)
+        )
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "timed out after 5 seconds"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertTrue(response.closed)
+        self.assertEqual(response.bytes_read, 0)
+
+    def test_socket_read_timeout_tracks_remaining_budget(self):
+        sock = FakeSocket()
+        response = FakeResponse(
+            b"abc", CH_URL, chunk=1, sock=sock,
+            on_read=lambda _response: self.clock.advance(0.5),
+        )
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 64, 5), b"abc")
+        self.assertAlmostEqual(sock.timeouts[0], 5.0)
+        self.assertAlmostEqual(sock.timeouts[1], 4.5)
+        self.assertTrue(
+            all(a > b for a, b in zip(sock.timeouts, sock.timeouts[1:]))
+        )
+
+    def test_chunked_reads_progress_before_deadline_and_respect_cap(self):
+        body = b"z" * 40
+        response = FakeResponse(
+            body, CH_URL, chunk=7,
+            on_read=lambda _response: self.clock.advance(0.5),
+        )
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 100, 5), body)
+        self.assertTrue(response.closed)
+        self.assertEqual(response.bytes_read, len(body))
+        self.assertTrue(response.read_sizes)
+        self.assertTrue(all(0 < size <= _READ_SIZE for size in response.read_sizes))
 
 
 if __name__ == "__main__":

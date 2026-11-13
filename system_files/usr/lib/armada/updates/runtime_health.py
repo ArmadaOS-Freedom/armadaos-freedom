@@ -215,6 +215,12 @@ def _candidate_sockets(uid: int) -> tuple[Path, list[Path]]:
     sockets: list[Path] = []
     matched_name = False
     for name in names:
+        # Compositors keep "<socket>.lock" sidecars next to their sockets.
+        # They are never connection endpoints and must not count as socket
+        # evidence, or a directory holding only sidecars would be reported as
+        # unusable instead of merely not ready yet.
+        if name.endswith(".lock"):
+            continue
         if not _SOCKET_NAME_RE.match(name):
             continue
         matched_name = True

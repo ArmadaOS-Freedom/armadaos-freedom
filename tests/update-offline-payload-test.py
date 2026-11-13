@@ -102,6 +102,43 @@ class OfflinePayloadIntegrationTests(unittest.TestCase):
     def _assert_untouched(self) -> None:
         self.fixture._assert_untouched()
 
+    def test_free_space_preflight_covers_expanded_image_and_repository(self) -> None:
+        required = self.entry["expandedBytes"] * 2
+        work = self._work("space-boundary-short")
+        with mock.patch.object(
+            offline_payload.os,
+            "statvfs",
+            return_value=SimpleNamespace(f_bavail=required - 1, f_frsize=1),
+        ):
+            with mock.patch.object(offline_payload, "import_offline_image") as imported:
+                with self.assertRaises(OfflineSourceError) as caught:
+                    self._invoke(work=work)
+        imported.assert_not_called()
+        self.assertFalse(work.exists())
+        message = str(caught.exception)
+        self.assertIn(str(required), message)
+        self.assertIn("repository", message)
+        self._assert_untouched()
+
+        work = self._work("space-boundary-exact")
+        with mock.patch.object(
+            offline_payload.os,
+            "statvfs",
+            return_value=SimpleNamespace(f_bavail=required, f_frsize=1),
+        ):
+            with mock.patch.object(
+                offline_payload,
+                "import_offline_image",
+                return_value={"phase": "imported", "commit": "c" * 64},
+            ) as imported:
+                result = self._invoke(work=work)
+        imported.assert_called_once()
+        self.assertEqual(result["phase"], "imported")
+        self.assertEqual(result["payloadPath"], str(self.payload))
+        self.assertEqual(result["expandedImage"], str(work / "linux-root.img"))
+        self.assertEqual(image_fix.sha256(self.payload), self.entry["sha256"])
+        self._assert_untouched()
+
     def test_real_gzip_import_preserves_source_and_current_deployment(self) -> None:
         compressed_before = image_fix.sha256(self.payload)
         image_before = image_fix.sha256(self.image)

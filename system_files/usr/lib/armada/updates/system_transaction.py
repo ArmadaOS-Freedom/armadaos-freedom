@@ -351,7 +351,8 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     channel_url=channel_url, signature_url=signature_url,
                     expected_channel=expected_channel, model=initial['model'],
                     updater_version=updater_version, sysroot_path=sysroot_path,
-                    work_dir=work / 'download', trusted_key=trusted_key)
+                    work_dir=work / 'download', current_commit=old[1],
+                    trusted_key=trusted_key)
                 if downloaded['commit'] == old[1]:
                     status.update(state='up_to_date', phase='complete', requiresReboot=False)
                     _save_json(work, 'status.json', status)

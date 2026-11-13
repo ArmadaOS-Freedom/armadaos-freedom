@@ -1,4 +1,5 @@
 """Authenticated online acquisition of an update image into an existing repo."""
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ _ENV = {
     "LC_ALL": "C",
     "HOME": "/root",
 }
+
+_log = logging.getLogger("armada.image_source")
 
 
 class ImageSourceError(RuntimeError):
@@ -110,6 +113,12 @@ def _read_commit(work):
     return digest
 
 
+def _commit_digest(value, field):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ImageSourceError(f"{field} must be 64 lowercase hexadecimal characters")
+    return value
+
+
 def _validate_repo_commit(repo, digest, package):
     ok, variant, state = repo.load_commit(digest)
     if not ok or variant is None or int(state) != 0:
@@ -122,6 +131,16 @@ def _validate_repo_commit(repo, digest, package):
         raise ImageSourceError(str(exc)) from exc
 
 
+def _remove_stage(stage):
+    """Drop a disposable staging repo without replacing the live error."""
+    try:
+        shutil.rmtree(stage)
+    except Exception as exc:
+        _log.warning("cannot remove staging repo %s: %s", stage, exc)
+        return exc
+    return None
+
+
 def _import_verified(destination_repo, origin_ref, work, expected_commit, validate):
     work = Path(work)
     stage = work / "staging-repo"
@@ -129,38 +148,60 @@ def _import_verified(destination_repo, origin_ref, work, expected_commit, valida
         stage.mkdir(mode=0o700, exist_ok=False)
     except OSError as exc:
         raise ImageSourceError(f"cannot create staging repo {stage}: {exc}") from exc
-    _run_command(
-        ["/usr/bin/ostree", "init", f"--repo={stage}", "--mode=bare"],
-        work / "init.log",
-    )
-    pull_log = _pull(stage, origin_ref, work)
-    digest = _read_commit(work)
-    if digest != expected_commit:
-        raise ImageSourceError(f"pulled commit does not match channel; log {pull_log}")
-    validate(stage, digest)
-    _run_command(
-        [
-            "/usr/bin/ostree", "pull-local", f"--repo={destination_repo}",
-            "--untrusted", "--disable-verify-bindings", str(stage), digest,
-        ],
-        work / "import.log",
-    )
     try:
-        shutil.rmtree(stage)
-    except OSError as exc:
-        raise ImageSourceError(f"cannot remove staging repo {stage}: {exc}") from exc
+        _run_command(
+            ["/usr/bin/ostree", "init", f"--repo={stage}", "--mode=bare"],
+            work / "init.log",
+        )
+        pull_log = _pull(stage, origin_ref, work)
+        digest = _read_commit(work)
+        if digest != expected_commit:
+            raise ImageSourceError(f"pulled commit does not match channel; log {pull_log}")
+        validate(stage, digest)
+        _run_command(
+            [
+                "/usr/bin/ostree", "pull-local", f"--repo={destination_repo}",
+                "--untrusted", "--disable-verify-bindings", str(stage), digest,
+            ],
+            work / "import.log",
+        )
+    except BaseException:
+        # The staging repo is disposable; only it is removed.  The command
+        # logs beside it stay for diagnosis and the original error wins even
+        # when the cleanup itself fails.
+        _remove_stage(stage)
+        raise
+    cleanup_error = _remove_stage(stage)
+    if cleanup_error is not None:
+        raise ImageSourceError(
+            f"cannot remove staging repo {stage}: {cleanup_error}"
+        ) from cleanup_error
     return pull_log
 
 
 def fetch_online_image(*, channel_url, signature_url, expected_channel, model,
                        updater_version, sysroot_path, work_dir,
-                       trusted_key=DEFAULT_TRUSTED_KEY):
-    """Authenticate and download an image; never deploy or activate it."""
+                       current_commit=None, trusted_key=DEFAULT_TRUSTED_KEY):
+    """Authenticate and download an image; never deploy or activate it.
+
+    ``current_commit`` is the commit the running deployment boots.  It is
+    compared with the signed package metadata before any staging work is
+    prepared, so an unchanged commit skips the pull and reports ``up_to_date``
+    only from authenticated material.
+    """
+    if current_commit is not None:
+        _commit_digest(current_commit, "current_commit")
     acquired = fetch_update(
         channel_url, signature_url, expected_channel=expected_channel,
         model=model, updater_version=updater_version, trusted_key=trusted_key,
     )
     channel, package = acquired["channel"], acquired["package"]
+    digest = package["ostreeCommit"]
+    if current_commit is not None and current_commit == digest:
+        return {
+            "channel": channel, "package": package,
+            "commit": digest, "phase": "up_to_date",
+        }
     oci_digest = package["ociDigest"]
     origin_ref = (
         "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
@@ -202,7 +243,6 @@ def fetch_online_image(*, channel_url, signature_url, expected_channel, model,
                 raise ImageSourceError(f"cannot open staging repository {stage_path}")
             _validate_repo_commit(stage_repo, stage_digest, package)
 
-        digest = package["ostreeCommit"]
         log_path = _import_verified(expected_repo, origin_ref, work, digest, _validate_stage)
         if not sysroot.load(None):
             raise ImageSourceError("sysroot reload after pull failed")
