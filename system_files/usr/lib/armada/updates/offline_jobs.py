@@ -40,6 +40,23 @@ _IDEMPOTENT = frozenset({
 _UNRECORDED_EXECUTE_STATES = frozenset({
     'execute_queued', 'executing', 'dispatch_uncertain',
 })
+# Receipt states in which a detached prepare may have written the terminal
+# transaction documents but died before recording its result on the receipt.
+_UNRECORDED_PREPARE_STATES = frozenset({
+    'prepare_queued', 'preparing', 'dispatch_uncertain',
+})
+# The only prepare result that leaves a durable, non-booting transaction the
+# client may still resume; ``up_to_date`` leaves no durable output at all.
+_PREPARED_STATE = 'awaiting_recovery_export'
+# Documents only an execute worker writes.  Their presence means the prepared
+# transaction has already moved on and must never be adopted as freshly
+# prepared.
+_EXECUTE_ARTIFACTS = ('recovery-ack.json', 'write-report.json')
+
+
+def _is_sha256(value):
+    return (type(value) is str and len(value) == 64 and
+            all(ch in '0123456789abcdef' for ch in value))
 
 
 def _read_trial_evidence():
@@ -171,22 +188,146 @@ class OfflineJobManager:
             return None
         return status
 
+    @staticmethod
+    def _durable_prepare(session, receipt):
+        """Return this session's durable prepared status, or None.
+
+        A prepare worker writes ``status.json`` last, after every other
+        transaction document, so only a status that is still awaiting the
+        recovery export proves the prepare step completed.  Earlier phases,
+        missing, partial or contradictory documents, foreign identities and
+        any later execute output are refused rather than repaired: nothing is
+        fabricated and no deployment step is repeated.
+
+        The binding is re-derived from the private documents instead of being
+        trusted from the receipt, and is matched against the signed session
+        document, the approved plan, the recovery manifest and the physical
+        identity recorded when the session was submitted.
+        """
+        transaction = session / 'transaction'
+        if transaction.is_symlink() or not transaction.is_dir():
+            return None
+        for name in _EXECUTE_ARTIFACTS:
+            path = transaction / name
+            if path.exists() or path.is_symlink():
+                return None
+        try:
+            status, _status_raw = offline_execute._load_json(
+                transaction, 'status.json')
+            prepared, _prepared_raw = offline_execute._load_json(
+                transaction, 'prepared.json')
+            plan, plan_raw = offline_execute._load_json(transaction, 'plan.json')
+            manifest, manifest_raw = offline_execute._load_json(
+                transaction, 'recovery-manifest.json')
+            package_document = offline_execute._read_bounded(
+                transaction / 'package.json', _DOCUMENT_MAX,
+                'transaction package document')
+            package_signature = offline_execute._read_bounded(
+                transaction / 'package.sig', _SIGNATURE_MAX,
+                'transaction package signature')
+            session_document = offline_execute._read_bounded(
+                session / 'package.json', _DOCUMENT_MAX,
+                'session package document')
+            session_signature = offline_execute._read_bounded(
+                session / 'package.sig', _SIGNATURE_MAX,
+                'session package signature')
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+        if (type(status.get('schemaVersion')) is not int or
+                status.get('schemaVersion') != 1 or
+                status.get('component') != 'system' or
+                status.get('operation') != 'offline-upgrade' or
+                status.get('policy') != 'offline-dual' or
+                status.get('bootPolicy') != system_transaction.BOOT_POLICY or
+                status.get('phase') != _PREPARED_STATE or
+                status.get('state') != _PREPARED_STATE or
+                status.get('bootWriteState') != 'not_started' or
+                status.get('slotControlState') != 'not_issued' or
+                status.get('requiresReboot') is not False):
+            return None
+        if (type(plan.get('schemaVersion')) is not int or
+                plan.get('schemaVersion') != 1 or
+                plan.get('operation') != 'offline-upgrade' or
+                plan.get('policy') != 'offline-dual' or
+                type(manifest.get('schemaVersion')) is not int or
+                manifest.get('schemaVersion') != 1 or
+                manifest.get('operation') != 'offline-upgrade'):
+            return None
+
+        identity = offline_completion.document_identity(
+            prepared, plan, hashlib.sha256(plan_raw).hexdigest())
+        if identity is None:
+            return None
+        physical = receipt.get('physical')
+        if (not isinstance(physical, dict) or
+                plan.get('model') != receipt.get('model') or
+                plan.get('channel') != receipt.get('channel') or
+                plan.get('oldDeployment') != physical.get('deployment') or
+                plan.get('fromSlot') != physical.get('actualSlot') or
+                plan.get('targetSlot') != physical.get('inactiveSlot')):
+            return None
+        if (status.get('transactionId') != identity['transactionId'] or
+                status.get('model') != plan.get('model') or
+                status.get('fromSlot') != identity['fromSlot'] or
+                status.get('targetSlot') != identity['targetSlot'] or
+                status.get('oldDeployment') != identity['oldDeployment'] or
+                status.get('newDeployment') != identity['newDeployment']):
+            return None
+
+        manifest_sha = prepared.get('recoveryManifestSha256')
+        package_sha = prepared.get('packageDescriptorSha256')
+        if (not _is_sha256(manifest_sha) or
+                hashlib.sha256(manifest_raw).hexdigest() != manifest_sha or
+                plan.get('recoveryManifestSha256') != manifest_sha or
+                status.get('recoveryManifestSha256') != manifest_sha or
+                status.get('planSha256') != identity['planSha256'] or
+                type(status.get('recoveryManifestBytes')) is not int or
+                status['recoveryManifestBytes'] != len(manifest_raw)):
+            return None
+        if (not _is_sha256(package_sha) or
+                hashlib.sha256(session_document).hexdigest() != package_sha or
+                plan.get('packageDescriptorSha256') != package_sha or
+                package_document != session_document or
+                package_signature != session_signature):
+            return None
+
+        if (manifest.get('transactionId') != identity['transactionId'] or
+                manifest.get('model') != plan.get('model') or
+                manifest.get('oldDeployment') != identity['oldDeployment'] or
+                manifest.get('fromSlot') != identity['fromSlot'] or
+                manifest.get('recoveryPartUuid') != physical.get('recoveryPartUuid') or
+                not physical_slots.same_physical_identity(
+                    manifest.get('physical'), physical) or
+                offline_completion._canonical_uuid(
+                    manifest.get('installationUuid')) is None or
+                type(manifest.get('board')) is not int):
+            return None
+        return status
+
     def _reconcile_interrupted(self, session_id):
-        """Adopt a durable execute completion that its dead worker never recorded.
+        """Adopt a durable terminal result that its dead worker never recorded.
 
         Returns True only when the receipt was changed; a second call sees the
         recorded result and does nothing.  No worker is relaunched and no
-        restart is issued here.
+        restart is issued here.  A prepare is adopted only as ``prepared`` from
+        its own terminal transaction documents, never as ``up_to_date``.
         """
         with self.store.session_lock(session_id) as session:
             receipt = self.store.read_receipt(session)
-            if (receipt.get('state') not in _UNRECORDED_EXECUTE_STATES or
-                    receipt.get('jobOperation') != 'execute'):
+            state = receipt.get('state')
+            operation = receipt.get('jobOperation')
+            if operation == 'prepare' and state in _UNRECORDED_PREPARE_STATES:
+                result = self._durable_prepare(session, receipt)
+                final = 'prepared'
+            elif operation == 'execute' and state in _UNRECORDED_EXECUTE_STATES:
+                result = self._durable_completion(session, receipt)
+                final = 'awaiting_reboot'
+            else:
                 return False
-            result = self._durable_completion(session, receipt)
             if result is None:
                 return False
-            receipt['state'] = 'awaiting_reboot'
+            receipt['state'] = final
             receipt['result'] = result
             receipt.pop('error', None)
             try:

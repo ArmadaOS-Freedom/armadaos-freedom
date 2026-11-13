@@ -37,6 +37,7 @@ PHYSICAL = {
 PAYLOAD = b'data'
 TX = '11111111-2222-4333-8444-555555555555'
 OTHER_TX = '99999999-8888-4777-8666-555555555555'
+INSTALLATION_UUID = '33333333-4444-4555-8666-777777777777'
 NEW_DEPLOYMENT = 'armada/' + ('b' * 64) + '.1'
 ORIGINAL_BOOT = {'a': 'e' * 64, 'b': 'f' * 64}
 NEW_BOOT = {'a': '1' * 64, 'b': '2' * 64}
@@ -117,7 +118,92 @@ class OfflineJobTests(unittest.TestCase):
                     'transactionId': prepared['transactionId'],
                     'planSha256': prepared['planSha256'],
                     'recoveryManifestSha256': prepared['recoveryManifestSha256'],
-                    'files': manifest['files']}
+                    'files': [{k: f[k] for k in ('path', 'bytes', 'sha256')}
+                              for f in manifest['files']]}
+
+    def write_prepare_documents(self, session, work_dir, transaction_id=TX,
+                                plan=None, status=None, manifest=None,
+                                prepared=None):
+        """Write the terminal documents a prepare worker leaves behind.
+
+        The shape follows offline_prepare.py: the manifest is written first,
+        then the plan that binds its digest, then prepared.json, and status.json
+        last as the durable completion marker.
+        """
+        work_dir.mkdir()
+        document = (session / 'package.json').read_bytes()
+        signature = (session / 'package.sig').read_bytes()
+        document_sha = hashlib.sha256(document).hexdigest()
+        manifest_body = {
+            'schemaVersion': 1, 'operation': 'offline-upgrade',
+            'transactionId': transaction_id, 'model': PHYSICAL['model'],
+            'installationUuid': INSTALLATION_UUID,
+            'recoveryPartUuid': PHYSICAL['recoveryPartUuid'], 'board': 1,
+            'oldDeployment': PHYSICAL['deployment'], 'fromSlot': 'a',
+            'physical': dict(PHYSICAL),
+            'partitions': {'a': 'partition-a', 'b': 'partition-b'},
+            'files': [{'path': 'original.img', 'bytes': len(PAYLOAD),
+                       'sha256': hashlib.sha256(PAYLOAD).hexdigest(),
+                       'kind': 'slot', 'label': 'a.boot'}],
+        }
+        manifest_body.update(manifest or {})
+        manifest_raw = system_transaction._save_json(
+            work_dir, 'recovery-manifest.json', manifest_body)
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        plan_body = {
+            'schemaVersion': 1, 'operation': 'offline-upgrade',
+            'policy': 'offline-dual', 'transactionId': transaction_id,
+            'model': PHYSICAL['model'], 'channel': 'stable',
+            'sysrootPath': '/sysroot', 'releaseId': 'release-1',
+            'version': '1.0.0', 'sourceRevision': 'c' * 40,
+            'ociDigest': 'sha256:' + ('d' * 64), 'ostreeCommit': 'b' * 64,
+            'fromSlot': 'a', 'targetSlot': 'b',
+            'oldDeployment': PHYSICAL['deployment'],
+            'newDeployment': NEW_DEPLOYMENT,
+            'originalBootSha256': dict(ORIGINAL_BOOT),
+            'newBootSha256': dict(NEW_BOOT),
+            'recoveryManifestSha256': manifest_sha,
+            'packageDescriptorSha256': document_sha,
+        }
+        plan_body.update(plan or {})
+        plan_raw = system_transaction._save_json(work_dir, 'plan.json', plan_body)
+        plan_sha = hashlib.sha256(plan_raw).hexdigest()
+        (work_dir / 'package.json').write_bytes(document)
+        (work_dir / 'package.sig').write_bytes(signature)
+        prepared_body = {
+            'schemaVersion': 1, 'operation': 'offline-upgrade',
+            'policy': 'offline-dual', 'transactionId': transaction_id,
+            'plan': 'plan.json', 'planSha256': plan_sha,
+            'trust': 'trust.json', 'materials': 'materials.json',
+            'candidates': {'a': 'candidate-a.json', 'b': 'candidate-b.json'},
+            'recoveryManifest': 'recovery-manifest.json',
+            'recoveryManifestSha256': manifest_sha,
+            'packageDescriptor': 'package.json',
+            'packageSignature': 'package.sig',
+            'packageDescriptorSha256': document_sha,
+        }
+        prepared_body.update(prepared or {})
+        system_transaction._save_json(work_dir, 'prepared.json', prepared_body)
+        status_body = {
+            'schemaVersion': 1, 'component': 'system',
+            'operation': 'offline-upgrade', 'policy': 'offline-dual',
+            'bootPolicy': system_transaction.BOOT_POLICY,
+            'transactionId': transaction_id, 'model': PHYSICAL['model'],
+            'fromSlot': 'a', 'targetSlot': 'b',
+            'oldDeployment': PHYSICAL['deployment'],
+            'newDeployment': NEW_DEPLOYMENT,
+            'phase': 'awaiting_recovery_export',
+            'state': 'awaiting_recovery_export',
+            'bootWriteState': 'not_started',
+            'slotControlState': 'not_issued', 'requiresReboot': False,
+            'recoveryManifest': 'recovery-manifest.json',
+            'recoveryManifestSha256': manifest_sha,
+            'recoveryManifestBytes': len(manifest_raw),
+            'planSha256': plan_sha,
+        }
+        status_body.update(status or {})
+        system_transaction._save_json(work_dir, 'status.json', status_body)
+        return status_body
 
     def write_executed_documents(self, work_dir, transaction_id):
         """Write the transaction documents a completed prepare leaves behind."""
@@ -436,6 +522,137 @@ class OfflineJobTests(unittest.TestCase):
         self.assertNotIn('jobInterrupted', result)
         with self.assertRaises(offline_session.OfflineSessionError):
             self.manager().request_restart(sid)
+        self.reboot.assert_not_called()
+
+    def interrupted_prepare(self, receipt_state='preparing', documents=None,
+                            tamper=None):
+        """Return a session whose prepare worker died before recording its result."""
+        sid = self.session()
+        self.manager().submit_prepare(sid)
+        changes = documents or {}
+
+        def prepare(work_dir, **_kwargs):
+            return self.write_prepare_documents(
+                work_dir.parent, work_dir, **changes)
+
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=prepare):
+            self.manager().run_job('prepare', sid)
+        with self.store.session_lock(sid) as session:
+            if tamper is not None:
+                tamper(session / 'transaction')
+            receipt = self.store.read_receipt(session)
+            receipt['state'] = receipt_state
+            receipt.pop('result', None)
+            self.store.update_receipt(session, receipt)
+        self.runner.reset_mock()
+        self.runner.return_value.returncode = 3
+        return sid
+
+    def test_interrupted_prepare_adopts_terminal_transaction_once(self):
+        sid = self.interrupted_prepare()
+        mgr = self.manager()
+
+        first = mgr.status(sid)
+        self.assertEqual(first['state'], 'prepared')
+        self.assertEqual(first['result']['state'], 'awaiting_recovery_export')
+        self.assertEqual(first['result']['transactionId'], TX)
+        self.assertEqual(first['transaction']['state'], 'awaiting_recovery_export')
+        self.assertNotIn('jobInterrupted', first)
+        self.assertNotIn('attentionRequired', first)
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.runner.call_args.args[0][0], 'systemctl')
+
+        recorded = self.receipt_bytes(sid)
+        second = mgr.status(sid)
+        self.assertEqual(second['state'], 'prepared')
+        self.assertEqual(self.receipt_bytes(sid), recorded)
+        self.assertEqual(self.runner.call_count, 1)
+        self.reboot.assert_not_called()
+
+        # The client continues through the existing explicit export/ack gate.
+        ack = self.ack(sid)
+        with self.assertRaises(ValueError):
+            mgr.submit_execute(sid, dict(ack, transactionId=OTHER_TX))
+        queued = mgr.submit_execute(sid, ack)
+        self.assertEqual(queued['state'], 'execute_queued')
+        self.assertEqual(queued['jobOperation'], 'execute')
+
+    def test_interrupted_prepare_dispatch_uncertain_adopts_terminal_documents(self):
+        sid = self.interrupted_prepare(receipt_state='dispatch_uncertain')
+        receipt = self.manager().status(sid)
+        self.assertEqual(receipt['state'], 'prepared')
+        self.assertEqual(receipt['result']['state'], 'awaiting_recovery_export')
+        self.reboot.assert_not_called()
+
+    def test_interrupted_prepare_refuses_incomplete_foreign_or_executed_documents(self):
+        def rewrite(name, extra):
+            def tamper(transaction):
+                path = transaction / name
+                path.write_bytes(path.read_bytes() + extra)
+            return tamper
+
+        cases = (
+            ('still preparing',
+             {'status': {'state': 'preparing', 'phase': 'preparing'}}, None),
+            ('later execute phase',
+             {'status': {'state': 'executing', 'phase': 'writing_boot',
+                         'bootWriteState': 'writing'}}, None),
+            ('completed execute output',
+             {'status': {'state': 'awaiting_reboot',
+                         'phase': 'awaiting_reboot',
+                         'bootWriteState': 'written',
+                         'requiresReboot': True}}, None),
+            ('slot control issued',
+             {'status': {'slotControlState': 'issued'}}, None),
+            ('foreign transaction',
+             {'status': {'transactionId': OTHER_TX},
+              'plan': {'transactionId': OTHER_TX},
+              'manifest': {'transactionId': OTHER_TX}}, None),
+            ('foreign model', {'plan': {'model': 'TB323FU'}}, None),
+            ('other channel', {'plan': {'channel': 'beta'}}, None),
+            ('other old deployment',
+             {'plan': {'oldDeployment': 'armada/' + ('c' * 64) + '.0'}}, None),
+            ('other slots', {'plan': {'fromSlot': 'b'}}, None),
+            ('foreign recovery identity',
+             {'manifest': {'recoveryPartUuid':
+                           '87654321-4321-4321-8321-123456789abc'}}, None),
+            ('manifest byte count',
+             {'status': {'recoveryManifestBytes': 1}}, None),
+            ('package digest',
+             {'prepared': {'packageDescriptorSha256': 'd' * 64}}, None),
+            ('tampered plan digest', {}, rewrite('plan.json', b' ')),
+            ('tampered manifest digest',
+             {}, rewrite('recovery-manifest.json', b' ')),
+            ('missing status', {},
+             lambda transaction: (transaction / 'status.json').unlink()),
+            ('missing manifest', {},
+             lambda transaction: (transaction / 'recovery-manifest.json').unlink()),
+            ('execute artifacts present', {},
+             lambda transaction: (transaction / 'write-report.json').write_bytes(b'{}')),
+        )
+        for name, documents, tamper in cases:
+            with self.subTest(case=name):
+                sid = self.interrupted_prepare(documents=documents, tamper=tamper)
+                before = self.receipt_bytes(sid)
+                receipt = self.manager().status(sid)
+                self.assertEqual(receipt['state'], 'preparing')
+                self.assertTrue(receipt['jobInterrupted'])
+                self.assertTrue(receipt['attentionRequired'])
+                self.assertEqual(self.receipt_bytes(sid), before)
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    self.manager().submit_execute(sid, {})
+                self.reboot.assert_not_called()
+
+    def test_interrupted_prepare_never_adopts_while_worker_is_active(self):
+        sid = self.interrupted_prepare()
+        self.runner.return_value.returncode = 0
+        receipt = self.manager().status(sid)
+        self.assertEqual(receipt['state'], 'preparing')
+        self.assertTrue(receipt['jobActive'])
+        self.assertNotIn('jobInterrupted', receipt)
+        with self.assertRaises(offline_session.OfflineSessionError):
+            self.manager().submit_execute(sid, {})
         self.reboot.assert_not_called()
 
     def test_status_binds_completion_without_writing_or_rebooting(self):

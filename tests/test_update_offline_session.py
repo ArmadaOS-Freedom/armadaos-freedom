@@ -76,6 +76,23 @@ class OfflineSessionStoreTest(unittest.TestCase):
     def _space(free):
         return SimpleNamespace(f_bavail=free // 4096, f_frsize=4096)
 
+    def _make_session(self, store, document, signature, session_id,
+                      data=None, age=0):
+        """Create one session under a chosen basename so lexical order is known."""
+        with mock.patch.object(store, "_new_session_id", return_value=session_id):
+            receipt = store.begin(document, signature)
+        if data is not None:
+            store.upload(session_id, 0, data)
+        if age:
+            self._age(store.base / session_id / "receipt.json", age)
+            if data is not None:
+                self._age(self._payload_file(store.base / session_id, receipt), age)
+        return receipt
+
+    @staticmethod
+    def _ids(count):
+        return ["%032x" % number for number in range(1, count + 1)]
+
     def test_upload_roundtrip_and_seal(self):
         for model in ("TB322FC", "TB323FU"):
             with self.subTest(model=model):
@@ -380,6 +397,124 @@ class OfflineSessionStoreTest(unittest.TestCase):
         self.assertFalse(payload.exists())
         self.assertTrue((base / sid).is_dir())
         self.assertEqual(store.status(sid)["state"], "up_to_date")
+
+    def test_begin_reaches_later_sessions_across_independent_stores(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "fair" / "offline"
+        store = self._store(base)
+        ids = self._ids(20)
+        receipts = {}
+        for sid in ids[:16]:
+            # Retained sessions that were already reclaimed: no payload left.
+            receipts[sid] = self._make_session(store, doc, sig, sid, age=2 * 86400)
+        for sid in ids[16:19]:
+            # Recent uploads stay protected by the age and activity checks.
+            receipts[sid] = self._make_session(store, doc, sig, sid, data=data)
+        stale = ids[19]
+        receipts[stale] = self._make_session(
+            store, doc, sig, stale, data=data, age=2 * 86400)
+        stale_payload = self._payload_file(base / stale, receipts[stale])
+
+        first = self._store(base)
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(0)]):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                first.begin(doc, sig)
+        self.assertTrue(stale_payload.exists())
+        for sid in ids[:16]:
+            self.assertTrue((base / sid).is_dir())
+            self.assertTrue((base / sid / "receipt.json").is_file())
+        cursor = json.loads(
+            (base / offline_session._RECLAIM_CURSOR).read_text())
+        self.assertEqual(cursor["after"], ids[15])
+
+        second = self._store(base)
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(10 ** 12)]):
+            second.begin(doc, sig)
+        self.assertFalse(stale_payload.exists())
+        self.assertTrue((base / stale).is_dir())
+        self.assertEqual(second.status(stale)["receivedBytes"], 0)
+        for sid in ids[16:19]:
+            self.assertEqual(
+                self._payload_file(base / sid, receipts[sid]).stat().st_size,
+                len(data))
+
+    def test_reclaim_cursor_wraps_and_restarts_after_invalid_value(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "wrap" / "offline"
+        store = self._store(base)
+        ids = self._ids(20)
+        payloads = {}
+        for sid in ids[:4]:
+            receipt = self._make_session(
+                store, doc, sig, sid, data=data, age=2 * 86400)
+            payloads[sid] = self._payload_file(base / sid, receipt)
+        for sid in ids[4:]:
+            self._make_session(store, doc, sig, sid)
+
+        # Start near the end of the lexical ring so the scan must wrap.
+        store._write_reclaim_cursor(ids[17])
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(10 ** 12)]):
+            store.begin(doc, sig)
+        self.assertFalse(payloads[ids[0]].exists())
+        for sid in ids[1:4]:
+            self.assertTrue(payloads[sid].exists())
+
+        # A corrupt cursor only restarts the scan from the first candidate.
+        (base / offline_session._RECLAIM_CURSOR).write_bytes(b"not a cursor")
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(10 ** 12)]):
+            store.begin(doc, sig)
+        self.assertFalse(payloads[ids[1]].exists())
+        for sid in ids[2:4]:
+            self.assertTrue(payloads[sid].exists())
+
+    def test_reclaim_skips_non_session_entries_and_missing_cursor_target(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "entries" / "offline"
+        store = self._store(base)
+        ids = self._ids(18)
+        receipts = {}
+        receipts[ids[0]] = self._make_session(store, doc, sig, ids[0])
+        receipts[ids[1]] = self._make_session(
+            store, doc, sig, ids[1], data=data, age=2 * 86400)
+        for sid in ids[2:]:
+            receipts[sid] = self._make_session(store, doc, sig, sid)
+
+        # Twenty non-session names sort before every session basename.
+        junk = [base / ("-junk-%02d" % number) for number in range(20)]
+        for path in junk:
+            path.write_text("not a session")
+
+        # No cursor at all still walks the real candidates, not the junk.
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(10 ** 12)]):
+            store.begin(doc, sig)
+        self.assertFalse(
+            self._payload_file(base / ids[1], receipts[ids[1]]).exists())
+        self.assertTrue(all(path.is_file() for path in junk))
+        self.assertTrue(all((base / sid).is_dir() for sid in ids))
+
+        # A cursor whose target disappeared still resumes after that basename.
+        store.upload(ids[2], 0, data)
+        receipt_path = base / ids[2] / "receipt.json"
+        self._age(receipt_path, 2 * 86400)
+        payload = self._payload_file(base / ids[2], receipts[ids[2]])
+        self._age(payload, 2 * 86400)
+        store._write_reclaim_cursor("%032x" % 999)
+        with mock.patch.object(
+                offline_session.os, "statvfs",
+                side_effect=[self._space(0), self._space(10 ** 12)]):
+            store.begin(doc, sig)
+        self.assertFalse(payload.exists())
+        self.assertTrue((base / ids[2]).is_dir())
 
     def _export_session(self, state="awaiting_recovery_export"):
         doc, sig, data = self._signed_package()

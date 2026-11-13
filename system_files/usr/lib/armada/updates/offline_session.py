@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import heapq
 import json
 import os
 from pathlib import Path
@@ -45,8 +46,12 @@ _DEFAULT_INSPECT = physical_slots.inspect_physical_slots
 # The newest receipt or payload timestamp is the activity evidence, so a slow
 # but still progressing upload is never reclaimed.
 _RECLAIM_AGE = 24 * 60 * 60
-# Bound the work and the candidates examined by one begin() call.
+# Bound the work and the candidates examined by one begin() call.  The scans
+# rotate through a persisted basename cursor so repeated independent helper
+# invocations reach every session instead of starving beyond the first window.
 _RECLAIM_SCAN_LIMIT = 16
+_RECLAIM_CURSOR = 'reclaim-cursor.json'
+_RECLAIM_CURSOR_MAX = 4096
 _RECLAIMABLE_STATES = frozenset({'uploading', 'up_to_date'})
 
 
@@ -401,24 +406,83 @@ class OfflineSessionStore:
             if lock_fd is not None:
                 os.close(lock_fd)
 
-    def _reclaim_abandoned(self, needed):
-        """Release abandoned payload storage until ``needed`` bytes are free."""
-        cutoff = time.time() - _RECLAIM_AGE
-        freed = 0
+    def _read_reclaim_cursor(self):
+        """Return the last examined basename, or None to restart from the top.
+
+        A missing, unreadable or malformed cursor is not an error: the scan
+        simply starts at the first candidate again.
+        """
         try:
+            raw = offline_execute._read_bounded(
+                self.base / _RECLAIM_CURSOR, _RECLAIM_CURSOR_MAX, 'reclaim cursor')
+            cursor = json.loads(raw.decode('ascii'))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(cursor, dict) or cursor.get('schemaVersion') != 1:
+            return None
+        after = cursor.get('after')
+        if type(after) is not str or _SESSION_ID.fullmatch(after) is None:
+            return None
+        return after
+
+    def _write_reclaim_cursor(self, after):
+        system_transaction._save_json(
+            self.base, _RECLAIM_CURSOR, {'schemaVersion': 1, 'after': after})
+
+    def _reclaim_candidates(self, after, limit):
+        """Return at most ``limit`` session basenames in lexical ring order.
+
+        Only session directories count, and only the next window is kept in
+        memory, so no directory listing order is assumed and no unbounded
+        list is built.  Names after the cursor come first; the remainder wraps
+        to the lexically smallest names.
+        """
+        def names():
             with os.scandir(self.base) as entries:
-                examined = 0
                 for entry in entries:
-                    if examined >= _RECLAIM_SCAN_LIMIT:
-                        break
-                    examined += 1
                     if _SESSION_ID.fullmatch(entry.name) is None:
                         continue
-                    freed += self._reclaim_session(entry.name, cutoff)
-                    if freed >= needed:
-                        break
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    yield entry.name
+
+        chosen = heapq.nsmallest(
+            limit, (name for name in names() if after is None or name > after))
+        if len(chosen) < limit and after is not None:
+            chosen += heapq.nsmallest(
+                limit - len(chosen), (name for name in names() if name <= after))
+        return chosen
+
+    def _reclaim_abandoned(self, needed):
+        """Release abandoned payload storage until ``needed`` bytes are free.
+
+        Each invocation inspects at most ``_RECLAIM_SCAN_LIMIT`` real session
+        candidates and persists the last basename it reached, so successive
+        begin() calls continue after that point, wrap around, and eventually
+        examine every retained session.  Only the cursor file is rewritten;
+        session receipts, directories and live transactions are untouched.
+        """
+        cutoff = time.time() - _RECLAIM_AGE
+        after = self._read_reclaim_cursor()
+        try:
+            candidates = self._reclaim_candidates(after, _RECLAIM_SCAN_LIMIT)
         except OSError:
-            return freed
+            return 0
+        freed = 0
+        visited = None
+        for name in candidates:
+            visited = name
+            freed += self._reclaim_session(name, cutoff)
+            if freed >= needed:
+                break
+        if visited is not None and visited != after:
+            try:
+                self._write_reclaim_cursor(visited)
+            except (OSError, ValueError):
+                pass
         return freed
 
     def begin(self, document: bytes, signature_b64: bytes):
