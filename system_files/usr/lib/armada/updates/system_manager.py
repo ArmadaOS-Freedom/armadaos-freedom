@@ -1,6 +1,7 @@
 """Freedom OS update status, signed update checks, and apply operations."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from .boot_context import BootContextError, read_boot_context
 from .trial_record import BOOT_POLICY
 from .trial_status import read_trial_status
 from .channel_source import fetch_update
-from . import channel_selection
+from . import channel_selection, offline_completion
 
 UPDATER_VERSION = "0.8.0"
 MAX_COMPATIBLE_BYTES = 4096
@@ -32,6 +33,12 @@ MODELS = {
 
 SYSTEM_APPLY_STATE_ROOT = Path("/var/lib/armada/updates/system")
 SYSTEM_APPLY_ARGV = ["/usr/bin/python3", "-m", "updates.system_apply"]
+OFFLINE_SESSION_ROOT = Path("/var/lib/armada-updates/offline")
+# Receipt states from which an execute result may still be missing or already
+# recorded; anything else cannot describe a written, unrebooted transaction.
+_OFFLINE_RECEIPT_STATES = frozenset({
+    "execute_queued", "executing", "dispatch_uncertain", "awaiting_reboot",
+})
 _APPLY_STATES = (
     "awaiting_reboot", "up_to_date", "failed", "uncertain", "recovery_required")
 
@@ -295,6 +302,85 @@ def _valid_trial_receipt(trial, model):
         return False
 
 
+def _private_directory(path):
+    info = os.lstat(path)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022):
+        raise RuntimeError(f"{path} is not a private root-owned directory")
+
+
+def _json_document(path):
+    return json.loads(
+        _read_regular(path, MAX_CONFIG_BYTES),
+        object_pairs_hook=_no_duplicate_properties)
+
+
+def _valid_offline_completion(trial, model):
+    """Match a durable offline execute result to the live trial journal.
+
+    Only the private pointer filed under this journal's canonical transaction
+    id is followed, so another queued session cannot displace an older pending
+    result.  The session's own documents must then pass the shared completion
+    validator against the approved plan and report a verified boot write with
+    slot control never issued.  A missing, foreign, misowned or contradictory
+    document simply fails the check.
+    """
+    try:
+        if not isinstance(trial, dict):
+            return False
+        root = OFFLINE_SESSION_ROOT
+        if not root.is_absolute() or root.resolve(strict=True) != root:
+            return False
+        _private_directory(root)
+        pointer = offline_completion.completion_pointer(
+            root, trial.get("transactionId"))
+        if pointer is None:
+            return False
+        _private_directory(pointer.parent)
+        session_id = offline_completion.pointer_session(
+            _json_document(pointer), trial.get("transactionId"))
+        if session_id is None:
+            return False
+        session = root / session_id
+        if session.parent != root or session.resolve(strict=True) != session:
+            return False
+        _private_directory(session)
+        receipt = _json_document(session / "receipt.json")
+        if (not isinstance(receipt, dict)
+                or type(receipt.get("schemaVersion")) is not int
+                or receipt["schemaVersion"] != 1
+                or receipt.get("sessionId") != session_id
+                or receipt.get("state") not in _OFFLINE_RECEIPT_STATES
+                or receipt.get("model") != model):
+            return False
+        transaction = session / "transaction"
+        if transaction.parent != session or transaction.resolve(strict=True) != transaction:
+            return False
+        _private_directory(transaction)
+        prepared = _json_document(transaction / "prepared.json")
+        plan = _json_document(transaction / "plan.json")
+        plan_raw = _read_regular(transaction / "plan.json", MAX_CONFIG_BYTES)
+        status = _json_document(transaction / "status.json")
+        report = _json_document(transaction / "write-report.json")
+        ack = _json_document(session / "ack.json")
+        identity = offline_completion.execute_completion(
+            prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+            status, report, ack, model)
+        if identity is None:
+            return False
+        return (
+            trial.get("transactionId") == identity["transactionId"]
+            and trial.get("fromSlot") == identity["fromSlot"]
+            and trial.get("targetSlot") == identity["targetSlot"]
+            and trial.get("oldDeployment") == identity["oldDeployment"]
+            and trial.get("newDeployment") == identity["newDeployment"]
+            and trial.get("planSha256") == identity["planSha256"]
+            and trial.get("recordState") == "prepared"
+            and trial.get("runningDeployment") == "old")
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _configuration(path, channel):
     try:
         raw = _read_regular(path, MAX_CONFIG_BYTES)
@@ -401,11 +487,12 @@ class SystemManager:
         if record_state not in {"prepared", "trial"}:
             return False
         result["requiresReboot"] = False
-        if trial.get("runningDeployment") == "new":
+        if (trial.get("runningDeployment") == "new"):
             result["state"] = "awaiting_confirmation"
         elif (trial.get("recordState") == "prepared"
                 and trial.get("runningDeployment") == "old"
-                and _valid_trial_receipt(trial, result["model"])):
+                and (_valid_trial_receipt(trial, result["model"])
+                     or _valid_offline_completion(trial, result["model"]))):
             result.update({
                 "state": "awaiting_reboot",
                 "requiresReboot": True,
@@ -606,7 +693,7 @@ def main():
     print(json.dumps(result, sort_keys=True))
     return int(result["state"] in {
         "failed", "check_failed", "not_configured", "unsupported",
-        "uncertain"
+        "uncertain", "recovery_required"
     })
 
 

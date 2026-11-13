@@ -121,7 +121,8 @@ class OfflineBootWriterTests(unittest.TestCase):
                         env, trust, cands, before, caps, originals, payloads, extents = \
                             self._prepare(stack, bs=bs, current=current, board=board)
                         events = []
-                        result = offline.write_offline_boots(trust, cands, progress=events.append)
+                        result = offline.write_offline_boots(
+                            trust, cands, commit=lambda: None, progress=events.append)
                         order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
                         writes = {slot: {
                             'sourceBootSha256': hashlib.sha256(originals[slot]).hexdigest(),
@@ -165,7 +166,7 @@ class OfflineBootWriterTests(unittest.TestCase):
         with boot_fixture.contextlib_stack() as stack:
             env, trust, cands, _, caps, _, _, _ = self._prepare(
                 stack, mode='gbl-preserve-metadata', payload_match=False)
-            result = offline.write_offline_boots(trust, cands)
+            result = offline.write_offline_boots(trust, cands, commit=lambda: None)
             self.assertEqual(result['phase'], 'dual_boots_written')
             self.assertEqual({p: p.read_bytes() for p in caps}, caps)
             self.assert_closed(env)
@@ -174,7 +175,7 @@ class OfflineBootWriterTests(unittest.TestCase):
                 stack, payload_match=False)
             spy = stack.enter_context(mock.patch.object(offline.os, 'pwrite', wraps=REAL_PWRITE))
             with self.assertRaisesRegex(boot_writer.BootWriteError, 'payload digest') as ctx:
-                offline.write_offline_boots(trust, cands)
+                offline.write_offline_boots(trust, cands, commit=lambda: None)
             self.assertEqual(ctx.exception.restore_status, 'not_needed')
             spy.assert_not_called()
             self.assert_unchanged(env, before, caps)
@@ -216,7 +217,8 @@ class OfflineBootWriterTests(unittest.TestCase):
                             offline.os, 'pwrite', wraps=REAL_PWRITE) as spy:
                         with self.assertRaisesRegex(
                                 boot_writer.BootWriteError, 'metadataSha256') as ctx:
-                            offline.write_offline_boots(changed_trust, changed)
+                            offline.write_offline_boots(
+                                changed_trust, changed, commit=lambda: None)
                         self.assertEqual(ctx.exception.restore_status, 'not_needed')
                         spy.assert_not_called()
                     self.assert_unchanged(env, before, caps)
@@ -227,7 +229,7 @@ class OfflineBootWriterTests(unittest.TestCase):
             for slot in ('a', 'b'):
                 trust['trust'][slot]['metadataSha256'] = 'a' * 64
                 cands[slot]['metadataSha256'] = 'b' * 64
-            result = offline.write_offline_boots(trust, cands)
+            result = offline.write_offline_boots(trust, cands, commit=lambda: None)
             self.assertEqual(result['phase'], 'dual_boots_written')
             self.assertEqual({p: p.read_bytes() for p in caps}, caps)
             self.assert_closed(env)
@@ -255,12 +257,92 @@ class OfflineBootWriterTests(unittest.TestCase):
                     with mock.patch.object(
                             offline.os, 'pwrite', wraps=REAL_PWRITE) as spy:
                         with self.assertRaisesRegex(boot_writer.BootWriteError, pattern) as ctx:
-                            offline.write_offline_boots(trust, changed)
+                            offline.write_offline_boots(trust, changed, commit=lambda: None)
                         self.assertEqual(ctx.exception.restore_status, 'not_needed')
                         spy.assert_not_called()
                     self.assert_unchanged(env, before, caps)
 
-    def test_partial_second_write_restores_both_in_reverse_order(self):
+    def test_commit_hook_is_required_and_runs_between_verified_slots(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            spy = stack.enter_context(mock.patch.object(
+                offline.os, 'pwrite', wraps=REAL_PWRITE))
+            with self.assertRaisesRegex(
+                    boot_writer.BootWriteError,
+                    'inter-slot durable journal commit hook is required') as ctx:
+                offline.write_offline_boots(trust, cands)
+            self.assertEqual(ctx.exception.restore_status, 'not_needed')
+            spy.assert_not_called()
+            self.assert_unchanged(env, before, caps)
+
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            state = {'calls': 0, 'before_commit': None}
+            writes = []
+            def track(fd, data, pos):
+                writes.append((bytes(data), pos))
+                return REAL_PWRITE(fd, data, pos)
+            def commit():
+                state['calls'] += 1
+                state['before_commit'] = list(writes)
+                first_lun, first_offset, first_size = extents[order[0]]
+                second_lun, second_offset, second_size = extents[order[1]]
+                self.assertEqual(
+                    env.images[first_lun].read_bytes()[
+                        first_offset:first_offset + first_size],
+                    payloads[order[0]])
+                self.assertEqual(
+                    env.images[second_lun].read_bytes()[
+                        second_offset:second_offset + second_size],
+                    originals[order[1]])
+            stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=track))
+            result = offline.write_offline_boots(trust, cands, commit=commit)
+            self.assertEqual(result['phase'], 'dual_boots_written')
+            self.assertEqual(state['calls'], 1)
+            self.assertEqual(len(state['before_commit']), 1)
+            self.assertEqual(state['before_commit'][0][0], payloads[order[0]])
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
+
+    def test_uncommitted_commit_failure_restores_nonrunning_image(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            def commit():
+                raise offline.JournalCommitError(
+                    'journal compare-and-swap lost', commit_state='not_committed')
+            with self.assertRaisesRegex(
+                    boot_writer.BootWriteError, 'restored') as ctx:
+                offline.write_offline_boots(trust, cands, commit=commit)
+            self.assertEqual(ctx.exception.restore_status, 'restored')
+            self.assertEqual(ctx.exception.commit_state, 'not_committed')
+            self.assertEqual(ctx.exception.slot_results[order[0]]['status'], 'restored')
+            self.assertEqual(ctx.exception.slot_results[order[1]]['status'], 'not_started')
+            self.assert_unchanged(env, before, caps)
+
+    def test_ambiguous_commit_failure_preserves_nonrunning_image(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            def commit():
+                raise offline.JournalCommitError(
+                    'journal fsync failed', commit_state='ambiguous')
+            with self.assertRaisesRegex(
+                    boot_writer.BootWriteError, 'ambiguous') as ctx:
+                offline.write_offline_boots(trust, cands, commit=commit)
+            self.assertEqual(ctx.exception.restore_status, 'not_restored')
+            self.assertEqual(ctx.exception.commit_state, 'ambiguous')
+            self.assertEqual(ctx.exception.slot_results[order[0]]['status'], 'preserved')
+            self.assertEqual(ctx.exception.slot_results[order[1]]['status'], 'not_started')
+            expected = list(before)
+            lun, offset, size = extents[order[0]]
+            expected[lun] = expected[lun][:offset] + payloads[order[0]] + expected[lun][offset + size:]
+            self.assertEqual([p.read_bytes() for p in env.images], expected)
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
+
+    def test_running_write_failure_after_commit_preserves_nonrunning_image(self):
         with boot_fixture.contextlib_stack() as stack:
             env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
             order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
@@ -268,67 +350,81 @@ class OfflineBootWriterTests(unittest.TestCase):
             def faulty(fd, data, pos):
                 calls.append((bytes(data), pos))
                 if len(calls) == 2:
-                    return REAL_PWRITE(fd, data[:len(data) // 2], pos)
-                if len(calls) == 3:
-                    raise OSError(errno.EIO, 'second-slot failure')
+                    raise OSError(errno.EIO, 'running-slot failure')
                 return REAL_PWRITE(fd, data, pos)
             stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=faulty))
-            with self.assertRaisesRegex(boot_writer.BootWriteError, 'restored') as ctx:
-                offline.write_offline_boots(trust, cands)
-            self.assertEqual(ctx.exception.restore_status, 'restored')
-            self.assertEqual([calls[i][0] for i in (0, 1, 3, 4)],
-                             [payloads[order[0]], payloads[order[1]],
-                              originals[order[1]], originals[order[0]]])
-            for slot in order:
-                evidence = ctx.exception.slot_results[slot]
-                self.assertEqual(evidence['status'], 'restored')
-                self.assertEqual(evidence['restoredSha256'], hashlib.sha256(originals[slot]).hexdigest())
-                self.assertEqual(evidence['candidate'], cands[slot]['candidate'])
-            self.assert_unchanged(env, before, caps)
+            with self.assertRaisesRegex(boot_writer.BootWriteError, 'preserved') as ctx:
+                offline.write_offline_boots(trust, cands, commit=lambda: None)
+            self.assertEqual(ctx.exception.restore_status, 'not_restored')
+            self.assertEqual(ctx.exception.commit_state, 'committed')
+            self.assertEqual(ctx.exception.slot_results[order[0]]['status'], 'preserved')
+            self.assertEqual(ctx.exception.slot_results[order[1]]['status'], 'writing')
+            self.assertEqual(len(calls), 2)
+            expected = list(before)
+            lun, offset, size = extents[order[0]]
+            expected[lun] = expected[lun][:offset] + payloads[order[0]] + expected[lun][offset + size:]
+            self.assertEqual([p.read_bytes() for p in env.images], expected)
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
 
-    def test_corrupt_second_write_real_readback_restores_both(self):
-        with boot_fixture.contextlib_stack() as stack:
-            env, trust, cands, before, caps, _, _, _ = self._prepare(stack)
-            calls = []
-            def corrupt(fd, data, pos):
-                calls.append(pos)
-                if len(calls) == 2:
-                    damaged = bytearray(data)
-                    damaged[200] ^= 0xFF
-                    return REAL_PWRITE(fd, bytes(damaged), pos)
-                return REAL_PWRITE(fd, data, pos)
-            stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=corrupt))
-            current = trust['physical']['actualSlot']
-            with self.assertRaisesRegex(boot_writer.BootWriteError,
-                                        f'boot_{current} readback digest mismatch') as ctx:
-                offline.write_offline_boots(trust, cands)
-            self.assertEqual(ctx.exception.restore_status, 'restored')
-            self.assert_unchanged(env, before, caps)
-
-    def test_current_restore_failure_still_restores_inactive(self):
+    def test_running_readback_failure_after_commit_preserves_nonrunning_image(self):
         with boot_fixture.contextlib_stack() as stack:
             env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
-            current = trust['physical']['actualSlot']
-            inactive = trust['physical']['inactiveSlot']
-            def verified_then_fail(event):
-                if event['phase'] == 'verified' and event['slot'] == current:
-                    raise OSError(errno.EIO, 'after both verified')
-            current_offset = extents[current][1]
-            def fail_current_restore(fd, data, pos):
-                if pos == current_offset and bytes(data) == originals[current]:
-                    raise OSError(errno.EIO, 'current restore failed')
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            faulted = bytearray(payloads[order[1]])
+            faulted[200] ^= 0xFF
+            faulted = bytes(faulted)
+            calls = []
+            def corrupt(fd, data, pos):
+                calls.append((pos, bytes(data)))
+                if len(calls) == 2:
+                    return REAL_PWRITE(fd, faulted, pos)
                 return REAL_PWRITE(fd, data, pos)
-            stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=fail_current_restore))
-            with self.assertRaisesRegex(boot_writer.BootWriteError, 'uncertain') as ctx:
-                offline.write_offline_boots(trust, cands, progress=verified_then_fail)
-            self.assertEqual(ctx.exception.restore_status, 'failed')
-            results = ctx.exception.slot_results
-            self.assertEqual(results[current]['status'], 'restore_failed')
-            self.assertNotIn('restoredSha256', results[current])
-            self.assertEqual(results[inactive]['status'], 'restored')
+            stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=corrupt))
+            with self.assertRaisesRegex(
+                    boot_writer.BootWriteError,
+                    f'boot_{order[1]} readback digest mismatch') as ctx:
+                offline.write_offline_boots(trust, cands, commit=lambda: None)
+            self.assertEqual(ctx.exception.restore_status, 'not_restored')
+            self.assertEqual(ctx.exception.commit_state, 'committed')
+            self.assertEqual(ctx.exception.slot_results[order[0]]['status'], 'preserved')
+            self.assertEqual(ctx.exception.slot_results[order[1]]['status'], 'writing')
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][1], payloads[order[0]])
+            self.assertEqual(calls[1], (extents[order[1]][1], payloads[order[1]]))
             expected = list(before)
-            lun, offset, size = extents[current]
-            expected[lun] = expected[lun][:offset] + payloads[current] + expected[lun][offset + size:]
+            for slot, data in ((order[0], payloads[order[0]]),
+                               (order[1], faulted)):
+                lun, offset, size = extents[slot]
+                self.assertEqual(len(data), size)
+                self.assertEqual(expected[lun][offset:offset + size], originals[slot])
+                expected[lun] = (expected[lun][:offset] + data +
+                                 expected[lun][offset + size:])
+            boot_luns = {extents[slot][0] for slot in order}
+            for lun, image in enumerate(before):
+                if lun not in boot_luns:
+                    self.assertEqual(env.images[lun].read_bytes(), image)
+            self.assertEqual([p.read_bytes() for p in env.images], expected)
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
+
+    def test_progress_failure_after_both_verified_preserves_images(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            def stop_after_second(event):
+                if event['phase'] == 'verified' and event['slot'] == order[1]:
+                    raise OSError('progress stop after both verified')
+            with self.assertRaisesRegex(boot_writer.BootWriteError, 'preserved') as ctx:
+                offline.write_offline_boots(
+                    trust, cands, commit=lambda: None, progress=stop_after_second)
+            self.assertEqual(ctx.exception.restore_status, 'not_restored')
+            self.assertEqual(ctx.exception.commit_state, 'committed')
+            expected = list(before)
+            for slot in order:
+                lun, offset, size = extents[slot]
+                expected[lun] = (expected[lun][:offset] + payloads[slot] +
+                                 expected[lun][offset + size:])
             self.assertEqual([p.read_bytes() for p in env.images], expected)
             self.assertEqual({p: p.read_bytes() for p in caps}, caps)
             self.assert_closed(env)
@@ -338,7 +434,9 @@ class OfflineBootWriterTests(unittest.TestCase):
             env, trust, cands, before, caps, _, _, _ = self._prepare(stack)
             spy = stack.enter_context(mock.patch.object(offline.os, 'pwrite', wraps=REAL_PWRITE))
             with self.assertRaisesRegex(boot_writer.BootWriteError, 'before writing') as ctx:
-                offline.write_offline_boots(trust, cands, progress=lambda event: (_ for _ in ()).throw(OSError('stop')))
+                offline.write_offline_boots(
+                    trust, cands, commit=lambda: None,
+                    progress=lambda event: (_ for _ in ()).throw(OSError('stop')))
             self.assertEqual(ctx.exception.restore_status, 'not_needed')
             spy.assert_not_called()
             self.assert_unchanged(env, before, caps)
@@ -355,7 +453,8 @@ class OfflineBootWriterTests(unittest.TestCase):
                     raise OSError('progress stop')
             stack.enter_context(mock.patch.object(offline.os, 'pwrite', side_effect=track))
             with self.assertRaisesRegex(boot_writer.BootWriteError, 'restored') as ctx:
-                offline.write_offline_boots(trust, cands, progress=stop_after_first)
+                offline.write_offline_boots(
+                    trust, cands, commit=lambda: None, progress=stop_after_first)
             self.assertEqual(ctx.exception.restore_status, 'restored')
             self.assertEqual(writes, [payloads[inactive], originals[inactive]])
             self.assertNotIn(payloads[current], writes)

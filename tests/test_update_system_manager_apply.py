@@ -466,6 +466,7 @@ class SystemManagerApplyTests(unittest.TestCase):
             ("up_to_date", 0),
             ("failed", 1),
             ("uncertain", 1),
+            ("recovery_required", 1),
         ):
             out = io.StringIO()
             with patch.object(sys, "argv", ["system_manager", "apply"]), patch.object(

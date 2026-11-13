@@ -17,12 +17,10 @@ from . import (
     offline_prepare,
     package_contract,
     physical_slots,
-    recovery_device,
     signature,
     system_transaction,
     trial_confirmation,
     trial_record,
-    trial_store,
 )
 
 _JSON_MAX = 2 * 1024 * 1024
@@ -371,7 +369,6 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
         write_call_started = False
         boots_written = False
         report_validated = False
-        journal_attempted = False
         try:
             ctx = _preflight(work, recovery_ack, updater_version, trusted_key)
             status = dict(ctx['saved_status'])
@@ -390,9 +387,15 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 status['bootWriteEvent'] = event
                 system_transaction._save_json(work, 'status.json', status)
 
+            def commit():
+                # The durable PREPARED journal must cross the commit boundary
+                # before the writer touches the running boot extent.
+                system_transaction._commit_prepared_journal(
+                    initial=initial, expected=ctx['journal'], record=record)
+
             write_call_started = True
             report = offline_boot_writer.write_offline_boots(
-                ctx['trust'], ctx['candidates'], progress=progress)
+                ctx['trust'], ctx['candidates'], commit=commit, progress=progress)
             boots_written = True
             if ( not isinstance(report, dict) or
                     report.get('phase') != 'dual_boots_written' or
@@ -422,19 +425,6 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             after_write = (physical_slots.inspect_physical_slots())
             if not physical_slots.same_physical_identity(after_write, initial):
                 raise ValueError('physical slots changed after boot writes')
-            status['phase'] = 'preparing_trial'
-            system_transaction._save_json(work, 'status.json', status)
-            journal = ctx['journal']
-            journal_attempted = True
-            with recovery_device.open_recovery(writable=True) as (fd, partuuid, board):
-                if (partuuid != initial['recoveryPartUuid'] or
-                        physical_slots._MODEL.get(board) != initial['model']):
-                    raise ValueError('recovery identity changed before journal write')
-                if trial_store.load(fd, partuuid, board) != journal:
-                    raise ValueError('recovery journal compare-and-swap failed')
-                trial_store.save(fd, journal, record)
-                if trial_store.load(fd, partuuid, board).record != record:
-                    raise ValueError('prepared journal readback mismatch')
             status['phase'] = 'journal_prepared'
             system_transaction._save_json(work, 'status.json', status)
 
@@ -462,8 +452,9 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 status['bootWriteState'] = 'not_started'
                 status['state'] = 'failed'
             elif (isinstance(exc, offline_boot_writer.BootWriteError) and
-                    not boots_written and not journal_attempted):
+                    not boots_written):
                 restore = exc.restore_status
+                commit_state = getattr(exc, 'commit_state', 'not_committed')
                 status['bootRestoreState'] = restore
                 if restore == 'not_needed':
                     status['bootWriteState'] = 'not_started'
@@ -471,6 +462,14 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 elif restore == 'restored':
                     status['bootWriteState'] = 'restored'
                     status['state'] = 'failed'
+                elif restore == 'not_restored':
+                    # The journal is committed or ambiguous; the verified
+                    # non-running image stays in place and no restart is
+                    # advertised from partial evidence.
+                    status['bootWriteState'] = (
+                        'written' if commit_state == 'committed' else 'uncertain')
+                    status['journalCommitState'] = commit_state
+                    status['state'] = 'recovery_required'
                 else:
                     status['bootWriteState'] = 'uncertain'
                     status['state'] = 'recovery_required'
@@ -479,6 +478,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             else:
                 status['bootWriteState'] = 'written' if report_validated else 'uncertain'
                 status['state'] = 'recovery_required'
+                if boots_written:
+                    status['journalCommitState'] = 'committed'
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
             try:
                 system_transaction._save_json(work, 'status.json', status)

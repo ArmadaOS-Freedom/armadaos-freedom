@@ -207,6 +207,68 @@ class RuntimeHealthTests(unittest.TestCase):
                 for endpoint in bound:
                     endpoint.close()
 
+    def test_readiness_error_only_marks_absent_wayland_evidence(self):
+        with mock.patch.object(runtime_health, "_run_cmd", return_value=""):
+            with self.assertRaises(runtime_health.RuntimeNotReady):
+                runtime_health._list_session_ids()
+
+        with mock.patch.object(
+            runtime_health, "_list_session_ids", return_value=["ssh"]
+        ), mock.patch.object(
+            runtime_health,
+            "_show_session",
+            return_value=_session_properties(Seat="", Type=""),
+        ):
+            with self.assertRaises(runtime_health.RuntimeNotReady):
+                runtime_health._select_wayland_session()
+
+        with mock.patch.object(
+            runtime_health, "_list_session_ids", return_value=["a", "b"]
+        ), mock.patch.object(
+            runtime_health, "_show_session", return_value=_session_properties()
+        ):
+            with self.assertRaises(runtime_health.RuntimeHealthError) as ambiguous:
+                runtime_health._select_wayland_session()
+        self.assertNotIsInstance(ambiguous.exception, runtime_health.RuntimeNotReady)
+
+        with mock.patch.object(
+            runtime_health, "_list_session_ids", return_value=["local"]
+        ), mock.patch.object(
+            runtime_health, "_show_session", return_value=_session_properties()
+        ), mock.patch.object(
+            runtime_health.pwd, "getpwuid", side_effect=KeyError("missing")
+        ):
+            with self.assertRaises(runtime_health.RuntimeHealthError) as bad_identity:
+                runtime_health._select_wayland_session()
+        self.assertNotIsInstance(bad_identity.exception, runtime_health.RuntimeNotReady)
+
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(runtime_health, "RUNTIME_USERS_ROOT", root):
+                with self.assertRaises(runtime_health.RuntimeNotReady):
+                    runtime_health._candidate_sockets(uid)
+
+                runtime_dir = root / str(uid)
+                runtime_dir.mkdir(mode=0o700)
+                with self.assertRaises(runtime_health.RuntimeNotReady):
+                    runtime_health._candidate_sockets(uid)
+
+                (runtime_dir / "wayland-0").write_text("not a socket")
+                with self.assertRaises(runtime_health.RuntimeHealthError) as unusable:
+                    runtime_health._candidate_sockets(uid)
+                self.assertNotIsInstance(
+                    unusable.exception, runtime_health.RuntimeNotReady
+                )
+
+                (runtime_dir / "wayland-0").unlink()
+                runtime_dir.chmod(0o770)
+                with self.assertRaises(runtime_health.RuntimeHealthError) as unsafe:
+                    runtime_health._candidate_sockets(uid)
+                self.assertNotIsInstance(
+                    unsafe.exception, runtime_health.RuntimeNotReady
+                )
+
     def test_probe_sockets_invokes_isolated_helper_with_exact_security_context(self):
         runtime_dir = Path("/run/user/1000")
         sockets = [

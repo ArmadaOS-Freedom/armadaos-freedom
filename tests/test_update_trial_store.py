@@ -185,7 +185,7 @@ class TrialStoreTest(unittest.TestCase):
 
         faults.append(('partial', partial_pwrite, None,
                        (store.TrialStoreError, OSError)))
-        faults.append(('flush', real_pwrite, flush_fsync, OSError))
+        faults.append(('flush', real_pwrite, flush_fsync, store.TrialStoreError))
         faults.append(('readback', real_pwrite, None,
                        store.TrialStoreError))
 
@@ -281,6 +281,55 @@ class TrialStoreTest(unittest.TestCase):
         with mock.patch.object(store.os, 'pread', return_value=b''):
             with self.assertRaises(layout.RecoveryLayoutError):
                 store.load(self.fd, self.part, 1)
+
+    def test_save_pins_copy_on_write_previous_copy(self):
+        snap = store.load(self.fd, self.part, 1)
+        self.assertIsNone(snap.selected)
+        untouched_b = os.pread(
+            self.fd, rec.RECORD_BYTES, store.REGION_OFFSET + rec.TAIL_OFFSET_B)
+        self.assertEqual(store.save(self.fd, snap, self.sample()), 0)
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES,
+                     store.REGION_OFFSET + rec.TAIL_OFFSET_A),
+            rec.encode_record(self.sample()))
+        self.assertEqual(
+            os.pread(self.fd, rec.RECORD_BYTES,
+                     store.REGION_OFFSET + rec.TAIL_OFFSET_B),
+            untouched_b)
+
+        snap2 = store.load(self.fd, self.part, 1)
+        self.assertEqual(snap2.selected, 0)
+        other_offset = store.REGION_OFFSET + rec.TAIL_OFFSET_A
+        real_pread = os.pread
+        reads = {'n': 0}
+
+        def corrupt_other_copy(fd, size, offset):
+            if size == rec.RECORD_BYTES and offset == other_offset:
+                reads['n'] += 1
+                if reads['n'] == 2:
+                    return b'Z' * size
+            return real_pread(fd, size, offset)
+
+        nxt = self.sample(sequence=2, state=rec.TRIAL, remaining=2)
+        with mock.patch.object(store.os, 'pread', side_effect=corrupt_other_copy):
+            with self.assertRaisesRegex(store.TrialStoreError, 'copy-on-write'):
+                store.save(self.fd, snap2, nxt)
+
+    def test_save_requires_durable_full_journal_readback(self):
+        snap = store.load(self.fd, self.part, 1)
+        real_read = store._read_snapshot
+        calls = {'n': 0}
+
+        def read_snapshot(fd, partition_uuid, board):
+            calls['n'] += 1
+            value = real_read(fd, partition_uuid, board)
+            if calls['n'] == 2:
+                return replace(value, record=None)
+            return value
+
+        with mock.patch.object(store, '_read_snapshot', side_effect=read_snapshot):
+            with self.assertRaisesRegex(store.TrialStoreError, 'durable readback'):
+                store.save(self.fd, snap, self.sample())
 
     def test_max_sequence(self):
         region_offset = 2 * 1024 * 1024 * 1024 - 65536

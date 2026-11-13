@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 
 import armada_os
@@ -33,6 +34,11 @@ _IDEMPOTENT = frozenset({
     'prepare_queued', 'preparing', 'prepared', 'up_to_date',
     'execute_queued', 'executing', 'awaiting_reboot', 'failed',
     'dispatch_uncertain',
+})
+# Receipt states in which a detached execute may have run to completion but
+# died before recording its result on the receipt.
+_UNRECORDED_EXECUTE_STATES = frozenset({
+    'execute_queued', 'executing', 'dispatch_uncertain',
 })
 
 
@@ -87,6 +93,107 @@ class OfflineJobManager:
         receipt['state'] = 'dispatch_uncertain'
         receipt['error'] = ('detached job dispatch failed or timed out: %s' % exc)[:500]
         return receipt
+
+    def _publish_completion_pointer(self, transaction_id, session_id):
+        """Publish the private pointer for this transaction's pending result.
+
+        The pointer is keyed by the validated canonical transaction id instead
+        of a single shared name, so a second session submitted while an earlier
+        execute is still pending cannot replace the pointer of the older one.
+        It is written atomically before the receipt is marked execute_queued:
+        read-only status follows the pointer for the live trial's transaction
+        and re-verifies the session's own documents before reporting anything.
+        """
+        document = offline_completion.completion_pointer_document(
+            transaction_id, session_id)
+        pointer = offline_completion.completion_pointer(
+            self.store.base, transaction_id)
+        if document is None or pointer is None:
+            raise offline_session.OfflineSessionError(
+                'transaction identity is not a canonical transaction id')
+        offline_session._check_dir(self.store.base)
+        created = False
+        try:
+            os.mkdir(pointer.parent, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        offline_session._check_dir(pointer.parent)
+        if created:
+            offline_session._fsync_dir(self.store.base)
+        system_transaction._save_json(pointer.parent, pointer.name, document)
+
+    def _job_active(self, operation, session_id):
+        """Return whether the detached unit for this operation still runs."""
+        completed = self._runner(
+            ['systemctl', 'is-active', self._unit(operation, session_id)],
+            capture_output=True, check=False, timeout=10)
+        if completed.returncode == 0:
+            return True
+        if completed.returncode not in (3, 4):
+            raise offline_session.OfflineSessionError(
+                'systemctl is-active failed with status %s' % completed.returncode)
+        return False
+
+    @staticmethod
+    def _durable_completion(session, receipt):
+        """Return this session's durable execute result, or None.
+
+        Only a private session whose own approved plan, verified write report
+        and final transaction status agree with the live trial journal is
+        accepted.  Missing or contradictory evidence is refused rather than
+        repaired, so an interrupted worker can never be turned into a success
+        claim it did not earn.
+        """
+        transaction = session / 'transaction'
+        if transaction.is_symlink() or not transaction.is_dir():
+            return None
+        try:
+            prepared, _raw = offline_execute._load_json(
+                transaction, 'prepared.json')
+            plan, plan_raw = offline_execute._load_json(transaction, 'plan.json')
+            status, _raw = offline_execute._load_json(transaction, 'status.json')
+            report, _raw = offline_execute._load_json(
+                transaction, 'write-report.json')
+            ack, _raw = offline_execute._load_json(session, 'ack.json')
+        except (OSError, ValueError, RuntimeError):
+            return None
+        identity = offline_completion.execute_completion(
+            prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+            status, report, ack, receipt.get('model'))
+        if identity is None:
+            return None
+        verdict = offline_completion.evaluate(
+            {'state': 'awaiting_reboot', 'result': status},
+            _read_trial_evidence(), identity)
+        if (verdict.get('state') != offline_completion.AWAITING_REBOOT or
+                verdict.get('restartEligible') is not True):
+            return None
+        return status
+
+    def _reconcile_interrupted(self, session_id):
+        """Adopt a durable execute completion that its dead worker never recorded.
+
+        Returns True only when the receipt was changed; a second call sees the
+        recorded result and does nothing.  No worker is relaunched and no
+        restart is issued here.
+        """
+        with self.store.session_lock(session_id) as session:
+            receipt = self.store.read_receipt(session)
+            if (receipt.get('state') not in _UNRECORDED_EXECUTE_STATES or
+                    receipt.get('jobOperation') != 'execute'):
+                return False
+            result = self._durable_completion(session, receipt)
+            if result is None:
+                return False
+            receipt['state'] = 'awaiting_reboot'
+            receipt['result'] = result
+            receipt.pop('error', None)
+            try:
+                self.store.update_receipt(session, receipt)
+            except OSError:
+                return False
+            return True
 
     def submit_prepare(self, sessionId):
         launch = False
@@ -145,6 +252,8 @@ class OfflineJobManager:
                     recovery_ack, tx=prepared['transactionId'],
                     plan=prepared, manifest=manifest)
                 system_transaction._save_json(session, 'ack.json', recovery_ack)
+                self._publish_completion_pointer(
+                    prepared['transactionId'], sessionId)
                 receipt.update(
                     state='execute_queued', jobOperation='execute',
                     jobUnit=self._unit('execute', sessionId))
@@ -289,6 +398,16 @@ class OfflineJobManager:
         request (failed) can be retried by the user, after the transaction is
         re-checked for eligibility.
         """
+        current = self.store.status(sessionId)
+        if current.get('state') in _UNRECORDED_EXECUTE_STATES:
+            # A dead execute worker may have completed the transaction without
+            # recording it.  Adopt that durable result once and continue with
+            # the normal checks; never while the worker still runs.
+            if (current.get('jobOperation') != 'execute' or
+                    self._job_active('execute', sessionId) or
+                    not self._reconcile_interrupted(sessionId)):
+                raise offline_session.OfflineSessionError(
+                    'session is not awaiting a restart')
         with self.store.session_lock(sessionId) as session:
             receipt = self.store.read_receipt(session)
             if receipt.get('state') != 'awaiting_reboot':
@@ -354,20 +473,19 @@ class OfflineJobManager:
         operation = receipt.get('jobOperation')
         if operation not in ('prepare', 'execute'):
             raise offline_session.OfflineSessionError('busy session has invalid job operation')
-        unit = self._unit(operation, sessionId)
-        completed = self._runner(
-            ['systemctl', 'is-active', unit],
-            capture_output=True, check=False, timeout=10)
-        if completed.returncode == 0:
+        if self._job_active(operation, sessionId):
             receipt['jobActive'] = True
             return receipt
-        if completed.returncode not in (3, 4):
-            raise offline_session.OfflineSessionError(
-                'systemctl is-active failed with status %s' % completed.returncode)
         # Re-read after the query: a worker may have committed a terminal result.
         receipt = self.store.status(sessionId)
         receipt['jobActive'] = False
         if receipt.get('state') in _BUSY:
-            receipt['jobInterrupted'] = True
-            receipt['attentionRequired'] = True
+            if self._reconcile_interrupted(sessionId):
+                # The durable completion is read back from the receipt instead
+                # of being fabricated in this response.
+                receipt = self.store.status(sessionId)
+                receipt['jobActive'] = False
+            else:
+                receipt['jobInterrupted'] = True
+                receipt['attentionRequired'] = True
         return self._attach_completion(sessionId, receipt)

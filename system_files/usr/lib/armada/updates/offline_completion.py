@@ -8,17 +8,35 @@ read-only: status and reconnect paths must never write boot media or receipts.
 
 A different or newer transaction is never accepted as this session's success,
 and a missing or contradictory piece of evidence degrades to ``unverified`` or
-``mismatch`` instead of ``confirmed``.
+``mismatch`` instead of ``confirmed``.  ``execute_completion`` also validates
+the final execute status and verified boot write report against the approved
+plan; both the detached job manager and the system status reader use it, and
+its per-transaction completion pointer lets status find a pending result
+without scanning sessions.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
 import uuid
 
+from .trial_record import BOOT_POLICY
+
 _DEPLOYMENT_RE = re.compile(
     r'[A-Za-z0-9][A-Za-z0-9_.-]*/[0-9a-f]{64}\.[0-9]+\Z', re.ASCII)
+_SESSION_ID_RE = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
 _SLOTS = ('a', 'b')
+_CANDIDATE_KEYS = frozenset({'path', 'bytes', 'sha256'})
+_WRITE_KEYS = frozenset(
+    {'sourceBootSha256', 'candidate', 'bytesWritten', 'readbackSha256'})
+
+# Private pointers that name the one session holding a pending execute result.
+# They live beside the session directories but are keyed by the validated
+# canonical transaction id, so a later queued session cannot overwrite an
+# earlier pending completion merely by being submitted.
+POINTER_DIRECTORY = 'pending'
+_POINTER_KEYS = frozenset({'schemaVersion', 'transactionId', 'sessionId'})
 
 _TERMINAL_FAILURE_STATES = frozenset({'failed', 'recovery_required'})
 _UNCERTAIN_STATES = frozenset({'execution_uncertain'})
@@ -110,6 +128,188 @@ def document_identity(prepared, plan, plan_sha256=None):
         'targetSlot': plan.get('targetSlot'),
     })
     if identity is None or plan.get('transactionId') != identity['transactionId']:
+        return None
+    return identity
+
+
+def completion_pointer(root, transaction_id):
+    """Return the private pointer path for one canonical transaction id.
+
+    ``None`` means the transaction id is not canonical, so no file name could
+    be derived from it safely.
+    """
+    transaction_id = _canonical_uuid(transaction_id)
+    if transaction_id is None:
+        return None
+    return Path(root) / POINTER_DIRECTORY / (transaction_id + '.json')
+
+
+def completion_pointer_document(transaction_id, session_id):
+    """Return the pointer document binding a transaction to a session.
+
+    ``None`` means either identifier is unusable, so nothing is published.
+    """
+    transaction_id = _canonical_uuid(transaction_id)
+    if (transaction_id is None or type(session_id) is not str or
+            _SESSION_ID_RE.fullmatch(session_id) is None):
+        return None
+    return {
+        'schemaVersion': 1,
+        'transactionId': transaction_id,
+        'sessionId': session_id,
+    }
+
+
+def pointer_session(pointer, transaction_id):
+    """Return the session a pointer selects for this transaction, or ``None``.
+
+    The stored key must repeat the canonical transaction id it is filed under;
+    a pointer that names another transaction, session or schema is refused
+    rather than followed.
+    """
+    transaction_id = _canonical_uuid(transaction_id)
+    if transaction_id is None or not isinstance(pointer, dict):
+        return None
+    if set(pointer) != _POINTER_KEYS:
+        return None
+    if type(pointer['schemaVersion']) is not int or pointer['schemaVersion'] != 1:
+        return None
+    if pointer['transactionId'] != transaction_id:
+        return None
+    session_id = pointer['sessionId']
+    if type(session_id) is not str or _SESSION_ID_RE.fullmatch(session_id) is None:
+        return None
+    return session_id
+
+
+def _slot_digests(plan, name):
+    """Return the canonical per-slot digest map from an approved plan."""
+    value = plan.get(name)
+    if not isinstance(value, dict) or set(value) != set(_SLOTS):
+        return None
+    digests = {}
+    for slot in _SLOTS:
+        digest = _sha(value[slot])
+        if digest is None:
+            return None
+        digests[slot] = digest
+    return digests
+
+
+def _status_evidence(status, identity, model):
+    """Return whether the final status proves the dual boot write completed."""
+    if not isinstance(status, dict):
+        return False
+    return (
+        type(status.get('schemaVersion')) is int and
+        status['schemaVersion'] == 1 and
+        status.get('component') == 'system' and
+        status.get('operation') == 'offline-upgrade' and
+        status.get('policy') == 'offline-dual' and
+        status.get('model') == model and
+        status.get('transactionId') == identity['transactionId'] and
+        status.get('planSha256') == identity['planSha256'] and
+        status.get('fromSlot') == identity['fromSlot'] and
+        status.get('targetSlot') == identity['targetSlot'] and
+        status.get('oldDeployment') == identity['oldDeployment'] and
+        status.get('newDeployment') == identity['newDeployment'] and
+        status.get('state') == AWAITING_REBOOT and
+        status.get('phase') == AWAITING_REBOOT and
+        status.get('requiresReboot') is True and
+        status.get('bootWriteState') == 'written' and
+        status.get('slotControlState') == 'not_issued' and
+        status.get('bootPolicy') == BOOT_POLICY)
+
+
+def _physical_evidence(value, identity, model):
+    """Accept an absent physical report but never a contradictory one."""
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    if value.get('model') != model:
+        return False
+    if value.get('actualSlot') != identity['fromSlot']:
+        return False
+    if value.get('inactiveSlot') != identity['targetSlot']:
+        return False
+    deployment = value.get('deployment')
+    return deployment is None or deployment == identity['oldDeployment']
+
+
+def _write_evidence(writes, new_digests, old_digests):
+    """Return whether every slot carries verified write evidence for its plan."""
+    if not isinstance(writes, dict) or set(writes) != set(_SLOTS):
+        return False
+    for slot in _SLOTS:
+        entry = writes[slot]
+        if not isinstance(entry, dict) or set(entry) != _WRITE_KEYS:
+            return False
+        candidate = entry['candidate']
+        if not isinstance(candidate, dict) or set(candidate) != _CANDIDATE_KEYS:
+            return False
+        path = candidate['path']
+        if type(path) is not str or not path:
+            return False
+        size = candidate['bytes']
+        if type(size) is not int or size <= 0:
+            return False
+        if type(entry['bytesWritten']) is not int or entry['bytesWritten'] != size:
+            return False
+        if _sha(candidate['sha256']) != new_digests[slot]:
+            return False
+        if _sha(entry['readbackSha256']) != new_digests[slot]:
+            return False
+        if _sha(entry['sourceBootSha256']) != old_digests[slot]:
+            return False
+    return True
+
+
+def execute_completion(prepared, plan, plan_sha256, status, report, ack,
+                       model=None):
+    """Validate durable evidence of a written but unrebooted transaction.
+
+    The approved plan decides which boot images belong in each slot: both
+    ``originalBootSha256`` and ``newBootSha256`` must map exactly ``a`` and
+    ``b`` to canonical digests.  The write report must have written the
+    inactive target slot first and the running slot second, and each slot's
+    verified candidate, readback and source digests must equal the plan.  The
+    same checks are shared by the detached job manager and the system status
+    reader, so neither can accept a report that merely lists slot names.
+
+    Returns the transaction identity on success and ``None`` on any missing,
+    malformed or contradictory document.
+    """
+    identity = document_identity(prepared, plan, plan_sha256)
+    if identity is None or not isinstance(plan, dict) or not isinstance(ack, dict):
+        return None
+    # The recovery acknowledgement binds the approved plan digest.
+    if (ack.get('transactionId') != identity['transactionId'] or
+            ack.get('planSha256') != identity['planSha256']):
+        return None
+    plan_model = plan.get('model')
+    if type(plan_model) is not str or not plan_model:
+        return None
+    if model is not None and plan_model != model:
+        return None
+    new_digests = _slot_digests(plan, 'newBootSha256')
+    old_digests = _slot_digests(plan, 'originalBootSha256')
+    if new_digests is None or old_digests is None:
+        return None
+    if not _status_evidence(status, identity, plan_model):
+        return None
+    if not isinstance(report, dict):
+        return None
+    if (report.get('phase') != 'dual_boots_written' or
+            report.get('model') != plan_model or
+            report.get('transactionUuid') != identity['transactionId'] or
+            report.get('deployment') != identity['newDeployment'] or
+            report.get('fromSlot') != identity['fromSlot'] or
+            report.get('slotOrder') != [identity['targetSlot'],
+                                        identity['fromSlot']] or
+            not _physical_evidence(report.get('physical'), identity, plan_model)):
+        return None
+    if not _write_evidence(report.get('writes'), new_digests, old_digests):
         return None
     return identity
 

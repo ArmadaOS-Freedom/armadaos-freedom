@@ -322,8 +322,13 @@ class TrialStatusTests(unittest.TestCase):
             (self.marker_path, b"\xff" * 16),
             (link_path, TXN_UUID),
         ):
-            if payload is not None and path == self.marker_path:
+            # The symlink target is the marker file, so every payload subcase
+            # must rewrite it: after the invalid payloads above, a reader that
+            # wrongly followed the link would otherwise see invalid bytes and
+            # pass for the wrong reason instead of valid transaction evidence.
+            if payload is not None:
                 self.marker_path.write_bytes(payload)
+                self.assertEqual(self.marker_path.read_bytes(), payload)
             with self.patch_journal(record=make_record(state=trial_record.CONFIRMED)):
                 bad = trial_status.read_trial_status(ctx_new, path)
             self.assertIsNone(bad["runningDeployment"])

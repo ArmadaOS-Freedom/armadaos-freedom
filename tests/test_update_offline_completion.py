@@ -17,6 +17,18 @@ OLD = 'armada/' + ('a' * 64) + '.0'
 NEW = 'armada/' + ('b' * 64) + '.1'
 SHA = 'c' * 64
 OTHER_SHA = 'd' * 64
+ORIGINAL = {'a': 'e' * 64, 'b': 'f' * 64}
+# Slot digests must contain a-f: an all-digit fixture would survive .upper()
+# unchanged and make the uppercase rejection cases pass for the wrong reason.
+NEW_BOOT = {'a': '4f3a9c1d' * 8, 'b': '9c7b2e50' * 8}
+MODEL = 'TB322FC'
+
+
+def uppercased(digest):
+    """Uppercase a fixture digest, insisting the fixture really has letters."""
+    folded = digest.upper()
+    assert folded != digest, 'all-digit digest %r has no case' % digest
+    return folded
 
 
 def receipt(**overrides):
@@ -49,6 +61,50 @@ def trial(**overrides):
     }
     body.update(overrides)
     return body
+
+
+def execute_documents(**overrides):
+    """Return the four documents a completed execute leaves behind."""
+    plan = {
+        'schemaVersion': 1, 'operation': 'offline-upgrade',
+        'policy': 'offline-dual', 'transactionId': TX, 'model': MODEL,
+        'fromSlot': 'a', 'targetSlot': 'b',
+        'oldDeployment': OLD, 'newDeployment': NEW,
+        'originalBootSha256': dict(ORIGINAL),
+        'newBootSha256': dict(NEW_BOOT),
+    }
+    prepared = {'transactionId': TX, 'planSha256': SHA}
+    status = {
+        'schemaVersion': 1, 'component': 'system',
+        'operation': 'offline-upgrade', 'policy': 'offline-dual',
+        'bootPolicy': 'dual-boot-no-slot-control',
+        'transactionId': TX, 'model': MODEL,
+        'fromSlot': 'a', 'targetSlot': 'b',
+        'oldDeployment': OLD, 'newDeployment': NEW,
+        'planSha256': SHA, 'state': 'awaiting_reboot',
+        'phase': 'awaiting_reboot', 'requiresReboot': True,
+        'bootWriteState': 'written', 'slotControlState': 'not_issued',
+    }
+    report = {
+        'phase': 'dual_boots_written', 'model': MODEL,
+        'transactionUuid': TX, 'deployment': NEW, 'fromSlot': 'a',
+        'slotOrder': ['b', 'a'],
+        'writes': {
+            slot: {
+                'sourceBootSha256': ORIGINAL[slot],
+                'candidate': {'path': '/work/candidate-%s.img' % slot,
+                              'bytes': 4096, 'sha256': NEW_BOOT[slot]},
+                'bytesWritten': 4096,
+                'readbackSha256': NEW_BOOT[slot],
+            } for slot in ('a', 'b')
+        },
+    }
+    ack = {'transactionId': TX, 'planSha256': SHA}
+    documents = {'plan': plan, 'prepared': prepared,
+                 'status': status, 'report': report, 'ack': ack}
+    for name, value in overrides.items():
+        documents[name] = value
+    return documents
 
 
 class IdentityTests(unittest.TestCase):
@@ -87,6 +143,158 @@ class IdentityTests(unittest.TestCase):
             prepared, dict(plan, transactionId=OTHER_TX)))
         self.assertIsNone(offline_completion.document_identity(prepared, None))
         self.assertIsNone(offline_completion.document_identity(None, plan))
+
+
+class ExecuteCompletionTests(unittest.TestCase):
+    """The shared validator must reject any write report it cannot verify."""
+
+    def check(self, documents=None, model=MODEL):
+        documents = documents if documents is not None else execute_documents()
+        return offline_completion.execute_completion(
+            documents['prepared'], documents['plan'], SHA,
+            documents['status'], documents['report'], documents['ack'], model)
+
+    def test_accepts_a_verified_dual_slot_write(self):
+        self.assertEqual(self.check()['transactionId'], TX)
+        documents = execute_documents()
+        documents['report']['physical'] = {
+            'model': MODEL, 'actualSlot': 'a', 'inactiveSlot': 'b',
+            'deployment': OLD,
+        }
+        self.assertIsNotNone(self.check(documents))
+        self.assertIsNone(self.check(model='TB323FU'))
+        self.assertIsNone(self.check(dict(documents, prepared=None)))
+        self.assertIsNone(self.check(dict(documents, report=None)))
+
+    def test_slot_entries_must_be_verified_candidates(self):
+        def claim(value):
+            def mutate(report):
+                report['writes']['b']['candidate'] = value
+            return mutate
+
+        def entry(**changes):
+            def mutate(report):
+                report['writes']['b'].update(changes)
+            return mutate
+
+        def boolean_size(report):
+            report['writes']['b']['candidate']['bytes'] = 1
+            report['writes']['b']['bytesWritten'] = True
+
+        cases = (
+            ('empty slot entries',
+             lambda report: report['writes'].update({'a': {}, 'b': {}})),
+            ('empty candidate object', claim({})),
+            ('candidate not an object', claim(['/work/b.img'])),
+            ('empty candidate path',
+             claim({'path': '', 'bytes': 4096, 'sha256': NEW_BOOT['b']})),
+            ('zero candidate bytes',
+             claim({'path': '/work/b.img', 'bytes': 0,
+                    'sha256': NEW_BOOT['b']})),
+            ('uppercase candidate digest',
+             claim({'path': '/work/b.img', 'bytes': 4096,
+                    'sha256': uppercased(NEW_BOOT['b'])})),
+            ('candidate digest mismatch',
+             claim({'path': '/work/b.img', 'bytes': 4096,
+                    'sha256': ORIGINAL['b']})),
+            ('short write', entry(bytesWritten=4095)),
+            ('boolean byte count', boolean_size),
+            ('readback mismatch', entry(readbackSha256='3' * 64)),
+            ('missing readback', entry(readbackSha256=None)),
+            ('source mismatch', entry(sourceBootSha256=NEW_BOOT['b'])),
+            ('extra evidence field', entry(slot='b')),
+            ('missing writes', lambda report: report.pop('writes')),
+            ('writes as a list', lambda report: report.update(writes=[])),
+            ('single slot', lambda report: report['writes'].pop('b')),
+        )
+        for name, mutate in cases:
+            with self.subTest(case=name):
+                documents = execute_documents()
+                mutate(documents['report'])
+                self.assertIsNone(self.check(documents))
+
+    def test_report_must_bind_plan_order_and_identity(self):
+        cases = (
+            ('running slot first',
+             lambda report: report.update(slotOrder=['a', 'b'])),
+            ('missing slot order', lambda report: report.pop('slotOrder')),
+            ('slot order as text', lambda report: report.update(slotOrder='ba')),
+            ('foreign transaction',
+             lambda report: report.update(transactionUuid=OTHER_TX)),
+            ('foreign deployment',
+             lambda report: report.update(
+                 deployment='armada/' + ('3' * 64) + '.2')),
+            ('foreign model', lambda report: report.update(model='TB323FU')),
+            ('wrong phase', lambda report: report.update(phase='writing')),
+            ('physical slot conflict',
+             lambda report: report.update(
+                 physical={'model': MODEL, 'actualSlot': 'b',
+                           'inactiveSlot': 'a'})),
+            ('physical deployment conflict',
+             lambda report: report.update(
+                 physical={'model': MODEL, 'actualSlot': 'a',
+                           'inactiveSlot': 'b', 'deployment': NEW})),
+            ('physical not an object',
+             lambda report: report.update(physical='a')),
+        )
+        for name, mutate in cases:
+            with self.subTest(case=name):
+                documents = execute_documents()
+                mutate(documents['report'])
+                self.assertIsNone(self.check(documents))
+
+    def test_plan_must_carry_both_canonical_slot_digest_maps(self):
+        cases = (
+            ('missing map', {}),
+            ('map is null', {'newBootSha256': None}),
+            ('map is a list', {'newBootSha256': [NEW_BOOT['a'], NEW_BOOT['b']]}),
+            ('missing slot', {'newBootSha256': {'a': NEW_BOOT['a']}}),
+            ('extra slot',
+             {'newBootSha256': dict(NEW_BOOT, c='3' * 64)}),
+            ('uppercase digest',
+             {'newBootSha256': {'a': uppercased(NEW_BOOT['a']),
+                                'b': NEW_BOOT['b']}}),
+            ('non-string digest',
+             {'newBootSha256': {'a': 1, 'b': NEW_BOOT['b']}}),
+            ('missing source map', {'originalBootSha256': None}),
+        )
+        for name, changes in cases:
+            with self.subTest(case=name):
+                documents = execute_documents()
+                if name == 'missing map':
+                    documents['plan'].pop('newBootSha256')
+                else:
+                    documents['plan'].update(changes)
+                self.assertIsNone(self.check(documents))
+
+    def test_status_and_acknowledgement_must_confirm_the_same_write(self):
+        cases = (
+            ('status write uncertain', 'status',
+             {'bootWriteState': 'uncertain'}),
+            ('status slot control issued', 'status',
+             {'slotControlState': 'issued'}),
+            ('status no reboot', 'status', {'requiresReboot': False}),
+            ('status schema type', 'status', {'schemaVersion': True}),
+            ('status foreign transaction', 'status',
+             {'transactionId': OTHER_TX}),
+            ('status foreign plan', 'status', {'planSha256': OTHER_SHA}),
+            ('status foreign deployment', 'status',
+             {'newDeployment': 'armada/' + ('3' * 64) + '.2'}),
+            ('status still executing', 'status',
+             {'state': 'executing', 'phase': 'writing_boot'}),
+            ('ack foreign transaction', 'ack', {'transactionId': OTHER_TX}),
+            ('ack foreign plan', 'ack', {'planSha256': OTHER_SHA}),
+            ('ack not an object', 'ack', None),
+            ('prepared not an object', 'prepared', None),
+        )
+        for name, document, changes in cases:
+            with self.subTest(case=name):
+                documents = execute_documents()
+                if changes is None:
+                    documents[document] = None
+                else:
+                    documents[document].update(changes)
+                self.assertIsNone(self.check(documents))
 
 
 class VerdictTests(unittest.TestCase):

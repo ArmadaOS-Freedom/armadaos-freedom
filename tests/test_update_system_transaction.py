@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import copy
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -297,7 +298,7 @@ class SystemTransactionTests(unittest.TestCase):
                 self.assertEqual(res['bootRestoreState'], restore)
                 self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
 
-    def test_partial_mirrored_write_restores_both_slots(self) -> None:
+    def test_partial_mirrored_write_restores_before_commit(self) -> None:
         with ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
             before = [image.read_bytes() for image in case.env.images]
@@ -306,11 +307,7 @@ class SystemTransactionTests(unittest.TestCase):
 
             def failing_pwrite(fd, data, offset):
                 calls['n'] += 1
-                # Fail only the second mirrored candidate write so the normal
-                # restore path can put both slots back; failing every later
-                # call would make the restore itself fail and prove nothing
-                # about the restored report.
-                if calls['n'] == 2:
+                if calls['n'] == 1:
                     raise offline_boot_writer.BootWriteError('simulated device failure')
                 return real_pwrite(fd, data, offset)
 
@@ -319,28 +316,165 @@ class SystemTransactionTests(unittest.TestCase):
             with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
                 self._run(sysroot, work)
             res = ctx.exception.result
-            self.assertNotEqual(res['state'], 'awaiting_reboot')
+            self.assertEqual(res['state'], 'failed')
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'restored')
+            self.assertEqual(res['bootRestoreState'], 'restored')
             first = 'ab'[1 - case.current]
             self.assertEqual(res['slotResults'][first]['status'], 'restored')
             self.assertEqual([image.read_bytes() for image in case.env.images], before)
+            self.assertIsNone(store.load(
+                case.journal.fd, case.journal.part, case.board).record)
 
-    def test_journal_failure_after_mirrored_write_is_not_success(self) -> None:
+    def test_journal_failure_before_write_restores_nonrunning_slot(self) -> None:
         with ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            inactive_before = self._boot_bytes(case, inactive, 512)
             stack.enter_context(mock.patch.object(
                 store, 'save', side_effect=OSError('journal io')))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'failed')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'restored')
+            self.assertEqual(res['bootRestoreState'], 'restored')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'restored')
+            self.assertEqual(self._boot_bytes(case, inactive, 512), inactive_before)
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertIsNone(store.load(
+                case.journal.fd, case.journal.part, case.board).record)
+
+    def test_journal_fsync_failure_after_write_is_ambiguous(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            real_fsync = os.fsync
+            journal_ino = os.fstat(case.journal.fd).st_ino
+
+            def fail_journal_fsync(fd):
+                if os.fstat(fd).st_ino == journal_ino:
+                    raise OSError(errno.EIO, 'simulated journal fsync failure')
+                return real_fsync(fd)
+
+            stack.enter_context(mock.patch.object(
+                store.os, 'fsync', side_effect=fail_journal_fsync))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'recovery_required')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'uncertain')
+            self.assertEqual(res['journalCommitState'], 'ambiguous')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertEqual(
+                self._boot_bytes(case, inactive, 512),
+                Path(candidates[inactive]['candidate']['path']).read_bytes())
+
+    def test_journal_cas_mismatch_is_ambiguous_and_preserves_alternate(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            real_load = store.load
+            calls = {'n': 0}
+
+            def load(fd, partuuid, board):
+                calls['n'] += 1
+                snapshot = real_load(fd, partuuid, board)
+                if calls['n'] == 2:
+                    return dataclasses.replace(
+                        snapshot, record=dataclasses.replace(
+                            case.journal.sample(sequence=1),
+                            partition_uuid=snapshot.layout.partition_uuid,
+                            installation_uuid=snapshot.layout.installation_uuid))
+                return snapshot
+
+            stack.enter_context(mock.patch.object(store, 'load', side_effect=load))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'recovery_required')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'uncertain')
+            self.assertEqual(res['journalCommitState'], 'ambiguous')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertEqual(
+                self._boot_bytes(case, inactive, 512),
+                Path(candidates[inactive]['candidate']['path']).read_bytes())
+
+    def test_running_write_failure_after_commit_preserves_alternate(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            real_pwrite = offline_boot_writer._pwrite_all
+            calls = {'n': 0}
+
+            def failing_pwrite(fd, data, offset):
+                calls['n'] += 1
+                if calls['n'] == 2:
+                    raise offline_boot_writer.BootWriteError(
+                        'simulated running-slot failure')
+                return real_pwrite(fd, data, offset)
+
+            stack.enter_context(mock.patch.object(
+                offline_boot_writer, '_pwrite_all', side_effect=failing_pwrite))
             with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
                 self._run(sysroot, work)
             res = ctx.exception.result
             self.assertEqual(res['state'], 'recovery_required')
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'written')
-            self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
+            self.assertEqual(res['journalCommitState'], 'committed')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(res['slotResults'][running]['status'], 'writing')
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertEqual(
+                self._boot_bytes(case, inactive, 512),
+                Path(candidates[inactive]['candidate']['path']).read_bytes())
+            record = store.load(
+                case.journal.fd, case.journal.part, case.board).record
+            self.assertEqual(record.state, rec.PREPARED)
+
+    def test_final_status_failure_after_commit_never_suggests_reboot(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            real_save = tx_mod._save_json
+
+            def save_json(directory, name, value):
+                if name == 'status.json' and value.get('state') == 'awaiting_reboot':
+                    raise OSError('final status disk full')
+                return real_save(directory, name, value)
+
+            stack.enter_context(mock.patch.object(
+                tx_mod, '_save_json', side_effect=save_json))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'recovery_required')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'written')
+            self.assertEqual(res['journalCommitState'], 'committed')
+            self.assertEqual(res['slotControlState'], 'not_issued')
+            self.assertNotIn('persistenceError', res)
             for slot in SLOTS:
-                expected = Path(candidates[slot]['candidate']['path']).read_bytes()
-                self.assertEqual(self._boot_bytes(case, slot, 512), expected)
+                self.assertEqual(
+                    self._boot_bytes(case, slot, 512),
+                    Path(candidates[slot]['candidate']['path']).read_bytes())
+            self.assertEqual(
+                store.load(case.journal.fd, case.journal.part, case.board).record.state,
+                rec.PREPARED)
+            act_test._assert_all_closed(case)
 
     def test_confirmation_accepts_either_physical_origin(self) -> None:
         for actual in (0, 1):
@@ -396,53 +530,57 @@ class SystemTransactionTests(unittest.TestCase):
                 self.assertEqual(confirmed.state, rec.CONFIRMED)
                 self.assertEqual(af.SlotActivationTests.shim.fixture_set_calls(), 0)
 
+    def _prepare_rollback(self, stack):
+        act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+        case.env.context['deployment'] = wf.TARGET_DEP
+        physical = physical_slots.inspect_physical_slots()
+        self.assertEqual(physical['deployment'], wf.TARGET_DEP)
+        trust = copy.deepcopy(trust)
+        trust['physical'] = physical
+        trust['sources']['physical'] = physical
+        stack.enter_context(mock.patch.object(
+            boot_trust, 'capture_boot_trust',
+            side_effect=lambda **kw: copy.deepcopy(trust)))
+
+        snap = store.load(case.journal.fd, case.journal.part, case.board)
+        confirmed = rec.TrialRecord(
+            sequence=1, partition_uuid=snap.layout.partition_uuid,
+            installation_uuid=snap.layout.installation_uuid,
+            transaction_uuid=uuid.uuid4().bytes, state=rec.CONFIRMED,
+            from_slot=case.current, target_slot=1 - case.current,
+            remaining=2, attempt_limit=3, old_serial=0, new_serial=0,
+            os_name='armada', old_commit=bytes.fromhex('a' * 64),
+            new_commit=bytes.fromhex('b' * 64),
+            old_boot_sha256=bytes.fromhex('4' * 64),
+            new_boot_sha256=bytes.fromhex('5' * 64),
+            plan_sha256=bytes.fromhex('6' * 64),
+            policy=rec.OFFLINE_DUAL,
+            other_boot_sha256=bytes.fromhex('7' * 64))
+        store.save(case.journal.fd, snap, confirmed)
+        evidence = boot_health.BootEvidence(
+            transaction_uuid=bytes(confirmed.transaction_uuid),
+            actual_slot=case.current,
+            deployment='armada/%s.0' % ('b' * 64),
+            kernel_release='6.12.0-armada',
+            boot_sha256=(bytes(confirmed.other_boot_sha256)
+                         if case.current == confirmed.from_slot
+                         else bytes(confirmed.new_boot_sha256)))
+        stack.enter_context(mock.patch.object(
+            trial_confirmation, 'collect_boot_evidence', return_value=evidence))
+        stack.enter_context(mock.patch.object(
+            trial_confirmation, '_finalize_deployment', return_value={}))
+
+        snapshot = dict(armada_os.snapshot())
+        snapshot['rollback'] = {
+            'incompatible': False, 'checksum': 'a' * 64, 'serial': 0,
+            'stateroot': 'armada', 'version': '1.2.2',
+        }
+        stack.enter_context(mock.patch.object(armada_os, 'snapshot', return_value=snapshot))
+        return act_test, case, trust, candidates, sysroot, work
+
     def test_rollback_repacks_both_slots_from_retained_deployment(self) -> None:
         with ExitStack() as stack:
-            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
-            case.env.context['deployment'] = wf.TARGET_DEP
-            physical = physical_slots.inspect_physical_slots()
-            self.assertEqual(physical['deployment'], wf.TARGET_DEP)
-            trust = copy.deepcopy(trust)
-            trust['physical'] = physical
-            trust['sources']['physical'] = physical
-            stack.enter_context(mock.patch.object(
-                boot_trust, 'capture_boot_trust',
-                side_effect=lambda **kw: copy.deepcopy(trust)))
-
-            snap = store.load(case.journal.fd, case.journal.part, case.board)
-            confirmed = rec.TrialRecord(
-                sequence=1, partition_uuid=snap.layout.partition_uuid,
-                installation_uuid=snap.layout.installation_uuid,
-                transaction_uuid=uuid.uuid4().bytes, state=rec.CONFIRMED,
-                from_slot=case.current, target_slot=1 - case.current,
-                remaining=2, attempt_limit=3, old_serial=0, new_serial=0,
-                os_name='armada', old_commit=bytes.fromhex('a' * 64),
-                new_commit=bytes.fromhex('b' * 64),
-                old_boot_sha256=bytes.fromhex('4' * 64),
-                new_boot_sha256=bytes.fromhex('5' * 64),
-                plan_sha256=bytes.fromhex('6' * 64),
-                policy=rec.OFFLINE_DUAL,
-                other_boot_sha256=bytes.fromhex('7' * 64))
-            store.save(case.journal.fd, snap, confirmed)
-            evidence = boot_health.BootEvidence(
-                transaction_uuid=bytes(confirmed.transaction_uuid),
-                actual_slot=case.current,
-                deployment='armada/%s.0' % ('b' * 64),
-                kernel_release='6.12.0-armada',
-                boot_sha256=(bytes(confirmed.other_boot_sha256)
-                             if case.current == confirmed.from_slot
-                             else bytes(confirmed.new_boot_sha256)))
-            stack.enter_context(mock.patch.object(
-                trial_confirmation, 'collect_boot_evidence', return_value=evidence))
-            stack.enter_context(mock.patch.object(
-                trial_confirmation, '_finalize_deployment', return_value={}))
-
-            snapshot = dict(armada_os.snapshot())
-            snapshot['rollback'] = {
-                'incompatible': False, 'checksum': 'a' * 64, 'serial': 0,
-                'stateroot': 'armada', 'version': '1.2.2',
-            }
-            stack.enter_context(mock.patch.object(armada_os, 'snapshot', return_value=snapshot))
+            act_test, case, trust, candidates, sysroot, work = self._prepare_rollback(stack)
             fetch = stack.enter_context(mock.patch.object(image_source, 'fetch_online_image'))
 
             status = tx_mod.run_rollback_transaction(
@@ -461,6 +599,43 @@ class SystemTransactionTests(unittest.TestCase):
             record = store.load(case.journal.fd, case.journal.part, case.board).record
             self.assertEqual(record.state, rec.PREPARED)
             self.assertEqual(record.policy, rec.OFFLINE_DUAL)
+            self.assertEqual(record.new_commit, bytes.fromhex('a' * 64))
+            act_test._assert_all_closed(case)
+
+    def test_rollback_running_write_failure_after_commit_preserves_alternate(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare_rollback(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            real_pwrite = offline_boot_writer._pwrite_all
+            calls = {'n': 0}
+
+            def failing_pwrite(fd, data, offset):
+                calls['n'] += 1
+                if calls['n'] == 2:
+                    raise offline_boot_writer.BootWriteError(
+                        'simulated rollback running-slot failure')
+                return real_pwrite(fd, data, offset)
+
+            stack.enter_context(mock.patch.object(
+                offline_boot_writer, '_pwrite_all', side_effect=failing_pwrite))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                tx_mod.run_rollback_transaction(
+                    expected_checksum='a' * 64, sysroot_path=sysroot, work_dir=work)
+            res = ctx.exception.result
+            self.assertEqual(res['state'], 'recovery_required')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'written')
+            self.assertEqual(res['journalCommitState'], 'committed')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'preserved')
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertEqual(
+                self._boot_bytes(case, inactive, 512),
+                Path(candidates[inactive]['candidate']['path']).read_bytes())
+            record = store.load(case.journal.fd, case.journal.part, case.board).record
+            self.assertEqual(record.state, rec.PREPARED)
+            self.assertEqual(record.old_commit, bytes.fromhex('b' * 64))
             self.assertEqual(record.new_commit, bytes.fromhex('a' * 64))
             act_test._assert_all_closed(case)
 

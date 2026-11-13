@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -40,6 +41,13 @@ _EXPORT_STATES = frozenset({
 })
 # info() treats exactly this inspector as "not injected" and reads the device.
 _DEFAULT_INSPECT = physical_slots.inspect_physical_slots
+# Only an upload that has been quiet for this long is treated as abandoned.
+# The newest receipt or payload timestamp is the activity evidence, so a slow
+# but still progressing upload is never reclaimed.
+_RECLAIM_AGE = 24 * 60 * 60
+# Bound the work and the candidates examined by one begin() call.
+_RECLAIM_SCAN_LIMIT = 16
+_RECLAIMABLE_STATES = frozenset({'uploading', 'up_to_date'})
 
 
 class OfflineSessionError(RuntimeError):
@@ -90,6 +98,11 @@ def _regular(fd, label):
     if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
         raise OfflineSessionError('%s is not a safe root-owned regular file' % label)
     return st
+
+
+def _available(path):
+    statvfs = os.statvfs(path)
+    return statvfs.f_bavail * statvfs.f_frsize
 
 
 def read_device_identity():
@@ -274,6 +287,140 @@ class OfflineSessionStore:
         system_transaction._save_json(session, 'receipt.json', receipt)
         return receipt
 
+    def _reclaimable_state(self, session, receipt):
+        """Return the state when this session's payload is safe to reclaim.
+
+        A transaction, acknowledgement, recovery request or any upload-side
+        job marker makes the payload part of live work, so it is left alone.
+        """
+        state = receipt.get('state')
+        if state not in _RECLAIMABLE_STATES:
+            return None
+        for marker in ('transaction', 'ack.json'):
+            path = session / marker
+            if path.exists() or path.is_symlink():
+                return None
+        if state == 'uploading':
+            for key in ('jobOperation', 'jobUnit', 'result', 'restart',
+                        'completion', 'attentionRequired'):
+                if key in receipt:
+                    return None
+        return state
+
+    def _signed_payload(self, session):
+        """Return path/bytes/sha256 from the signed descriptor, or None."""
+        try:
+            document = offline_execute._read_bounded(
+                session / 'package.json', _DOCUMENT_MAX, 'package document')
+            signature_b64 = offline_execute._read_bounded(
+                session / 'package.sig', _SIGNATURE_MAX, 'package signature')
+            package = package_contract.load_package(
+                document, signature_b64, trusted_key=self.trusted_key)
+            parts, size, digest, _expanded, _expanded_sha = \
+                offline_payload._select_payload_entry(package)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return '/'.join(parts), size, digest
+
+    def _reclaim_session(self, name, cutoff):
+        """Reclaim one bounded candidate; return the bytes released.
+
+        The session is locked without waiting so a running upload is never
+        blocked.  Only the signed payload path from the receipt is removed:
+        directories, receipts, package documents, backups and transaction
+        work stay in place for recovery.
+        """
+        session = self.base / name
+        try:
+            session_stat = os.lstat(session)
+        except OSError:
+            return 0
+        if (not stat.S_ISDIR(session_stat.st_mode) or
+                session_stat.st_uid != 0 or session_stat.st_mode & 0o022 or
+                session.is_symlink()):
+            return 0
+        lock_fd = None
+        try:
+            lock_fd = os.open(
+                session / '.lock',
+                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            _regular(lock_fd, 'session lock')
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0
+            _check_dir(session)
+            receipt = self.read_receipt(session)
+            state = self._reclaimable_state(session, receipt)
+            if state is None:
+                return 0
+            payload = receipt.get('payload')
+            if not isinstance(payload, dict):
+                return 0
+            expected = payload.get('bytes')
+            digest = payload.get('sha256')
+            if (type(expected) is not int or expected <= 0 or
+                    type(digest) is not str or len(digest) != 64 or
+                    any(ch not in '0123456789abcdef' for ch in digest)):
+                return 0
+            path = self._payload_path(session, receipt)
+            try:
+                payload_stat = os.lstat(path)
+                receipt_stat = os.lstat(session / 'receipt.json')
+            except OSError:
+                return 0
+            if (not stat.S_ISREG(payload_stat.st_mode) or
+                    payload_stat.st_uid != 0 or payload_stat.st_mode & 0o022 or
+                    payload_stat.st_size <= 0 or payload_stat.st_size > expected):
+                return 0
+            if max(receipt_stat.st_mtime, payload_stat.st_mtime) > cutoff:
+                return 0
+            signed = self._signed_payload(session)
+            if (signed is None or payload.get('path') != signed[0] or
+                    expected != signed[1] or digest != signed[2]):
+                return 0
+            fd = os.open(
+                path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
+                getattr(os, 'O_NONBLOCK', 0))
+            try:
+                opened = _regular(fd, 'payload')
+                if (opened.st_dev, opened.st_ino) != (
+                        payload_stat.st_dev, payload_stat.st_ino):
+                    return 0
+            finally:
+                os.close(fd)
+            os.unlink(path)
+            _fsync_dir(path.parent)
+            if state == 'uploading':
+                receipt['receivedBytes'] = 0
+                self.update_receipt(session, receipt)
+            return payload_stat.st_size
+        except (OSError, ValueError, OfflineSessionError):
+            return 0
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+    def _reclaim_abandoned(self, needed):
+        """Release abandoned payload storage until ``needed`` bytes are free."""
+        cutoff = time.time() - _RECLAIM_AGE
+        freed = 0
+        try:
+            with os.scandir(self.base) as entries:
+                examined = 0
+                for entry in entries:
+                    if examined >= _RECLAIM_SCAN_LIMIT:
+                        break
+                    examined += 1
+                    if _SESSION_ID.fullmatch(entry.name) is None:
+                        continue
+                    freed += self._reclaim_session(entry.name, cutoff)
+                    if freed >= needed:
+                        break
+        except OSError:
+            return freed
+        return freed
+
     def begin(self, document: bytes, signature_b64: bytes):
         if type(document) is not bytes or not 0 < len(document) <= _DOCUMENT_MAX:
             raise ValueError('document must be nonempty bytes of at most 2 MiB')
@@ -289,7 +436,10 @@ class OfflineSessionStore:
         parts, size, digest, _expanded_size, _expanded_sha = \
             offline_payload._select_payload_entry(package)
         base = self._ensure_base()
-        free = os.statvfs(base).f_bavail * os.statvfs(base).f_frsize
+        free = _available(base)
+        if free < size:
+            self._reclaim_abandoned(size - free)
+            free = _available(base)
         if free < size:
             raise OfflineSessionError('insufficient free space for compressed payload')
 
@@ -399,6 +549,29 @@ class OfflineSessionStore:
             finally:
                 os.close(fd)
 
+    def _reset_upload(self, session, receipt, path, st):
+        """Drop a complete but corrupt payload and its progress only.
+
+        The caller already holds the session lock and verified the opened
+        descriptor.  The receipt, package documents and directories are kept
+        so the same session can be uploaded again from offset zero.
+        """
+        try:
+            current = os.lstat(path)
+        except OSError:
+            return False
+        if (not stat.S_ISREG(current.st_mode) or
+                (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino)):
+            return False
+        try:
+            os.unlink(path)
+            _fsync_dir(path.parent)
+            receipt['receivedBytes'] = 0
+            self.update_receipt(session, receipt)
+        except OSError:
+            return False
+        return True
+
     def seal(self, sessionId):
         with self.session_lock(sessionId) as session:
             receipt = self.read_receipt(session)
@@ -407,6 +580,12 @@ class OfflineSessionStore:
             if receipt.get('state') != 'uploading':
                 raise OfflineSessionError('session cannot be sealed in its current state')
             expected = receipt['payload']
+            if (not isinstance(expected, dict) or
+                    type(expected.get('bytes')) is not int or expected['bytes'] <= 0 or
+                    type(expected.get('sha256')) is not str or
+                    len(expected['sha256']) != 64 or
+                    any(ch not in '0123456789abcdef' for ch in expected['sha256'])):
+                raise OfflineSessionError('invalid payload descriptor in receipt')
             path = self._payload_path(session, receipt)
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
                          getattr(os, 'O_NONBLOCK', 0))
@@ -424,7 +603,12 @@ class OfflineSessionStore:
                     if total > expected['bytes']:
                         raise OfflineSessionError('payload grew while sealing')
                     hasher.update(chunk)
-                if total != expected['bytes'] or hasher.hexdigest() != expected['sha256']:
+                if total != expected['bytes']:
+                    raise OfflineSessionError('payload sha256/size mismatch')
+                if hasher.hexdigest() != expected['sha256']:
+                    if self._reset_upload(session, receipt, path, st):
+                        raise OfflineSessionError(
+                            'payload sha256 mismatch; upload progress was reset')
                     raise OfflineSessionError('payload sha256/size mismatch')
             finally:
                 os.close(fd)

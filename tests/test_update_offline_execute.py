@@ -101,16 +101,28 @@ class OfflineExecuteTest(unittest.TestCase):
                     offline_execute.deployment_options, "read_deployment_options",
                     return_value=options)),
                 opened=stack.enter_context(mock.patch.object(
-                    offline_execute.recovery_device, "open_recovery", open_recovery)),
+                    system_transaction.recovery_device, "open_recovery", open_recovery)),
                 load=stack.enter_context(mock.patch.object(
-                    offline_execute.trial_store, "load", side_effect=load)),
+                    system_transaction.trial_store, "load", side_effect=load)),
             )
             yield mocks
 
-    def _writer_report(self, env, trust, candidates, progress):
+    @staticmethod
+    def _commit_failure(exc):
+        if exc.commit_state == "not_committed":
+            error = offline_boot_writer.BootWriteError(
+                "%s; started boot slots restored" % exc, "restored")
+        else:
+            error = offline_boot_writer.BootWriteError(
+                "%s; verified non-running boot image preserved" % exc, "not_restored")
+        error.commit_state = exc.commit_state
+        return error
+
+    def _writer_report(self, env, trust, candidates, progress, *, commit):
         plan = self._json(env.work, "plan.json")
+        order = [plan["targetSlot"], plan["fromSlot"]]
         writes = {}
-        for slot in (plan["targetSlot"], plan["fromSlot"]):
+        for index, slot in enumerate(order):
             progress({"phase": "writing", "slot": slot})
             progress({"phase": "verified", "slot": slot})
             self.assertEqual(self._json(env.work, "status.json")["bootWriteEvent"],
@@ -121,10 +133,15 @@ class OfflineExecuteTest(unittest.TestCase):
                 "bytesWritten": candidates[slot]["candidate"]["bytes"],
                 "readbackSha256": plan["newBootSha256"][slot],
             }
+            if index == 0:
+                try:
+                    commit()
+                except offline_boot_writer.JournalCommitError as exc:
+                    raise self._commit_failure(exc) from exc
         return {"phase": "dual_boots_written", "model": plan["model"],
                 "physical": dict(env.physical), "transactionUuid": plan["transactionId"],
                 "deployment": plan["newDeployment"], "fromSlot": plan["fromSlot"],
-                "slotOrder": [plan["targetSlot"], plan["fromSlot"]], "writes": writes}
+                "slotOrder": order, "writes": writes}
 
     def _activate(self, env, report):
         plan = self._json(env.work, "plan.json")
@@ -139,8 +156,8 @@ class OfflineExecuteTest(unittest.TestCase):
 
     def _install_success_spies(self, env) -> None:
         env.spies["write_offline_boots"].side_effect = (
-            lambda trust, candidates, progress: self._writer_report(
-                env, trust, candidates, progress))
+            lambda trust, candidates, *, commit, progress: self._writer_report(
+                env, trust, candidates, progress, commit=commit))
 
     def _assert_sources_untouched(self, env) -> None:
         self.assertEqual((env.sysroot / "var/home/user-marker.txt").read_bytes(),
@@ -318,8 +335,50 @@ class OfflineExecuteTest(unittest.TestCase):
                 env.spies["trial_save"].assert_not_called()
                 env.spies["activate_offline_slots"].assert_not_called()
 
+    def test_running_write_failure_after_commit_preserves_alternate(self) -> None:
+        with self.fixture._case() as env:
+            self._ready(env)
+            ack = self._ack(env)
+
+            def writer(trust, candidates, *, commit, progress):
+                plan = self._json(env.work, "plan.json")
+                progress({"phase": "writing", "slot": plan["targetSlot"]})
+                progress({"phase": "verified", "slot": plan["targetSlot"]})
+                commit()
+                error = offline_boot_writer.BootWriteError(
+                    "running write failed; journal commit is committed; "
+                    "verified non-running boot image preserved", "not_restored")
+                error.commit_state = "committed"
+                error.slot_results = {
+                    plan["targetSlot"]: {"status": "preserved"},
+                    plan["fromSlot"]: {"status": "writing"},
+                }
+                raise error
+
+            env.spies["write_offline_boots"].side_effect = writer
+            with self._execution(env):
+                with self.assertRaises(system_transaction.SystemTransactionError) as raised:
+                    offline_execute.execute_offline_update(
+                        work_dir=env.work, recovery_ack=ack,
+                        trusted_key=self.fixture.pub_key)
+            result = raised.exception.result
+            self.assertEqual(result["state"], "recovery_required")
+            self.assertEqual(result["bootWriteState"], "written")
+            self.assertEqual(result["journalCommitState"], "committed")
+            self.assertFalse(result["requiresReboot"])
+            self.assertEqual(env.spies["trial_save"].call_count, 1)
+            self.assertFalse((env.work / "write-report.json").exists())
+            env.spies["activate_offline_slots"].assert_not_called()
+
     def test_post_write_failures_are_recovery_required(self) -> None:
-        for case in ("malformed_report", "report_save", "journal_compare", "journal_save"):
+        expected = {
+            "malformed_report": ("recovery_required", "uncertain"),
+            "report_save": ("recovery_required", "written"),
+            "journal_compare": ("recovery_required", "uncertain"),
+            "journal_ambiguous": ("recovery_required", "uncertain"),
+            "journal_save": ("failed", "restored"),
+        }
+        for case in expected:
             with self.subTest(case=case), self.fixture._case() as env:
                 self._ready(env)
                 ack = self._ack(env)
@@ -340,6 +399,25 @@ class OfflineExecuteTest(unittest.TestCase):
                             layout=env.journal.layout, header=b"bad", region=b"bad", record=None)
                     elif case == "journal_save":
                         env.spies["trial_save"].side_effect = OSError("journal disk full")
+                    elif case == "journal_ambiguous":
+                        state = {"record": None, "written": False}
+
+                        def ambiguous_save(fd, journal, record):
+                            state["record"] = record
+                            state["written"] = True
+                            raise OSError("journal fsync failed")
+
+                        def written_load(fd, partuuid, board):
+                            return SimpleNamespace(
+                                layout=env.journal.layout,
+                                header=env.journal.header,
+                                region=(b"new-region" if state["written"]
+                                        else env.journal.region),
+                                record=(state["record"] if state["written"]
+                                        else env.journal.record))
+
+                        env.spies["trial_save"].side_effect = ambiguous_save
+                        mocks.load.side_effect = written_load
                     with mock.patch.object(offline_execute.system_transaction, "_save_json",
                                            side_effect=save_json):
                         with self.assertRaises(system_transaction.SystemTransactionError) as raised:
@@ -347,10 +425,15 @@ class OfflineExecuteTest(unittest.TestCase):
                                 work_dir=env.work, recovery_ack=ack,
                                 trusted_key=self.fixture.pub_key)
                 result = raised.exception.result
-                self.assertEqual(result["state"], "recovery_required")
-                self.assertEqual(result["bootWriteState"],
-                                 "uncertain" if case == "malformed_report" else "written")
+                self.assertEqual(
+                    (result["state"], result["bootWriteState"]), expected[case])
                 self.assertFalse(result["requiresReboot"])
+                if case == "journal_compare":
+                    self.assertEqual(result["journalCommitState"], "ambiguous")
+                elif case == "journal_ambiguous":
+                    self.assertEqual(result["journalCommitState"], "ambiguous")
+                elif case == "report_save":
+                    self.assertEqual(result["journalCommitState"], "committed")
                 env.spies["activate_offline_slots"].assert_not_called()
 
     def test_final_status_save_failure_never_reports_success(self) -> None:
