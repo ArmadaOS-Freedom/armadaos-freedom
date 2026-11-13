@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import gi
 gi.require_version("OSTree", "1.0")
@@ -130,6 +131,40 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
 
     def _bindings(self) -> list[str]:
         return [binding(dep) for dep in self._deployments()]
+
+    def _refs(self) -> dict[str, str]:
+        ok, repo = self._sysroot().get_repo(None)
+        self.assertTrue(ok and repo is not None)
+        ok, refs = repo.list_refs(None, None)
+        self.assertTrue(ok, "listing repository refs failed")
+        return dict(refs)
+
+    def _pending_refs(self) -> list[str]:
+        return [
+            name for name in self._refs()
+            if name.startswith("armada-update/pending/")
+        ]
+
+    def _commit_exists(self, checksum: str) -> bool:
+        ok, repo = self._sysroot().get_repo(None)
+        self.assertTrue(ok and repo is not None)
+        try:
+            ok, variant, state = repo.load_commit(checksum)
+        except GLib.Error:
+            return False
+        return bool(ok and variant is not None and int(state) == 0)
+
+    def _options(self, wanted: str) -> list[str]:
+        dep = next(
+            item for item in self._deployments() if binding(item) == wanted
+        )
+        return (dep.get_bootconfig().get("options") or "").split()
+
+    def _armada_tokens(self, wanted: str) -> list[str]:
+        return [
+            tok for tok in self._options(wanted)
+            if tok.startswith("armada.deployment=")
+        ]
 
     def _pin_state(self) -> dict[str, bool]:
         return {binding(dep): dep.is_pinned() for dep in self._deployments()}
@@ -287,6 +322,87 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(reused["path"], third["path"])
         self.assertEqual(reused["retainedDeployments"], expected)
         self.assertEqual(self._bindings(), expected)
+        self._assert_user_data_unchanged()
+
+    def test_fresh_first_install_appends_digest_only_target(self) -> None:
+        repo = str(self.root / "ostree/repo")
+        target = self.commits[1]
+        # A fresh first-install deployment predates the per-deployment token,
+        # so append has to persist the current self-binding before use.
+        self.assertEqual(self._armada_tokens(self.initial_binding), [])
+
+        # The target lives in the repository but is named by no ref: dropping
+        # the fixture branch leaves it reachable by checksum only, so a real
+        # prune deletes it unless the append keeps it alive.
+        run("ostree", "refs", f"--repo={repo}", "--delete", "fixture-2-arm64")
+        refs_before = self._refs()
+        fixture_refs = {
+            name: csum for name, csum in refs_before.items()
+            if name.startswith("fixture-")
+        }
+        self.assertNotIn("fixture-2-arm64", fixture_refs)
+        self.assertIn("fixture-1-arm64", fixture_refs)
+        self.assertIn("fixture-3-arm64", fixture_refs)
+        self.assertNotIn(
+            target, refs_before.values(), "target commit is still pinned by a ref"
+        )
+        self.assertEqual(self._pending_refs(), [])
+        self.assertTrue(self._commit_exists(target), "target commit object missing")
+
+        original = deployment_store._persist_self_binding
+        pruned = []
+
+        def persist_then_prune(sysroot, dep, own_binding, label):
+            changed = original(sysroot, dep, own_binding, label)
+            if changed:
+                # Real pre-registration boundary: the current deployment now
+                # names itself, the target is not deployed yet, and no ref
+                # holds the target commit.
+                self.assertFalse(
+                    [item for item in (sysroot.get_deployments() or [])
+                     if item.get_csum() == target],
+                    "prune must run before the target is registered",
+                )
+                run("ostree", "prune", "--refs-only", f"--repo={repo}")
+                self.assertTrue(
+                    self._commit_exists(target),
+                    "target commit did not survive the pre-registration prune",
+                )
+                pruned.append(label)
+            return changed
+
+        with mock.patch.object(
+            deployment_store, "_persist_self_binding",
+            side_effect=persist_then_prune,
+        ):
+            result = self._call(1)
+        self.assertEqual(len(pruned), 1, "pre-registration prune did not run")
+        self.assertFalse(result["reused"])
+        self.assertTrue(
+            result["deployment"].startswith(f"default/{target}."),
+            result["deployment"],
+        )
+        self.assertEqual(
+            self._bindings(), [self.initial_binding, result["deployment"]]
+        )
+        self.assertEqual(
+            self._armada_tokens(self.initial_binding),
+            [f"armada.deployment={self.initial_binding}"],
+        )
+        self.assertEqual(
+            self._armada_tokens(result["deployment"]),
+            [f"armada.deployment={result['deployment']}"],
+        )
+        self.assertTrue(self._commit_exists(target), "target commit disappeared")
+        self.assertEqual(self._pending_refs(), [])
+        # Registering the candidate legitimately rewrites internal ostree/*
+        # refs, so only the fixture namespace has to be untouched.
+        self.assertEqual(
+            {name: csum for name, csum in self._refs().items()
+             if name.startswith("fixture-")},
+            fixture_refs,
+            "append changed or dropped an unrelated fixture ref",
+        )
         self._assert_user_data_unchanged()
 
     def test_five_confirmed_updates_apply_promotion_grace(self) -> None:
