@@ -603,45 +603,55 @@ test('identical values republished after an observed gap are accepted as new evi
   assert.deepEqual(h.data.calls.restart, []);
 });
 
-test('a failed apply baseline keeps a historical result non-fresh until it changes', async () => {
+test('an unknown baseline refuses the apply before any native side effect', async () => {
   const h = host();
-  const historical = {
-    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
-  };
-  h.data.apply = historical;
-  let mode = 'result';
   h.UpdateStore.m_updater.GetApplyResult = (type) => {
     if (type !== 1) return { type, eresult: 2 };
-    if (mode === 'throw') throw new Error('native read failed');
-    return Object.assign({}, historical);
+    throw new Error('native read failed');
   };
   const adapter = createAdapter(h);
   await adapter.check();
 
-  // The baseline read fails, so the pre-apply publication is unknown.
-  mode = 'throw';
-  const awaiting = await adapter.apply();
-  assert.equal(awaiting.state, 'awaiting_status');
-  assert.equal(awaiting.busy, true);
-  assert.equal(awaiting.requiresClientRestart, false);
-  await assert.rejects(adapter.restartClient(), /restart evidence/);
-
-  // The unchanged historical value is adopted only as a comparison point.
-  mode = 'result';
-  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'available');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.equal(snap.error, null);
   await assert.rejects(adapter.restartClient(), /restart evidence/);
   assert.deepEqual(h.data.calls.restart, []);
+});
 
-  // A genuine change during the pending apply is fresh evidence.
-  h.UpdateStore.m_updater.GetApplyResult = (type) =>
-    type === 1 ? {
-      type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
-    } : { type, eresult: 2 };
-  const ready = adapter.snapshot();
-  assert.equal(ready.state, 'restart_required');
-  assert.equal(ready.requiresClientRestart, true);
-  await adapter.restartClient();
-  assert.deepEqual(h.data.calls.restart, [false]);
+test('a retry after a readable baseline settles from one stable terminal publication', async () => {
+  const h = host();
+  h.data.apply = null;
+  const readable = h.UpdateStore.m_updater.GetApplyResult;
+  let failBaseline = true;
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type === 1 && failBaseline) throw new Error('native read failed');
+    return readable(type);
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+
+  // The retry observes an explicit absence as its baseline, so the first
+  // stable terminal publication after the accepted apply is fresh evidence.
+  failBaseline = false;
+  h.data.applyImpl = () => {
+    h.data.apply = {
+      type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+    };
+    return h.data.applyReturn;
+  };
+  const snap = await adapter.apply();
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.equal(snap.state, 'up_to_date');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
 });
 
 test('a failed apply-result read is unknown, not an observed gap', async () => {
@@ -682,13 +692,12 @@ test('a failed apply-result read is unknown, not an observed gap', async () => {
   assert.equal(failed.requiresClientRestart, false);
 });
 
-test('after a failed baseline an observed gap makes the next result fresh', async () => {
+test('an unreadable baseline is refused even when an old rejection is published', async () => {
   const h = host();
   let mode = 'result';
   h.UpdateStore.m_updater.GetApplyResult = (type) => {
     if (type !== 1) return { type, eresult: 2 };
     if (mode === 'throw') throw new Error('native read failed');
-    if (mode === 'absent') return null;
     return {
       type: 1, eresult: 2,
       requires_client_restart: false, requires_system_restart: false
@@ -697,18 +706,14 @@ test('after a failed baseline an observed gap makes the next result fresh', asyn
   const adapter = createAdapter(h);
   await adapter.check();
 
+  // No comparison point exists, so the pre-apply publication cannot be
+  // attributed; refusing keeps a late rejection from being mistaken for the
+  // outcome of an apply that never started.
   mode = 'throw';
-  assert.equal((await adapter.apply()).state, 'awaiting_status');
-
-  // An observed gap (successful read with no result) is real evidence even
-  // when the baseline itself was unknown.
-  mode = 'absent';
-  assert.equal(adapter.snapshot().state, 'awaiting_status');
-  mode = 'reject';
-  const failed = adapter.snapshot();
-  assert.equal(failed.state, 'failed');
-  assert.match(failed.error, /Client apply failed \(2\)/);
-  assert.equal(failed.busy, false);
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+  assert.equal(adapter.snapshot().state, 'available');
+  assert.deepEqual(h.data.calls.restart, []);
 });
 
 test('failed refresh while a client apply awaits preserves awaiting status and its error', async () => {

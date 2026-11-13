@@ -10,7 +10,6 @@
     var local = null;
     var applyEvidenceToken = null;
     var applyEvidenceAbsent = false;
-    var applyEvidenceUnknown = false;
 
     function parts() {
       var steam = host && host.SteamClient;
@@ -70,22 +69,24 @@
     // same flags, so evidence is the semantic token, never object identity.
     // An actually observed gap (a successful read with no result) is
     // remembered so identical values republished after the gap count as new
-    // evidence.  A failed baseline read leaves the pre-apply publication
-    // unknown: a later valid result may be historical, so it is only adopted
-    // as a comparison point and must genuinely change (or follow an observed
-    // gap) before it can be promoted to fresh evidence.
+    // evidence.  The baseline must be a real observation: without one, a
+    // single stable terminal publication could not be told apart from a value
+    // that predates the apply, so apply() refuses to start on an unknown read.
+    // Returns the observed kind so the caller can enforce that rule.
     function recordApplyBaseline() {
       var observed = readApplyResult();
+      if (observed.kind === 'unknown') return 'unknown';
       applyEvidenceToken = observed.kind === 'result' ?
         applyResultToken(observed.result) : null;
       applyEvidenceAbsent = observed.kind === 'absent';
-      applyEvidenceUnknown = observed.kind === 'unknown';
+      return observed.kind;
     }
     function observeApplyResult() {
       var observed = readApplyResult();
       if (observed.kind === 'unknown') {
         // A failed read is not an observation at all: it neither creates a
-        // gap nor erases one that was genuinely observed before it.
+        // gap nor erases one that was genuinely observed before it, and it
+        // must not make an unchanged historical value look fresh.
         return null;
       }
       if (observed.kind === 'absent') {
@@ -94,19 +95,9 @@
       }
       var raw = observed.result;
       var token = applyResultToken(raw);
-      if (applyEvidenceUnknown) {
-        if (applyEvidenceToken === null && !applyEvidenceAbsent) {
-          // First valid value after a failed baseline: remember it only.
-          applyEvidenceToken = token;
-          return null;
-        }
-        if (!applyEvidenceAbsent && token === applyEvidenceToken) return null;
-      } else if (!applyEvidenceAbsent && token === applyEvidenceToken) {
-        return null;
-      }
+      if (!applyEvidenceAbsent && token === applyEvidenceToken) return null;
       applyEvidenceToken = token;
       applyEvidenceAbsent = false;
-      applyEvidenceUnknown = false;
       return raw;
     }
     function awaitingApply() {
@@ -262,7 +253,13 @@
       var check = checkResult();
       if (!check || !check.available || (local && local.state !== 'available'))
         throw new Error('A successful client check with an available update is required');
-      recordApplyBaseline();
+      // Refuse before any native apply side effect: an unreadable baseline
+      // leaves the pre-apply publication unknown, so one stable terminal
+      // result could neither be confirmed as fresh nor ruled out as stale and
+      // awaiting_status could stick forever.  Throwing here leaves the
+      // accepted check intact, so a plain retry is the recovery.
+      if (recordApplyBaseline() === 'unknown')
+        throw new Error('Client apply baseline is unknown; refusing to start the apply');
       operation = 'apply';
       local = { state: 'applying', phase: 'apply', error: null, restart: false };
       try {
