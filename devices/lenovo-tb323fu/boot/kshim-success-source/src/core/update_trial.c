@@ -434,6 +434,7 @@ int kshim_update_trial_confirm(const struct kshim_update_trial *record,
                                struct kshim_update_trial *next)
 {
     struct kshim_update_trial tmp;
+    int slot_matches;
     int rc;
 
     if (!record || !os_name || !commit || !next || actual_slot > 1u)
@@ -441,8 +442,22 @@ int kshim_update_trial_confirm(const struct kshim_update_trial *record,
     if (!validate_logical_record(record, NULL))
         return KSHIM_STORAGE_FORMAT;
     if (record->state != KSHIM_UPDATE_TRIAL_TRIAL ||
-        actual_slot != record->target_slot ||
         !new_deployment_matches(record, os_name, commit, serial))
+        return KSHIM_STORAGE_CONFLICT;
+
+    /*
+     * Mirrored writes put the same logical deployment in both physical slots,
+     * so an OFFLINE_DUAL boot on either slot is valid confirmation evidence.
+     * Legacy ONLINE_SINGLE records keep their single-target rule.  Only the
+     * journal is advanced here: Android keeps slot selection, success marking
+     * and boot-control state.
+     */
+    if (record->policy == KSHIM_UPDATE_POLICY_OFFLINE_DUAL)
+        slot_matches = actual_slot == record->from_slot ||
+                       actual_slot == record->target_slot;
+    else
+        slot_matches = actual_slot == record->target_slot;
+    if (!slot_matches)
         return KSHIM_STORAGE_CONFLICT;
 
     rc = start_mutation(record, &tmp);

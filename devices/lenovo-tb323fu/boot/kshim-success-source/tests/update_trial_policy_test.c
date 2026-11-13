@@ -323,11 +323,116 @@ static void test_dual(uint32_t from, uint32_t target)
                                        &out) == KSHIM_STORAGE_FORMAT);
 }
 
+static void assert_confirm_refused(const struct kshim_update_trial *rec,
+                                   uint32_t slot, const char *os_name,
+                                   const uint8_t *commit, uint32_t serial,
+                                   int expected)
+{
+    struct kshim_update_trial out, snap;
+
+    memset(&out, 0xa5, sizeof(out));
+    memcpy(&snap, &out, sizeof(out));
+    assert(kshim_update_trial_confirm(rec, slot, os_name, commit, serial,
+                                      &out) == expected);
+    assert(memcmp(&out, &snap, sizeof(out)) == 0);
+}
+
+/*
+ * Confirmation must follow the mirrored policy: a dual record confirms from
+ * either physical slot with the mirrored (new) deployment, while a legacy
+ * single-slot record still confirms only on its target slot.  No slot is
+ * selected or marked successful by this transition.
+ */
+static void test_confirm_policy(uint32_t from, uint32_t target)
+{
+    struct kshim_update_trial rec, from_out, target_out;
+    uint8_t bad_commit[32];
+
+    memset(bad_commit, 0x99, sizeof(bad_commit));
+
+    /* Both physical origins confirm the same mirrored deployment. */
+    init_dual_fixture(&rec, from, target);
+    rec.state = KSHIM_UPDATE_TRIAL_TRIAL;
+    rec.remaining = 3u;
+    assert(kshim_update_trial_confirm(&rec, from, "default", rec.new_commit,
+                                      1u, &from_out) == KSHIM_STORAGE_OK);
+    assert(from_out.state == KSHIM_UPDATE_TRIAL_CONFIRMED);
+    assert(from_out.sequence == rec.sequence + 1u);
+    assert(from_out.from_slot == from && from_out.target_slot == target);
+    assert(from_out.policy == KSHIM_UPDATE_POLICY_OFFLINE_DUAL);
+    assert(memcmp(from_out.other_boot_sha256, rec.other_boot_sha256, 32) == 0);
+    assert(kshim_update_trial_confirm(&rec, target, "default", rec.new_commit,
+                                      1u, &target_out) == KSHIM_STORAGE_OK);
+    assert(target_out.state == KSHIM_UPDATE_TRIAL_CONFIRMED);
+    assert_wire_eq(&from_out, &target_out);
+    assert_wire_eq(&target_out, &from_out);
+
+    /* Invalid state, deployment and slot are refused without mutation. */
+    init_dual_fixture(&rec, from, target);
+    assert_confirm_refused(&rec, from, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    rec.state = KSHIM_UPDATE_TRIAL_TRIAL;
+    rec.remaining = 3u;
+    assert_confirm_refused(&rec, from, "wrong", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, from, "default", rec.old_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", bad_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", rec.new_commit, 9u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, from, NULL, rec.new_commit, 1u,
+                           KSHIM_STORAGE_ARG);
+    assert_confirm_refused(&rec, target, "default", NULL, 1u,
+                           KSHIM_STORAGE_ARG);
+    assert_confirm_refused(&rec, 2u, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_ARG);
+    rec.state = KSHIM_UPDATE_TRIAL_CONFIRMED;
+    assert_confirm_refused(&rec, target, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    rec.state = KSHIM_UPDATE_TRIAL_ROLLED_BACK;
+    assert_confirm_refused(&rec, from, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_FORMAT);
+
+    /* A dual confirmation that cannot advance its sequence fails cleanly. */
+    init_dual_fixture(&rec, from, target);
+    rec.state = KSHIM_UPDATE_TRIAL_TRIAL;
+    rec.remaining = 3u;
+    rec.sequence = UINT64_MAX;
+    assert_confirm_refused(&rec, from, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_OVERFLOW);
+    assert_confirm_refused(&rec, target, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_OVERFLOW);
+
+    /* Legacy single-slot records still confirm on the target slot only. */
+    init_fixture(&rec, from, target);
+    rec.state = KSHIM_UPDATE_TRIAL_TRIAL;
+    rec.remaining = 2u;
+    assert(kshim_update_trial_confirm(&rec, target, "default", rec.new_commit,
+                                      1u, &target_out) == KSHIM_STORAGE_OK);
+    assert(target_out.state == KSHIM_UPDATE_TRIAL_CONFIRMED);
+    assert(target_out.sequence == rec.sequence + 1u);
+    assert_confirm_refused(&rec, from, "default", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "wrong", rec.new_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", rec.old_commit, 1u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", rec.new_commit, 9u,
+                           KSHIM_STORAGE_CONFLICT);
+    assert_confirm_refused(&rec, target, "default", NULL, 1u,
+                           KSHIM_STORAGE_ARG);
+}
+
 int main(void)
 {
     test_legacy(0u, 1u);
     test_legacy(1u, 0u);
     test_dual(0u, 1u);
     test_dual(1u, 0u);
+    test_confirm_policy(0u, 1u);
+    test_confirm_policy(1u, 0u);
     return 0;
 }
