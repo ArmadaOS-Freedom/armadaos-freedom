@@ -463,11 +463,13 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                     status['bootWriteState'] = 'restored'
                     status['state'] = 'failed'
                 elif restore == 'not_restored':
-                    # The journal is committed or ambiguous; the verified
-                    # non-running image stays in place and no restart is
-                    # advertised from partial evidence.
-                    status['bootWriteState'] = (
-                        'written' if commit_state == 'committed' else 'uncertain')
+                    # A committed journal only records that the commit
+                    # boundary was crossed; it does not prove that both slots
+                    # received the image, and this failure happened before the
+                    # writer returned its report.  Keep the run in recovery,
+                    # record the reported commit state and per-slot results,
+                    # and never advertise a restart from partial evidence.
+                    status['bootWriteState'] = 'uncertain'
                     status['journalCommitState'] = commit_state
                     status['state'] = 'recovery_required'
                 else:

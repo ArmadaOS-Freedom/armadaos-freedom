@@ -997,3 +997,103 @@ test('13: superseded expected job consumes its completed entry while the newer j
     return btn.style.display !== 'none' && !btn.disabled && current.textContent.includes('3.5.2');
   }, null, { timeout: 5000 });
 });
+
+async function prepareSystemRestart(page) {
+  await page.evaluate(() => {
+    window.fixture.setBackendComponent('system', {
+      busy: false,
+      jobId: null,
+      operation: null,
+      result: { state: 'awaiting_reboot', requiresReboot: true }
+    });
+    window.fixture.setBackendComponent('decky', {
+      busy: false,
+      jobId: null,
+      operation: null
+    });
+    return window.ArmadaUpdatesPage.refresh();
+  });
+  const sysBtn = page.locator('.armada-row[data-comp="system"] .armada-btn-primary');
+  await sysBtn.waitFor({ state: 'visible' });
+  assert.match(await sysBtn.textContent(), /Restart system/);
+}
+
+async function confirmSystemRestart(page, scenario) {
+  await page.evaluate((kind) => {
+    const components = window.fixture.state.status.components;
+    if (kind === 'decky-busy') components.decky.busy = true;
+    else if (kind === 'decky-missing') delete components.decky;
+    else if (kind === 'decky-malformed') components.decky.busy = 'false';
+    else if (kind === 'no-live-reboot') components.system.result.requiresReboot = false;
+    // The backend changes above are not polled yet: the page still holds its
+    // previous idle snapshot when the confirmation is clicked.
+    const row = document.querySelector('.armada-row[data-comp="system"]');
+    row.querySelector('.armada-btn-primary').click();
+    row.querySelector('.armada-btn-danger').click();
+  }, scenario || null);
+}
+
+test('15: Restart device refetches GetStatus and requires fresh idle system and Decky records before RestartPC', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+  await prepareSystemRestart(page);
+
+  await page.evaluate(() => {
+    window.fixture.state.heldRequests = {};
+    window.fixture.state.holdMethods.GetStatus = true;
+  });
+  await confirmSystemRestart(page);
+  await page.waitForFunction(() =>
+    (window.fixture.state.heldRequests.GetStatus || []).length >= 1,
+  null, { timeout: 5000 });
+  await page.waitForTimeout(100);
+  assert.equal(await page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+
+  await page.evaluate(() => {
+    const status = JSON.parse(JSON.stringify(window.fixture.state.status));
+    for (let i = 0; i < 10; i++) {
+      if (!window.fixture.replyOne('GetStatus', status, true)) break;
+    }
+    window.fixture.state.holdMethods.GetStatus = false;
+  });
+  await page.waitForFunction(() => window.fixture.state.restartPCCalls === 1,
+    null, { timeout: 5000 });
+  assert.equal(await page.evaluate(() =>
+    window.fixture.state.bridgeCalls.filter(c => c.method === 'StartSystemUpdate').length), 0);
+
+  const busy = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(busy.page);
+  await prepareSystemRestart(busy.page);
+  await confirmSystemRestart(busy.page, 'decky-busy');
+  const busyErr = busy.page.locator('.armada-row[data-comp="system"] .armada-error-box');
+  await busyErr.waitFor({ state: 'visible' });
+  assert.match(await busyErr.textContent(), /Restart verification rejected.*Decky is not idle/i);
+  assert.equal(await busy.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+
+  const missing = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(missing.page);
+  await prepareSystemRestart(missing.page);
+  await confirmSystemRestart(missing.page, 'decky-missing');
+  const missingErr = missing.page.locator('.armada-row[data-comp="system"] .armada-error-box');
+  await missingErr.waitFor({ state: 'visible' });
+  assert.match(await missingErr.textContent(), /Malformed decky status record/i);
+  assert.equal(await missing.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+
+  const malformed = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(malformed.page);
+  await prepareSystemRestart(malformed.page);
+  await confirmSystemRestart(malformed.page, 'decky-malformed');
+  const malformedErr = malformed.page.locator('.armada-row[data-comp="system"] .armada-error-box');
+  await malformedErr.waitFor({ state: 'visible' });
+  assert.match(await malformedErr.textContent(), /Malformed decky status record/i);
+  assert.equal(await malformed.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+
+  const stale = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(stale.page);
+  await prepareSystemRestart(stale.page);
+  await confirmSystemRestart(stale.page, 'no-live-reboot');
+  const staleErr = stale.page.locator('.armada-row[data-comp="system"] .armada-error-box');
+  await staleErr.waitFor({ state: 'visible' });
+  assert.match(await staleErr.textContent(), /system is not freshly awaiting reboot/i);
+  assert.equal(await stale.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+});

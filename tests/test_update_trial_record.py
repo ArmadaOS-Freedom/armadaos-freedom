@@ -86,6 +86,11 @@ def legacy_v1_encode(r):
     return body + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF)
 
 
+# storage_block.h: the two selector outcomes this test distinguishes.
+KSHIM_STORAGE_FORMAT = -3
+KSHIM_STORAGE_EMPTY = -8
+
+
 def resealed(wire, offset, fmt, value):
     data = bytearray(wire)
     struct.pack_into(fmt, data, offset, value)
@@ -148,6 +153,25 @@ class UpdateTrialRecordTest(unittest.TestCase):
         with self.assertRaises(tr.TrialRecordError):
             tr.decode_record(wire, PART, INST)
         self.assertNotEqual(self.c_decode(wire)[0], 0)
+
+    def c_select(self, a, b):
+        output, selected = CRecord(), ctypes.c_uint(99)
+        rc = self.lib.kshim_update_trial_select(
+            a, b, len(a), PART, INST, ctypes.byref(output), ctypes.byref(selected))
+        return rc, selected.value
+
+    def assert_select_empty(self, a, b):
+        """Both implementations must call this pair a durable empty journal."""
+        self.assertEqual(self.c_select(a, b), (KSHIM_STORAGE_EMPTY, 99))
+        with self.assertRaises(tr.EmptyTrialJournal):
+            tr.select_record(a, b, PART, INST)
+
+    def assert_select_invalid(self, a, b):
+        """Both implementations must call this pair invalid, never empty."""
+        self.assertEqual(self.c_select(a, b), (KSHIM_STORAGE_FORMAT, 99))
+        with self.assertRaises(tr.TrialRecordError) as ctx:
+            tr.select_record(a, b, PART, INST)
+        self.assertNotIsInstance(ctx.exception, tr.EmptyTrialJournal)
 
     def assert_select(self, a, b, index=None, error=None):
         output, selected = CRecord(), ctypes.c_uint(99)
@@ -239,8 +263,8 @@ class UpdateTrialRecordTest(unittest.TestCase):
             other_boot_sha256=bytes(range(36, 68))))
         self.assert_select(old, offline, 1)
         self.assert_select(offline, old, 0)
-        self.assert_select(bytes(4096), bytes(4096), error=tr.EmptyTrialJournal)
-        self.assert_select(bytes(torn), bytes(4096), error=tr.TrialRecordError)
+        self.assert_select_empty(bytes(4096), bytes(4096))
+        self.assert_select_invalid(bytes(torn), bytes(4096))
 
     def test_logical_empty_marker_parity(self):
         zero = bytes(4096)
@@ -252,32 +276,24 @@ class UpdateTrialRecordTest(unittest.TestCase):
         self.assertEqual(self.lib.kshim_update_trial_is_empty_marker(marker, 4096), 1)
         self.assertEqual(self.lib.kshim_update_trial_is_empty_marker(zero, 4096), 0)
         self.assert_both_reject(marker)
-        self.assert_select(zero, marker, error=tr.EmptyTrialJournal)
+        self.assert_select_empty(zero, marker)
         with self.assertRaises(tr.LogicalEmptyTrialJournal):
             tr.select_record(zero, marker, PART, INST)
         torn = bytearray(tr.encode_record(sample()))
         torn[300] ^= 1
-        self.assert_select(bytes(torn), marker, error=tr.EmptyTrialJournal)
-        self.assert_select(marker, zero, error=tr.TrialRecordError)
+        self.assert_select_empty(bytes(torn), marker)
+        self.assert_select_invalid(marker, zero)
         # The sentinel belongs to copy B only: a marker pair is a writer fault,
         # never an empty journal, so a real record cannot be masked that way.
-        output, selected = CRecord(), ctypes.c_uint(99)
-        self.assertEqual(
-            self.lib.kshim_update_trial_select(
-                marker, marker, len(marker), PART, INST,
-                ctypes.byref(output), ctypes.byref(selected)),
-            -3)  # KSHIM_STORAGE_FORMAT, never KSHIM_STORAGE_EMPTY (-8)
-        self.assertEqual(selected.value, 99)
-        with self.assertRaises(tr.TrialRecordError) as ctx:
-            tr.select_record(marker, marker, PART, INST)
-        self.assertNotIsInstance(ctx.exception, tr.EmptyTrialJournal)
+        self.assert_select_invalid(marker, marker)
         old = tr.encode_record(sample())
         self.assert_select(old, marker, 0)
-        # A complete CRC-valid image next to the marker is never empty.
+        # A complete CRC-valid image next to the marker is never empty, even
+        # when only its identity is foreign or its version is unsupported.
         foreign = resealed(old, 40, "<16s", bytes(range(48, 64)))
-        self.assert_select(foreign, marker, error=tr.TrialRecordError)
+        self.assert_select_invalid(foreign, marker)
         unknown = resealed(old, 8, "<I", 3)
-        self.assert_select(unknown, marker, error=tr.TrialRecordError)
+        self.assert_select_invalid(unknown, marker)
 
     def test_python_strict_arguments(self):
         base = sample()

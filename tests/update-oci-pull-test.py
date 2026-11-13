@@ -284,13 +284,12 @@ class UpdateOciPullTest(unittest.TestCase):
             diagnostic = str(caught.exception)
             self.assertFalse((bad_work / "commit").exists(), diagnostic)
             self.assertFalse((bad_work / "import.log").exists(), diagnostic)
+            self.assertTrue((bad_work / "init.log").is_file(), diagnostic)
             self.assertTrue((bad_work / "pull.log").is_file(), diagnostic)
             bad_stage = bad_work / "staging-repo"
-            self.assertTrue(bad_stage.is_dir(), diagnostic)
+            self.assertFalse(bad_stage.exists(), diagnostic)
             self.assertEqual(_run([OSTREE_BIN, "refs", f"--repo={destination}"]).stdout, refs_before)
             self.assertEqual(self._object_files(destination), objects_before)
-            bad_stage_objects = self._object_files(bad_stage)
-            bad_stage_refs = _run([OSTREE_BIN, "refs", f"--repo={bad_stage}"]).stdout
 
             layer_path.write_bytes(original_bytes)
             good_work = base / "work-good"
@@ -303,6 +302,7 @@ class UpdateOciPullTest(unittest.TestCase):
             self.assertEqual((good_work / "commit").read_text(encoding="ascii").strip(), expected)
             self.assertTrue((good_work / "import.log").is_file())
             self.assertFalse((good_work / "staging-repo").exists())
+            self.assertFalse(bad_stage.exists())
             _run([OSTREE_BIN, "fsck", f"--repo={destination}"])
             cat = _run([
                 OSTREE_BIN, "cat", f"--repo={destination}", expected,
@@ -310,8 +310,6 @@ class UpdateOciPullTest(unittest.TestCase):
             ])
             self.assertEqual(cat.stdout, payload.decode())
             self.assertEqual(_run([OSTREE_BIN, "refs", f"--repo={destination}"]).stdout, refs_before)
-            self.assertEqual(self._object_files(bad_stage), bad_stage_objects)
-            self.assertEqual(_run([OSTREE_BIN, "refs", f"--repo={bad_stage}"]).stdout, bad_stage_refs)
 
     def test_expected_commit_mismatch_rejected_before_live_import(self):
         with tempfile.TemporaryDirectory(prefix="oci-mismatch-") as tmp:
@@ -330,6 +328,8 @@ class UpdateOciPullTest(unittest.TestCase):
                 image_source._import_verified(destination, origin, work, "f" * 64, callback)
             callback.assert_not_called()
             self.assertFalse((work / "import.log").exists())
+            self.assertTrue((work / "pull.log").is_file())
+            self.assertFalse((work / "staging-repo").exists())
             self.assertEqual(_run([OSTREE_BIN, "refs", f"--repo={destination}"]).stdout, refs_before)
             self.assertEqual(self._object_files(destination), objects_before)
 

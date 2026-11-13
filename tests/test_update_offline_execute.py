@@ -315,18 +315,20 @@ class OfflineExecuteTest(unittest.TestCase):
                 self._assert_no_execution(env, initial_bytes)
 
     def test_boot_writer_error_states(self) -> None:
-        cases = (("not_needed", "failed", "not_started"),
-                 ("restored", "failed", "restored"),
-                 ("failed", "recovery_required", "uncertain"),
-                 ("oserror", "recovery_required", "uncertain"))
-        for restore, state, write_state in cases:
-            with self.subTest(restore=restore), self.fixture._case() as env:
+        cases = (("not_needed", "not_committed", "failed", "not_started"),
+                 ("restored", "not_committed", "failed", "restored"),
+                 ("not_restored", "committed", "recovery_required", "uncertain"),
+                 ("failed", "not_committed", "recovery_required", "uncertain"),
+                 ("oserror", None, "recovery_required", "uncertain"))
+        for restore, commit_state, state, write_state in cases:
+            with self.subTest(restore=restore, commit=commit_state), self.fixture._case() as env:
                 self._ready(env)
                 ack = self._ack(env)
                 if restore == "oserror":
                     env.spies["write_offline_boots"].side_effect = OSError("device I/O")
                 else:
                     error = offline_boot_writer.BootWriteError("write failed", restore_status=restore)
+                    error.commit_state = commit_state
                     error.slot_results = {"a": "failed"}
                     env.spies["write_offline_boots"].side_effect = error
                 with self._execution(env):
@@ -338,6 +340,8 @@ class OfflineExecuteTest(unittest.TestCase):
                 self.assertFalse(result["requiresReboot"])
                 if restore != "oserror":
                     self.assertEqual(result["slotResults"], {"a": "failed"})
+                if restore == "not_restored":
+                    self.assertEqual(result["journalCommitState"], commit_state)
                 env.spies["trial_save"].assert_not_called()
                 env.spies["activate_offline_slots"].assert_not_called()
 
@@ -345,9 +349,9 @@ class OfflineExecuteTest(unittest.TestCase):
         with self.fixture._case() as env:
             self._ready(env)
             ack = self._ack(env)
+            plan = self._json(env.work, "plan.json")
 
             def writer(trust, candidates, *, commit, progress):
-                plan = self._json(env.work, "plan.json")
                 progress({"phase": "writing", "slot": plan["targetSlot"]})
                 progress({"phase": "verified", "slot": plan["targetSlot"]})
                 commit()
@@ -369,8 +373,15 @@ class OfflineExecuteTest(unittest.TestCase):
                         trusted_key=self.fixture.pub_key)
             result = raised.exception.result
             self.assertEqual(result["state"], "recovery_required")
-            self.assertEqual(result["bootWriteState"], "written")
+            # The journal commit crossed its boundary, but the writer never
+            # returned a validated report, so both slots are not proven and
+            # the run may not advertise a restart.
+            self.assertEqual(result["bootWriteState"], "uncertain")
             self.assertEqual(result["journalCommitState"], "committed")
+            self.assertEqual(result["slotResults"], {
+                plan["targetSlot"]: {"status": "preserved"},
+                plan["fromSlot"]: {"status": "writing"},
+            })
             self.assertFalse(result["requiresReboot"])
             self.assertEqual(env.spies["trial_save"].call_count, 1)
             self.assertFalse((env.work / "write-report.json").exists())

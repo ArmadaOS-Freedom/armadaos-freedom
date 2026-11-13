@@ -60,6 +60,46 @@ def _trusted_parent(path: Path, *, create: bool) -> Path:
     return parent / path.name
 
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(
+        path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _durable_ancestors(parent: Path) -> None:
+    """Flush every directory entry that leads to ``parent``, outermost first.
+
+    ``mkdir(parents=True)`` can create several directories in one call, so
+    flushing only the immediate parent would leave their entries undurable.
+    The whole chain on the receipt's filesystem is re-flushed on every write,
+    not just the directories this call created: a previous attempt may have
+    failed after creating part of the chain, and only repeating the flush can
+    make such a retry durable.  The filesystem root is part of the chain when
+    it lives on the same device, because it holds the entry of the top-level
+    directory below it.  A failure here, including an ancestor that cannot be
+    inspected, propagates before the receipt becomes visible, so an unflushed
+    tree is never reported as complete.
+    """
+    chain = [parent]
+    device = os.lstat(parent).st_dev
+    current = parent
+    while True:
+        ancestor = current.parent
+        if ancestor == current:
+            break
+        info = os.lstat(ancestor)
+        if info.st_dev != device:
+            break
+        chain.append(ancestor)
+        current = ancestor
+    for directory in reversed(chain):
+        _fsync_directory(directory)
+
+
 def _no_duplicate_keys(pairs) -> dict:
     result = {}
     for key, value in pairs:
@@ -118,6 +158,11 @@ def write(record) -> dict:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        # Make the directory entries on the way to the receipt durable before
+        # it becomes visible.  A failure here leaves no receipt behind and is
+        # repeated by any retry, which is what makes a retry after a partially
+        # synced creation durable.
+        _durable_ancestors(target.parent)
         # Open the containing directory before the rename so that a failure to
         # open it leaves the previous receipt in place instead of replacing
         # evidence this call could never make durable.

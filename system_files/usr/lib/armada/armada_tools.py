@@ -14,6 +14,10 @@ PRIVILEGED_TIMEOUT = 90
 # The helper waits up to 120 s for the update service to finish a channel
 # change, so the desktop side must outlast that wait.
 CHANNEL_TIMEOUT = 150
+# get-os snapshots the booted system (15 s), resolves the update target
+# (60 s) and then queries the update service (120 s) sequentially.  The
+# outer timeout must outlast their sum plus snapshot and process margin.
+GET_OS_TIMEOUT = 240
 
 
 def privileged_command(action, *arguments):
@@ -25,7 +29,12 @@ def privileged_operation(action, *arguments):
 
 
 def privileged_request(action, *arguments):
-    timeout = CHANNEL_TIMEOUT if action.startswith("channel-") else PRIVILEGED_TIMEOUT
+    if action.startswith("channel-"):
+        timeout = CHANNEL_TIMEOUT
+    elif action == "get-os":
+        timeout = GET_OS_TIMEOUT
+    else:
+        timeout = PRIVILEGED_TIMEOUT
     result = subprocess.run(privileged_command(action, *arguments),
                             capture_output=True, text=True, timeout=timeout, check=False)
     if result.returncode:

@@ -21,10 +21,24 @@ modify.  Symlinks are never followed: a symlinked job or artifact is left
 alone, and links found inside a proven artifact tree are unlinked without
 touching their targets.  Repeating the call after a successful retirement is a
 no-op, so a retried confirmation stays safe.
+
+A confirmed offline session keeps the same problem one level deeper: the
+uploaded signed payload under its private ``incoming`` directory plus a fixed
+set of bulky build files below ``transaction/materials`` and
+``transaction/candidate-a``/``candidate-b`` stay on disk after the trial
+journal is CONFIRMED and the finalization receipt is durable, while every
+status, receipt and recovery export path only reads the compact documents
+beside them.  ``retire_confirmed_offline_session`` follows the transaction's
+own pending pointer -- never a directory scan -- and re-proves the receipt,
+plan, prepared documents, write report and recovery manifest against the
+confirmed record before unlinking exactly those named regular files.  No tree
+is walked or removed: directories, logs, candidate and material reports,
+acknowledgements, receipts and every recovery export stay in place.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -32,7 +46,7 @@ import uuid
 from pathlib import Path
 
 from . import boot_context
-from .trial_record import BOOT_POLICY
+from .trial_record import BOOT_POLICY, CONFIRMED, OFFLINE_DUAL
 
 APPLY_STATE_ROOT = Path('/var/lib/armada/updates/system')
 POINTER_NAME = 'current.json'
@@ -42,6 +56,19 @@ ARTIFACT_NAMES = (
 
 _MAX_DOCUMENT_BYTES = 64 * 1024
 _MAX_TREE_DEPTH = 8
+
+# Private offline-session layout: the pending pointer names one session, and
+# only the fixed bulky regular files of that session are dead once confirmed.
+# Every other entry, including every directory, is retained.
+_OFFLINE_POINTER_MAX = 8 * 1024
+_OFFLINE_SLOTS = ('a', 'b')
+_OFFLINE_CONFIRMED_STATE = 'awaiting_reboot'
+_OFFLINE_MATERIAL_FILES = (
+    'kernel.img', 'initramfs.img', 'runtime.bin', 'source.dtb',
+    'dtb-normal.img', 'dtb-diagnostic.img')
+_OFFLINE_CANDIDATE_FILES = (
+    'inspect-slot/base.bin', 'build-raw/PackedKernel',
+    'repack-envelope/candidate.img')
 
 
 class JobRetirementError(RuntimeError):
@@ -217,3 +244,270 @@ def retire_finalized_job(transaction_id, *, plan_sha256, state_root=None):
             continue
         retired = True
     return retired
+
+
+def _record_bounds(record):
+    """Return the confirmed identity the live journal record proves, or ``None``."""
+    try:
+        if (type(record.transaction_uuid) is not bytes or
+                type(record.plan_sha256) is not bytes or
+                type(record.installation_uuid) is not bytes or
+                type(record.partition_uuid) is not bytes or
+                getattr(record, 'state', None) != CONFIRMED or
+                getattr(record, 'policy', None) != OFFLINE_DUAL or
+                record.from_slot not in (0, 1) or
+                record.target_slot not in (0, 1) or
+                record.from_slot == record.target_slot):
+            return None
+        return {
+            'transactionId': str(uuid.UUID(bytes=record.transaction_uuid)),
+            'planSha256': record.plan_sha256.hex(),
+            'oldDeployment': '%s/%s.%d' % (
+                record.os_name, record.old_commit.hex(), record.old_serial),
+            'newDeployment': '%s/%s.%d' % (
+                record.os_name, record.new_commit.hex(), record.new_serial),
+            'fromSlot': 'ab'[record.from_slot],
+            'targetSlot': 'ab'[record.target_slot],
+            'installationUuid': str(uuid.UUID(bytes=record.installation_uuid)),
+            'recoveryPartUuid': str(uuid.UUID(bytes=record.partition_uuid)),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _manifest_paths(manifest):
+    """Return the validated recovery-export paths, or ``None``."""
+    files = manifest.get('files')
+    if not isinstance(files, list) or not files:
+        return None
+    paths = []
+    for entry in files:
+        path = entry.get('path') if isinstance(entry, dict) else None
+        if (type(path) is not str or not path or path.startswith('/') or
+                '\\' in path or ':' in path or
+                any(part in ('', '.', '..') for part in path.split('/')) or
+                path in paths):
+            return None
+        paths.append(path)
+    return set(paths)
+
+
+def _offline_proof(session, receipt, bounds):
+    """Return the exact files that may be unlinked once the session is proven.
+
+    ``offline_completion.execute_completion`` already validates the prepared,
+    plan, acknowledgement, final status and verified write report chain.  This
+    only adds the live-record binding, the manifest digest bound to that plan,
+    the recovery identity and the recovery-export exclusion.  The materials
+    and candidate reports are not parsed: their bulky file names are fixed.
+    """
+    from . import offline_completion, offline_execute, offline_session
+
+    transaction = session / 'transaction'
+    try:
+        offline_session._check_dir(transaction)
+        if (receipt.get('state') != _OFFLINE_CONFIRMED_STATE or
+                receipt.get('jobOperation') != 'execute'):
+            return None
+        model = receipt.get('model')
+        if type(model) is not str or not model:
+            return None
+        prepared, _ = offline_execute._load_json(transaction, 'prepared.json')
+        plan, plan_raw = offline_execute._load_json(transaction, 'plan.json')
+        status, _ = offline_execute._load_json(transaction, 'status.json')
+        report, _ = offline_execute._load_json(transaction, 'write-report.json')
+        manifest, manifest_raw = offline_execute._load_json(
+            transaction, 'recovery-manifest.json')
+        ack, _ = offline_execute._load_json(session, 'ack.json')
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+    identity = offline_completion.execute_completion(
+        prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+        status, report, ack, model)
+    if identity is None:
+        return None
+    for key in ('transactionId', 'planSha256', 'oldDeployment', 'newDeployment',
+                'fromSlot', 'targetSlot'):
+        if identity.get(key) != bounds[key]:
+            return None
+
+    manifest_sha256 = prepared.get('recoveryManifestSha256')
+    if (not _sha256(manifest_sha256) or
+            hashlib.sha256(manifest_raw).hexdigest() != manifest_sha256 or
+            plan.get('recoveryManifestSha256') != manifest_sha256):
+        return None
+    if (manifest.get('transactionId') != bounds['transactionId'] or
+            manifest.get('model') != model or
+            manifest.get('oldDeployment') != bounds['oldDeployment'] or
+            manifest.get('fromSlot') != bounds['fromSlot'] or
+            manifest.get('installationUuid') != bounds['installationUuid'] or
+            manifest.get('recoveryPartUuid') != bounds['recoveryPartUuid']):
+        return None
+    members = _manifest_paths(manifest)
+    if members is None:
+        return None
+
+    targets = []
+    for name in _OFFLINE_MATERIAL_FILES:
+        relative = 'materials/' + name
+        if relative not in members:
+            targets.append(('transaction/' + relative, None))
+    for slot in _OFFLINE_SLOTS:
+        for name in _OFFLINE_CANDIDATE_FILES:
+            relative = 'candidate-%s/%s' % (slot, name)
+            if relative not in members:
+                targets.append(('transaction/' + relative, None))
+    return targets
+
+
+def _payload_target(store, session, receipt):
+    """Return the descriptor-bound payload's path and size below *session*."""
+    try:
+        signed = store._signed_payload(session)
+        if signed is None:
+            return None
+        path, size, digest = signed
+        payload = receipt.get('payload')
+        if (not isinstance(payload, dict) or payload.get('path') != path or
+                payload.get('bytes') != size or payload.get('sha256') != digest):
+            return None
+        source = store._payload_path(session, receipt)
+        relative = source.relative_to(session)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not relative.parts or relative.parts[0] != 'incoming' or '..' in relative.parts:
+        return None
+    return relative.as_posix(), size
+
+
+def _fd_mount_id(fd):
+    """Return the Linux mount id of an open descriptor, or ``None``."""
+    try:
+        with open('/proc/self/fdinfo/%d' % fd, encoding='ascii') as stream:
+            for line in stream:
+                if line.startswith('mnt_id:'):
+                    return int(line.split(':', 1)[1])
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return None
+
+
+def _unlink_below(root_fd, mount_id, relative, expected_size):
+    """Unlink one exact file below *root_fd* without crossing a mount."""
+    parts = relative.split('/')
+    if not parts or any(part in ('', '.', '..') for part in parts):
+        return False
+    current = None
+    try:
+        current = os.dup(root_fd)
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current)
+            os.close(current)
+            current = child
+            info = os.fstat(current)
+            if (not stat.S_ISDIR(info.st_mode) or not _owned_by_root(info) or
+                    info.st_mode & 0o022 or _fd_mount_id(current) != mount_id):
+                return False
+        name = parts[-1]
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
+            getattr(os, 'O_NONBLOCK', 0), dir_fd=current)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or not _owned_by_root(info) or
+                    info.st_mode & 0o022 or _fd_mount_id(descriptor) != mount_id or
+                    (expected_size is not None and info.st_size != expected_size)):
+                return False
+        finally:
+            os.close(descriptor)
+        os.unlink(name, dir_fd=current)
+        return True
+    except OSError:
+        return False
+    finally:
+        if current is not None:
+            os.close(current)
+
+
+def _retire_offline_files(session, targets):
+    """Unlink the proven files of one session; return whether any name went."""
+    try:
+        info = os.lstat(session)
+        if (not stat.S_ISDIR(info.st_mode) or not _owned_by_root(info) or
+                info.st_mode & 0o022):
+            return False
+        session_fd = os.open(
+            session, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        mount_id = _fd_mount_id(session_fd)
+        if mount_id is None:
+            return False
+        retired = False
+        for relative, size in targets:
+            if _unlink_below(session_fd, mount_id, relative, size):
+                retired = True
+        return retired
+    finally:
+        os.close(session_fd)
+
+
+def retire_confirmed_offline_session(record, *, base=None):
+    """Remove the dead payload and fixed bulky files of a confirmed session.
+
+    The session is resolved from its own per-transaction pending pointer and
+    locked with the store's session lock; no directory is scanned.  ``True``
+    means at least one file was removed.  ``False`` covers every unproven case
+    -- absent pointer, foreign or duplicate identity, an unconfirmed or
+    still-active session, a symlinked or untrusted path, a corrupt document,
+    a recovery manifest member or an unresolvable mount identity -- and leaves
+    everything untouched.  Cleanup failures are swallowed: the durable
+    finalization receipt already proved the transaction complete, so a space
+    saving must never turn a confirmed update into a failure.
+    """
+    bounds = _record_bounds(record)
+    if bounds is None:
+        return False
+    try:
+        from . import offline_completion, offline_execute, offline_session
+    except ImportError:
+        return False
+    try:
+        if base is None:
+            store = offline_session.OfflineSessionStore()
+        else:
+            store = offline_session.OfflineSessionStore(base=base)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    try:
+        base_path = offline_session._check_dir(Path(store.base))
+        pointer_path = offline_completion.completion_pointer(
+            base_path, bounds['transactionId'])
+        if (pointer_path is None or
+                pointer_path.parent !=
+                base_path / offline_completion.POINTER_DIRECTORY):
+            return False
+        offline_session._check_dir(pointer_path.parent)
+        raw = offline_execute._read_bounded(
+            pointer_path, _OFFLINE_POINTER_MAX, 'completion pointer')
+        pointer = json.loads(
+            raw.decode('ascii'), object_pairs_hook=_no_duplicate_keys)
+        session_id = offline_completion.pointer_session(
+            pointer, bounds['transactionId'])
+        if session_id is None:
+            return False
+        with store.session_lock(session_id) as session:
+            receipt = store.read_receipt(session)
+            targets = _offline_proof(session, receipt, bounds)
+            if targets is None:
+                return False
+            payload = _payload_target(store, session, receipt)
+            if payload is not None:
+                targets.append(payload)
+            return _retire_offline_files(session, targets)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
