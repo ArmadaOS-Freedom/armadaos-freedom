@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 from . import boot_context
-from .trial_record import CONFIRMED, encode_record
+from .trial_record import BOOT_POLICY, CONFIRMED, encode_record
 
 STATE_PATH = Path("/var/lib/armada/updates/system/finalized.json")
 _MAX_RECEIPT_BYTES = 8192
@@ -30,8 +30,9 @@ def _document(record) -> dict:
         "transactionId": str(uuid.UUID(bytes=bytes(record.transaction_uuid))),
         "recordSequence": record.sequence,
         "deployment": deployment,
-        "firmwareSlotSuccess": True,
         "defaultDeployment": deployment,
+        "bootPolicy": BOOT_POLICY,
+        "firmwareSlotControl": "not_issued",
     }
 
 
@@ -135,7 +136,8 @@ def read(record) -> dict:
         if (
             type(loaded.get("schemaVersion")) is not int
             or type(loaded.get("recordSequence")) is not int
-            or type(loaded.get("firmwareSlotSuccess")) is not bool
+            or loaded.get("bootPolicy") != BOOT_POLICY
+            or loaded.get("firmwareSlotControl") != "not_issued"
             or loaded != expected
         ):
             return _pending("finalization receipt does not match confirmed record")

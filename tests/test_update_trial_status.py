@@ -208,16 +208,24 @@ class TrialStatusTests(unittest.TestCase):
         self.assertNotIn("bootEvidenceError", res)
 
         # Only the live slot and deployment matching the journal's own from-slot
-        # binding count; the slot selected for writing is not evidence.
+        # binding describe the old deployment; the slot selected for writing is
+        # not evidence for it.
         for bad_ctx in (
             make_context(1, OLD_COMMIT, 1),
-            make_context(0, NEW_COMMIT, 2),
             make_context(0, OLD_COMMIT, 9),
         ):
             with self.patch_journal(record=rec):
                 bad = trial_status.read_trial_status(bad_ctx, self.marker_path)
             self.assertIsNone(bad["runningDeployment"])
             self.assertFalse(bad["bootConfirmed"])
+
+        # With mirrored writes the new deployment is also valid evidence when
+        # observed on the from-slot after the reboot.
+        self.marker_path.write_bytes(TXN_UUID)
+        with self.patch_journal(record=rec):
+            mirrored = trial_status.read_trial_status(
+                make_context(0, NEW_COMMIT, 2), self.marker_path)
+        self.assertEqual(mirrored["runningDeployment"], "new")
 
     def test_offline_trial_running_old_is_not_a_restart_candidate(self):
         # OFFLINE_DUAL never records ROLLED_BACK, and a TRIAL record that is
@@ -278,14 +286,16 @@ class TrialStatusTests(unittest.TestCase):
             {"state": "awaiting_reboot"}, trial, self._identity(trial))
         self.assertEqual(verdict["state"], "finalizing")
 
-        # The both-slot allowance exists only for CONFIRMED; a prepared record
-        # that appears on the from-slot with the new deployment is not evidence.
+        # Mirrored writes put the same new deployment in both physical slots,
+        # so a boot observed on the from-slot with the new deployment is valid
+        # evidence for the trial exactly like the target slot.
         prepared = make_record(state=trial_record.PREPARED, from_slot=0, target_slot=1,
                                policy=trial_record.OFFLINE_DUAL)
         with self.patch_journal(record=prepared):
             trial = trial_status.read_trial_status(
                 make_context(0, NEW_COMMIT, 2, boot_ver=0), self.marker_path)
-        self.assertIsNone(trial["runningDeployment"])
+        self.assertEqual(trial["runningDeployment"], "new")
+        self.assertFalse(trial["bootConfirmed"])
 
     def test_target_deployment_marker_validation_and_states(self):
         self.marker_path.write_bytes(TXN_UUID)

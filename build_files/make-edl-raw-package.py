@@ -813,6 +813,9 @@ def _verified_deployment_runtimes(
                 raise ValueError(
                     f"embedded runtime for {model} must be {RUNTIME_BYTES} bytes"
                 )
+            verifier.require_runtime_marker(
+                runtime_path, model, runtime_record["path"]
+            )
             verified[model] = {
                 "path": str(runtime_path),
                 "bytes": runtime_record["bytes"],

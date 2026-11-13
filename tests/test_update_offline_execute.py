@@ -141,7 +141,6 @@ class OfflineExecuteTest(unittest.TestCase):
         env.spies["write_offline_boots"].side_effect = (
             lambda trust, candidates, progress: self._writer_report(
                 env, trust, candidates, progress))
-        env.spies["activate_offline_slots"].side_effect = lambda report: self._activate(env, report)
 
     def _assert_sources_untouched(self, env) -> None:
         self.assertEqual((env.sysroot / "var/home/user-marker.txt").read_bytes(),
@@ -175,6 +174,9 @@ class OfflineExecuteTest(unittest.TestCase):
                     self.assertEqual((result["state"], result["phase"]),
                                      ("awaiting_reboot", "awaiting_reboot"))
                     self.assertTrue(result["requiresReboot"])
+                    self.assertEqual(result["bootPolicy"], "dual-boot-no-slot-control")
+                    self.assertEqual(result["slotControlState"], "not_issued")
+                    self.assertNotIn("activationOutcome", result)
                     inactive = initial["targetSlot"]
                     record = env.journal.record
                     self.assertEqual(record.from_slot, 0 if actual == "a" else 1)
@@ -192,7 +194,8 @@ class OfflineExecuteTest(unittest.TestCase):
                     self.assertEqual(result["bootWriteEvent"]["slot"], actual)
                     self.assertTrue((env.work / "recovery-ack.json").is_file())
                     self.assertTrue((env.work / "write-report.json").is_file())
-                    self.assertTrue((env.work / "activation-report.json").is_file())
+                    self.assertFalse((env.work / "activation-report.json").exists())
+                    env.spies["activate_offline_slots"].assert_not_called()
                     self.assertEqual(env.import_payload.call_count, imports)
                     self._assert_sources_untouched(env)
                     with self._execution(env):
@@ -350,44 +353,33 @@ class OfflineExecuteTest(unittest.TestCase):
                 self.assertFalse(result["requiresReboot"])
                 env.spies["activate_offline_slots"].assert_not_called()
 
-    def test_activation_failures_and_final_status_save_failure(self) -> None:
-        cases = ("unchanged", "uncertain", "wrong_report", "final_save")
-        for case in cases:
-            with self.subTest(case=case), self.fixture._case() as env:
-                self._ready(env)
-                ack = self._ack(env)
-                self._install_success_spies(env)
-                if case in ("unchanged", "uncertain"):
-                    env.spies["activate_offline_slots"].side_effect = slot_activation.ActivationError(
-                        "activation failed", outcome=case)
-                elif case == "wrong_report":
-                    env.spies["activate_offline_slots"].side_effect = None
-                    env.spies["activate_offline_slots"].return_value = {"phase": "wrong"}
-                real_save = system_transaction._save_json
+    def test_final_status_save_failure_never_reports_success(self) -> None:
+        with self.fixture._case() as env:
+            self._ready(env)
+            ack = self._ack(env)
+            self._install_success_spies(env)
+            real_save = system_transaction._save_json
 
-                def save_json(directory, name, payload):
-                    if case == "final_save" and name == "status.json" and payload.get(
-                            "state") == "awaiting_reboot":
-                        raise OSError("final status disk full")
-                    return real_save(directory, name, payload)
+            def save_json(directory, name, payload):
+                if name == "status.json" and payload.get("state") == "awaiting_reboot":
+                    raise OSError("final status disk full")
+                return real_save(directory, name, payload)
 
-                with self._execution(env):
-                    with mock.patch.object(offline_execute.system_transaction, "_save_json",
-                                           side_effect=save_json):
-                        with self.assertRaises(system_transaction.SystemTransactionError) as raised:
-                            offline_execute.execute_offline_update(
-                                work_dir=env.work, recovery_ack=ack,
-                                trusted_key=self.fixture.pub_key)
-                result = raised.exception.result
-                self.assertEqual(result["state"], "recovery_required")
-                self.assertEqual(result["bootWriteState"], "written")
-                self.assertFalse(result["requiresReboot"])
-                self.assertNotEqual(result["activationOutcome"], "activated")
-                if case in ("unchanged", "uncertain"):
-                    self.assertEqual(result["activationOutcome"], case)
-                if case == "final_save":
-                    self.assertIn("final status disk full", result["error"])
-                    self.assertNotIn("persistenceError", result)
+            with self._execution(env):
+                with mock.patch.object(offline_execute.system_transaction, "_save_json",
+                                       side_effect=save_json):
+                    with self.assertRaises(system_transaction.SystemTransactionError) as raised:
+                        offline_execute.execute_offline_update(
+                            work_dir=env.work, recovery_ack=ack,
+                            trusted_key=self.fixture.pub_key)
+            result = raised.exception.result
+            self.assertEqual(result["state"], "recovery_required")
+            self.assertEqual(result["bootWriteState"], "written")
+            self.assertFalse(result["requiresReboot"])
+            self.assertEqual(result["slotControlState"], "not_issued")
+            self.assertIn("final status disk full", result["error"])
+            self.assertNotIn("persistenceError", result)
+            env.spies["activate_offline_slots"].assert_not_called()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,44 @@
 # nothing is rolled back or reordered here.
 set -uo pipefail
 
+# The same read-only gate as the updater: on an internal-medium board this
+# returns success before the boot-method dispatch, the update call and the
+# bootc rollback, so finalization cannot mark an internal deployment failed.
+# The gate ships in the image: a copy that cannot be read, sourced or run
+# leaves no safe choice, so fail before any action instead of guessing a
+# medium from the environment. This script has no set -e, hence the explicit
+# guards on every step.
+BOOT_MEDIUM_GATE=/usr/lib/armada/boot-medium-gate
+[ -r "${BOOT_MEDIUM_GATE}" ] || {
+    echo "armada-bootimg-finalize: missing ${BOOT_MEDIUM_GATE}; refusing to choose a boot writer" >&2
+    exit 1
+}
+. "${BOOT_MEDIUM_GATE}" || {
+    echo "armada-bootimg-finalize: cannot source ${BOOT_MEDIUM_GATE}; refusing to choose a boot writer" >&2
+    exit 1
+}
+ARMADA_BOOT_MEDIUM=
+armada_boot_medium_gate || {
+    echo "armada-bootimg-finalize: ${BOOT_MEDIUM_GATE} failed; refusing to choose a boot writer" >&2
+    exit 1
+}
+case "${ARMADA_BOOT_MEDIUM:-}" in
+    internal)
+        echo "armada-bootimg-finalize: internal medium boot; installed boot images are runtime-owned"
+        exit 0
+        ;;
+    legacy)
+        ;;
+    refuse)
+        echo "armada-bootimg-finalize: supported internal-board medium is missing or invalid; refusing the old boot writer and rollback" >&2
+        exit 1
+        ;;
+    *)
+        echo "armada-bootimg-finalize: ${BOOT_MEDIUM_GATE} returned an invalid medium; refusing to choose a boot writer" >&2
+        exit 1
+        ;;
+esac
+
 BOOT_METHOD_FILE=/etc/armada/boot-method
 
 boot_method=abl

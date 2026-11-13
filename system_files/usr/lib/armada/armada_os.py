@@ -265,7 +265,8 @@ def execute(operation, checksum=None):
             and result.get("state") == "awaiting_reboot"
             and result.get("requiresReboot") is True
             and result.get("bootWriteState") == "written"
-            and result.get("activationOutcome") == "activated"
+            and result.get("bootPolicy") == "dual-boot-no-slot-control"
+            and result.get("slotControlState") == "not_issued"
             and result.get("newDeployment") == binding):
         return {"message": "Rollback ready. Restart to apply."}
     raw_details = (result.get("phase"), result.get("error")) if isinstance(result, dict) else ()

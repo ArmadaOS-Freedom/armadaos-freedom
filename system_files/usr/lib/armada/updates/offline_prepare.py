@@ -20,6 +20,7 @@ from . import (
     signature,
     system_transaction,
     trial_confirmation,
+    trial_record,
 )
 
 _CHANNELS = frozenset({'stable', 'beta', 'testing'})
@@ -100,8 +101,10 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                             trusted_key=signature.DEFAULT_TRUSTED_KEY):
     status = {'component': 'system', 'operation': 'offline-upgrade',
               'policy': 'offline-dual', 'schemaVersion': 1,
+              'bootPolicy': trial_record.BOOT_POLICY,
               'phase': 'preparing', 'state': 'preparing',
-              'bootWriteState': 'not_started', 'requiresReboot': False}
+              'bootWriteState': 'not_started', 'slotControlState': 'not_issued',
+              'requiresReboot': False}
     work = None
     created = False
     with trial_confirmation._locked():
@@ -162,15 +165,16 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             if (imported.get('package') != package or
                     imported.get('commit') != package['ostreeCommit']):
                 raise ValueError('offline import does not match authenticated package')
-            if inspect_slots() != initial:
+            if not physical_slots.same_physical_identity(inspect_slots(), initial):
                 raise ValueError('physical slots changed after offline import')
 
             status['phase'] = 'capturing_boot_trust'
             system_transaction._save_json(work, 'status.json', status)
             trust = boot_trust.capture_boot_trust(
                 output_dir=work / 'trust', boot_tool_path=boot_tool_path)
-            if (trust['physical'] != initial or
-                    trust['sources']['physical'] != initial):
+            if (not physical_slots.same_physical_identity(trust['physical'], initial) or
+                    not physical_slots.same_physical_identity(
+                        trust['sources']['physical'], initial)):
                 raise ValueError('boot trust physical report mismatch')
 
             status['phase'] = 'deploying'
@@ -275,7 +279,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             }
             system_transaction._save_json(work, 'prepared.json', prepared)
 
-            if inspect_slots() != initial:
+            if not physical_slots.same_physical_identity(inspect_slots(), initial):
                 raise ValueError('physical slots changed before preparation completed')
             final_journal = system_transaction._check_recovery(initial, old)
             if (final_journal.header != journal.header or

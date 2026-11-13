@@ -238,7 +238,9 @@ def prepare_boot_materials(
         manifest_rel = "usr/share/armada/update-boot/manifest.json"
         manifest_bytes = _read_regular(target_path / manifest_rel, _MAX_MANIFEST_BYTES)
         manifest_doc = json.loads(manifest_bytes.decode("utf-8"))
-        verified = verify_manifest(Path(target_path), model, manifest_doc)
+        verified = verify_manifest(
+            Path(target_path), model, manifest_doc, require_runtime_marker=True
+        )
         profile = verified["profile"]
 
         os.mkdir(out, 0o700)
@@ -315,7 +317,10 @@ def prepare_boot_materials(
         current_manifest_doc = json.loads(current_manifest_bytes.decode("utf-8"))
         if current_manifest_bytes != manifest_bytes or current_manifest_doc != manifest_doc:
             raise BootMaterialsError("boot manifest changed during preparation")
-        reverified = verify_manifest(Path(target_path), model, current_manifest_doc)
+        reverified = verify_manifest(
+            Path(target_path), model, current_manifest_doc,
+            require_runtime_marker=True,
+        )
         if reverified != verified:
             raise BootMaterialsError("boot manifest verification changed during preparation")
 

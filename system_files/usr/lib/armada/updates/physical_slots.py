@@ -23,10 +23,33 @@ _DEC_RE = re.compile(r'^[0-9]+$')
 _HEX_RE = re.compile(r'^0[xX][0-9a-fA-F]+$')
 _DEV_RE = re.compile(r'^([0-9]+):([0-9]+)$')
 _HCTL_RE = re.compile(r'^([0-9]+):([0-9]+):([0-9]+):([0-9]+)$')
+# Android-owned state reported for telemetry.  It may change while Linux
+# mirrors both slots and must not be treated as update identity drift.
+_TELEMETRY_KEYS = frozenset({'selectedSlot', 'bootableSlots'})
 
 
 class PhysicalSlotsError(RuntimeError):
     """Raised when physical slot precheck evidence is invalid or drifting."""
+
+
+def physical_identity(report):
+    """Project a slot report to the fields that must stay stable per update."""
+    if not isinstance(report, dict):
+        return report
+    return {
+        key: value for key, value in report.items()
+        if key not in _TELEMETRY_KEYS
+    }
+
+
+def same_physical_identity(left, right):
+    """Compare reports without treating Android-owned telemetry as drift.
+
+    Reports written before the telemetry fields existed compare equal to
+    reports that carry them, so cross-version receipts do not manufacture a
+    physical-slot conflict.
+    """
+    return physical_identity(left) == physical_identity(right)
 
 
 def _sysfs_read(path):
@@ -225,8 +248,33 @@ def _read_slot_flags(fds, found):
     return current, {'a': bool(boot_a), 'b': bool(boot_b)}
 
 
-def _run_inspection(fds, found):
+def _read_slot_state(fds, found):
+    """Read the controller selection and both real Android bootable bits.
+
+    Those bits are evidence, not a Linux precondition: mirrored updates write
+    both physical slots and never issue slot selection, success marking or
+    boot-LUN changes.  The one witness this probe still refuses is the
+    degenerate all-zero result, where the native inspection reports that
+    neither Android slot is bootable at all.
+    """
     current, bootable = _read_slot_flags(fds, found)
+    if not bootable['a'] and not bootable['b']:
+        raise PhysicalSlotsError(
+            "native inspection reports no bootable slot "
+            f"(a={int(bootable['a'])}, b={int(bootable['b'])}); "
+            "refusing an all-zero bootability witness"
+        )
+    return current, bootable
+
+
+def _run_inspection(fds, found):
+    """Legacy slot-control helper: both slots must be bootable.
+
+    Only the deprecated, unreferenced ``slot_activation`` path still calls
+    this.  The mirrored update path uses :func:`_read_slot_state` and treats
+    the bootable bits as telemetry.
+    """
+    current, bootable = _read_slot_state(fds, found)
     if not bootable['a'] or not bootable['b']:
         raise PhysicalSlotsError(
             f"both slots must be bootable (a={int(bootable['a'])}, b={int(bootable['b'])})"
@@ -263,14 +311,12 @@ def _inspect_slots(reader, phase):
         for lun in sorted(found):
             item = found[lun]
             fds.append(_device_fd(item['path'], item['rdev']))
-        current = _run_inspection(fds, found)
+        current, bootable = _read_slot_state(fds, found)
         selected_slot = 'ab'[current]
-        if selected_slot != context['actualSlot']:
-            raise PhysicalSlotsError(
-                'actual boot != next selected slot; restart or repair required '
-                f'(witness={context["actualSlot"]}, controller reports slot index {current})'
-            )
-        bootable_slots = {'a': True, 'b': True}
+        # The controller-selected slot and the Android bootable bits are
+        # Android-owned telemetry.  A pending switch must not block the
+        # mirrored update: the running slot still comes from the verified boot
+        # witness, and both slots are written from their own signed material.
         for lun, fd in zip(sorted(found), fds):
             info = os.fstat(fd)
             if not stat.S_ISBLK(info.st_mode) or info.st_rdev != found[lun]['rdev']:
@@ -307,7 +353,7 @@ def _inspect_slots(reader, phase):
         }
         report['deployment'] = context['deployment']
         report['selectedSlot'] = selected_slot
-        report['bootableSlots'] = dict(bootable_slots)
+        report['bootableSlots'] = dict(bootable)
         report['recoveryPartUuid'] = part_uuid
         report['ufsController'] = str(anchor)
         report['luns'] = luns

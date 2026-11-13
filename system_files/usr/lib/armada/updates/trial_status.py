@@ -75,6 +75,10 @@ def read_trial_status(
             "planSha256": record.plan_sha256.hex(),
             "runningDeployment": None,
         }
+        if record.policy == trial_record.OFFLINE_DUAL:
+            # Only the mirrored (v2) policy claims the no-slot-control boot
+            # contract; legacy single-slot records are never relabelled.
+            result["bootPolicy"] = trial_record.BOOT_POLICY
 
         # Running the old deployment is evidence only when the live boot
         # witness slot and the cmdline deployment both match the trial's own
@@ -93,7 +97,6 @@ def read_trial_status(
         elif (deployment == new_deployment
                 and (actual_slot == "ab"[record.target_slot]
                      or (record.policy == trial_record.OFFLINE_DUAL
-                         and record.state == trial_record.CONFIRMED
                          and actual_slot == "ab"[record.from_slot]))):
             try:
                 marker = boot_context._read_regular(transaction_path, 16)

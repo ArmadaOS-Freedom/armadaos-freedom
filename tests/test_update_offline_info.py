@@ -10,7 +10,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'system_files/usr/lib/armada'))
 
-from updates import offline_session, physical_slots  # noqa: E402
+from updates import offline_session, physical_slots, trial_record  # noqa: E402
 
 CHECKSUM = 'b' * 64
 PART_UUID = '12345678-1234-5678-9abc-123456789abc'
@@ -64,7 +64,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
         return self._install(mock.patch.object(
             physical_slots, 'inspect_physical_slots',
             side_effect=physical_slots.PhysicalSlotsError(
-                'actual boot != next selected slot; restart or repair required')))
+                'physical slot precheck failed')))
 
     def test_info_describes_the_booted_system_while_a_switch_is_pending(self):
         strict = self._strict_inspector()
@@ -73,6 +73,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
         self.assertEqual(info, {
             'schemaVersion': 1,
             'updaterVersion': '0.8.0',
+            'bootPolicy': 'dual-boot-no-slot-control',
             'model': 'TB322FC',
             'actualSlot': 'b',
             'inactiveSlot': 'a',
@@ -82,6 +83,11 @@ class DeviceIdentityInfoTest(unittest.TestCase):
         })
         self.boot.assert_called_once_with(self.record)
         self.recovery.assert_called_once_with(require_edl=False)
+
+    def test_info_advertises_the_exact_new_system_boot_policy(self):
+        info = self.store().info()
+        self.assertEqual(trial_record.BOOT_POLICY, 'dual-boot-no-slot-control')
+        self.assertEqual(info['bootPolicy'], trial_record.BOOT_POLICY)
 
     def test_identity_reader_reports_only_verified_fields(self):
         self.assertEqual(offline_session.read_device_identity(), {
@@ -151,7 +157,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
 
     def test_begin_still_requires_the_strict_physical_precheck(self):
         strict = mock.Mock(side_effect=physical_slots.PhysicalSlotsError(
-            'actual boot != next selected slot; restart or repair required'))
+            'physical slot precheck failed'))
         store = self.store(inspect=strict)
         with self.assertRaises(physical_slots.PhysicalSlotsError):
             store.begin(b'{}', b'signature')
@@ -161,6 +167,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
 
     def test_injected_inspector_still_supplies_the_info_fixture(self):
         info = self.store(inspect=lambda: dict(FIXTURE)).info()
+        self.assertEqual(info['bootPolicy'], 'dual-boot-no-slot-control')
         self.assertEqual(info['model'], FIXTURE['model'])
         self.assertEqual(info['actualSlot'], FIXTURE['actualSlot'])
         self.assertEqual(info['deployment'], FIXTURE['deployment'])
@@ -170,8 +177,9 @@ class DeviceIdentityInfoTest(unittest.TestCase):
 
     def test_explicit_info_reader_overrides_an_injected_inspector(self):
         strict = mock.Mock(side_effect=physical_slots.PhysicalSlotsError(
-            'actual boot != next selected slot; restart or repair required'))
+            'physical slot precheck failed'))
         info = self.store(inspect=strict, info_reader=lambda: dict(FIXTURE)).info()
+        self.assertEqual(info['bootPolicy'], 'dual-boot-no-slot-control')
         self.assertEqual(info['actualSlot'], 'a')
         self.assertEqual(info['deployment'], FIXTURE['deployment'])
         strict.assert_not_called()

@@ -78,6 +78,9 @@ class OfflineBootWriterTests(unittest.TestCase):
         }
         trust['trust'][actual] = copy.deepcopy(trust['trust'][inactive])
         for slot in (inactive, actual):
+            trust['trust'][slot]['metadataSha256'] = hashlib.sha256(
+                f'authenticated-metadata-{slot}'.encode()).hexdigest()
+        for slot in (inactive, actual):
             original = snapshot['slots'][slot]['boot']
             originals[slot] = Path(original['path']).read_bytes()
             changed = bytearray(originals[slot])
@@ -100,6 +103,7 @@ class OfflineBootWriterTests(unittest.TestCase):
                 'candidate': claim, 'sourceBootSha256': original['sha256'],
                 'baseImageSha256': '1' * 64, 'rootPublicKeySha256': '2' * 64,
                 'bootPublicKeySha256': '3' * 64,
+                'metadataSha256': trust['trust'][slot]['metadataSha256'],
                 'payloadDigestMatchesSignedMetadata': payload_match,
             }
             part = snapshot['partitions'][f'boot_{slot}']
@@ -174,6 +178,59 @@ class OfflineBootWriterTests(unittest.TestCase):
             self.assertEqual(ctx.exception.restore_status, 'not_needed')
             spy.assert_not_called()
             self.assert_unchanged(env, before, caps)
+
+    def test_gbl_metadata_must_match_authenticated_source_before_any_write(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, _, _, _ = self._prepare(
+                stack, mode='gbl-preserve-metadata')
+            first, second = 'a', 'b'
+            self.assertNotEqual(
+                trust['trust'][first]['metadataSha256'],
+                trust['trust'][second]['metadataSha256'])
+            cases = [
+                ('missing candidate metadata',
+                 lambda c, t: c[second].pop('metadataSha256')),
+                ('non-hex candidate metadata',
+                 lambda c, t: c[second].__setitem__('metadataSha256', 'z' * 64)),
+                ('short candidate metadata',
+                 lambda c, t: c[second].__setitem__('metadataSha256', 'f' * 63)),
+                ('candidate mismatch on second slot',
+                 lambda c, t: c[second].__setitem__(
+                     'metadataSha256', t['trust'][first]['metadataSha256'])),
+                ('cross-slot metadata swap',
+                 lambda c, t: (
+                     c[first].__setitem__(
+                         'metadataSha256', t['trust'][second]['metadataSha256']),
+                     c[second].__setitem__(
+                         'metadataSha256', t['trust'][first]['metadataSha256']))),
+                ('missing trusted metadata',
+                 lambda c, t: t['trust'][second].pop('metadataSha256')),
+                ('malformed trusted metadata',
+                 lambda c, t: t['trust'][second].__setitem__('metadataSha256', 'g' * 64)),
+            ]
+            for label, mutate in cases:
+                with self.subTest(label):
+                    changed, changed_trust = copy.deepcopy(cands), copy.deepcopy(trust)
+                    mutate(changed, changed_trust)
+                    with mock.patch.object(
+                            offline.os, 'pwrite', wraps=REAL_PWRITE) as spy:
+                        with self.assertRaisesRegex(
+                                boot_writer.BootWriteError, 'metadataSha256') as ctx:
+                            offline.write_offline_boots(changed_trust, changed)
+                        self.assertEqual(ctx.exception.restore_status, 'not_needed')
+                        spy.assert_not_called()
+                    self.assert_unchanged(env, before, caps)
+
+    def test_aosp_resign_new_metadata_is_intentionally_not_compared(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, _, caps, _, _, _ = self._prepare(stack)
+            for slot in ('a', 'b'):
+                trust['trust'][slot]['metadataSha256'] = 'a' * 64
+                cands[slot]['metadataSha256'] = 'b' * 64
+            result = offline.write_offline_boots(trust, cands)
+            self.assertEqual(result['phase'], 'dual_boots_written')
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
 
     def test_current_candidate_rejections_happen_before_any_write(self):
         with boot_fixture.contextlib_stack() as stack:

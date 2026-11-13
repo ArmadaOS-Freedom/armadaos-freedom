@@ -308,6 +308,10 @@ build_profile() {
     [[ -f "$binary" ]] || die "missing binary: $binary"
     size="$(stat -c %s -- "$binary")"
     [[ "$size" == "$RUNTIME_BYTES" ]] || die "$binary is $size bytes, expected $RUNTIME_BYTES"
+    if [[ "$model" == TB322FC || "$model" == TB323FU ]]; then
+        grep -aqF 'ARMADA_LINUX_MIRROR_V1' "$binary" \
+            || die "$binary is missing the ARMADA_LINUX_MIRROR_V1 runtime contract marker"
+    fi
     check_cache "$build_dir/CMakeCache.txt"
     symbols="$(aarch64-linux-gnu-nm -u "$build_dir/kShimC.elf")"
     [[ -z "${symbols//[[:space:]]/}" ]] || die "undefined symbols in $build_dir/kShimC.elf"

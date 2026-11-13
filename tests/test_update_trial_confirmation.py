@@ -50,7 +50,6 @@ class TrialConfirmationTest(unittest.TestCase):
         self.sleep_mock = mock.Mock()
         self.sysroot_path = self.fx.path.parent / "sysroot"
         self.promote_mock = mock.Mock(side_effect=self._promotion_result)
-        self.mark_mock = mock.Mock(side_effect=self._mark_result)
         self.receipt_mock = mock.Mock()
 
         for p in (
@@ -60,24 +59,11 @@ class TrialConfirmationTest(unittest.TestCase):
             mock.patch.object(tc, "collect_boot_evidence", self.boot_mock),
             mock.patch.object(tc, "collect_runtime_evidence", self.runtime_mock),
             mock.patch.object(tc.deployment_store, "promote_confirmed_deployment", self.promote_mock),
-            mock.patch.object(tc.slot_activation, "mark_confirmed_slot", self.mark_mock),
             mock.patch.object(tc.finalization_receipt, "write", self.receipt_mock),
             mock.patch.object(tc.time, "sleep", self.sleep_mock),
         ):
             p.start()
             self.addCleanup(p.stop)
-
-    def _mark_result(self, record: rec.TrialRecord) -> dict:
-        self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, record)
-        self.assertEqual(record.state, rec.CONFIRMED)
-        return {
-            "schemaVersion": 1,
-            "phase": "slot_confirmed",
-            "targetSlot": "ab"[record.target_slot],
-            "deployment": f"{record.os_name}/{record.new_commit.hex()}.{record.new_serial}",
-            "transactionUuid": str(uuid.UUID(bytes=record.transaction_uuid)),
-            "recordSequence": record.sequence,
-        }
 
     def _promotion_result(self, **kw) -> dict:
         return {
@@ -136,8 +122,6 @@ class TrialConfirmationTest(unittest.TestCase):
 
                 def check_saved_before_promotion(**kw):
                     self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, confirmed)
-                    self.mark_mock.assert_called_with(confirmed)
-                    self.assertEqual(self.mark_mock.call_count, self.promote_mock.call_count)
                     return self._promotion_result(**kw)
 
                 self.promote_mock.side_effect = check_saved_before_promotion
@@ -151,9 +135,11 @@ class TrialConfirmationTest(unittest.TestCase):
                     "state": "confirmed",
                     "sequence": 2,
                     "transactionId": str(uuid.UUID(bytes=seeded.transaction_uuid)),
+                    "bootSlot": slot_name,
                     "targetSlot": slot_name,
                     "deployment": f"{seeded.os_name}/{seeded.new_commit.hex()}.{seeded.new_serial}",
-                    "firmwareSlotSuccess": "confirmed",
+                    "bootPolicy": rec.BOOT_POLICY,
+                    "slotControlState": "not_issued",
                 })
                 self.assertEqual(self.open_calls, [False, True])
                 self.sleep_mock.assert_called_once_with(30)
@@ -185,15 +171,13 @@ class TrialConfirmationTest(unittest.TestCase):
                 self.assertEqual(self.open_calls, [False])
                 pwrite_mock.assert_not_called()
                 self.sleep_mock.assert_called_once_with(30)
-                self.assertEqual(self.mark_mock.call_count, 2)
-                self.mark_mock.assert_called_with(confirmed)
                 self.assertEqual(self.promote_mock.call_count, 2)
                 self.promote_mock.assert_called_with(**self._promotion_kwargs(seeded))
                 self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, confirmed)
 
     def test_non_pending_states_skip_probes_and_writable_open(self) -> None:
         self.assertEqual(tc.confirm_trial(), {"state": "not_pending", "recordState": None})
-        self.mark_mock.assert_not_called()
+        self.promote_mock.assert_not_called()
         for state in (rec.PREPARED, rec.ROLLED_BACK):
             snap = store.load(self.fx.fd, self.fx.part, 1)
             seq = 1 if snap.record is None else snap.record.sequence + 1
@@ -206,7 +190,7 @@ class TrialConfirmationTest(unittest.TestCase):
             self.assertEqual(self.open_calls, [False])
             self.boot_mock.assert_not_called()
             self.runtime_mock.assert_not_called()
-            self.mark_mock.assert_not_called()
+            self.promote_mock.assert_not_called()
 
     def test_confirmed_state_rechecks_boot_and_promotes_without_probes(self) -> None:
         r = self._seed_trial(state=rec.CONFIRMED)
@@ -217,7 +201,6 @@ class TrialConfirmationTest(unittest.TestCase):
         self.boot_mock.assert_called_once()
         self.runtime_mock.assert_not_called()
         self.sleep_mock.assert_not_called()
-        self.mark_mock.assert_called_once_with(r)
         self.promote_mock.assert_called_once_with(**self._promotion_kwargs(r))
 
     def test_evidence_validation_failures_prevent_writable_open(self) -> None:
@@ -275,7 +258,7 @@ class TrialConfirmationTest(unittest.TestCase):
                 tc.confirm_trial()
             self.sleep_mock.assert_called_once_with(30)
             self.assertEqual(self.open_calls, [False])
-            self.mark_mock.assert_not_called()
+            self.promote_mock.assert_not_called()
 
     def test_concurrent_journal_change_or_reopen_identity_mismatch_rejected(self) -> None:
         r = self._seed_trial()
@@ -366,58 +349,56 @@ class TrialConfirmationTest(unittest.TestCase):
         finally:
             os.close(lfd)
 
-    def test_marker_uncertain_failure_preserves_journal_then_retries(self) -> None:
-        r = self._seed_trial()
-        error = tc.slot_activation.ActivationError(
-            "physical slot outcome uncertain", outcome="uncertain", native_result=-30
-        )
-        self.mark_mock.side_effect = error
-        with self.assertRaises(tc.ConfirmationError) as raised:
-            tc.confirm_trial()
-        self.assertIs(raised.exception.__cause__, error)
-        confirmed = replace(r, sequence=2, state=rec.CONFIRMED)
-        self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, confirmed)
-        self.mark_mock.assert_called_once_with(confirmed)
-        self.promote_mock.assert_not_called()
-        self.sleep_mock.assert_called_once_with(30)
-
-        self.mark_mock.side_effect = self._mark_result
-        with mock.patch.object(os, "pwrite", wraps=os.pwrite) as pwrite_mock:
-            self.assertEqual(
-                tc.confirm_trial(),
-                {"state": "not_pending", "recordState": rec.CONFIRMED},
-            )
-        pwrite_mock.assert_not_called()
-        self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, confirmed)
-        self.assertEqual(self.mark_mock.call_count, 2)
-        self.mark_mock.assert_called_with(confirmed)
-        self.promote_mock.assert_called_once_with(**self._promotion_kwargs(r))
-        self.sleep_mock.assert_called_once_with(30)
-        self.assertEqual(self.open_calls, [False, True, False])
-
-    def test_malformed_marker_result_preserves_confirmed_journal(self) -> None:
-        for field in ("targetSlot", "transactionUuid"):
-            with self.subTest(field=field):
+    def test_mirrored_origin_confirm_accepts_either_physical_slot(self) -> None:
+        for actual in (0, 1):
+            with self.subTest(actual=actual):
                 self.doCleanups()
                 self.setUp()
-                r = self._seed_trial()
-                confirmed = replace(r, sequence=2, state=rec.CONFIRMED)
-
-                def malformed(record: rec.TrialRecord) -> dict:
-                    marked = self._mark_result(record)
-                    marked[field] = (
-                        "ab"[1 - record.target_slot] if field == "targetSlot" else str(uuid.uuid4())
-                    )
-                    return marked
-
-                self.mark_mock.side_effect = malformed
-                with self.assertRaises(tc.ConfirmationError):
-                    tc.confirm_trial()
-                self.mark_mock.assert_called_once_with(confirmed)
-                self.promote_mock.assert_not_called()
-                self.assertEqual(
-                    store.load(self.fx.fd, self.fx.part, 1).record, confirmed
+                r = self._seed_trial(
+                    state=rec.TRIAL, remaining=2, policy=rec.OFFLINE_DUAL,
+                    other_boot_sha256=b"9" * 32)
+                self.boot_ev = replace(
+                    self._valid_boot(r),
+                    actual_slot=actual,
+                    boot_sha256=(r.new_boot_sha256 if actual == r.target_slot
+                                 else r.other_boot_sha256),
                 )
+                self.assertEqual(tc.confirm_trial()["state"], "confirmed")
+                confirmed = store.load(self.fx.fd, self.fx.part, 1).record
+                self.assertEqual(confirmed.state, rec.CONFIRMED)
+                self.promote_mock.assert_called_once_with(**self._promotion_kwargs(r))
+
+    def test_mirrored_origin_hash_mismatch_is_rejected(self) -> None:
+        r = self._seed_trial(
+            state=rec.TRIAL, remaining=2, policy=rec.OFFLINE_DUAL,
+            other_boot_sha256=b"9" * 32)
+        self.boot_ev = replace(
+            self._valid_boot(r), actual_slot=r.from_slot, boot_sha256=b"8" * 32)
+        with self.assertRaises(tc.ConfirmationError):
+            tc.confirm_trial()
+        self.assertEqual(
+            store.load(self.fx.fd, self.fx.part, 1).record, r)
+        self.promote_mock.assert_not_called()
+        self.receipt_mock.assert_not_called()
+        self.assertEqual(self.open_calls, [False])
+
+    def test_journal_promotion_receipt_order(self) -> None:
+        r = self._seed_trial()
+        events = []
+        real_pwrite = os.pwrite
+        self.promote_mock.side_effect = lambda **kw: events.append("promotion") or self._promotion_result(**kw)
+        self.receipt_mock.side_effect = lambda record: events.append("receipt")
+        with mock.patch.object(os, "pwrite", side_effect=lambda *a: events.append("journal") or real_pwrite(*a)):
+            tc.confirm_trial()
+        self.assertEqual(events, ["journal", "promotion", "receipt"])
+        self.receipt_mock.assert_called_once_with(replace(r, sequence=2, state=rec.CONFIRMED))
+
+    def test_promotion_failure_never_writes_receipt(self) -> None:
+        self._seed_trial()
+        self.promote_mock.side_effect = OSError("failure")
+        with self.assertRaises(Exception):
+            tc.confirm_trial()
+        self.receipt_mock.assert_not_called()
 
     def test_promotion_failure_preserves_confirmed_journal_then_retries(self) -> None:
         r = self._seed_trial()
@@ -445,30 +426,6 @@ class TrialConfirmationTest(unittest.TestCase):
         self.sleep_mock.assert_called_once_with(30)
         self.assertEqual(self.open_calls, [False, True, False])
 
-    def test_journal_slot_promotion_receipt_order(self) -> None:
-        r = self._seed_trial()
-        events = []
-        real_pwrite = os.pwrite
-        self.mark_mock.side_effect = lambda record: events.append("slot") or self._mark_result(record)
-        self.promote_mock.side_effect = lambda **kw: events.append("promotion") or self._promotion_result(**kw)
-        self.receipt_mock.side_effect = lambda record: events.append("receipt")
-        with mock.patch.object(os, "pwrite", side_effect=lambda *a: events.append("journal") or real_pwrite(*a)):
-            tc.confirm_trial()
-        self.assertEqual(events, ["journal", "slot", "promotion", "receipt"])
-        self.receipt_mock.assert_called_once_with(replace(r, sequence=2, state=rec.CONFIRMED))
-
-    def test_slot_or_promotion_failure_never_writes_receipt(self) -> None:
-        for failing in ("slot", "promotion"):
-            with self.subTest(failing=failing):
-                self.doCleanups()
-                self.setUp()
-                self._seed_trial()
-                target = self.mark_mock if failing == "slot" else self.promote_mock
-                target.side_effect = OSError("failure")
-                with self.assertRaises(Exception):
-                    tc.confirm_trial()
-                self.receipt_mock.assert_not_called()
-
     def test_receipt_failure_preserves_journal_and_retry_does_not_rewrite(self) -> None:
         r = self._seed_trial()
         self.receipt_mock.side_effect = OSError("receipt unavailable")
@@ -491,7 +448,6 @@ class TrialConfirmationTest(unittest.TestCase):
         )
         with self.assertRaises(tc.ConfirmationError):
             tc.confirm_trial()
-        self.mark_mock.assert_not_called()
         self.promote_mock.assert_not_called()
         self.runtime_mock.assert_not_called()
         self.sleep_mock.assert_not_called()

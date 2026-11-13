@@ -67,7 +67,10 @@ class UpdateBootPayloadTests(unittest.TestCase):
             dtb = mod / "dtb" / prof["dtb"]
             dtb.parent.mkdir(parents=True, exist_ok=True)
             dtb.write_bytes(dtb_bytes)
-            (rt_dir / f"{model}.bin").write_bytes(bytes([idx + 1]) * 4194304)
+            runtime = bytearray(bytes([idx + 1]) * 4194304)
+            marker = boot_payload.MIRROR_RUNTIME_MARKER
+            runtime[:len(marker)] = marker
+            (rt_dir / f"{model}.bin").write_bytes(bytes(runtime))
         return root
 
     def test_roundtrip_and_zero_writes(self) -> None:
@@ -87,6 +90,57 @@ class UpdateBootPayloadTests(unittest.TestCase):
             rt_hashes.add(res["runtime"]["sha256"])
         self.assertEqual(len(rt_hashes), 3)
         self.assertEqual(before, snap())
+
+    def _unmark_runtime(self, root: Path, model: str, document: dict) -> bytes:
+        """Remove the marker in place and keep the manifest record truthful."""
+        path = root / f"usr/share/armada/update-boot/runtimes/{model}.bin"
+        data = bytearray(path.read_bytes())
+        marker = boot_payload.MIRROR_RUNTIME_MARKER
+        offset = data.find(marker)
+        self.assertGreaterEqual(offset, 0)
+        data[offset:offset + len(marker)] = b"\x00" * len(marker)
+        path.write_bytes(bytes(data))
+        document["models"][model]["runtime"]["sha256"] = (
+            hashlib.sha256(data).hexdigest()
+        )
+        return bytes(data)
+
+    def test_mirror_marker_gate_is_policy_specific(self) -> None:
+        for model in ("TB322FC", "TB323FU"):
+            if model not in self.models:
+                continue
+            with self.subTest(model=model):
+                root = self._make_root()
+                document = copy.deepcopy(boot_payload.create_manifest(root))
+                self._unmark_runtime(root, model, document)
+
+                # The new-system target gate refuses the unmarked runtime.
+                with self.assertRaisesRegex(
+                    ValueError, "ARMADA_LINUX_MIRROR_V1"
+                ):
+                    boot_payload.verify_manifest(
+                        root, model, document, require_runtime_marker=True
+                    )
+
+                # Read-only/legacy manifest inspection still works; only the
+                # accepted new-system runtime boundary has the extra gate.
+                verified = boot_payload.verify_manifest(root, model, document)
+                self.assertEqual(
+                    verified["runtime"]["sha256"],
+                    document["models"][model]["runtime"]["sha256"],
+                )
+
+        if "TB710FU" in self.models:
+            root = self._make_root()
+            document = copy.deepcopy(boot_payload.create_manifest(root))
+            self._unmark_runtime(root, "TB710FU", document)
+            verified = boot_payload.verify_manifest(
+                root, "TB710FU", document, require_runtime_marker=True
+            )
+            self.assertEqual(
+                verified["runtime"]["sha256"],
+                document["models"]["TB710FU"]["runtime"]["sha256"],
+            )
 
     def test_mutated_files_and_symlinks_rejected(self) -> None:
         m0 = self.models[0]
@@ -297,6 +351,44 @@ class UpdateBootPayloadTests(unittest.TestCase):
                         verified[model]["sha256"],
                         case["manifest"]["models"][model]["runtime"]["sha256"],
                     )
+
+    def _unmark_case_runtime(self, case, model):
+        path = (
+            case["root"]
+            / "usr/share/armada/update-boot/runtimes"
+            / f"{model}.bin"
+        )
+        data = bytearray(path.read_bytes())
+        marker = boot_payload.MIRROR_RUNTIME_MARKER
+        offset = data.find(marker)
+        self.assertGreaterEqual(offset, 0)
+        data[offset:offset + len(marker)] = b"\x00" * len(marker)
+        path.write_bytes(bytes(data))
+        digest = hashlib.sha256(data).hexdigest()
+        case["manifest"]["models"][model]["runtime"]["sha256"] = digest
+        (case["ub"] / "manifest.json").write_text(
+            json.dumps(case["manifest"]), encoding="utf-8"
+        )
+        return digest
+
+    def test_package_builder_requires_mirror_marker(self):
+        wrapper = self._load_wrapper()
+        for model in ("TB322FC", "TB323FU"):
+            if model not in self.models:
+                continue
+            with self.subTest(model=model):
+                case = self._prepare_case([model])
+                self._unmark_case_runtime(case, model)
+                with self.assertRaisesRegex(
+                    ValueError, "ARMADA_LINUX_MIRROR_V1"
+                ):
+                    self._call_verified(wrapper, case, [model], {})
+
+        if "TB710FU" in self.models:
+            case = self._prepare_case(["TB710FU"])
+            digest = self._unmark_case_runtime(case, "TB710FU")
+            verified = self._call_verified(wrapper, case, ["TB710FU"], {})
+            self.assertEqual(verified["TB710FU"]["sha256"], digest)
 
     def test_external_runtime_crosscheck_rejections(self):
         wrapper = self._load_wrapper()

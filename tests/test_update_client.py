@@ -66,7 +66,9 @@ class LegacyCliTest(unittest.TestCase):
         app.run.side_effect = [
             {"state": "up_to_date"},
             {"state": "awaiting_reboot", "requiresReboot": True,
-             "bootWriteState": "written", "activationOutcome": "activated"},
+             "bootWriteState": "written",
+             "bootPolicy": "dual-boot-no-slot-control",
+             "slotControlState": "not_issued"},
         ]
         rc, out, _ = self._run_cli(["--enable-duplicate-detection"], app)
         self.assertEqual((rc, out), (0, "100%\n"))
@@ -139,7 +141,9 @@ class LegacyCliTest(unittest.TestCase):
             cb({"phase": "fetch\r\n1"})
             cb({"phase": "deploy\n2"})
             return {"state": "awaiting_reboot", "requiresReboot": True,
-                    "bootWriteState": "written", "activationOutcome": "activated"}
+                    "bootWriteState": "written",
+                    "bootPolicy": "dual-boot-no-slot-control",
+                    "slotControlState": "not_issued"}
 
         ok = mock.Mock( run=mock.Mock(side_effect=run_with_progress) )
         rc, out, err = self._run_cli([], ok)
@@ -149,9 +153,13 @@ class LegacyCliTest(unittest.TestCase):
 
         bad_terminals = [
             {"state": "awaiting_reboot", "requiresReboot": True,
-             "bootWriteState": "uncertain", "activationOutcome": "activated"},
+             "bootWriteState": "uncertain",
+             "bootPolicy": "dual-boot-no-slot-control",
+             "slotControlState": "not_issued"},
             {"state": "awaiting_reboot", "requiresReboot": True,
-             "bootWriteState": "written", "activationOutcome": "awaiting_confirmation"},
+             "bootWriteState": "written",
+             "bootPolicy": "legacy-single-slot",
+             "slotControlState": "not_issued"},
             {"state": "failed", "phase": "deploy", "error": "disk full"},
         ]
         for term in bad_terminals:

@@ -23,7 +23,8 @@ def _b64(raw: bytes) -> str:
 
 def _manager() -> mock.MagicMock:
     mgr = mock.MagicMock()
-    mgr.store.info.return_value = {'protocol': 1}
+    mgr.store.info.return_value = {
+        'schemaVersion': 1, 'bootPolicy': 'dual-boot-no-slot-control'}
     mgr.store.begin.return_value = {'sessionId': SID, 'state': 'uploading'}
     mgr.status.return_value = {'sessionId': SID, 'state': 'uploaded'}
     mgr.store.upload.return_value = {'offset': 9}
@@ -77,6 +78,8 @@ class OfflineRpcTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([r['id'] for r in out], list(range(1, 9)))
         self.assertTrue(all(r['ok'] for r in out))
+        self.assertEqual(out[0]['result'], {
+            'schemaVersion': 1, 'bootPolicy': 'dual-boot-no-slot-control'})
         self.assertEqual(out[7]['result'], {'data': _b64(b'recovery-bytes')})
         mgr.store.info.assert_called_once_with()
         mgr.store.begin.assert_called_once_with(b'doc', b'sig')
@@ -86,6 +89,28 @@ class OfflineRpcTests(unittest.TestCase):
         mgr.submit_prepare.assert_called_once_with(SID)
         mgr.submit_execute.assert_called_once_with(SID, ack)
         mgr.store.export.assert_called_once_with(SID, 'recovery.tar', 0, 14)
+
+    def test_info_transfers_the_boot_policy_verbatim(self):
+        mgr = _manager()
+        result = {
+            'schemaVersion': 1,
+            'updaterVersion': '0.8.0',
+            'bootPolicy': 'dual-boot-no-slot-control',
+            'model': 'TB322FC',
+            'actualSlot': 'b',
+            'inactiveSlot': 'a',
+            'deployment': 'armada/' + ('b' * 64) + '.2',
+            'recoveryPartUuid': '12345678-1234-5678-9abc-123456789abc',
+            'channel': 'beta',
+        }
+        mgr.store.info.return_value = result
+        request = {'protocolVersion': 1, 'id': 1, 'method': 'info',
+                   'params': {}}
+        rc, out = _run_lines(mgr, (json.dumps(request) + '\n').encode('utf-8'))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0]['ok'])
+        self.assertEqual(out[0]['result'], result)
+        mgr.store.info.assert_called_once_with()
 
     def test_restart_to_verify_passes_only_the_session_id(self):
         mgr = _manager()

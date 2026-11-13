@@ -269,6 +269,62 @@ class BootMaterialsIntegrationTests(unittest.TestCase):
         self.assertFalse((out / "materials.json").exists())
         self._assert_sources_unchanged(before)
 
+    def _commit_with_unmarked_runtime(self, model):
+        def damage(source: Path) -> None:
+            self._real_dtbs()(source)
+            runtime = (
+                source
+                / "usr/share/armada/update-boot/runtimes"
+                / f"{model}.bin"
+            )
+            data = bytearray(runtime.read_bytes())
+            marker = boot_payload.MIRROR_RUNTIME_MARKER
+            offset = data.find(marker)
+            self.assertGreaterEqual(offset, 0)
+            data[offset:offset + len(marker)] = b"\x00" * len(marker)
+            runtime.write_bytes(bytes(data))
+            manifest_path = (
+                source / "usr/share/armada/update-boot/manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["models"][model]["runtime"]["sha256"] = (
+                hashlib.sha256(data).hexdigest()
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return self.f._commit_tree("unmarked-runtime", 1, damage=damage)
+
+    def test_unmarked_mirror_runtime_is_rejected(self):
+        model = self.f.model
+        self.assertIn(model, boot_payload.MIRROR_POLICY_MODELS)
+        bad_commit = self._commit_with_unmarked_runtime(model)
+        bad = self.f._call(1, target_commit=bad_commit)
+        self.target_binding = bad["deployment"]
+        self.target_path = Path(bad["path"])
+        before = self._source_snapshot()
+        out = self.f.root.parent / "materials-unmarked-runtime"
+        with self.assertRaisesRegex(
+            boot_materials.BootMaterialsError, "ARMADA_LINUX_MIRROR_V1"
+        ):
+            self._prepare(model, out)
+        self.assertFalse((out / "materials.json").exists())
+        self._assert_sources_unchanged(before)
+
+    def test_unmarked_tb710fu_runtime_is_not_gated(self):
+        model = "TB710FU"
+        if model not in self.f.payload.cfg["profiles"]:
+            self.skipTest("TB710FU profile is not configured")
+        bad_commit = self._commit_with_unmarked_runtime(model)
+        bad = self.f._call(1, target_commit=bad_commit)
+        self.target_binding = bad["deployment"]
+        self.target_path = Path(bad["path"])
+        before = self._source_snapshot()
+        out = self.f.root.parent / "materials-unmarked-tb710fu"
+        report = self._prepare(model, out)
+        self.assertEqual(report["phase"], "materials_prepared")
+        runtime = Path(report["artifacts"]["runtime"]["path"]).read_bytes()
+        self.assertNotIn(boot_payload.MIRROR_RUNTIME_MARKER, runtime)
+        self._assert_sources_unchanged(before)
+
     def test_transaction_uuid_written_verified_and_reported(self):
         before = self._source_snapshot()
         transaction_uuid = uuid.UUID("01020a0b-0c0d-4e0f-8001-020304050607")

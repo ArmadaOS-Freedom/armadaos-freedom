@@ -82,7 +82,8 @@ def _pwrite_all(fd, data, offset):
 
 
 def _check_context(initial, lock_state, recovery):
-    if physical_slots.inspect_physical_slots() != initial:
+    if not physical_slots.same_physical_identity(
+            physical_slots.inspect_physical_slots(), initial):
         raise BootWriteError('physical slot report drifted')
     if read_boot_lock() != lock_state:
         raise BootWriteError('boot-lock state drifted')
@@ -147,7 +148,9 @@ def write_inactive_boot(trust_report, candidate_report):
             raise BootWriteError('candidate source digest is not captured inactive boot')
         candidate = _verify_claim(candidate_report['candidate'], 'candidate')
         original_claim = _verify_claim(boot_claim, 'original inactive boot')
-        if physical_slots.inspect_physical_slots() != initial or read_boot_lock() != trust_report['lockState']:
+        if (not physical_slots.same_physical_identity(
+                physical_slots.inspect_physical_slots(), initial)
+                or read_boot_lock() != trust_report['lockState']):
             raise BootWriteError('physical slot or lock state changed since trust capture')
         recovery = physical_slots.locate_recovery_partition(require_edl=False)
         dev, part_uuid, board, recovery_rdev = recovery

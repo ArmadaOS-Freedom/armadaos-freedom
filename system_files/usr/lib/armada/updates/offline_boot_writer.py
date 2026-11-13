@@ -23,6 +23,27 @@ from .boot_writer import (
 from .deployment_store import _parse_binding
 
 _SLOTS = ('a', 'b')
+_HEX64 = frozenset('0123456789abcdef')
+
+
+def _hex64(value):
+    if not isinstance(value, str) or len(value) != 64:
+        return None
+    normalized = value.lower()
+    if any(ch not in _HEX64 for ch in normalized):
+        return None
+    return normalized
+
+
+def _require_matching_metadata_hash(slot, report_sha256, trusted_sha256):
+    trusted = _hex64(trusted_sha256)
+    if trusted is None:
+        raise BootWriteError(f'authenticated metadataSha256 is invalid for slot {slot}')
+    candidate = _hex64(report_sha256)
+    if candidate is None:
+        raise BootWriteError(f'candidate metadataSha256 is missing or invalid for slot {slot}')
+    if candidate != trusted:
+        raise BootWriteError(f'candidate metadataSha256 mismatch for slot {slot}')
 
 
 def _error_with_results(message, restore_status, slot_results):
@@ -46,6 +67,9 @@ def _validate_candidate_report(slot, report, trust_report, snapshot, initial, *,
     if mode == 'aosp-resign' and report.get('payloadDigestMatchesSignedMetadata') is not True:
         raise BootWriteError(f'candidate payload digest does not match signed metadata for slot {slot}')
     trusted = trust_report['trust'][slot]
+    if mode == 'gbl-preserve-metadata':
+        _require_matching_metadata_hash(
+            slot, report.get('metadataSha256'), trusted.get('metadataSha256'))
     material = trusted['material']
     _require_positive_int(report['maxRawBytes'], f'candidates.{slot}.maxRawBytes')
     if report['maxRawBytes'] > trusted['maxRawBytes']:
@@ -138,7 +162,8 @@ def _write_offline_boots(trust_report, candidates, *, progress):
         slot_order = [inactive, actual]
 
         fresh_physical = physical_slots.inspect_physical_slots()
-        if fresh_physical != initial or read_boot_lock() != trust_report['lockState']:
+        if (not physical_slots.same_physical_identity(fresh_physical, initial)
+                or read_boot_lock() != trust_report['lockState']):
             raise BootWriteError('physical slot or lock state changed since trust capture')
         recovery = physical_slots.locate_recovery_partition(require_edl=False)
         _, part_uuid, board, recovery_rdev = recovery

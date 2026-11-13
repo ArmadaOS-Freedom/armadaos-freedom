@@ -17,6 +17,51 @@ FDT_MAGIC = 0xD00DFEED
 FDT_MIN_HEADER_BYTES = 40
 KERNEL_RELEASE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 
+# Stable byte contract emitted by the used kShim update_trial_boot gate. Only
+# the new-system mirrored policy models require it; TB710FU and read-only
+# inspection of older deployments stay outside this gate.
+MIRROR_RUNTIME_MARKER = b"ARMADA_LINUX_MIRROR_V1"
+MIRROR_POLICY_MODELS = frozenset({"TB322FC", "TB323FU"})
+
+
+def runtime_marker_required(model: str) -> bool:
+    """True only for models that must carry the mirrored-policy marker."""
+    return model in MIRROR_POLICY_MODELS
+
+
+def _file_contains_marker(path: Path, marker: bytes, limit: int) -> bool:
+    """Bounded streaming search so the runtime is never loaded as one object."""
+    overlap = len(marker) - 1
+    tail = b""
+    total = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(HASH_CHUNK_BYTES)
+            if not chunk:
+                return False
+            total += len(chunk)
+            if total > limit:
+                return False
+            window = tail + chunk
+            if marker in window:
+                return True
+            tail = window[-overlap:] if overlap else b""
+
+
+def require_runtime_marker(path: str | Path, model: str, label: str) -> None:
+    """Refuse an unmarked runtime for a mirrored-policy model.
+
+    The caller must already have established the file identity and length. The
+    marker is a compatibility proof only, not authentication or a boot claim.
+    """
+    if not runtime_marker_required(model):
+        return
+    if not _file_contains_marker(Path(path), MIRROR_RUNTIME_MARKER, RUNTIME_SIZE_BYTES):
+        raise ValueError(
+            f"Runtime {label} for {model} is missing the "
+            f"{MIRROR_RUNTIME_MARKER.decode('ascii')} compatibility marker"
+        )
+
 
 def _load_helpers() -> tuple[Any, Any]:
     from . import edl_boot_requirements, edl_device_config
@@ -105,7 +150,13 @@ def _discover_kernel_release(canonical_root: Path, canonical_usr: Path) -> str:
     return kver
 
 
-def _inspect_file(path: Path, rel_posix: str, kind: str) -> dict[str, Any]:
+def _inspect_file(
+    path: Path,
+    rel_posix: str,
+    kind: str,
+    *,
+    require_marker: bool = False,
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     total = 0
     header = bytearray()
@@ -132,15 +183,32 @@ def _inspect_file(path: Path, rel_posix: str, kind: str) -> dict[str, Any]:
         magic, totalsize = struct.unpack(">II", bytes(header[:8]))
         if magic != FDT_MAGIC or totalsize < FDT_MIN_HEADER_BYTES or totalsize > total:
             raise ValueError(f"DTB {rel_posix} has invalid FDT header")
+    if kind == "runtime" and require_marker:
+        if not _file_contains_marker(path, MIRROR_RUNTIME_MARKER, total):
+            raise ValueError(
+                f"Runtime {rel_posix} is missing the "
+                f"{MIRROR_RUNTIME_MARKER.decode('ascii')} compatibility marker"
+            )
     return {"path": rel_posix, "bytes": total, "sha256": digest.hexdigest()}
 
 
-def _record(canonical_root: Path, canonical_usr: Path, relpath: str, kind: str) -> dict[str, Any]:
+def _record(
+    canonical_root: Path,
+    canonical_usr: Path,
+    relpath: str,
+    kind: str,
+    *,
+    require_marker: bool = False,
+) -> dict[str, Any]:
     resolved, rel_posix = _resolve_regular_file(canonical_root, canonical_usr, relpath)
-    return _inspect_file(resolved, rel_posix, kind)
+    return _inspect_file(resolved, rel_posix, kind, require_marker=require_marker)
 
 
-def _collect(root: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _collect(
+    root: str | Path,
+    *,
+    require_runtime_marker_models: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any], dict[str, Any]]:
     canonical_root, canonical_usr = _resolve_root(root)
     kver = _discover_kernel_release(canonical_root, canonical_usr)
     edl_device_config, edl_boot_requirements = _load_helpers()
@@ -170,6 +238,10 @@ def _collect(root: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
             canonical_usr,
             f"usr/share/armada/update-boot/runtimes/{model}.bin",
             "runtime",
+            require_marker=(
+                model in require_runtime_marker_models
+                and runtime_marker_required(model)
+            ),
         )
         dtb_record = _record(
             canonical_root,
@@ -204,11 +276,20 @@ def create_manifest(root: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def verify_manifest(root: str | Path, model: str, document: dict[str, Any]) -> dict[str, Any]:
+def verify_manifest(
+    root: str | Path,
+    model: str,
+    document: dict[str, Any],
+    *,
+    require_runtime_marker: bool = False,
+) -> dict[str, Any]:
     if not isinstance(model, str) or not model:
         raise ValueError("Model must be a non-empty string")
     provided_json = _canonical_json(document)
-    expected_manifest, config = _collect(root)
+    required = frozenset({model}) if require_runtime_marker else frozenset()
+    expected_manifest, config = _collect(
+        root, require_runtime_marker_models=required
+    )
     if provided_json != _canonical_json(expected_manifest):
         raise ValueError("Boot payload manifest does not match deployment root")
     models = expected_manifest["models"]

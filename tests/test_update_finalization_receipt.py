@@ -29,7 +29,8 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(doc["recordSha256"], __import__("hashlib").sha256(
             __import__("updates.trial_record", fromlist=["encode_record"]).encode_record(record)
         ).hexdigest())
-        self.assertTrue(doc["firmwareSlotSuccess"])
+        self.assertEqual(doc["bootPolicy"], "dual-boot-no-slot-control")
+        self.assertEqual(doc["firmwareSlotControl"], "not_issued")
         for changed in (
             replace(record, sequence=record.sequence + 1),
             replace(record, new_serial=record.new_serial + 1),
@@ -94,7 +95,7 @@ class ReceiptFilesystemTests(unittest.TestCase):
             "extra": good[:-1] + ',"extra":1}',
             "booleanSequence": good.replace('"recordSequence":9', '"recordSequence":true'),
             "booleanSchema": good.replace('"schemaVersion":1', '"schemaVersion":true'),
-            "wrongType": good.replace('"firmwareSlotSuccess":true', '"firmwareSlotSuccess":1'),
+            "wrongType": good.replace('"firmwareSlotControl":"not_issued"', '"firmwareSlotControl":1'),
             "array": "[]",
             "oversize": " " * 8193,
         }

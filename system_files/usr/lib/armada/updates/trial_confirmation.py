@@ -3,7 +3,11 @@
 
 Serializes with the shared Decky update lock, verifies pre- and post-stability
 evidence against the pending trial record, then writes the CONFIRMED trial
-record into the opposite journal slot."""
+record into the opposite journal slot.  Confirmation never selects a physical
+boot slot, marks slot success, or writes Android boot-control state: the boot
+that is running (slot A or B) must simply match the mirrored deployment and
+one of the two boot hashes recorded for it.
+"""
 
 from __future__ import annotations
 
@@ -21,13 +25,19 @@ from . import (
     deployment_store,
     finalization_receipt,
     runtime_health,
-    slot_activation,
     trial_store,
 )
 from .boot_health import BootEvidence, collect_boot_evidence
 from .recovery_device import open_recovery
 from .runtime_health import RuntimeEvidence, collect_runtime_evidence
-from .trial_record import CONFIRMED, TRIAL, TrialRecordError, encode_record, expected_boot_sha256
+from .trial_record import (
+    BOOT_POLICY,
+    CONFIRMED,
+    TRIAL,
+    TrialRecordError,
+    encode_record,
+    expected_boot_sha256,
+)
 
 UPDATE_LOCK_PATH = Path("/run/lock/armada-update.lock")
 SYSROOT_PATH = Path("/sysroot")
@@ -94,20 +104,7 @@ def _finalize_deployment(record, boot: BootEvidence, *, sysroot_path=None) -> di
     previous_binding = (
         f"{record.os_name}/{record.old_commit.hex()}.{record.old_serial}"
     )
-    expected_tx = str(uuid.UUID(bytes=bytes(record.transaction_uuid)))
-    expected_slot = "ab"[boot.actual_slot]
     try:
-        marked = slot_activation.mark_confirmed_slot(record)
-        if (
-            not isinstance(marked, dict)
-            or marked.get("schemaVersion") != 1
-            or marked.get("phase") != "slot_confirmed"
-            or marked.get("targetSlot") != expected_slot
-            or marked.get("deployment") != boot.deployment
-            or marked.get("transactionUuid") != expected_tx
-            or marked.get("recordSequence") != record.sequence
-        ):
-            raise ConfirmationError("confirmed slot metadata mismatch")
         promoted = deployment_store.promote_confirmed_deployment(
             sysroot_path=SYSROOT_PATH if sysroot_path is None else sysroot_path,
             current_binding=boot.deployment,
@@ -192,9 +189,11 @@ def confirm_trial() -> dict:
             "state": "confirmed",
             "sequence": next_record.sequence,
             "transactionId": str(uuid.UUID(bytes=next_record.transaction_uuid)),
+            "bootSlot": "a" if boot_before.actual_slot == 0 else "b",
             "targetSlot": "a" if next_record.target_slot == 0 else "b",
             "deployment": boot_before.deployment,
-            "firmwareSlotSuccess": "confirmed",
+            "bootPolicy": BOOT_POLICY,
+            "slotControlState": "not_issued",
         }
 
 

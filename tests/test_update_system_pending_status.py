@@ -45,7 +45,8 @@ def make_receipt(work, trial, **overrides):
         "phase": "awaiting_reboot",
         "requiresReboot": True,
         "bootWriteState": "written",
-        "activationOutcome": "activated",
+        "bootPolicy": "dual-boot-no-slot-control",
+        "slotControlState": "not_issued",
         "workDir": str(work),
         "model": MODEL,
         "transactionId": trial["transactionId"],
@@ -220,7 +221,8 @@ class PendingStatusTests(unittest.TestCase):
             ("requiresReboot", False),
             ("requiresReboot", 1),
             ("bootWriteState", "pending"),
-            ("activationOutcome", "failed"),
+            ("bootPolicy", "legacy-single-slot"),
+            ("slotControlState", "issued"),
         )
         for key, value in mutations:
             altered = copy.deepcopy(base)

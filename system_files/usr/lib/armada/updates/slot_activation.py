@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""Internal physical UFS A/B slot activation after inactive boot write."""
+"""Internal physical UFS A/B slot activation after inactive boot write.
+
+Deprecated and unreferenced.  The ordinary Linux update, rollback, boot and
+confirmation paths use the mirrored dual-slot writer and never select a slot,
+mark slot success, or write Android boot-control state.  Kept only so the
+native selector contract stays documented; no update path imports it.
+"""
 
 import ctypes
 import os
