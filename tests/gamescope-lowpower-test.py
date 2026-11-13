@@ -6,15 +6,23 @@ because ConVar<T>::m_Value is a plain T. Patch 0043 keeps a mutex-guarded mirror
 for the broker and an atomic mirror for a companion. This test extracts the
 added globals, helpers, reconnect block and the drm_prepare sleep expression
 from the patch itself and runs them against small stubs, so the code under test
-is the patched source and not a reimplementation. It needs g++ (the gamescope
-build container) and no DRM hardware.
+is the patched source and not a reimplementation. The sleep expression is
+rebuilt from the hunk's new side because a canonical diff keeps its unchanged
+leading line as context and only re-emits the changed continuation. It needs
+g++ (the gamescope build container) and no DRM hardware.
 
-Limitation: the stubs replace the lease socket, so ordering is observed through
-lease_send_control; the 100 ms window in the contention case is only a
-scheduling allowance for the second thread, not a correctness margin.
+The socket is stubbed: send outcomes are chosen with errno (EAGAIN for a benign
+transient failure, EPIPE for a permanent one), so a retry is observed without
+inducing a real transport stall. The socket thread's flush is called directly
+by the test for each simulated poll; the production retry is the existing
+bounded poll, not a caller-side wait. The one-shot hook disarms itself before
+it waits, so only the send a test armed is ever held; a contention test starts
+a newer command while that send is held and checks that it serializes behind
+g_leaseClientMutex instead of overwriting the packet mid-flight.
 '''
 
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,8 +38,11 @@ BACKEND = 'src/Backends/DRMBackend.cpp'
 MAIN_HPP = 'src/main.hpp'
 WLSERVER = 'src/wlserver.cpp'
 
+HUNK_HEADER = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
 
 def parse_hunks(text):
+    '''Group the patch into files and hunks, rejecting malformed lengths.'''
     files = {}
     current = None
     hunk = None
@@ -42,15 +53,84 @@ def parse_hunks(text):
             files[path] = current
             hunk = None
         elif line.startswith('@@'):
-            hunk = {'header': line, 'lines': []}
+            match = HUNK_HEADER.match(line)
+            if match is None:
+                raise AssertionError('malformed hunk header %r' % line)
+            if current is None:
+                raise AssertionError('hunk before any diff header: %r' % line)
+            hunk = {
+                'header': line,
+                'lines': [],
+                'old_count': int(match.group(2) or 1),
+                'new_count': int(match.group(4) or 1),
+            }
             current.append(hunk)
         elif hunk is not None:
             hunk['lines'].append(line)
+
+    for path, hunks in files.items():
+        if not hunks:
+            raise AssertionError('%s has no hunks' % path)
+        for entry in hunks:
+            check_hunk_lengths(path, entry)
     return files
+
+
+def check_hunk_lengths(path, hunk):
+    old = 0
+    new = 0
+    for line in hunk['lines']:
+        if line.startswith('\\'):
+            continue
+        prefix = line[:1]
+        if prefix == ' ':
+            old += 1
+            new += 1
+        elif prefix == '-':
+            old += 1
+        elif prefix == '+':
+            new += 1
+        else:
+            raise AssertionError('%s: hunk line without a diff prefix: %r' % (path, line))
+    if (old, new) != (hunk['old_count'], hunk['new_count']):
+        raise AssertionError(
+            '%s: %r declares -%d +%d but carries -%d +%d'
+            % (path, hunk['header'], hunk['old_count'], hunk['new_count'], old, new)
+        )
 
 
 def added(hunk):
     return [line[1:] for line in hunk['lines'] if line.startswith('+')]
+
+
+def new_side(hunk):
+    return [line[1:] for line in hunk['lines'] if line[:1] in (' ', '+')]
+
+
+def new_statement(hunk, start_marker):
+    '''Rebuild one whole statement from the hunk's new side.
+
+    A canonical diff re-emits only the changed lines, so the unchanged first
+    line of the drm_prepare sleep expression is context and added() alone
+    cannot yield compilable code. Walk the new side from the declaration
+    through the terminating semicolon instead, ignoring how the diff split
+    context, removals and additions.
+    '''
+    lines = new_side(hunk)
+    starts = [index for index, line in enumerate(lines) if start_marker in line]
+    if len(starts) != 1:
+        raise AssertionError(
+            'expected exactly one new-side line with %r, found %d'
+            % (start_marker, len(starts))
+        )
+    statement = []
+    for line in lines[starts[0]:]:
+        statement.append(line)
+        if line.rstrip().endswith(';'):
+            return statement
+    raise AssertionError(
+        'statement starting with %r has no terminating semicolon' % start_marker
+    )
 
 
 def all_added(files):
@@ -62,11 +142,11 @@ def all_added(files):
     ]
 
 
-def only(hunks, needle):
-    found = [hunk for hunk in hunks if any(needle in line for line in added(hunk))]
+def only_new(hunks, needle):
+    found = [hunk for hunk in hunks if any(needle in line for line in new_side(hunk))]
     if len(found) != 1:
         raise AssertionError(
-            'expected exactly one hunk adding %r, found %d' % (needle, len(found))
+            'expected exactly one hunk whose new side has %r, found %d' % (needle, len(found))
         )
     return found[0]
 
@@ -78,64 +158,80 @@ def check_source(text):
             raise AssertionError('patch does not touch %s' % path)
     backend = files[BACKEND]
 
-    globals_hunk = only(backend, 'static bool g_bLeaseClientPanelSleep = false;')
-    helper_hunk = only(backend, 'static void drm_lease_send_sleep( bool bSleep )')
-    sync_hunk = only(backend, 'lease_send_panel_sleep_locked( g_bLeaseClientPanelSleep );')
-    bsleep_hunk = only(backend, 'g_bDrmLeasePanelSleep.load()')
-    callback_hunk = only(backend, 'drm_lease_send_sleep( cv );')
+    every_add = all_added(files)
+    assert not any('std::thread' in line for line in every_add), every_add
+    assert not any('sleep_for' in line for line in every_add), every_add
+    assert not any('this_thread' in line for line in every_add), every_add
+    assert not any('poll(' in line for line in every_add), every_add
+    assert not any('kLeasePanelSleepRetry' in line for line in every_add), every_add
+    print('PASS source: no caller poll, extra thread, sleep, or fixed retry count')
+
+    globals_hunk = only_new(backend, 'static bool g_bLeaseClientPanelSleepPending = false;')
+    panel_hunk = only_new(backend, 'static void drm_lease_send_sleep( bool bSleep )')
+    poll_hunk = only_new(backend, 'pfds[1].events |= POLLOUT;')
+    flush_hunk = only_new(backend, 'lease_flush_panel_sleep( nClientFd )')
+    sync_hunk = only_new(backend, 'g_nActiveLeaseClients.fetch_add( 1 );')
+    bsleep_hunk = only_new(backend, 'g_bDrmLeasePanelSleep.load()')
+    callback_hunk = only_new(backend, 'drm_lease_send_sleep( cv );')
 
     globals_adds = added(globals_hunk)
-    helper_adds = added(helper_hunk)
+    panel_adds = added(panel_hunk)
     sync_adds = added(sync_hunk)
-    bsleep_adds = added(bsleep_hunk)
+    bsleep_statement = new_statement(
+        bsleep_hunk, 'const bool bSleep = drm->pConnector &&'
+    )
     callback_adds = added(callback_hunk)
 
-    init = [line for line in globals_adds if line.startswith('static bool g_bLeaseClientPanelSleep')]
-    assert len(init) == 1 and init[0].rstrip().endswith('= false;'), init
-    mirror = [line for line in globals_adds if 'static std::atomic<bool> g_bDrmLeasePanelSleep' in line]
-    assert mirror == ['static std::atomic<bool> g_bDrmLeasePanelSleep{ false };'], mirror
-    assert any(line.startswith('extern gamescope::ConVar<bool> cv_drm_sleep_screens[];') for line in globals_adds)
-    print('PASS source: broker replay state and companion mirror both start false')
+    assert any('static bool g_bLeaseClientPanelSleep = false;' in line for line in globals_adds)
+    assert any('static bool g_bLeaseClientPanelSleepPending = false;' in line for line in globals_adds)
+    assert any('static std::atomic<bool> g_bDrmLeasePanelSleep{ false };' in line for line in globals_adds)
+    assert any('extern gamescope::ConVar<bool> cv_drm_sleep_screens[];' in line for line in globals_adds)
+    print('PASS source: pending flag, latest desired value and companion mirror start false')
 
-    assert 'lease_socket_thread_run' in sync_hunk['header'], sync_hunk['header']
-    assert sync_adds, sync_adds
-    assert not any('cv_drm_sleep_screens' in line for line in sync_adds), sync_adds
-    assert not any('drm_lease_send_sleep(' in line for line in sync_adds), sync_adds
+    panel = NL.join(panel_adds)
+    assert 'MSG_DONTWAIT | MSG_NOSIGNAL' in panel, panel
+    assert 'LeasePanelSleepSend::Retry' in panel, panel
+    assert 'LeasePanelSleepSend::Dead' in panel, panel
+    assert 'shutdown( g_nLeaseClientFd, SHUT_RDWR );' in panel, panel
+    assert 'lease_send_control' not in panel, panel
+    assert 'WantsTouch' not in panel and 'Yields' not in panel, panel
+    assert 'g_bLeaseClientPanelSleepPending = true;' in panel, panel
+    assert 'g_bLeaseClientPanelSleepPending = false;' in panel, panel
+    assert 'std::lock_guard lock( g_leaseClientMutex );' in panel, panel
+    print('PASS source: panel packet has its own raw send and never touches touch/yield')
+
+    assert not any(
+        'lease_send_control' in line
+        for hunk in backend
+        for line in hunk['lines']
+    ), '0043 must leave the Suspend/Resume helper untouched'
+    print('PASS source: the legacy control helper is left untouched')
+
+    poll = NL.join(added(poll_hunk))
+    assert 'lease_panel_sleep_pending()' in poll, poll
+    assert 'pfds[1].events |= POLLOUT;' in poll, poll
+    flush = NL.join(added(flush_hunk))
+    assert 'lease_flush_panel_sleep( nClientFd )' in flush, flush
+    assert 'lease_disconnect_client( nClientFd )' in flush, flush
+    print('PASS source: the socket thread polls POLLOUT while pending and may recycle a dead client')
+
+    assert any('g_bLeaseClientPanelSleepPending = true;' in line for line in sync_adds), sync_adds
     assert any('std::lock_guard lock( g_leaseClientMutex );' in line for line in sync_adds), sync_adds
-    assert any('lease_send_panel_sleep_locked( g_bLeaseClientPanelSleep );' in line for line in sync_adds), sync_adds
-    print('PASS source: reconnect uses the mutex-guarded helper, no ConVar read')
+    assert not any('drm_lease_send_sleep(' in line for line in sync_adds), sync_adds
+    print('PASS source: reconnect marks the cached state pending instead of sending inline')
 
-    helper = NL.join(helper_adds)
-    assert 'cv_drm_sleep_screens' not in helper, helper
-    lock_at = helper.index('std::lock_guard lock( g_leaseClientMutex );')
-    store_at = helper.index('g_bLeaseClientPanelSleep = bSleep;')
-    send_at = helper.index('lease_send_panel_sleep_locked( bSleep );')
-    assert lock_at < store_at < send_at, helper
-    print('PASS source: the helper caches, then sends, under g_leaseClientMutex')
-
-    shutdown_lines = [line.strip() for line in helper_adds if 'shutdown(' in line]
-    assert shutdown_lines == ['shutdown( g_nLeaseClientFd, SHUT_RDWR );'], shutdown_lines
-    assert not any('lease_disconnect_client' in line for line in helper_adds), helper
-    assert not any(line.strip().startswith('close(') for line in helper_adds), helper
-    fail_at = helper.index('if ( !lease_send_control(')
-    shutdown_at = helper.index('shutdown( g_nLeaseClientFd, SHUT_RDWR );')
-    assert fail_at < shutdown_at, helper
-    print('PASS source: a failed Sleep/Wake send shuts the socket down once and nothing else')
-
-    setter_at = helper.index('void drm_lease_client_set_panel_sleep( bool bSleep )')
-    setter = helper[setter_at:]
-    assert 'g_bDrmLeasePanelSleep.exchange( bSleep ) != bSleep' in setter, setter
-    assert 'force_repaint();' in setter, setter
-    print('PASS source: the companion sleep mirror repaints only on a change')
-
-    stores = [
-        line.strip()
-        for line in all_added(files)
-        if 'g_bLeaseClientPanelSleep =' in line
-        and not line.strip().startswith('static bool')
-    ]
-    assert stores == ['g_bLeaseClientPanelSleep = bSleep;'], stores
-    print('PASS source: nothing resets the desired state, disconnect keeps it')
+    bsleep = NL.join(bsleep_statement)
+    assert bsleep.rstrip().endswith(';'), bsleep
+    assert bsleep.count('const bool bSleep') == 1, bsleep
+    assert 'const bool bSleep = drm->pConnector &&' in bsleep, bsleep
+    assert 'cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ]' in bsleep, bsleep
+    assert 'g_sDrmLeaseClientSocket && ( frameInfo->layers.count() == 0 || g_bDrmLeasePanelSleep.load() )' in bsleep, bsleep
+    assert not any(
+        'g_bDrmLeasePanelSleep' in line[1:]
+        for line in bsleep_hunk['lines']
+        if line.startswith('-')
+    ), '0043 must only add the companion mirror to the sleep expression'
+    print('PASS source: drm_prepare ORs the companion mirror only under --drm-lease-client')
 
     assert any(
         '&cv == &cv_drm_sleep_screens[ gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL ]' in line
@@ -143,27 +239,6 @@ def check_source(text):
     ), callback_adds
     assert any('force_repaint();' in line for line in callback_hunk['lines']), callback_hunk
     print('PASS source: only the broker internal callback forwards, external unchanged')
-
-    assert len(bsleep_adds) == 2, bsleep_adds
-    bsleep = NL.join(bsleep_adds)
-    assert 'drm_prepare' in bsleep_hunk['header'], bsleep_hunk['header']
-    assert 'const bool bSleep = drm->pConnector &&' in bsleep, bsleep
-    assert 'cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ]' in bsleep, bsleep
-    assert 'g_sDrmLeaseClientSocket && ( frameInfo->layers.count() == 0 || g_bDrmLeasePanelSleep.load() )' in bsleep, bsleep
-    print('PASS source: drm_prepare ORs the companion mirror only under --drm-lease-client')
-
-    for hunk in backend:
-        for line in added(hunk):
-            if line.lstrip().startswith('//'):
-                continue
-            if 'cv_drm_sleep_screens' not in line:
-                continue
-            if line.startswith('extern gamescope::ConVar<bool> cv_drm_sleep_screens[]'):
-                continue
-            if '&cv == &cv_drm_sleep_screens[' in line:
-                continue
-            assert 'drm_prepare' in hunk['header'], line
-    print('PASS source: only drm_prepare reads the ConVar, never the socket thread')
 
     main_adds = all_added({MAIN_HPP: files[MAIN_HPP]})
     assert any('void drm_lease_client_set_panel_sleep( bool bSleep );' in line for line in main_adds), main_adds
@@ -181,16 +256,18 @@ def check_source(text):
 
     assert not any(
         'output_luts_applied' in line or 'needs_modeset' in line
-        for line in all_added(files)
+        for line in every_add
     ), '0043 must leave the existing bSleep LUT/modeset path alone'
     print('PASS source: the existing single bSleep still drives LUTs and modeset')
 
-    return globals_adds, helper_adds, sync_adds, bsleep_adds
+    return globals_adds, panel_adds, sync_adds, bsleep_statement
 
 
 FIXTURE_HEAD = r'''#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -248,6 +325,7 @@ static const char *g_sDrmLeaseClientSocket = nullptr;
 // helpers themselves come from the patch.
 static std::mutex g_leaseClientMutex;
 static int g_nLeaseClientFd = -1;
+static uint64_t g_uLeaseClientGeneration = 0;
 
 enum class DrmLeaseEventType
 {
@@ -258,6 +336,15 @@ enum class DrmLeaseEventType
     Resume,
     Sleep,
     Wake,
+};
+
+struct DrmLeaseEvent
+{
+    DrmLeaseEventType type;
+    int32_t touchId;
+    uint32_t time;
+    float x;
+    float y;
 };
 
 static int g_repaints = 0;
@@ -277,65 +364,112 @@ static std::mutex g_sentMutex;
 static std::vector<DrmLeaseEventType> g_sent;
 static int g_sendAttempts = 0;
 static DrmLeaseEventType g_lastAttempt = DrmLeaseEventType::Down;
-static bool g_sendShouldFail = false;
+static int g_transientLeft = 0;
+static bool g_permanent = false;
 
-// Keeps a send open while g_leaseClientMutex is held so a second sender has
-// to wait for it; that is how reconnect/wake ordering becomes observable.
-static std::mutex g_hookMutex;
-static std::condition_variable g_hookCv;
-static bool g_hookArmed = false;
-static bool g_hookEntered = false;
-static bool g_hookRelease = false;
+// One-shot hook: disarm before waiting, so a retry or a second sender can never
+// be held by the same arm and only the send a test armed is observed.
+static std::mutex g_sendHookMutex;
+static std::condition_variable g_sendHookCv;
+static bool g_sendHookArmed = false;
+static bool g_sendHookEntered = false;
+static bool g_sendHookRelease = false;
 
-static bool lease_send_control( DrmLeaseEventType type )
+// A transient failure is a benign EAGAIN; a permanent one is EPIPE. Both are
+// chosen by the test, so no real socket is stalled.
+extern "C" ssize_t __wrap_send( int, const void *pData, size_t nLen, int )
 {
     {
-        std::unique_lock lock( g_hookMutex );
-        if ( g_hookArmed )
+        std::unique_lock<std::mutex> lock( g_sendHookMutex );
+        if ( g_sendHookArmed )
         {
-            g_hookEntered = true;
-            g_hookCv.notify_all();
-            g_hookCv.wait_for( lock, std::chrono::seconds( 2 ), [] { return g_hookRelease; } );
-            g_hookArmed = false;
+            g_sendHookArmed = false;
+            g_sendHookEntered = true;
+            g_sendHookCv.notify_all();
+            g_sendHookCv.wait_for( lock, std::chrono::seconds( 2 ), [] { return g_sendHookRelease; } );
         }
     }
     {
-        std::lock_guard lock( g_sentMutex );
-        g_lastAttempt = type;
+        std::lock_guard<std::mutex> lock( g_sentMutex );
+        if ( nLen == sizeof( DrmLeaseEvent ) )
+            g_lastAttempt = static_cast<const DrmLeaseEvent *>( pData )->type;
         g_sendAttempts++;
-        if ( g_sendShouldFail )
-            return false;
-        g_sent.push_back( type );
+        if ( g_permanent )
+        {
+            errno = EPIPE;
+            return -1;
+        }
+        if ( g_transientLeft > 0 )
+        {
+            g_transientLeft--;
+            errno = EAGAIN;
+            return -1;
+        }
+        if ( nLen == sizeof( DrmLeaseEvent ) )
+            g_sent.push_back( static_cast<const DrmLeaseEvent *>( pData )->type );
     }
-    return true;
+    return (ssize_t)nLen;
 }'''
 
 
 FIXTURE_TAIL = r'''static void reset_state()
 {
     {
-        std::lock_guard lock( g_sentMutex );
+        std::lock_guard<std::mutex> lock( g_sentMutex );
         g_sent.clear();
         g_sendAttempts = 0;
         g_lastAttempt = DrmLeaseEventType::Down;
-        g_sendShouldFail = false;
+        g_transientLeft = 0;
+        g_permanent = false;
     }
     {
-        std::lock_guard lock( g_hookMutex );
-        g_hookArmed = false;
-        g_hookEntered = false;
-        g_hookRelease = false;
+        std::lock_guard<std::mutex> lock( g_sendHookMutex );
+        g_sendHookArmed = false;
+        g_sendHookEntered = false;
+        g_sendHookRelease = false;
     }
     g_nLeaseClientFd = -1;
+    g_uLeaseClientGeneration = 0;
     g_bLeaseClientPanelSleep = false;
+    g_bLeaseClientPanelSleepPending = false;
     g_bDrmLeasePanelSleep.store( false );
     g_shutdownCalls = 0;
     g_repaints = 0;
 }
 
+static void connect_client( int nFd )
+{
+    std::lock_guard<std::mutex> lock( g_leaseClientMutex );
+    g_nLeaseClientFd = nFd;
+    g_uLeaseClientGeneration++;
+}
+
+static void disconnect_client()
+{
+    std::lock_guard<std::mutex> lock( g_leaseClientMutex );
+    g_nLeaseClientFd = -1;
+    g_uLeaseClientGeneration++;
+}
+
+// One simulated socket-thread poll: flush the pending state if a client is
+// present. The production loop decides this from POLLOUT; here the mock send
+// outcome makes the same flush deterministic.
+static bool flush_once()
+{
+    const int nFd = g_nLeaseClientFd;
+    if ( nFd < 0 )
+        return false;
+    if ( lease_flush_panel_sleep( nFd ) )
+    {
+        disconnect_client();
+        return true;
+    }
+    return false;
+}
+
 static std::vector<DrmLeaseEventType> sent_now()
 {
-    std::lock_guard lock( g_sentMutex );
+    std::lock_guard<std::mutex> lock( g_sentMutex );
     return g_sent;
 }
 
@@ -357,10 +491,14 @@ static void run_no_client_state_change()
 
     drm_lease_send_sleep( true );
     CHECK( g_bLeaseClientPanelSleep );
+    CHECK( g_bLeaseClientPanelSleepPending );
     CHECK( sent_now().empty() );
+    CHECK( g_sendAttempts == 0 );
+    CHECK( g_shutdownCalls == 0 );
 
     drm_lease_send_sleep( false );
     CHECK( !g_bLeaseClientPanelSleep );
+    CHECK( g_bLeaseClientPanelSleepPending );
     CHECK( sent_now().empty() );
 
     std::cout << "PASS no-client state change is cached" << std::endl;
@@ -372,18 +510,21 @@ static void run_sleep_before_connect()
     reset_state();
 
     drm_lease_send_sleep( true );
-    CHECK( g_bLeaseClientPanelSleep );
+    CHECK( g_bLeaseClientPanelSleepPending );
 
-    g_nLeaseClientFd = 7;
+    connect_client( 7 );
     reconnect_sync();
+    CHECK( g_bLeaseClientPanelSleepPending );
+    flush_once();
     auto sent = sent_now();
     CHECK( sent.size() == 1 );
     CHECK( sent[0] == DrmLeaseEventType::Sleep );
 
-    g_nLeaseClientFd = -1;
+    disconnect_client();
     CHECK( g_bLeaseClientPanelSleep );
-    g_nLeaseClientFd = 9;
+    connect_client( 9 );
     reconnect_sync();
+    flush_once();
     sent = sent_now();
     CHECK( sent.size() == 2 );
     CHECK( sent[1] == DrmLeaseEventType::Sleep );
@@ -396,8 +537,9 @@ static void run_sync_after_reconnect()
     std::cout << "RUN reconnect while awake syncs Wake" << std::endl;
     reset_state();
 
-    g_nLeaseClientFd = 7;
+    connect_client( 7 );
     reconnect_sync();
+    flush_once();
     const auto sent = sent_now();
     CHECK( sent.size() == 1 );
     CHECK( sent[0] == DrmLeaseEventType::Wake );
@@ -411,8 +553,9 @@ static void run_wake_after_reconnect()
     reset_state();
 
     drm_lease_send_sleep( true );
-    g_nLeaseClientFd = 7;
+    connect_client( 7 );
     reconnect_sync();
+    flush_once();
     drm_lease_send_sleep( false );
 
     const auto sent = sent_now();
@@ -424,135 +567,174 @@ static void run_wake_after_reconnect()
     std::cout << "PASS wake after a reconnect ends in Wake" << std::endl;
 }
 
-static void run_reconnect_wake_contention()
+static void run_transient_fails_twice_then_succeeds()
 {
-    std::cout << "RUN reconnect and wake are ordered by g_leaseClientMutex" << std::endl;
+    std::cout << "RUN two would-blocks then success with no new command" << std::endl;
     reset_state();
 
+    connect_client( 7 );
+    g_transientLeft = 2;
     drm_lease_send_sleep( true );
-    g_nLeaseClientFd = 7;
+    CHECK( g_bLeaseClientPanelSleepPending );
+    CHECK( sent_now().empty() );
+
+    flush_once();
+    CHECK( g_bLeaseClientPanelSleepPending );
+    CHECK( sent_now().empty() );
+
+    flush_once();
+    const auto sent = sent_now();
+    CHECK( sent.size() == 1 );
+    CHECK( sent[0] == DrmLeaseEventType::Sleep );
+    CHECK( !g_bLeaseClientPanelSleepPending );
+    CHECK( g_bLeaseClientPanelSleep );
+    CHECK( g_sendAttempts == 3 );
+    CHECK( g_shutdownCalls == 0 );
+
+    std::cout << "PASS two would-blocks then success with no new command" << std::endl;
+}
+
+static void run_transient_coalesces_latest()
+{
+    std::cout << "RUN a pending sleep is replaced by a newer wake" << std::endl;
+    reset_state();
+
+    connect_client( 7 );
+    g_transientLeft = 2;
+    drm_lease_send_sleep( true );
+    drm_lease_send_sleep( false );
+    CHECK( g_bLeaseClientPanelSleepPending );
+    CHECK( !g_bLeaseClientPanelSleep );
+    CHECK( g_lastAttempt == DrmLeaseEventType::Wake );
+
+    flush_once();
+    const auto sent = sent_now();
+    CHECK( sent.size() == 1 );
+    CHECK( sent[0] == DrmLeaseEventType::Wake );
+    CHECK( !g_bLeaseClientPanelSleepPending );
+    CHECK( g_sendAttempts == 3 );
+
+    std::cout << "PASS a pending sleep is replaced by a newer wake" << std::endl;
+}
+
+static void run_permanent_error_shuts_down()
+{
+    std::cout << "RUN a permanent send error shuts down once and retains the state" << std::endl;
+
+    for ( int i = 0; i < 2; i++ )
     {
-        std::lock_guard lock( g_hookMutex );
-        g_hookArmed = true;
-        g_hookEntered = false;
-        g_hookRelease = false;
+        reset_state();
+
+        const bool bSleep = i == 0;
+        const DrmLeaseEventType expected = bSleep ? DrmLeaseEventType::Sleep : DrmLeaseEventType::Wake;
+        connect_client( 7 );
+        g_permanent = true;
+        drm_lease_send_sleep( bSleep );
+
+        CHECK( g_bLeaseClientPanelSleep == bSleep );
+        CHECK( !g_bLeaseClientPanelSleepPending );
+        CHECK( g_shutdownCalls == 1 );
+        CHECK( g_sendAttempts == 1 );
+        CHECK( g_lastAttempt == expected );
+        CHECK( sent_now().empty() );
+
+        // The socket thread still owns the fd; once it recycles the client, a
+        // reconnect replays the retained state.
+        g_permanent = false;
+        disconnect_client();
+        connect_client( 9 );
+        reconnect_sync();
+        flush_once();
+
+        const auto sent = sent_now();
+        CHECK( sent.size() == 1 );
+        CHECK( sent[0] == expected );
+        CHECK( g_shutdownCalls == 1 );
     }
 
-    std::atomic<bool> wake_started{ false };
-    std::atomic<bool> wake_done{ false };
+    std::cout << "PASS a permanent send error shuts down once and retains the state" << std::endl;
+}
 
-    std::thread reconnect( [] { reconnect_sync(); } );
+static void run_send_sleep_serializes_contention()
+{
+    std::cout << "RUN a newer command waits for the send in flight" << std::endl;
+    reset_state();
+
+    connect_client( 7 );
     {
-        std::unique_lock lock( g_hookMutex );
-        CHECK( g_hookCv.wait_for( lock, std::chrono::seconds( 2 ), [] { return g_hookEntered; } ) );
+        std::lock_guard<std::mutex> lock( g_sendHookMutex );
+        g_sendHookArmed = true;
     }
 
-    std::thread wake( [&] {
-        wake_started.store( true, std::memory_order_release );
-        drm_lease_send_sleep( false );
-        wake_done.store( true, std::memory_order_release );
-    } );
+    // The hook disarms before it waits, so only the send armed here is held.
+    std::thread first( [] { drm_lease_send_sleep( true ); } );
+    {
+        std::unique_lock<std::mutex> lock( g_sendHookMutex );
+        CHECK( g_sendHookCv.wait_for( lock, std::chrono::seconds( 2 ), [] { return g_sendHookEntered; } ) );
+    }
 
-    for ( int i = 0; i < 2000 && !wake_started.load( std::memory_order_acquire ); i++ )
-        std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
-    CHECK( wake_started.load( std::memory_order_acquire ) );
-
-    // The reconnect's Sleep is on the wire while it holds the mutex; a wake
-    // that shares that mutex cannot finish first, so the last control is Wake.
+    // drm_lease_send_sleep holds g_leaseClientMutex across the send, so this
+    // newer Wake must serialize behind the in-flight Sleep rather than
+    // replacing the packet that is already on its way.
+    std::thread second( [] { drm_lease_send_sleep( false ); } );
     std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
-    CHECK( !wake_done.load( std::memory_order_acquire ) );
+    CHECK( g_bLeaseClientPanelSleep );
+    CHECK( g_bLeaseClientPanelSleepPending );
+    CHECK( sent_now().empty() );
 
     {
-        std::lock_guard lock( g_hookMutex );
-        g_hookRelease = true;
-        g_hookCv.notify_all();
+        std::lock_guard<std::mutex> lock( g_sendHookMutex );
+        g_sendHookRelease = true;
+        g_sendHookCv.notify_all();
     }
-
-    reconnect.join();
-    wake.join();
+    first.join();
+    second.join();
 
     const auto sent = sent_now();
     CHECK( sent.size() == 2 );
     CHECK( sent[0] == DrmLeaseEventType::Sleep );
     CHECK( sent[1] == DrmLeaseEventType::Wake );
     CHECK( !g_bLeaseClientPanelSleep );
-
-    std::cout << "PASS reconnect and wake are ordered by g_leaseClientMutex" << std::endl;
-}
-
-static void run_failed_sleep_shutdown()
-{
-    std::cout << "RUN a failed Sleep send shuts down once and retains the state" << std::endl;
-    reset_state();
-
-    g_nLeaseClientFd = 7;
-    g_sendShouldFail = true;
-    drm_lease_send_sleep( true );
-
-    CHECK( g_bLeaseClientPanelSleep );
-    CHECK( g_shutdownCalls == 1 );
-    CHECK( g_sendAttempts == 1 );
-    CHECK( g_lastAttempt == DrmLeaseEventType::Sleep );
-    CHECK( sent_now().empty() );
-
-    // The socket thread still owns the fd; once it recycles the client, a
-    // reconnect replays the retained state.
-    g_sendShouldFail = false;
-    g_nLeaseClientFd = -1;
-    g_nLeaseClientFd = 9;
-    reconnect_sync();
-
-    const auto sent = sent_now();
-    CHECK( sent.size() == 1 );
-    CHECK( sent[0] == DrmLeaseEventType::Sleep );
-    CHECK( g_shutdownCalls == 1 );
-
-    std::cout << "PASS a failed Sleep send shuts down once and retains the state" << std::endl;
-}
-
-static void run_failed_wake_shutdown()
-{
-    std::cout << "RUN a failed Wake send shuts down once and retains the state" << std::endl;
-    reset_state();
-
-    drm_lease_send_sleep( true );
-    CHECK( g_bLeaseClientPanelSleep );
+    CHECK( !g_bLeaseClientPanelSleepPending );
+    CHECK( g_sendAttempts == 2 );
     CHECK( g_shutdownCalls == 0 );
 
-    g_nLeaseClientFd = 7;
-    g_sendShouldFail = true;
+    std::cout << "PASS a newer command serializes behind the in-flight send" << std::endl;
+}
+
+static void run_one_shot_hook_disarms()
+{
+    std::cout << "RUN the one-shot send hook disarms before it waits" << std::endl;
+    reset_state();
+
+    connect_client( 7 );
+    {
+        std::lock_guard<std::mutex> lock( g_sendHookMutex );
+        g_sendHookArmed = true;
+    }
+
+    std::thread first( [] { drm_lease_send_sleep( true ); } );
+    {
+        std::unique_lock<std::mutex> lock( g_sendHookMutex );
+        CHECK( g_sendHookCv.wait_for( lock, std::chrono::seconds( 2 ), [] { return g_sendHookEntered; } ) );
+    }
+    {
+        std::lock_guard<std::mutex> lock( g_sendHookMutex );
+        g_sendHookRelease = true;
+        g_sendHookCv.notify_all();
+    }
+    first.join();
+
+    CHECK( !g_sendHookArmed );
+    CHECK( sent_now().size() == 1 );
+
     drm_lease_send_sleep( false );
-
-    CHECK( !g_bLeaseClientPanelSleep );
-    CHECK( g_shutdownCalls == 1 );
-    CHECK( g_sendAttempts == 1 );
-    CHECK( g_lastAttempt == DrmLeaseEventType::Wake );
-    CHECK( sent_now().empty() );
-
-    g_sendShouldFail = false;
-    g_nLeaseClientFd = -1;
-    g_nLeaseClientFd = 9;
-    reconnect_sync();
-
     const auto sent = sent_now();
-    CHECK( sent.size() == 1 );
-    CHECK( sent[0] == DrmLeaseEventType::Wake );
-    CHECK( g_shutdownCalls == 1 );
+    CHECK( sent.size() == 2 );
+    CHECK( sent[0] == DrmLeaseEventType::Sleep );
+    CHECK( sent[1] == DrmLeaseEventType::Wake );
 
-    std::cout << "PASS a failed Wake send shuts down once and retains the state" << std::endl;
-}
-
-static void run_no_client_no_shutdown()
-{
-    std::cout << "RUN no client means no send and no shutdown" << std::endl;
-    reset_state();
-
-    drm_lease_send_sleep( true );
-    CHECK( g_bLeaseClientPanelSleep );
-    CHECK( g_shutdownCalls == 0 );
-    CHECK( g_sendAttempts == 0 );
-
-    std::cout << "PASS no client means no send and no shutdown" << std::endl;
+    std::cout << "PASS the one-shot send hook disarms before it waits" << std::endl;
 }
 
 static void run_panel_sleep_mirror()
@@ -650,10 +832,11 @@ int main()
     run_sleep_before_connect();
     run_sync_after_reconnect();
     run_wake_after_reconnect();
-    run_reconnect_wake_contention();
-    run_failed_sleep_shutdown();
-    run_failed_wake_shutdown();
-    run_no_client_no_shutdown();
+    run_transient_fails_twice_then_succeeds();
+    run_transient_coalesces_latest();
+    run_permanent_error_shuts_down();
+    run_send_sleep_serializes_contention();
+    run_one_shot_hook_disarms();
     run_panel_sleep_mirror();
     run_bsleep_visible_layers();
     run_bsleep_wake_respects_independent();
@@ -665,7 +848,7 @@ int main()
 }'''
 
 
-def build_fixture(globals_adds, helper_adds, sync_adds, bsleep_adds):
+def build_fixture(globals_adds, panel_adds, sync_adds, bsleep_statement):
     reconnect_fn = NL.join([
         'static void reconnect_sync()',
         '{',
@@ -675,7 +858,7 @@ def build_fixture(globals_adds, helper_adds, sync_adds, bsleep_adds):
     bsleep_fn = NL.join([
         'static bool compute_bSleep( drm_t *drm, const FrameInfo_t *frameInfo )',
         '{',
-        NL.join(bsleep_adds),
+        NL.join(bsleep_statement),
         '\treturn bSleep;',
         '}',
     ])
@@ -683,7 +866,7 @@ def build_fixture(globals_adds, helper_adds, sync_adds, bsleep_adds):
         FIXTURE_HEAD,
         NL.join(globals_adds),
         '',
-        NL.join(helper_adds),
+        NL.join(panel_adds),
         '',
         reconnect_fn,
         '',
@@ -696,8 +879,8 @@ def build_fixture(globals_adds, helper_adds, sync_adds, bsleep_adds):
 
 def main():
     text = PATCH.read_text(encoding='utf-8')
-    globals_adds, helper_adds, sync_adds, bsleep_adds = check_source(text)
-    fixture = build_fixture(globals_adds, helper_adds, sync_adds, bsleep_adds)
+    globals_adds, panel_adds, sync_adds, bsleep_statement = check_source(text)
+    fixture = build_fixture(globals_adds, panel_adds, sync_adds, bsleep_statement)
 
     if shutil.which('g++') is None:
         raise SystemExit('g++ not found; run this test in the gamescope container')
@@ -707,7 +890,8 @@ def main():
         binary = pathlib.Path(work) / 'lease_sleep_fixture'
         source.write_text(fixture, encoding='utf-8')
         build = subprocess.run(
-            ['g++', '-std=c++20', '-O0', '-g', '-pthread', '-Wl,--wrap=shutdown',
+            ['g++', '-std=c++20', '-O0', '-g', '-pthread',
+             '-Wl,--wrap=send', '-Wl,--wrap=shutdown',
              '-o', str(binary), str(source)],
             capture_output=True,
             text=True,

@@ -8,39 +8,83 @@ socket, including to a companion that connects while it is asleep.
 
 The companion keeps that state in its own atomic mirror instead of the
 per-connector sleep ConVar, so an externally leased connector is not driven
-by the broker's internal setting. A failed send shuts the socket down and
-leaves the cached state for the reconnect replay; the socket thread still
-owns the fd.
+by the broker's internal setting. The lease socket is nonblocking, so a
+Sleep/Wake the peer cannot take yet is not a reason to drop the session:
+the latest desired state and a pending flag are kept under the broker
+mutex and flushed by the socket thread, whose bounded poll includes POLLOUT
+while one is owed. A would-block keeps the flag for the next writable poll,
+a newer sleep/wake replaces the older one, and a reconnect replays the
+cached state. The panel packet has its own MSG_DONTWAIT|MSG_NOSIGNAL send
+and never calls lease_send_control, so it leaves both the touch/yield flags
+and the Suspend/Resume helper untouched. A permanent panel send error still
+shuts the socket down and leaves the cached state for the reconnect replay;
+the socket thread still owns the fd and no caller waits or polls.
 ---
 diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+index 50af4ff..4705fc3 100644
 --- a/src/Backends/DRMBackend.cpp
 +++ b/src/Backends/DRMBackend.cpp
-@@ -1662,6 +1662,14 @@ static bool g_bLeaseClientSuspendPending = false;
+@@ -1668,6 +1668,18 @@ static bool g_bLeaseClientYields = false;
+ static bool g_bLeaseClientSuspendPending = false;
  static bool g_bLeaseClientSuspended = false;
  static uint64_t g_uLeaseClientGeneration = 0;
 +// ConVar's value is not atomic, so the socket thread must never read it; this
 +// mirror is only touched with g_leaseClientMutex held.
 +static bool g_bLeaseClientPanelSleep = false;
++// The latest Sleep/Wake is owed to the peer; the socket thread flushes it on
++// POLLOUT and keeps it set across a would-block or a reconnect.
++static bool g_bLeaseClientPanelSleepPending = false;
 +
 +// Companion-only: the broker's screen sleep, kept apart from this process's
 +// own per-connector cv_drm_sleep_screens settings.
 +static std::atomic<bool> g_bDrmLeasePanelSleep{ false };
- 
++
 +extern gamescope::ConVar<bool> cv_drm_sleep_screens[];
  
  static bool lease_send_fd( int nClientFd, int nLeaseFd )
- 
-@@ -1778,6 +1786,33 @@ bool drm_lease_companion_suspend( int nTimeoutMs )
+ {
+@@ -1785,6 +1797,85 @@ bool drm_lease_companion_suspend( int nTimeoutMs )
  	return true;
  }
  
-+// Caller holds g_leaseClientMutex.
-+static void lease_send_panel_sleep_locked( bool bSleep )
++// The panel packet has its own send so a transient would-block never touches
++// the touch or yielding state; only the latest sleep/wake is ever sent.
++enum class LeasePanelSleepSend
 +{
-+	if ( g_nLeaseClientFd < 0 )
-+		return;
-+	if ( !lease_send_control( bSleep ? DrmLeaseEventType::Sleep : DrmLeaseEventType::Wake ) )
-+		shutdown( g_nLeaseClientFd, SHUT_RDWR );
++	Sent,
++	Retry,
++	Dead,
++};
++
++// Caller holds g_leaseClientMutex. A newer Sleep/Wake replaces the desired
++// value, so a retry always sends what is current, never a stale packet.
++static LeasePanelSleepSend lease_try_send_panel_sleep_locked()
++{
++	if ( g_nLeaseClientFd < 0 || !g_bLeaseClientPanelSleepPending )
++		return LeasePanelSleepSend::Sent;
++
++	DrmLeaseEvent event = {
++		.type = g_bLeaseClientPanelSleep ? DrmLeaseEventType::Sleep : DrmLeaseEventType::Wake,
++	};
++	if ( send( g_nLeaseClientFd, &event, sizeof( event ), MSG_DONTWAIT | MSG_NOSIGNAL ) == sizeof( event ) )
++	{
++		g_bLeaseClientPanelSleepPending = false;
++		return LeasePanelSleepSend::Sent;
++	}
++
++	const int nError = errno;
++	if ( nError == EINTR || nError == EAGAIN || nError == EWOULDBLOCK )
++	{
++		// The peer is behind, not gone; keep the desired value and the
++		// pending flag for the socket thread's next POLLOUT.
++		return LeasePanelSleepSend::Retry;
++	}
++
++	// The socket is unusable but the lease fd may still be driven; let the
++	// peer's disconnect end its tenure. The cached value stays for replay.
++	g_bLeaseClientPanelSleepPending = false;
++	shutdown( g_nLeaseClientFd, SHUT_RDWR );
++	return LeasePanelSleepSend::Dead;
 +}
 +
 +// Steam only sleeps the broker's screen, so the companion's panel would stay lit.
@@ -50,7 +94,28 @@ diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
 +{
 +	std::lock_guard lock( g_leaseClientMutex );
 +	g_bLeaseClientPanelSleep = bSleep;
-+	lease_send_panel_sleep_locked( bSleep );
++	g_bLeaseClientPanelSleepPending = true;
++	// The common case is immediate and nonblocking; if the peer is behind,
++	// the socket thread owns the retry and no wait happens here.
++	lease_try_send_panel_sleep_locked();
++}
++
++// The socket thread reads this under the mutex to decide whether its bounded
++// poll must also wait for writability.
++static bool lease_panel_sleep_pending()
++{
++	std::lock_guard lock( g_leaseClientMutex );
++	return g_bLeaseClientPanelSleepPending;
++}
++
++// Socket thread: returns true when the socket is permanently unusable and the
++// caller should recycle the client. A would-block leaves the flag set.
++static bool lease_flush_panel_sleep( int nClientFd )
++{
++	std::lock_guard lock( g_leaseClientMutex );
++	if ( g_nLeaseClientFd != nClientFd )
++		return false;
++	return lease_try_send_panel_sleep_locked() == LeasePanelSleepSend::Dead;
 +}
 +
 +// Companion side: the broker mirrors its sleep here instead of touching this
@@ -64,21 +129,47 @@ diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
  void drm_lease_companion_resume()
  {
  	std::lock_guard lock( g_leaseClientMutex );
-@@ -1884,6 +1919,13 @@ static void lease_socket_thread_run( struct drm_t *drm )
+@@ -1802,10 +1893,15 @@ static void lease_socket_thread_run( struct drm_t *drm )
+ 
+ 	while ( drm->bLeaseThreadRunning.load() )
+ 	{
++		// A cached Sleep/Wake is flushed by this thread; including POLLOUT
++		// only while one is owed keeps the wait bounded for every peer.
++		const bool bPanelSleepPending = lease_panel_sleep_pending();
+ 		struct pollfd pfds[2] = {
+ 			{ .fd = drm->nLeaseSocketFd, .events = POLLIN },
+ 			{ .fd = nClientFd, .events = POLLIN },
+ 		};
++		if ( bPanelSleepPending )
++			pfds[1].events |= POLLOUT;
+ 		int ret = poll( pfds, nClientFd >= 0 ? 2 : 1, 1000 );
+ 		if ( ret <= 0 )
+ 			continue;
+@@ -1813,6 +1909,10 @@ static void lease_socket_thread_run( struct drm_t *drm )
+ 		if ( nClientFd >= 0 && pfds[1].revents & ( POLLHUP | POLLERR | POLLNVAL ) )
+ 			lease_disconnect_client( nClientFd );
+ 
++		if ( nClientFd >= 0 && pfds[1].revents & POLLOUT &&
++			lease_flush_panel_sleep( nClientFd ) )
++			lease_disconnect_client( nClientFd );
++
+ 		if ( nClientFd >= 0 && pfds[1].revents & POLLIN )
+ 		{
+ 			char request = 0;
+@@ -1891,6 +1991,12 @@ static void lease_socket_thread_run( struct drm_t *drm )
  		g_nActiveLeaseClients.fetch_add( 1 );
  		grantLock.unlock();
  		drm_log.infof( "lease-connector: sent lease fd to companion app" );
 +		{
-+			// A companion that connects while the panel sleeps would
-+			// otherwise keep its own panel lit.
++			// A companion that connects while the panel sleeps is owed the
++			// cached state; the next writable poll sends it, never drops it.
 +			std::lock_guard lock( g_leaseClientMutex );
-+			if ( g_nLeaseClientFd >= 0 )
-+				lease_send_panel_sleep_locked( g_bLeaseClientPanelSleep );
++			g_bLeaseClientPanelSleepPending = true;
 +		}
  	}
  
  	lease_disconnect_client( nClientFd );
-@@ -2345,8 +2387,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+@@ -2352,8 +2458,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
  	return true;
  }
  
@@ -90,17 +181,17 @@ diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
  	force_repaint();
  }
  
-@@ -4135,7 +4179,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
+@@ -4138,7 +4246,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
  	// A sleeping screen holds no output LUTs, so its desired state is "not applied";
  	// otherwise every repaint while asleep would see a mismatch and ask for a modeset.
--	const bool bSleep = drm->pConnector && ( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ] ||
+ 	const bool bSleep = drm->pConnector && ( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ] ||
 -		( g_sDrmLeaseClientSocket && frameInfo->layers.count() == 0 ) );
-+	const bool bSleep = drm->pConnector && ( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ] ||
 +		( g_sDrmLeaseClientSocket && ( frameInfo->layers.count() == 0 || g_bDrmLeasePanelSleep.load() ) ) );
  
  	// The output LUTs change on this request when they go on or off (which changes
  	// the display blocks the CRTC owns and needs a modeset) or when their contents do;
 diff --git a/src/main.hpp b/src/main.hpp
+index 9b750d2..ec6a275 100644
 --- a/src/main.hpp
 +++ b/src/main.hpp
 @@ -75,6 +75,9 @@ enum class DrmLeaseEventType : uint32_t
@@ -113,7 +204,7 @@ diff --git a/src/main.hpp b/src/main.hpp
  };
  
  struct DrmLeaseEvent
-@@ -89,6 +92,10 @@
+@@ -88,6 +91,10 @@ struct DrmLeaseEvent
  
  void drm_lease_send_touch( DrmLeaseEventType type, double x, double y, int touchId, uint32_t time );
  
@@ -125,9 +216,10 @@ diff --git a/src/main.hpp b/src/main.hpp
  // acknowledged that nothing of its can commit; false leaves it the holder.
  bool drm_lease_companion_suspend( int nTimeoutMs );
 diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 8f498a5..04c624d 100644
 --- a/src/wlserver.cpp
 +++ b/src/wlserver.cpp
-@@ -2092,6 +2092,10 @@ static void drm_lease_client_dispatch_event()
+@@ -2137,6 +2137,10 @@ static void drm_lease_client_dispatch_event()
  			GetBackend()->DirtyState( true, true );
  			wl_log.infof( "DRM lease resumed by the broker" );
  			break;
