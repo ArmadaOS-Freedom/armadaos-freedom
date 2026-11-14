@@ -275,33 +275,21 @@ def _normalize_module_name(name):
     return name.replace("-", "_")
 
 
-def _modules_builtin_contains(builtin_path, module_name):
-    wanted = _normalize_module_name(module_name)
-    try:
-        with open(builtin_path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                entry = stripped.split()[0]
-                if entry.endswith(".ko"):
-                    entry = entry[:-3]
-                candidate = entry.rsplit("/", 1)[-1]
-                if _normalize_module_name(candidate) == wanted:
-                    return True
-    except OSError:
-        return False
-    return False
+def _module_filename_stem(filename):
+    for suffix in _DRIVER_SUFFIXES:
+        if filename.endswith(suffix):
+            return filename[: -len(suffix)]
+    return None
 
 
-def _resolve_module_file(root, kver, module_name):
-    """Return module file name for *module_name* if it is a built-in module
-    according to modules.builtin, else None."""
-    modules_root = Path(root) / "usr" / "lib" / "modules" / kver
-    builtin_path = modules_root / "modules.builtin"
+def _builtin_entries(builtin_path):
+    """Parse modules.builtin into {normalized name: raw entry}.
+
+    A missing or unreadable file yields an empty mapping, matching the result
+    the previous per-query helpers produced."""
+    entries = {}
     if not builtin_path.is_file():
-        return None
-    wanted = _normalize_module_name(module_name)
+        return entries
     try:
         with open(builtin_path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -312,11 +300,23 @@ def _resolve_module_file(root, kver, module_name):
                 candidate = entry.rsplit("/", 1)[-1]
                 if candidate.endswith(".ko"):
                     candidate = candidate[:-3]
-                if _normalize_module_name(candidate) == wanted:
-                    return entry
+                entries.setdefault(_normalize_module_name(candidate), entry)
     except OSError:
-        return None
-    return None
+        return {}
+    return entries
+
+
+def _modules_builtin_contains(builtin_path, module_name):
+    return _normalize_module_name(module_name) in _builtin_entries(builtin_path)
+
+
+def _resolve_module_file(root, kver, module_name):
+    """Return module file name for *module_name* if it is a built-in module
+    according to modules.builtin, else None."""
+    modules_root = Path(root) / "usr" / "lib" / "modules" / kver
+    return _builtin_entries(modules_root / "modules.builtin").get(
+        _normalize_module_name(module_name)
+    )
 
 
 def _read_builtin_modinfo(modules_root):
@@ -329,10 +329,17 @@ def _read_builtin_modinfo(modules_root):
     return [entry for entry in text.split("\x00") if entry]
 
 
-def _module_builtin_aliases(modules_root, module_path):
+_UNREAD_MODINFO = object()
+
+
+def _module_builtin_aliases(modules_root, module_path, *, modinfo=_UNREAD_MODINFO):
     """Return alias strings declared by a built-in module, or None if the
     modinfo file cannot be read."""
-    entries = _read_builtin_modinfo(modules_root)
+    entries = (
+        _read_builtin_modinfo(modules_root)
+        if modinfo is _UNREAD_MODINFO
+        else modinfo
+    )
     if entries is None:
         return None
     normalized = module_path.removesuffix(".ko") if module_path else module_path
@@ -357,43 +364,21 @@ def _alias_matches(declared, requested):
     return False
 
 
-def _module_alias_present(root, kver, module_name, alias):
-    """Return (ok, diagnostic) for requested alias mapped to module_name."""
-    modules_root = Path(root) / "usr" / "lib" / "modules" / kver
-    module_path = _resolve_module_file(root, kver, module_name)
-    if module_path is not None:
-        declared = _module_builtin_aliases(modules_root, module_path)
-        if declared is None:
-            return (
-                False,
-                f"modules.builtin.modinfo unreadable for driver {module_name!r} "
-                f"alias {alias!r}",
-            )
-        for declared_alias in declared:
-            if _alias_matches(declared_alias, alias):
-                return True, None
-        return (
-            False,
-            f"driver {module_name!r} is built-in but alias {alias!r} not declared "
-            f"in modules.builtin.modinfo",
-        )
+def _read_modules_alias(modules_root):
+    """Parse modules.alias once for one module tree.
 
+    Returns ``("missing", None)`` when absent, ``("error", message)`` when it
+    cannot be read, or ``("ok", table)`` where *table* maps each declared alias
+    to a list of ``(normalized target, raw target)`` pairs.
+    """
     aliases_path = modules_root / "modules.alias"
     if not aliases_path.is_file():
-        return (
-            False,
-            f"driver {module_name!r} alias {alias!r} cannot be verified: "
-            f"modules.alias missing under usr/lib/modules/{kver}",
-        )
+        return "missing", None
     try:
         text = aliases_path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
-        return (
-            False,
-            f"driver {module_name!r} alias {alias!r}: could not read modules.alias: {error}",
-        )
-    wanted = _normalize_module_name(module_name)
-    other_owners = []
+        return "error", str(error)
+    table = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -407,52 +392,139 @@ def _module_alias_present(root, kver, module_name, alias):
         target = parts[2].rsplit("/", 1)[-1]
         if target.endswith(".ko"):
             target = target[:-3]
-        target_norm = _normalize_module_name(target)
-        if _alias_matches(declared_alias, alias):
-            if target_norm == wanted:
-                return True, None
-            other_owners.append(parts[2])
-    if other_owners:
-        detail = ", ".join(sorted(set(other_owners)))
-        return (
-            False,
-            f"driver {module_name!r} alias {alias!r} is declared for {detail}",
+        table.setdefault(declared_alias, []).append(
+            (_normalize_module_name(target), parts[2])
         )
-    return (
-        False,
-        f"driver {module_name!r} alias {alias!r} not found in modules.alias",
-    )
+    return "ok", table
 
 
-def _module_present(root, kver, module_name):
-    modules_root = Path(root) / "usr" / "lib" / "modules" / kver
-    if modules_root.is_dir():
-        builtin_path = modules_root / "modules.builtin"
-        if builtin_path.is_file() and _modules_builtin_contains(builtin_path, module_name):
-            return True
+class _ModuleIndex:
+    """Call-scoped index of one (root, kver) module tree.
 
-        kernel_dir = modules_root / "kernel"
-        if kernel_dir.is_dir():
-            wanted = _normalize_module_name(module_name)
-            for path in kernel_dir.rglob("*"):
-                if not path.is_file():
-                    continue
-                filename = path.name
-                stem = None
-                for suffix in _DRIVER_SUFFIXES:
-                    if filename.endswith(suffix):
-                        stem = filename[: -len(suffix)]
-                        break
-                if stem is None:
-                    continue
-                if _normalize_module_name(stem) == wanted:
+    ``verify_tree`` builds one instance and shares it across every driver and
+    alias check, so the kernel tree is walked once and modules.builtin,
+    modules.builtin.modinfo and modules.alias are each read at most once.
+    It is deliberately never cached across calls: a later ``verify_tree``
+    re-reads the filesystem and therefore observes added or removed modules.
+    """
+
+    def __init__(self, root, kver):
+        self.modules_root = Path(root) / "usr" / "lib" / "modules" / kver
+        self.kver = kver
+        self._loadable_names = None
+        self._builtin_names = None
+        self._modinfo_entries = None
+        self._modinfo_loaded = False
+        self._alias_state = None
+
+    def _loadable(self):
+        if self._loadable_names is None:
+            names = set()
+            kernel_dir = self.modules_root / "kernel"
+            if kernel_dir.is_dir():
+                for path in kernel_dir.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    stem = _module_filename_stem(path.name)
+                    if stem is None:
+                        continue
                     try:
                         if path.stat().st_size <= 0:
                             continue
                     except OSError:
                         continue
-                    return True
-    return False
+                    names.add(_normalize_module_name(stem))
+            self._loadable_names = names
+        return self._loadable_names
+
+    def _builtin(self):
+        if self._builtin_names is None:
+            self._builtin_names = _builtin_entries(
+                self.modules_root / "modules.builtin"
+            )
+        return self._builtin_names
+
+    def _modinfo(self):
+        if not self._modinfo_loaded:
+            self._modinfo_entries = _read_builtin_modinfo(self.modules_root)
+            self._modinfo_loaded = True
+        return self._modinfo_entries
+
+    def module_present(self, module_name):
+        if not self.modules_root.is_dir():
+            return False
+        wanted = _normalize_module_name(module_name)
+        if wanted in self._builtin():
+            return True
+        return wanted in self._loadable()
+
+    def module_aliases(self, module_path):
+        return _module_builtin_aliases(
+            self.modules_root, module_path, modinfo=self._modinfo()
+        )
+
+    def alias_present(self, module_name, alias):
+        """Return (ok, diagnostic) for requested alias mapped to module_name."""
+        module_path = self._builtin().get(_normalize_module_name(module_name))
+        if module_path is not None:
+            declared = self.module_aliases(module_path)
+            if declared is None:
+                return (
+                    False,
+                    f"modules.builtin.modinfo unreadable for driver {module_name!r} "
+                    f"alias {alias!r}",
+                )
+            for declared_alias in declared:
+                if _alias_matches(declared_alias, alias):
+                    return True, None
+            return (
+                False,
+                f"driver {module_name!r} is built-in but alias {alias!r} not declared "
+                f"in modules.builtin.modinfo",
+            )
+
+        if self._alias_state is None:
+            self._alias_state = _read_modules_alias(self.modules_root)
+        status, payload = self._alias_state
+        if status == "missing":
+            return (
+                False,
+                f"driver {module_name!r} alias {alias!r} cannot be verified: "
+                f"modules.alias missing under usr/lib/modules/{self.kver}",
+            )
+        if status == "error":
+            return (
+                False,
+                f"driver {module_name!r} alias {alias!r}: "
+                f"could not read modules.alias: {payload}",
+            )
+        wanted = _normalize_module_name(module_name)
+        targets = payload.get(alias, []) + payload.get(alias + "C*", [])
+        if any(target == wanted for target, _ in targets):
+            return True, None
+        if targets:
+            detail = ", ".join(sorted({raw for _, raw in targets}))
+            return (
+                False,
+                f"driver {module_name!r} alias {alias!r} is declared for {detail}",
+            )
+        return (
+            False,
+            f"driver {module_name!r} alias {alias!r} not found in modules.alias",
+        )
+
+
+def _module_present(root, kver, module_name, index=None):
+    if index is None:
+        index = _ModuleIndex(root, kver)
+    return index.module_present(module_name)
+
+
+def _module_alias_present(root, kver, module_name, alias, index=None):
+    """Return (ok, diagnostic) for requested alias mapped to module_name."""
+    if index is None:
+        index = _ModuleIndex(root, kver)
+    return index.alias_present(module_name, alias)
 
 
 def _read_firmware_bytes(path):
@@ -473,6 +545,7 @@ def verify_tree(root, kver, requirements):
     if not root_path.is_dir():
         raise ValueError(f"root {root!r} is not a directory")
 
+    index = _ModuleIndex(root_path, kver)
     errors = []
     for model, req in requirements.items():
         if not isinstance(req, dict):
@@ -511,7 +584,7 @@ def verify_tree(root, kver, requirements):
 
         for module_name in drivers:
             try:
-                present = _module_present(root_path, kver, module_name)
+                present = _module_present(root_path, kver, module_name, index=index)
             except OSError as error:
                 errors.append(f"{model}: driver {module_name!r}: {error}")
                 continue
@@ -523,7 +596,7 @@ def verify_tree(root, kver, requirements):
             for alias in alias_map.get(module_name, []):
                 try:
                     ok, detail = _module_alias_present(
-                        root_path, kver, module_name, alias
+                        root_path, kver, module_name, alias, index=index
                     )
                 except OSError as error:
                     ok = False

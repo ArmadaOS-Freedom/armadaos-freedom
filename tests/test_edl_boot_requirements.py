@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Unit tests for build_files/edl_boot_requirements.py.
 
-External boundary mocked: only the ``lsinitrd`` subprocess call.
+External boundary mocked: only the ``lsinitrd`` subprocess call.  The kernel
+scan regression additionally wraps ``Path.rglob`` to count invocations while
+delegating to the real filesystem walk.
 """
 
 from __future__ import annotations
@@ -94,6 +96,13 @@ def write_builtin_modinfo(root, kver, payload):
     path = root / "usr" / "lib" / "modules" / kver / "modules.builtin.modinfo"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
+    return path
+
+
+def write_modules_alias(root, kver, entries):
+    path = root / "usr" / "lib" / "modules" / kver / "modules.alias"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(entries) + "\n", encoding="utf-8")
     return path
 
 
@@ -555,6 +564,107 @@ class VerifyTreeTests(unittest.TestCase):
         self.assertIn("A:", message)
         self.assertIn("B:", message)
         self.assertGreaterEqual(message.count("; ") + 1, 3)
+
+
+class VerifyTreeKernelScanRegressionTests(unittest.TestCase):
+    """Regression for redundant kernel-tree walks with overlapping drivers.
+
+    Both models require ``drv_common`` plus a model-specific loadable module,
+    and aliases are verified through modules.alias.  ``Path.rglob`` is wrapped
+    so the real traversal still happens, only its invocation count is recorded.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.kver = "6.1.0-test"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _populate(self):
+        modules_root = self.root / "usr" / "lib" / "modules" / self.kver
+        kernel_drivers = modules_root / "kernel" / "drivers"
+        write_file(kernel_drivers / "usb" / "drv_common.ko", b"\x7fELF")
+        write_file(kernel_drivers / "pci" / "drv_alpha.ko.xz", b"\x7fELF-xz")
+        write_file(kernel_drivers / "pci" / "drv_beta.ko.zst", b"\x7fELF-zst")
+        write_file(kernel_drivers / "misc" / "drv_unused.ko", b"\x7fELF")
+        write_modules_alias(
+            self.root,
+            self.kver,
+            [
+                "alias usb:v1A2Bp3C4D* kernel/drivers/usb/drv_common.ko",
+                "alias pci:v00001234d00005678* kernel/drivers/pci/drv_alpha.ko",
+                "alias pci:v00009ABCDd0000EF01* kernel/drivers/pci/drv_beta.ko",
+            ],
+        )
+
+    def _requirements(self):
+        return {
+            "A": {
+                "earlyFirmware": [],
+                "earlyDrivers": ["drv_common", "drv_alpha"],
+                "firmwareSha256": {},
+                "moduleAliases": {
+                    "drv_common": ["usb:v1A2Bp3C4D*"],
+                    "drv_alpha": ["pci:v00001234d00005678*"],
+                },
+            },
+            "B": {
+                "earlyFirmware": [],
+                "earlyDrivers": ["drv_common", "drv_beta"],
+                "firmwareSha256": {},
+                "moduleAliases": {
+                    "drv_common": ["usb:v1A2Bp3C4D*"],
+                    "drv_beta": ["pci:v00009ABCDd0000EF01*"],
+                },
+            },
+        }
+
+    def _counting_rglob(self):
+        original = Path.rglob
+        scans = []
+
+        def counting_rglob(path_self, pattern):
+            scans.append((path_self, pattern))
+            return original(path_self, pattern)
+
+        patcher = mock.patch.object(Path, "rglob", new=counting_rglob)
+        return scans, patcher
+
+    def test_overlapping_drivers_scan_kernel_tree_at_most_once(self):
+        self._populate()
+        scans, patcher = self._counting_rglob()
+        with patcher:
+            result = ebr.verify_tree(self.root, self.kver, self._requirements())
+
+        self.assertIsNone(result)
+        self.assertGreaterEqual(
+            len(scans),
+            1,
+            "kernel tree was never walked; module presence must be read from disk",
+        )
+        self.assertLessEqual(
+            len(scans),
+            1,
+            f"kernel tree walked {len(scans)} times for one verify_tree call; "
+            "expected at most one scan per (root, kver)",
+        )
+
+    def test_second_call_observes_removed_module(self):
+        self._populate()
+        requirements = self._requirements()
+        self.assertIsNone(ebr.verify_tree(self.root, self.kver, requirements))
+
+        modules_root = self.root / "usr" / "lib" / "modules" / self.kver
+        (modules_root / "kernel" / "drivers" / "pci" / "drv_alpha.ko.xz").unlink()
+
+        with self.assertRaises(ValueError) as ctx:
+            ebr.verify_tree(self.root, self.kver, requirements)
+        message = str(ctx.exception)
+        self.assertIn("A:", message)
+        self.assertIn("drv_alpha", message)
+        self.assertNotIn("B:", message)
 
 
 class VerifyInitramfsTests(unittest.TestCase):
