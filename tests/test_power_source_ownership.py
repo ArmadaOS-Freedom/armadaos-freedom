@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import shlex
 import unittest
+from collections import namedtuple
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,22 +65,62 @@ def logical_lines(text: str):
         yield pending
 
 
+Copy = namedtuple("Copy", "stage from_stage sources dest")
+CTX_STAGE = "ctx"
+
+
+def stage_instruction(arguments: str):
+    """Return the stage alias from FROM arguments, or the image name."""
+    fields = arguments.split()
+    for index, field in enumerate(fields[:-1]):
+        if field.upper() == "AS":
+            return fields[index + 1]
+    return fields[-1] if fields else None
+
+
+def copy_options(arguments: str):
+    """Strip COPY options, returning the --from stage and remaining fields."""
+    from_stage = None
+    while arguments.startswith("--"):
+        option = arguments.split(None, 1)
+        if len(option) < 2:
+            return from_stage, ""
+        flag, remainder = option
+        arguments = remainder.lstrip()
+        name, has_value, value = flag.partition("=")
+        if name.upper() == "--FROM":
+            if has_value:
+                from_stage = value
+            else:
+                from_stage, _, arguments = arguments.partition(" ")
+                arguments = arguments.lstrip()
+    return from_stage, arguments
+
+
 def copy_instructions(text: str):
+    """Yield COPY instructions with the stage they belong to.
+
+    A COPY's sources are build-context paths only when --from is absent;
+    otherwise they name paths inside another stage or image.
+    """
+    stage = None
     for line in logical_lines(text):
         instruction = line.split(None, 1)
-        if len(instruction) < 2 or instruction[0].upper() != "COPY":
+        keyword = instruction[0].upper()
+        if keyword == "FROM":
+            stage = (
+                stage_instruction(instruction[1].strip())
+                if len(instruction) > 1
+                else None
+            )
             continue
-        arguments = instruction[1].strip()
-        while arguments.startswith("--"):
-            option = arguments.split(None, 1)
-            if len(option) < 2:
-                arguments = ""
-                break
-            arguments = option[1].lstrip()
+        if keyword != "COPY" or len(instruction) < 2:
+            continue
+        from_stage, arguments = copy_options(instruction[1].strip())
         fields = _copy_arguments(arguments)
         if len(fields) < 2:
             continue
-        yield fields[:-1], fields[-1]
+        yield Copy(stage, from_stage, tuple(fields[:-1]), fields[-1])
 
 
 def _copy_arguments(arguments: str):
@@ -107,6 +149,15 @@ def tree_files(root: Path) -> set[str]:
     }
 
 
+def normalize(path: str) -> str:
+    """Collapse . and .. lexically; the filesystem is never touched."""
+    return posixpath.normpath(path)
+
+
+def in_ctx(copied: Copy) -> bool:
+    return copied.stage is not None and copied.stage.casefold() == CTX_STAGE
+
+
 class PowerSourceOwnershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -127,26 +178,40 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     f"{relative} must not exist in this repository: nothing "
                     "at that path would ship",
                 )
-                destination = f"/system_files/{relative}"
-                expected = f"{SOURCE_PREFIX}/{relative}"
-                sources = [
-                    source
-                    for copied_sources, dest in self.copies
-                    if dest == destination
-                    for source in copied_sources
+                destination = normalize(f"/system_files/{relative}")
+                expected = normalize(f"{SOURCE_PREFIX}/{relative}")
+                installed = [
+                    (normalize(source), copied.from_stage)
+                    for copied in self.copies
+                    if in_ctx(copied) and normalize(copied.dest) == destination
+                    for source in copied.sources
                 ]
                 self.assertIn(
                     expected,
-                    sources,
-                    f"Containerfile must COPY {relative} from Freedom Control "
-                    "to its root path",
+                    [
+                        source
+                        for source, from_stage in installed
+                        if from_stage is None
+                    ],
+                    f"Containerfile must COPY {relative} from the build "
+                    "context, sourced from Freedom Control, inside the ctx "
+                    "stage",
                 )
-                competing = sorted(set(sources) - {expected})
+                competing = sorted(
+                    {
+                        source
+                        if from_stage is None
+                        else f"--from {from_stage} {source}"
+                        for source, from_stage in installed
+                        if not (from_stage is None and source == expected)
+                    }
+                )
                 self.assertEqual(
                     competing,
                     [],
-                    f"Containerfile also COPYs {relative} from {competing} to "
-                    "its root path; only Freedom Control may own that file",
+                    f"Containerfile also writes {relative} from {competing} "
+                    "to its root path in the ctx stage; only Freedom Control "
+                    "may own that file",
                 )
 
     def test_only_named_shared_fixtures_overlap(self):
@@ -164,18 +229,22 @@ class PowerSourceOwnershipTests(unittest.TestCase):
             )
 
     def test_containerfile_never_installs_control_fixtures(self):
-        for sources, dest in self.copies:
-            for source in sources:
-                if source != SOURCE_PREFIX and not source.startswith(
+        for copied in self.copies:
+            if copied.from_stage is not None:
+                continue
+            for source in copied.sources:
+                normalized = normalize(source)
+                if normalized != SOURCE_PREFIX and not normalized.startswith(
                     SOURCE_PREFIX + "/"
                 ):
                     continue
-                relative = source[len(SOURCE_PREFIX):].lstrip("/")
+                relative = normalized[len(SOURCE_PREFIX):].lstrip("/")
                 self.assertIn(
                     relative,
                     CANONICAL,
                     f"Containerfile installs non-canonical control file "
-                    f"{source} to {dest}; a broad system_files COPY counts",
+                    f"{source} to {copied.dest}; a broad system_files COPY "
+                    "counts",
                 )
 
 
