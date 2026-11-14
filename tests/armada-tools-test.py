@@ -143,7 +143,8 @@ class ToolsTests(unittest.TestCase):
         with patch.object(backend.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, stdout="{}")) as run:
             backend.privileged_request("channel-beta")
-            self.assertTrue(120 < run.call_args.kwargs["timeout"] <= 180)
+            self.assertEqual(run.call_args.kwargs["timeout"], 240)
+            self.assertGreater(run.call_args.kwargs["timeout"], 15 + 60 + 10 + 120 + 10)
             backend.privileged_request("get-os")
             self.assertEqual(run.call_args.kwargs["timeout"], 240)
             self.assertGreater(run.call_args.kwargs["timeout"], 15 + 60 + 120)

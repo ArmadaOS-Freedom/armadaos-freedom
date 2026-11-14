@@ -46,8 +46,8 @@ class OfflinePayloadIntegrationTests(unittest.TestCase):
         self.fixture = image_fix.OfflineImageIntegrationTests(
             "test_real_btrfs_import_preserves_repo_metadata_and_excludes_decoys"
         )
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.temp = self.fixture.temp
         self.image = self.fixture.image
         self.payload_dir = self.temp / "payload"

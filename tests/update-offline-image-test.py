@@ -69,8 +69,8 @@ class OfflineImageIntegrationTests(unittest.TestCase):
         self.fixture = source_fix.OfflineSourceIntegrationTests(
             "test_real_import_preserves_source_sysroot_and_user_data"
         )
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.temp = self.fixture.temp
         self.image = self.temp / "linux-root.btrfs"
         top = self.temp / "image-root"

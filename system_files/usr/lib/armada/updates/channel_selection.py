@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import trial_confirmation
+from . import finalization_receipt, trial_confirmation
 
 
 CHANNELS = ("stable", "beta", "testing")
@@ -57,6 +57,10 @@ def set_channel(channel, state_path=DEFAULT_STATE_PATH):
                 stream.write(channel + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            # mkdir(parents=True) may have created several directories, so the
+            # immediate parent alone is not enough to make the path durable.
+            # Flush the whole ancestor chain before the file becomes visible.
+            finalization_receipt._durable_ancestors(parent)
             os.replace(str(temporary), str(destination))
             temporary = None
             directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

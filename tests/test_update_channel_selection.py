@@ -94,6 +94,38 @@ class ChannelSelectionTests(unittest.TestCase):
         self.assertEqual(self.state_path.read_text(encoding="utf-8"), "beta\n")
         self.assertEqual(list(self.state_path.parent.glob(".update-channel.*")), [])
 
+    def test_nested_parent_directories_are_flushed_before_publication(self):
+        destination = self.tmpdir / "one" / "two" / "update-channel"
+        real_fsync = os.fsync
+        flushed = []
+
+        def record(fd):
+            info = os.fstat(fd)
+            flushed.append((info.st_dev, info.st_ino))
+            real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=record):
+            channel_selection.set_channel("beta", destination)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "beta\n")
+        for directory in (destination.parent, destination.parent.parent, self.tmpdir):
+            info = os.lstat(directory)
+            self.assertIn((info.st_dev, info.st_ino), flushed)
+
+    def test_ancestor_flush_failure_prevents_publication(self):
+        destination = self.tmpdir / "one" / "two" / "update-channel"
+        real_fsync = os.fsync
+
+        def fail_on_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("fsync boom")
+            real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=fail_on_directory):
+            with self.assertRaisesRegex(OSError, "fsync boom"):
+                channel_selection.set_channel("beta", destination)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.glob(".update-channel.*")), [])
+
 
 @unittest.skipUnless(os.geteuid() == 0, "requires root")
 class ManagerChannelIntegrationTests(unittest.TestCase):
