@@ -158,6 +158,30 @@ def in_ctx(copied: Copy) -> bool:
     return copied.stage is not None and copied.stage.casefold() == CTX_STAGE
 
 
+def context_source(copied: Copy, source: str):
+    """Return the build-context path a COPY source addresses, or None.
+
+    A COPY without --from already names a build-context path.  The ctx stage
+    holds a copy of the build context, so its absolute sources address that
+    same tree once the stage root is dropped; any other stage has its own
+    filesystem and its paths say nothing about this repository.
+    """
+    if copied.from_stage is None:
+        return normalize(source)
+    if copied.from_stage.casefold() == CTX_STAGE:
+        return normalize(source).lstrip("/") or "."
+    return None
+
+
+def source_origin(copied: Copy) -> str:
+    """Name the stage a COPY reads from, for diagnostics."""
+    return (
+        "the build context"
+        if copied.from_stage is None
+        else f"--from {copied.from_stage}"
+    )
+
+
 class PowerSourceOwnershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -230,10 +254,10 @@ class PowerSourceOwnershipTests(unittest.TestCase):
 
     def test_containerfile_never_installs_control_fixtures(self):
         for copied in self.copies:
-            if copied.from_stage is not None:
-                continue
             for source in copied.sources:
-                normalized = normalize(source)
+                normalized = context_source(copied, source)
+                if normalized is None:
+                    continue
                 if normalized != SOURCE_PREFIX and not normalized.startswith(
                     SOURCE_PREFIX + "/"
                 ):
@@ -243,18 +267,20 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     relative,
                     CANONICAL,
                     f"Containerfile installs non-canonical control file "
-                    f"{source} to {copied.dest}; a broad system_files COPY "
+                    f"{source} from {source_origin(copied)} to {copied.dest} "
+                    f"in stage {copied.stage}; a broad system_files COPY "
                     "counts",
                 )
 
         # A directory COPY from an ancestor of the control tree copies its
         # contents, so a fixture can land on its shipped path without the
-        # source naming system_files at all (e.g. decky/freedom-control to /).
+        # source naming system_files at all (e.g. decky/freedom-control to /,
+        # including read back out of the ctx stage).
         for copied in self.copies:
-            if copied.from_stage is not None:
-                continue
             for source in copied.sources:
-                directory = normalize(source)
+                directory = context_source(copied, source)
+                if directory is None:
+                    continue
                 if directory != "." and not SOURCE_PREFIX.startswith(
                     directory + "/"
                 ):
@@ -271,9 +297,10 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     self.assertNotEqual(
                         projected,
                         normalize(f"/system_files/{relative}"),
-                        f"Containerfile COPY {source} {copied.dest} in the "
-                        f"ctx stage overwrites the shipped fixture "
-                        f"{relative} at {projected}",
+                        f"Containerfile COPY {source} {copied.dest} from "
+                        f"{source_origin(copied)} into stage {copied.stage} "
+                        f"overwrites the shipped fixture {relative} at "
+                        f"{projected}",
                     )
 
 
