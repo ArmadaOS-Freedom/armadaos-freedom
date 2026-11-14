@@ -37,6 +37,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0067-drm-msm-dpu-enable-qseed-detail-enhancer.patch`
   source: https://github.com/ROCKNIX/distribution/blob/60bb58c1db053255b700f3953b72d619ec5aa85d/projects/ROCKNIX/devices/SM8550/patches/linux/0067-drm-msm-dpu-enable-qseed-detail-enhancer.patch
   upstream: unknown
+  notes: Authored by tiopex (from the patch header); not enabled in `series` and kept as a reference patch. Enables the QSEED detail enhancer and directional filter only while QSEED is actually scaling.
 - `patches/0068-drm-msm-dpu-lutdma-dspp-igc-gamut.patch`
   source: armada
   upstream: local
@@ -428,7 +429,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0900-power-supply-qcom-battmgr-log-usb-adapter-type.patch`
   source: armada
   upstream: local
-  notes: Armada wrote this diagnostic patch to log the USB type and Qualcomm firmware's adapter type when either value changes.
+  notes: Armada wrote this diagnostic patch to log the USB type and Qualcomm firmware's adapter type when either value changes. Not enabled in `series`; kept as a reference patch.
 - `patches/0001-pcie-update-sm8650-dtsi.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/patches/linux/0001-pcie-update-sm8650-dtsi.patch
   upstream: https://lore.kernel.org/r/20260611-wake-v2-35-2744251b1181@oss.qualcomm.com
@@ -857,6 +858,26 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/h0cheung/tb322fc-linux-kernel/blob/6f97250ead155fc3b980856323e99a4623dae73d/drivers/power/sequencing/pwrseq-qcom-wcn.c
   upstream: unknown
   notes: Local adaptation of the tb322fc WCN7861 PMU provider. Adds a `qcom,wcn7861-pmu` platform-data entry and a 7861-only AOSS/PDC initialisation that runs before any supply or enable vote; votes seven external supplies by voltage range and load so the variable RPMh rails are not left at their floor. The existing WCN7860 path is untouched. Bounded scope: the reference's Bluetooth reset timing and its OL-CPR / QMI dynamic-map and mutex code are omitted. The msm PCIe endpoint waits on ldo9 until the 7861 PMU binds.
+- `patches/0148-clk-elden-display-power-handoff.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
+  upstream: unknown
+  notes: Adapted from the pinned tb322fc tree; restores Elden display clock and power dependencies by reparenting orphaned clocks with the parent migration references held. The patch header names only the pinned commit; no separate upstream submission was found.
+- `patches/0149-power-supply-qcom-battmgr-sm8750-reporting.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
+  upstream: unknown
+  notes: Adapted from the tb322fc tree's `qcom_battmgr.c` blob `d7fff0936693830c938d5c5bc1b46adfe442cf9e`; honors the board's battery-current-inverted property and omits `POWER_NOW` on SM8750, whose firmware reports a maximum-load value. Battery naming and charge-control callbacks are unchanged.
+- `patches/0150-power-supply-qcom-battmgr-sm8750-usb-current.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
+  upstream: unknown
+  notes: Adapted from the same tb322fc `qcom_battmgr.c` blob; adds the `INPUT_CURRENT_LIMIT` protocol setter and response handling only for the SM8750 USB supply. Requests pass the current unchanged; no autonomous current increase or replay policy is added.
+- `patches/0151-ASoC-codecs-add-aw88461-speaker-amplifier.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
+  upstream: unknown
+  notes: Imported from the pinned tb322fc tree's `aw88461.c` blob `73f37c253963c0a59bfea499ae64168aaf002521` with its Kconfig/Makefile wiring; the original GPL-2.0-only notice and author attribution are retained. Each board supplies its own speaker tuning firmware; Armada's shared AudioReach and machine drivers are not replaced.
+- `patches/0152-usb-dwc3-shared-connector-role-mux.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
+  upstream: unknown
+  notes: Adapted from the pinned tb322fc tree; adds a shared DWC3 data path across two Type-C connectors with role-mux handoff. Non-mux reset behavior is kept and the unrelated full suspend reinitialization is excluded.
 - `patches/0153-drm-msm-elden-video-teardown.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
   upstream: unknown
@@ -1130,6 +1151,22 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armadaos-freedom
   upstream: local
   notes: Adds Kaanapali inline-rotation capabilities, DPU 13 ROT90 register programming, catalog-limited split allocation, rotation-aware clock calculation and the no-pre-downscale bound. Existing SoC catalogs retain their limits.
+- `patches/0225-drm-msm-sm8850-output-lut.patch`
+  source: armada
+  upstream: local
+  notes: Local Kaanapali DSPP output LUT support. Moves the DSPP blocks to the Kaanapali LUT definitions, streams IGC v5.1 samples in the vendor's R, G, B order, adds the reg-DMA v4 layout with per-controller error and trigger registers, and checks every window access against the mapped length. Not submitted upstream.
+- `patches/0226-drm-msm-whole-gpu-busy-time.patch`
+  source: armada
+  upstream: local
+  notes: Local telemetry support. Adds the read-only `gpu_busy_time_ns` attribute, which accumulates whole-GPU busy time from the driver's busy counter. Accounting starts on the first read, reads do not wake a suspended GPU, and devfreq governor accounting is left untouched. Not submitted upstream.
+- `patches/0227-Bluetooth-qca-add-WCN7861-peripheral-setup.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474
+  upstream: unknown
+  notes: Retains GEEKiDoS's authorship. Ports the TB322FC WCN7861 peripheral firmware, NVM and TME-L initialization and its tag-27 IBS layout to the unified Bluetooth path while preserving the WCN7850/WCN7860 and configured-address paths. The header also references `ac6ae99d08b70ffad9c6733967e0ca8f52e1751d` in the same repository.
+- `patches/0228-drm-msm-dpu-qseed-v11-rotation-boundaries.patch`
+  source: armada
+  upstream: local
+  notes: Local Kaanapali and Elden QSEED3 V11 axis handling for inline 90/270-degree rotation. Computes phase step, initial phase, preload and fetch extension in post-rotation coordinates, records the physical extended source rectangle, and uses it for bandwidth and pixel-extension programming. Older scaler revisions keep the existing path; not submitted upstream.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local
