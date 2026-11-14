@@ -102,6 +102,10 @@ def copy_instructions(text: str):
 
     A COPY's sources are build-context paths only when --from is absent;
     otherwise they name paths inside another stage or image.
+
+    Sources must be explicit paths.  This guard compares them literally, so a
+    wildcard source could slip past the ownership checks instead of failing;
+    any source containing *, ? or [ is therefore rejected outright.
     """
     stage = None
     for line in logical_lines(text):
@@ -120,6 +124,12 @@ def copy_instructions(text: str):
         fields = _copy_arguments(arguments)
         if len(fields) < 2:
             continue
+        for source in fields[:-1]:
+            if any(character in source for character in "*?["):
+                raise ValueError(
+                    "ownership guard requires explicit COPY source paths; "
+                    f"wildcard COPY sources are unsupported: {source}"
+                )
         yield Copy(stage, from_stage, tuple(fields[:-1]), fields[-1])
 
 
