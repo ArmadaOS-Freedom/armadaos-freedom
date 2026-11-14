@@ -41,12 +41,31 @@ def find_control() -> Path:
     return CONTROL_SUBMODULE
 
 
-def copy_instructions(text: str):
+def logical_lines(text: str):
+    """Join standard backslash continuations into logical instructions.
+
+    Comment and blank physical lines are dropped, including inside a
+    continuation, so an instruction split over several lines is parsed as one.
+    """
+    pending = None
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        instruction = stripped.split(None, 1)
+        pending = stripped if pending is None else f"{pending} {stripped}"
+        trailing = len(pending) - len(pending.rstrip("\\"))
+        if trailing % 2:
+            pending = pending[:-1]
+            continue
+        yield pending
+        pending = None
+    if pending:
+        yield pending
+
+
+def copy_instructions(text: str):
+    for line in logical_lines(text):
+        instruction = line.split(None, 1)
         if len(instruction) < 2 or instruction[0].upper() != "COPY":
             continue
         arguments = instruction[1].strip()
