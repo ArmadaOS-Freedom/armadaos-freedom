@@ -68,6 +68,22 @@ def logical_lines(text: str):
 Copy = namedtuple("Copy", "stage from_stage sources dest")
 CTX_STAGE = "ctx"
 
+# The one tolerated variable COPY source.  It seeds the boot-tool builder from
+# a resolved tree this guard never compares, so it cannot hide a control file.
+KNOWN_VARIABLE_SOURCE = "${BOOT_TOOL_SOURCE}/"
+KNOWN_VARIABLE_STAGE = "boot-tool-builder"
+
+
+def _known_variable_source(stage, from_stage, source, dest):
+    """Whether a variable source is the single tolerated boot-tool seed."""
+    return (
+        source == KNOWN_VARIABLE_SOURCE
+        and from_stage is None
+        and dest == "./"
+        and stage is not None
+        and stage.casefold() == KNOWN_VARIABLE_STAGE
+    )
+
 
 def stage_instruction(arguments: str):
     """Return the stage alias from FROM arguments, or the image name."""
@@ -103,9 +119,13 @@ def copy_instructions(text: str):
     A COPY's sources are build-context paths only when --from is absent;
     otherwise they name paths inside another stage or image.
 
-    Sources must be explicit paths.  This guard compares them literally, so a
-    wildcard source could slip past the ownership checks instead of failing;
-    any source containing *, ? or [ is therefore rejected outright.
+    Sources and destinations must be explicit.  Variables are not expanded
+    here, so an unresolved "$" would make the path this guard compares differ
+    from the path Docker copies; only the known boot-tool seed is tolerated and
+    every other variable is rejected.  A wildcard source could likewise slip
+    past the ownership checks, so any source containing *, ? or [ is rejected.
+    A --from reference must name a stage, because a numeric index silently
+    points at whichever stage happens to come first.
     """
     stage = None
     for line in logical_lines(text):
@@ -121,16 +141,39 @@ def copy_instructions(text: str):
         if keyword != "COPY" or len(instruction) < 2:
             continue
         from_stage, arguments = copy_options(instruction[1].strip())
+        if from_stage is not None and from_stage.isdigit():
+            raise ValueError(
+                "ownership guard requires COPY --from to name a stage; "
+                f"numeric stage index {from_stage} is unsupported: use the "
+                "stage alias instead"
+            )
         fields = _copy_arguments(arguments)
         if len(fields) < 2:
             continue
-        for source in fields[:-1]:
+        sources, dest = fields[:-1], fields[-1]
+        for source in sources:
+            if "$" in source and not _known_variable_source(
+                stage, from_stage, source, dest
+            ):
+                raise ValueError(
+                    "ownership guard requires explicit COPY source paths; "
+                    f"unresolved variable in COPY source {source}: the guard "
+                    "does not expand it, so use a literal build-context path "
+                    f"(only {KNOWN_VARIABLE_SOURCE} from stage "
+                    f"{KNOWN_VARIABLE_STAGE} is supported)"
+                )
             if any(character in source for character in "*?["):
                 raise ValueError(
                     "ownership guard requires explicit COPY source paths; "
                     f"wildcard COPY sources are unsupported: {source}"
                 )
-        yield Copy(stage, from_stage, tuple(fields[:-1]), fields[-1])
+        if "$" in dest:
+            raise ValueError(
+                "ownership guard requires explicit COPY destination paths; "
+                f"unresolved variable in COPY destination {dest}: use a "
+                "literal path"
+            )
+        yield Copy(stage, from_stage, tuple(sources), dest)
 
 
 def _copy_arguments(arguments: str):
@@ -164,6 +207,17 @@ def normalize(path: str) -> str:
     return posixpath.normpath(path)
 
 
+def context_identity(source: str) -> str:
+    """Return the build-context path a literal source addresses, or its root.
+
+    Docker resolves build-context sources against the context root, discarding
+    a leading slash and any parent traversal.  Pinning each source at that root
+    makes /decky/x and ../decky/x the same path as decky/x, so the checks below
+    see the file Docker would actually copy.  This is lexical, not realpath.
+    """
+    return normalize("/" + source).lstrip("/") or "."
+
+
 def in_ctx(copied: Copy) -> bool:
     return copied.stage is not None and copied.stage.casefold() == CTX_STAGE
 
@@ -172,14 +226,12 @@ def context_source(copied: Copy, source: str):
     """Return the build-context path a COPY source addresses, or None.
 
     A COPY without --from already names a build-context path.  The ctx stage
-    holds a copy of the build context, so its absolute sources address that
-    same tree once the stage root is dropped; any other stage has its own
-    filesystem and its paths say nothing about this repository.
+    holds a copy of the build context, so its sources address that same tree
+    from that stage root; any other stage has its own filesystem and its paths
+    say nothing about this repository.
     """
-    if copied.from_stage is None:
-        return normalize(source)
-    if copied.from_stage.casefold() == CTX_STAGE:
-        return normalize(source).lstrip("/") or "."
+    if copied.from_stage is None or copied.from_stage.casefold() == CTX_STAGE:
+        return context_identity(source)
     return None
 
 
@@ -213,9 +265,9 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     "at that path would ship",
                 )
                 destination = normalize(f"/system_files/{relative}")
-                expected = normalize(f"{SOURCE_PREFIX}/{relative}")
+                expected = context_identity(f"{SOURCE_PREFIX}/{relative}")
                 installed = [
-                    (normalize(source), copied.from_stage)
+                    (context_identity(source), copied.from_stage)
                     for copied in self.copies
                     if in_ctx(copied) and normalize(copied.dest) == destination
                     for source in copied.sources
