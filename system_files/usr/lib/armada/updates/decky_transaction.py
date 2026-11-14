@@ -17,7 +17,7 @@ from .decky_source import _validate_release
 
 
 class DeckyTransaction:
-    _PHASES = {"stopping", "applying", "committed"}
+    _PHASES = {"stopping", "backing_up", "applying", "committed"}
 
     def __init__(self, services_dir: Path, state_dir: Path, lock_path: Path, service):
         self.services_dir = Path(services_dir)
@@ -247,7 +247,10 @@ class DeckyTransaction:
             if phase == "stopping":
                 if previous and not self.service.is_active():
                     self.service.start()
-            elif phase == "applying":
+            elif phase in ("backing_up", "applying"):
+                # backing_up never restarts the current on-disk loader: the
+                # backup snapshot is not trustworthy yet, so recovery must go
+                # through the validated-backup restore path instead.
                 self.service.stop()
                 entries = self._validated_backups(txdir)
                 self._restore(txdir, entries)
@@ -282,6 +285,7 @@ class DeckyTransaction:
                 previous = bool(self.service.is_active())
                 self._journal(txid, "stopping", previous)
                 self.service.stop()
+                self._journal(txid, "backing_up", previous)
                 entries = self._backup(txdir)
                 self._journal(txid, "applying", previous)
                 version = (release.tag + "\n").encode()

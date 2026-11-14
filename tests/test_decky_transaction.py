@@ -226,6 +226,67 @@ class TestDeckyTransaction(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Recovery required"):
             recovery.install(self.release, self.payload)
 
+    def test_backing_up_crash_with_incomplete_backups_never_restarts_or_cleans(self):
+        service = Service()
+        tx = self.transaction(service)
+        real = tx._copy
+
+        def interrupt(source, destination, expected=None):
+            result = real(source, destination, expected)
+            if Path(destination).name == "PluginLoader.backup":
+                raise PowerLoss()
+            return result
+
+        tx._copy = interrupt
+        with self.assertRaises(PowerLoss):
+            tx.install(self.release, self.payload)
+        journal = json.loads(tx.pending.read_text())
+        self.assertEqual(journal["phase"], "backing_up")
+        txdir = tx.txroot / journal["txid"]
+        backup = txdir / "PluginLoader.backup"
+        self.assertEqual(backup.read_bytes(), OLD["PluginLoader"])
+        self.assertFalse((txdir / "backups.json").exists())
+        self.assertFalse(service.active)
+
+        recovery_service = Service(active=False)
+        recovery = self.transaction(recovery_service)
+        with self.assertRaises(ValueError):
+            recovery.recover()
+        self.assertEqual(recovery_service.calls, ["stop"])
+        self.assertFalse(recovery_service.active)
+        self.assertTrue(recovery.pending.exists())
+        self.assertTrue(backup.exists())
+        self.assertEqual(self.target("PluginLoader").read_bytes(), OLD["PluginLoader"])
+        self.assertEqual(self.target(".loader.version").read_bytes(), OLD[".loader.version"])
+        self.assertEqual(self.target("managed.json").read_bytes(), OLD["managed.json"])
+
+    def test_backing_up_crash_with_complete_backups_restores_before_applying(self):
+        service = Service()
+        tx = self.transaction(service)
+        real = tx._journal
+
+        def interrupt(txid, phase, previous):
+            if phase == "applying":
+                raise PowerLoss()
+            real(txid, phase, previous)
+
+        tx._journal = interrupt
+        with self.assertRaises(PowerLoss):
+            tx.install(self.release, self.payload)
+        self.assertEqual(json.loads(tx.pending.read_text())["phase"], "backing_up")
+        self.assert_old()
+
+        recovery_service = Service(active=False)
+        recovery = self.transaction(recovery_service)
+        result = recovery.recover()
+        self.assertEqual(result["state"], "recovered")
+        self.assertTrue(result["rollback_files_restored"])
+        self.assertEqual(recovery_service.calls, ["stop", "start", ("healthy", None)])
+        self.assertTrue(recovery_service.active)
+        self.assert_old()
+        self.assertFalse(recovery.pending.exists())
+        self.assertIsNone(recovery.recover())
+
     def test_committed_interruption_finishes_without_service_actions(self):
         tx = self.transaction(Service())
         real = tx._journal
@@ -352,6 +413,52 @@ class TestDeckyTransaction(unittest.TestCase):
         self.assertEqual(self.target("managed.json").read_bytes(), OLD["managed.json"])
         self.assert_no_bytes(b"root-only-secret", self.services, self.state)
         self.assertEqual(secret.read_bytes(), b"root-only-secret")
+
+    def test_install_regular_inode_swap_never_restarts_or_copies_secret(self):
+        secret = self.root / "root-secret"
+        secret.write_bytes(b"root-only-secret")
+        secret.chmod(0o600)
+        service = Service()
+        tx = self.transaction(service)
+        loader = self.target("PluginLoader")
+
+        def swap():
+            replacement = self.root / "replacement"
+            shutil.copyfile(secret, replacement)
+            os.replace(replacement, loader)
+
+        self.race_copy(tx, "PluginLoader", swap)
+        result = tx.install(self.release, self.payload)
+        self.assertEqual(result["state"], "failed")
+        self.assertFalse(result["rollback_files_restored"])
+        self.assertFalse(result["rollback_service_healthy"])
+        self.assertIn("source changed", result.get("error", ""))
+        self.assertIn("Invalid backup manifest", result.get("rollback_error", ""))
+        self.assertEqual(service.calls, ["is_active", "stop", "stop"])
+        self.assertNotIn("start", service.calls)
+        self.assertFalse(service.active)
+        journal = json.loads(tx.pending.read_text())
+        self.assertEqual(journal["phase"], "backing_up")
+        txdir = tx.txroot / journal["txid"]
+        self.assertFalse((txdir / "PluginLoader.backup").exists())
+        self.assertFalse((txdir / "backups.json").exists())
+        # Only the attacker replacement touched the loader; nothing was copied.
+        self.assertFalse(loader.is_symlink())
+        self.assertEqual(loader.read_bytes(), b"root-only-secret")
+        self.assertEqual(self.target(".loader.version").read_bytes(), OLD[".loader.version"])
+        self.assertEqual(self.target("managed.json").read_bytes(), OLD["managed.json"])
+        self.assert_no_bytes(b"root-only-secret", self.state)
+        self.assertEqual(secret.read_bytes(), b"root-only-secret")
+
+        recovery_service = Service(active=False)
+        recovery = self.transaction(recovery_service)
+        with self.assertRaises(ValueError):
+            recovery.recover()
+        self.assertNotIn("start", recovery_service.calls)
+        self.assertFalse(recovery_service.active)
+        self.assertTrue(recovery.pending.exists())
+        self.assertEqual(loader.read_bytes(), b"root-only-secret")
+        self.assert_no_bytes(b"root-only-secret", self.state)
 
     def test_backup_rejects_fifo_before_and_after_lstat_without_blocking(self):
         service = Service()
