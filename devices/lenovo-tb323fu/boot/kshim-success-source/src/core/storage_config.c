@@ -53,8 +53,10 @@ int kshim_config_open(struct kshim_config_store *store,
     uint8_t *d = scratch;
     int rc = kshim_block_read(dev, region_lba, KSHIM_CONFIG_SLOT_BYTES / dev->block_size, d);
     if (rc) return rc;
-    if (!same(d, (const uint8_t *)"KSCFGV3", 8) || get32(d + 8) != 1 ||
-        get32(d + 12) != KSHIM_CONFIG_SLOT_BYTES) return KSHIM_STORAGE_FORMAT;
+    uint32_t descriptor_version = get32(d + 8);
+    if (!same(d, (const uint8_t *)"KSCFGV3", 8) || descriptor_version < 1 ||
+        descriptor_version > 3 || get32(d + 12) != KSHIM_CONFIG_SLOT_BYTES)
+        return KSHIM_STORAGE_FORMAT;
     if (kshim_crc32(d, 4092) != get32(d + 4092)) return KSHIM_STORAGE_CRC;
     if (get64(d + 16) != KSHIM_CONFIG_PARTITION_BYTES ||
         get64(d + 24) < 65536 || get64(d + 24) > region_offset ||
@@ -62,10 +64,18 @@ int kshim_config_open(struct kshim_config_store *store,
         get32(d + 44) != KSHIM_CONFIG_SLOT_BYTES || get32(d + 80) != 4096 ||
         get32(d + 84) != 8192) return KSHIM_STORAGE_RANGE;
     if (!same(d + 48, partition->uuid, 16) || zero(d + 64, 16) ||
-        get32(d + 88) != board_id || !zero(d + 92, 4000)) return KSHIM_STORAGE_FORMAT;
-    /* Version 1 reserves every byte after the two slots as zero. Check the
-     * whole region without reading any recovery payload or allocating memory. */
-    for (uint32_t offset = 3 * KSHIM_CONFIG_SLOT_BYTES;
+        get32(d + 88) != board_id) return KSHIM_STORAGE_FORMAT;
+    if (descriptor_version < 3) {
+        if (!zero(d + 92, 4000)) return KSHIM_STORAGE_FORMAT;
+    } else if (get32(d + 92) != 28672 || get32(d + 96) != 32768 ||
+               get32(d + 100) != 4096 || !zero(d + 104, 3988)) {
+        return KSHIM_STORAGE_FORMAT;
+    }
+    /* Check only the reserved tail, without reading mutable logs, trial data,
+     * or any recovery payload, and without allocating memory. */
+    for (uint32_t offset = descriptor_version == 3 ? 9 * KSHIM_CONFIG_SLOT_BYTES :
+         descriptor_version == 2 ? 7 * KSHIM_CONFIG_SLOT_BYTES :
+         3 * KSHIM_CONFIG_SLOT_BYTES;
          offset < KSHIM_CONFIG_REGION_BYTES; offset += KSHIM_CONFIG_SLOT_BYTES) {
         uint8_t *reserved = d + KSHIM_CONFIG_SLOT_BYTES;
         rc = kshim_block_read(dev, region_lba + offset / dev->block_size,
@@ -79,6 +89,7 @@ int kshim_config_open(struct kshim_config_store *store,
     copy(store->installation_uuid, d + 64, 16);
     store->scratch = scratch;
     store->board_id = board_id;
+    store->descriptor_version = descriptor_version;
     store->ready = 1;
     return KSHIM_STORAGE_OK;
 }

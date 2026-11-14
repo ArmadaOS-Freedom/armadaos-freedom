@@ -41,17 +41,15 @@ static int start(struct kshim_ufs_settings *b, bool writes)
     }
     return rc;
 }
-static int begin_save(void *ctx)
+static int begin_config(struct kshim_ufs_settings *b, bool writes,
+                        struct kshim_config_store *current)
 {
-    struct kshim_ufs_settings *b=ctx;
-    ++b->save_attempts;
-    int rc=start(b,true);
+    int rc=start(b,writes);
     if (rc) return rc;
     const struct kshim_config_store *old=&b->settings.medium[0].config;
     struct kshim_partition partition;
-    struct kshim_config_store current;
     /* A stable blockdev pointer is not proof that the medium is unchanged.
-     * Re-read its GPT and descriptor after every new claim, before any write. */
+     * Re-read its GPT and descriptor after every new claim, before any IO. */
     if (b->settings.source!=KSHIM_SETTINGS_INTERNAL ||
         b->lun.block.block_size!=b->block_size ||
         b->lun.block.block_count!=b->block_count) {
@@ -61,10 +59,10 @@ static int begin_save(void *ctx)
         if (!rc && (partition.first_lba!=old->partition.first_lba ||
                     partition.last_lba!=old->partition.last_lba ||
                     memcmp(partition.uuid,old->partition.uuid,16))) rc=KSHIM_STORAGE_FORMAT;
-        if (!rc) rc=kshim_config_open(&current,&b->lun.block,&partition,b->board,
+        if (!rc) rc=kshim_config_open(current,&b->lun.block,&partition,b->board,
                                         b->scratch,sizeof(b->scratch));
-        if (!rc && (current.region_lba!=old->region_lba ||
-                    memcmp(current.installation_uuid,old->installation_uuid,16)))
+        if (!rc && (current->region_lba!=old->region_lba ||
+                    memcmp(current->installation_uuid,old->installation_uuid,16)))
             rc=KSHIM_STORAGE_FORMAT;
     }
     b->begin_status=rc;
@@ -73,6 +71,49 @@ static int begin_save(void *ctx)
         if (cleanup) return cleanup;
     }
     return rc;
+}
+static int begin_save(void *ctx)
+{
+    struct kshim_ufs_settings *b=ctx;
+    ++b->save_attempts;
+    struct kshim_config_store current;
+    return begin_config(b,true,&current);
+}
+int kshim_ufs_settings_trial_load(struct kshim_ufs_settings *b,
+    struct kshim_update_trial *record, unsigned *selected)
+{
+    if (!b || !b->preflight || !record || !selected)
+        return KSHIM_STORAGE_ARG;
+    struct kshim_config_store current;
+    int rc=begin_config(b,false,&current);
+    if (rc) return rc; /* already released or never claimed */
+    struct kshim_update_trial local_record;
+    unsigned local_selected;
+    rc=kshim_update_trial_load(&current,&local_record,&local_selected);
+    int cleanup=finish(b);
+    if (cleanup) return cleanup;
+    if (rc) return rc;
+    *record=local_record;
+    *selected=local_selected;
+    return KSHIM_STORAGE_OK;
+}
+int kshim_ufs_settings_trial_save(struct kshim_ufs_settings *b,
+    uint64_t expected_sequence, const struct kshim_update_trial *next,
+    unsigned *written)
+{
+    if (!b || !b->preflight || !next || !written)
+        return KSHIM_STORAGE_ARG;
+    ++b->save_attempts;
+    struct kshim_config_store current;
+    int rc=begin_config(b,true,&current);
+    if (rc) return rc; /* already released or never claimed */
+    unsigned local_written;
+    rc=kshim_update_trial_save(&current,expected_sequence,next,&local_written);
+    int cleanup=finish(b);
+    if (cleanup) return cleanup;
+    if (rc) return rc;
+    *written=local_written;
+    return KSHIM_STORAGE_OK;
 }
 int kshim_ufs_settings_open(struct kshim_ufs_settings *b,
     const struct kshim_ufs_ops *ops,void *arena,uint32_t board,
@@ -110,10 +151,10 @@ static int get_boot_lun(void *ctx,uint32_t *value)
 { return kshim_ufs_get_boot_lun(ctx,value); }
 static int set_boot_lun(void *ctx,uint32_t value)
 { return kshim_ufs_set_boot_lun(ctx,value); }
-int kshim_ufs_settings_ab(struct kshim_ufs_settings *b,struct kshim_ab_status *status,
-                           bool change,unsigned target,unsigned expected_current)
+static int ufs_ab(struct kshim_ufs_settings *b,struct kshim_ab_status *status,
+                   bool change,bool mark_success,unsigned target,
+                   unsigned expected_current)
 {
-    if(!b||!b->preflight||!status)return KSHIM_STORAGE_ARG;
     int rc=start(b,change);if(rc)return rc;
     struct kshim_ufs_lun luns[KSHIM_AB_LUNS];
     struct kshim_ab_media media={.ctx=&b->host,.get_boot_lun=get_boot_lun,.set_boot_lun=set_boot_lun};
@@ -129,8 +170,26 @@ int kshim_ufs_settings_ab(struct kshim_ufs_settings *b,struct kshim_ab_status *s
         if(rc)break;
         media.lun[l]=luns[l].block;
     }
-    if(!rc)rc=change?kshim_ab_select(&media,target,expected_current):kshim_ab_inspect(&media,status);
+    if(!rc){
+        if(mark_success)rc=kshim_ab_mark_success(&media,expected_current);
+        else rc=change?kshim_ab_select(&media,target,expected_current)
+                      :kshim_ab_inspect(&media,status);
+    }
     if(rc==KSHIM_AB_UNCERTAIN)b->unsafe=1;
     int cleanup=finish(b);
     return cleanup?cleanup:rc;
+}
+int kshim_ufs_settings_ab(struct kshim_ufs_settings *b,struct kshim_ab_status *status,
+                           bool change,unsigned target,unsigned expected_current)
+{
+    if(!b||!b->preflight||!status)return KSHIM_STORAGE_ARG;
+    return ufs_ab(b,status,change,false,target,expected_current);
+}
+int kshim_ufs_settings_ab_mark_success(struct kshim_ufs_settings *b,
+                                        unsigned expected_current)
+{
+    if(!b||!b->preflight)return KSHIM_STORAGE_ARG;
+    if(expected_current>1)return KSHIM_STORAGE_ARG;
+    struct kshim_ab_status status;
+    return ufs_ab(b,&status,true,true,0,expected_current);
 }

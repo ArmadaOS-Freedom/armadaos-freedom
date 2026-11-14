@@ -19,6 +19,7 @@ struct kshim_config_store {
     uint8_t installation_uuid[16];
     uint8_t *scratch;
     uint32_t board_id;
+    uint32_t descriptor_version;
     uint32_t ready;
 };
 /* scratch remains owned by caller and must live until the last load/save.

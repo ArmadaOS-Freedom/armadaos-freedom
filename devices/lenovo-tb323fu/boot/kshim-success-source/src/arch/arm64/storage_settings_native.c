@@ -102,7 +102,8 @@ bool storage_settings_native_ab_supported(void)
         && kshim_ufs_settings_handoff_safe(&Backend);
 }
 static int ab_transaction(struct kshim_ab_status *status,bool change,
-                          unsigned target,unsigned expected_current)
+                          bool mark_success,unsigned target,
+                          unsigned expected_current)
 {
     if(!storage_settings_native_ab_supported())return KSHIM_UFS_UNSUPPORTED;
     bool restore_off=!kshim_mmu_is_enabled();
@@ -110,7 +111,9 @@ static int ab_transaction(struct kshim_ab_status *status,bool change,
         Backend.begin_status=KSHIM_UFS_UNSUPPORTED;
         return KSHIM_UFS_UNSUPPORTED;
     }
-    int rc=kshim_ufs_settings_ab(&Backend,status,change,target,expected_current);
+    int rc=mark_success
+        ?kshim_ufs_settings_ab_mark_success(&Backend,expected_current)
+        :kshim_ufs_settings_ab(&Backend,status,change,target,expected_current);
     if(!kshim_ufs_settings_handoff_safe(&Backend))return KSHIM_UFS_QUARANTINED;
     if(restore_off && kshim_mmu_prepare_handoff()){
         Backend.unsafe=1;
@@ -120,10 +123,62 @@ static int ab_transaction(struct kshim_ab_status *status,bool change,
 }
 int storage_settings_native_ab_status(struct kshim_ab_status *status)
 {
-    return ab_transaction(status,false,0,0);
+    return ab_transaction(status,false,false,0,0);
 }
 int storage_settings_native_ab_select(unsigned target,unsigned expected_current)
 {
     struct kshim_ab_status status;
-    return ab_transaction(&status,true,target,expected_current);
+    return ab_transaction(&status,true,false,target,expected_current);
+}
+int storage_settings_native_ab_mark_success(unsigned expected_current)
+{
+    if(expected_current>1)return KSHIM_STORAGE_ARG;
+    struct kshim_ab_status status;
+    return ab_transaction(&status,true,true,0,expected_current);
+}
+int storage_settings_native_trial_load(struct kshim_update_trial *record,
+                                       unsigned *selected)
+{
+    if(!record || !selected)return KSHIM_STORAGE_ARG;
+    if(!storage_settings_native_ab_supported())return KSHIM_UFS_UNSUPPORTED;
+    bool restore_off=!kshim_mmu_is_enabled();
+    if(restore_off && (!kshim_mmu_root_table() || kshim_mmu_enable_current_cpu())){
+        Backend.begin_status=KSHIM_UFS_UNSUPPORTED;
+        return KSHIM_UFS_UNSUPPORTED;
+    }
+    struct kshim_update_trial local;
+    unsigned local_selected=0;
+    int rc=kshim_ufs_settings_trial_load(&Backend,&local,&local_selected);
+    if(!kshim_ufs_settings_handoff_safe(&Backend))return KSHIM_UFS_QUARANTINED;
+    if(restore_off && kshim_mmu_prepare_handoff()){
+        Backend.unsafe=1;
+        return KSHIM_UFS_QUARANTINED;
+    }
+    if(rc)return rc;
+    *record=local;
+    *selected=local_selected;
+    return 0;
+}
+int storage_settings_native_trial_save(uint64_t expected_sequence,
+                                       const struct kshim_update_trial *next,
+                                       unsigned *written)
+{
+    if(!next || !written)return KSHIM_STORAGE_ARG;
+    if(!storage_settings_native_ab_supported())return KSHIM_UFS_UNSUPPORTED;
+    bool restore_off=!kshim_mmu_is_enabled();
+    if(restore_off && (!kshim_mmu_root_table() || kshim_mmu_enable_current_cpu())){
+        Backend.begin_status=KSHIM_UFS_UNSUPPORTED;
+        return KSHIM_UFS_UNSUPPORTED;
+    }
+    unsigned local_written=0;
+    int rc=kshim_ufs_settings_trial_save(&Backend,expected_sequence,next,
+                                         &local_written);
+    if(!kshim_ufs_settings_handoff_safe(&Backend))return KSHIM_UFS_QUARANTINED;
+    if(restore_off && kshim_mmu_prepare_handoff()){
+        Backend.unsafe=1;
+        return KSHIM_UFS_QUARANTINED;
+    }
+    if(rc)return rc;
+    *written=local_written;
+    return 0;
 }
