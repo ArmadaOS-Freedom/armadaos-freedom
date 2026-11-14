@@ -66,6 +66,11 @@ class KernelCatalogueTest(unittest.TestCase):
                 self.records[documented]["source"],
                 f"{documented} has no source",
             )
+            self.assertTrue(
+                (self.patch_dir / entry).is_file(),
+                f"{entry} is active in series and documented but the patch "
+                f"file is missing: {documented}",
+            )
 
     def test_upstream_values_are_recognisable(self):
         for name, record in self.records.items():
