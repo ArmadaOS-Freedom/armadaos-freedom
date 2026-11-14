@@ -327,7 +327,7 @@ int main( int argc, char **argv )
             double x = g_last_x;
             double y = g_last_y;
             if ( g_last_connector != nullptr )
-                apply_touchscreen_orientation( GAMESCOPE_PANEL_ORIENTATION_AUTO, &x, &y );
+                apply_touchscreen_orientation( g_last_connector->GetCurrentOrientation(), &x, &y );
             std::cout << "applied " << x << " " << y << "\n";
         }
         else if ( op == "state" )
