@@ -160,7 +160,7 @@ set(SRC_FILES
 
     src/core/main.c src/core/platform.c src/core/uefi_boot.c src/core/picoport.c src/core/boot_metrics.c
     src/core/menu_locale.c src/core/boot_settings.c
-    src/dt/dt.c src/dt/device_info.c src/dt/initrd.c src/dt/handoff.c src/dt/handoff_reservations.c src/dt/console.c src/dt/resources.c src/dt/probe.c
+    src/dt/dt.c src/dt/device_info.c src/dt/boot_witness.c src/dt/initrd.c src/dt/handoff.c src/dt/handoff_reservations.c src/dt/console.c src/dt/resources.c src/dt/probe.c
     src/dt/tb323fu_ramoops.c src/dt/tb323fu_ramoops_export.c
     src/drivers/console.c src/drivers/pl011.c src/drivers/keys.c src/drivers/qcom_reboot.c
     src/arch/arm64/exception.c src/arch/arm64/relocation.c src/arch/arm64/mmu.c
@@ -179,6 +179,7 @@ if(CONFIG_KSHIM_STORAGE_ENTRY_PROBE OR CONFIG_KSHIM_UFS_NATIVE_IO)
             src/arch/arm64/storage_ufs_store.S)
         if(CONFIG_KSHIM_UFS_SETTINGS)
             list(APPEND SRC_FILES src/arch/arm64/storage_settings_native.c
+                src/core/update_trial_boot.c
                 src/drivers/storage_ufs_settings.c src/dt/storage_settings_export.c)
         endif()
         if(CONFIG_KSHIM_UFS_READ_PROBE)
@@ -193,7 +194,8 @@ if(CONFIG_KSHIM_STORAGE_ENTRY_PROBE OR CONFIG_KSHIM_UFS_NATIVE_IO)
     endif()
 endif()
 # Storage formats are shared by the later hardware backends.
-list(APPEND SRC_FILES src/core/storage_block.c src/core/storage_ab.c src/core/storage_config.c
+list(APPEND SRC_FILES src/core/storage_block.c src/core/storage_ab.c src/core/storage_config.c src/core/update_trial.c src/core/update_trial_store.c
+    src/core/update_binding.c
     src/core/storage_settings.c src/drivers/storage_ufs.c src/drivers/storage_sdhci.c)
 
 if(CONFIG_KSHIM_SMP)

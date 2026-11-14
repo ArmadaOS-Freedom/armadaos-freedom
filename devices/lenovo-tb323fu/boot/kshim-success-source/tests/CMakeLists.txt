@@ -478,9 +478,15 @@ foreach(target platform_menu_test platform_menu_no_power_test platform_menu_cons
         "${KSHIM_ROOT}/src/core/storage_config.c" "${KSHIM_ROOT}/src/core/storage_block.c")
 endforeach()
 
+kshim_test(update_trial_test update_trial_test.c "${KSHIM_ROOT}/src/core/update_trial.c" "${KSHIM_ROOT}/src/core/storage_block.c")
+kshim_test(update_trial_policy_test update_trial_policy_test.c "${KSHIM_ROOT}/src/core/update_trial.c" "${KSHIM_ROOT}/src/core/storage_block.c")
+kshim_test(update_trial_store_test update_trial_store_test.c "${KSHIM_ROOT}/src/core/update_trial.c" "${KSHIM_ROOT}/src/core/storage_block.c" "${KSHIM_ROOT}/src/core/storage_config.c" "${KSHIM_ROOT}/src/core/update_trial_store.c")
+kshim_test(update_binding_test update_binding_test.c "${KSHIM_ROOT}/src/core/update_binding.c")
+kshim_test(update_trial_boot_test update_trial_boot_test.c "${KSHIM_ROOT}/src/core/update_trial_boot.c" "${KSHIM_ROOT}/src/core/update_binding.c" "${KSHIM_ROOT}/src/core/update_trial.c" "${KSHIM_ROOT}/src/core/storage_block.c")
 kshim_test(storage_ufs_settings_test storage_ufs_settings_test.c
     "${KSHIM_ROOT}/src/core/storage_settings.c"
-    "${KSHIM_ROOT}/src/core/storage_config.c" "${KSHIM_ROOT}/src/core/storage_block.c")
+    "${KSHIM_ROOT}/src/core/storage_config.c" "${KSHIM_ROOT}/src/core/storage_block.c"
+    "${KSHIM_ROOT}/src/core/update_trial.c" "${KSHIM_ROOT}/src/core/update_trial_store.c")
 
 target_sources(storage_ufs_settings_test PRIVATE "${KSHIM_ROOT}/src/drivers/storage_ufs_settings.c")
 

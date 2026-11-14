@@ -55,6 +55,31 @@ int kshim_ufs_settings_ab(struct kshim_ufs_settings *b,struct kshim_ab_status *s
     assert(!change || (target==1&&current==0));
     ++ab_calls;if(ab_unsafe)b->unsafe=1;return ab_rc;
 }
+static unsigned mark_calls,mark_current;
+static int mark_rc,mark_unsafe;
+int kshim_ufs_settings_ab_mark_success(struct kshim_ufs_settings *b,unsigned current){
+    assert(b==last&&mmu_on&&current<=1);++mark_calls;mark_current=current;
+    if(mark_unsafe)
+        b->unsafe=1;
+    return mark_rc;
+}
+static unsigned trial_loads,trial_saves;
+static int trial_load_rc,trial_save_rc,trial_load_unsafe,trial_save_unsafe;
+static struct kshim_update_trial trial_value;
+static unsigned trial_selected,trial_written;
+int kshim_ufs_settings_trial_load(struct kshim_ufs_settings *b,
+    struct kshim_update_trial *record,unsigned *selected){
+    assert(b==last&&record&&selected&&mmu_on);++trial_loads;
+    *record=trial_value;*selected=trial_selected;
+    if(trial_load_unsafe)b->unsafe=1;
+    return trial_load_rc;
+}
+int kshim_ufs_settings_trial_save(struct kshim_ufs_settings *b,
+    uint64_t expected,const struct kshim_update_trial *next,unsigned *written){
+    assert(b==last&&expected==55&&next&&written&&mmu_on);++trial_saves;
+    *written=trial_written;if(trial_save_unsafe)b->unsafe=1;
+    return trial_save_rc;
+}
 int kshim_mmu_is_enabled(void){return mmu_on;}
 uint64_t kshim_mmu_root_table(void){return root_table;}
 int kshim_mmu_enable_current_cpu(void){++enables;if(!enable_rc)mmu_on=1;return enable_rc;}
@@ -117,6 +142,89 @@ static void serial_ab(void){
     assert(storage_settings_native_ab_status(&status)==KSHIM_UFS_QUARANTINED&&ab_calls==6&&closes==4);
     assert(!storage_settings_native_handoff_safe());
 }
+static void native_success(void){
+    last->unsafe=0;mmu_on=0;root_table=0x4000;enable_rc=close_rc=0;
+    mark_rc=mark_unsafe=0;mark_calls=mark_current=0;enables=closes=0;
+    assert(storage_settings_native_ab_mark_success(0)==0);
+    assert(mark_calls==1&&mark_current==0&&enables==1&&closes==1&&!mmu_on);
+    assert(storage_settings_native_ab_mark_success(1)==0);
+    assert(mark_calls==2&&mark_current==1&&enables==2&&closes==2&&!mmu_on);
+    mmu_on=1;
+    assert(storage_settings_native_ab_mark_success(0)==0);
+    assert(mark_calls==3&&mark_current==0&&enables==2&&closes==2&&mmu_on);
+    assert(storage_settings_native_ab_mark_success(2)==KSHIM_STORAGE_ARG);
+    assert(mark_calls==3&&enables==2&&closes==2&&mmu_on);
+    uint32_t board=last->board;last->board=DEVICE_BOARD_UNKNOWN;mmu_on=0;
+    assert(storage_settings_native_ab_mark_success(0)==KSHIM_UFS_UNSUPPORTED);
+    assert(mark_calls==3&&enables==2&&closes==2);
+    last->board=board;root_table=0;
+    assert(storage_settings_native_ab_mark_success(0)==KSHIM_UFS_UNSUPPORTED);
+    assert(mark_calls==3&&enables==2&&closes==2);
+    root_table=0x4000;enable_rc=-1;
+    assert(storage_settings_native_ab_mark_success(0)==KSHIM_UFS_UNSUPPORTED);
+    assert(mark_calls==3&&enables==3&&closes==2&&!mmu_on);
+    enable_rc=0;mark_rc=-79;
+    assert(storage_settings_native_ab_mark_success(1)==-79);
+    assert(mark_calls==4&&mark_current==1&&enables==4&&closes==3&&!mmu_on);
+    assert(storage_settings_native_handoff_safe());
+    mark_rc=0;mark_unsafe=1;
+    assert(storage_settings_native_ab_mark_success(0)==KSHIM_UFS_QUARANTINED);
+    assert(mark_calls==5&&mark_current==0&&enables==5&&closes==3&&mmu_on);
+    assert(!storage_settings_native_handoff_safe());
+    assert(storage_settings_native_ab_mark_success(0)==KSHIM_UFS_UNSUPPORTED);
+    assert(mark_calls==5&&enables==5&&closes==3);
+    last->unsafe=0;mark_unsafe=0;mmu_on=0;close_rc=-1;
+    assert(storage_settings_native_ab_mark_success(1)==KSHIM_UFS_QUARANTINED);
+    assert(mark_calls==6&&mark_current==1&&enables==6&&closes==4&&mmu_on);
+    assert(!storage_settings_native_handoff_safe());
+    last->unsafe=0;close_rc=0;mmu_on=0;root_table=0x4000;
+}
+static void trial_io(void){
+    struct kshim_update_trial out,next; uint8_t old[sizeof(out)];
+    unsigned selected=99,written=99;
+    last->unsafe=0;mmu_on=0;root_table=0x4000;enable_rc=close_rc=0;
+    trial_load_rc=trial_save_rc=trial_load_unsafe=trial_save_unsafe=0;
+    trial_loads=trial_saves=enables=closes=0;trial_selected=trial_written=1;
+    memset(&trial_value,0xa5,sizeof(trial_value));memset(&next,0x5a,sizeof(next));
+    memset(&out,0x33,sizeof(out));memcpy(old,&out,sizeof(out));
+    assert(storage_settings_native_trial_load(&out,&selected)==0);
+    assert(out.sequence==trial_value.sequence&&out.state==trial_value.state&&out.remaining==trial_value.remaining&&selected==1);
+    assert(trial_loads==1&&enables==1&&closes==1&&!mmu_on);
+    assert(storage_settings_native_trial_save(55,&next,&written)==0);
+    assert(written==1&&trial_saves==1&&enables==2&&closes==2&&!mmu_on);
+    mmu_on=1;selected=written=0;
+    assert(storage_settings_native_trial_load(&out,&selected)==0&&selected==1);
+    assert(storage_settings_native_trial_save(55,&next,&written)==0&&written==1);
+    assert(trial_loads==2&&trial_saves==2&&enables==2&&closes==2&&mmu_on);
+    mmu_on=0;memcpy(&out,old,sizeof(out));selected=written=77;trial_load_rc=trial_save_rc=-77;
+    assert(storage_settings_native_trial_load(&out,&selected)==-77);
+    assert(!memcmp(&out,&old,sizeof(out))&&selected==77&&closes==3);
+    assert(storage_settings_native_trial_save(55,&next,&written)==-77);
+    assert(written==77&&closes==4);
+    root_table=0;
+    assert(storage_settings_native_trial_load(&out,&selected)==KSHIM_UFS_UNSUPPORTED);
+    assert(storage_settings_native_trial_save(55,&next,&written)==KSHIM_UFS_UNSUPPORTED);
+    assert(trial_loads==3&&trial_saves==3&&enables==4&&closes==4);
+    root_table=0x4000;enable_rc=-1;
+    assert(storage_settings_native_trial_load(&out,&selected)==KSHIM_UFS_UNSUPPORTED);
+    assert(storage_settings_native_trial_save(55,&next,&written)==KSHIM_UFS_UNSUPPORTED);
+    assert(trial_loads==3&&trial_saves==3&&enables==6&&closes==4);
+    enable_rc=0;trial_load_rc=trial_save_rc=0;trial_load_unsafe=1;
+    assert(storage_settings_native_trial_load(&out,&selected)==KSHIM_UFS_QUARANTINED);
+    assert(!memcmp(&out,&old,sizeof(out))&&selected==77&&closes==4&&mmu_on);
+    last->unsafe=0;trial_load_unsafe=0;mmu_on=0;trial_save_unsafe=1;
+    assert(storage_settings_native_trial_save(55,&next,&written)==KSHIM_UFS_QUARANTINED);
+    assert(written==77&&closes==4&&mmu_on);
+    last->unsafe=0;trial_save_unsafe=0;mmu_on=0;close_rc=-1;
+    assert(storage_settings_native_trial_load(&out,&selected)==KSHIM_UFS_QUARANTINED);
+    assert(!memcmp(&out,&old,sizeof(out))&&selected==77&&closes==5);
+    last->unsafe=0;mmu_on=0;
+    assert(storage_settings_native_trial_save(55,&next,&written)==KSHIM_UFS_QUARANTINED);
+    assert(written==77&&closes==6);
+    last->unsafe=0;close_rc=0;mmu_on=0;
+    assert(storage_settings_native_trial_load(NULL,&selected)==KSHIM_STORAGE_ARG);
+    assert(storage_settings_native_trial_save(55,NULL,&written)==KSHIM_STORAGE_ARG);
+}
 int main(void){
     const struct kshim_config_values defaults={0,0,1, 0, 0};
     assert(storage_settings_native_open(DEVICE_BOARD_UNKNOWN,&defaults)==KSHIM_UFS_UNSUPPORTED);
@@ -139,6 +247,8 @@ int main(void){
     assert(storage_settings_native_export(&opens)==123);
     late_history();
     serial_ab();
+    native_success();
+    trial_io();
     unsigned old=opens;last->unsafe=1;
     assert(!storage_settings_native_handoff_safe());
     assert(storage_settings_native_open(DEVICE_BOARD_TB322FC,&defaults)==KSHIM_UFS_QUARANTINED&&opens==old);

@@ -92,6 +92,40 @@ static void test_descriptor(unsigned bs) {
     assert(kshim_config_load(&store,&v,&seq)==KSHIM_STORAGE_EMPTY && seq==99);
     assert(kshim_config_save(&store,&v,&seq)==KSHIM_STORAGE_READ_ONLY && writes==0);
 }
+static void test_descriptor_versions(unsigned bs) {
+    fixture(bs);assert(open_store()==0 && store.descriptor_version==1);
+
+    fixture(bs);le32(descriptor()+8,2);seal(descriptor());
+    memset(descriptor()+12288,0xa5,16384);
+    assert(open_store()==0 && store.descriptor_version==2);
+    descriptor()[28672]=1;assert(open_store()==KSHIM_STORAGE_FORMAT && writes==0);
+
+    fixture(bs);le32(descriptor()+8,3);le32(descriptor()+92,28672);
+    le32(descriptor()+96,32768);le32(descriptor()+100,4096);seal(descriptor());
+    memset(descriptor()+28672,0x5a,8192);descriptor()[32768]=0xc3;
+    assert(open_store()==0 && store.descriptor_version==3);
+    descriptor()[36864]=1;assert(open_store()==KSHIM_STORAGE_FORMAT && writes==0);
+
+    const uint32_t wrong[]={28673,32769,8192};
+    for(unsigned i=0;i<4;i++) {
+        fixture(bs);le32(descriptor()+8,3);le32(descriptor()+92,28672);
+        le32(descriptor()+96,32768);le32(descriptor()+100,4096);
+        if(i<3)le32(descriptor()+92+4*i,wrong[i]);else descriptor()[104]=1;
+        seal(descriptor());assert(open_store()==KSHIM_STORAGE_FORMAT && writes==0);
+    }
+    fixture(bs);le32(descriptor()+8,4);seal(descriptor());
+    assert(open_store()==KSHIM_STORAGE_FORMAT && writes==0);
+
+    fixture(bs);le32(descriptor()+8,3);le32(descriptor()+92,28672);
+    le32(descriptor()+96,32768);le32(descriptor()+100,4096);seal(descriptor());
+    memset(descriptor()+12288,0xa5,16384);memset(descriptor()+28672,0x3c,8192);
+    descriptor()[28672]=0xf0;descriptor()[32768]=0x0f;
+    assert(open_store()==0 && store.descriptor_version==3);
+    memcpy(before,media,sizeof(media));writes=0;
+    struct kshim_config_values v={2,3,1,2,1};uint64_t seq=99;
+    assert(kshim_config_save(&store,&v,&seq)==0 && seq==1);
+    assert_only_slot_changed(0);
+}
 static void test_selection(unsigned bs) {
     /* First-valid selection, bad-CRC acceptance and equal-sequence ambiguity fail. */
     struct kshim_config_values v={9,9,9, 0, 0};uint64_t seq=999;
@@ -192,7 +226,9 @@ int main(void) {
     test_one_shot_v3(512);test_one_shot_v3(4096);
     test_last_boot_v2(512);test_last_boot_v2(4096);
     assert(fixture_crc((const unsigned char *)"123456789",9)==0xcbf43926u);
-    test_descriptor(512);test_descriptor(4096);test_selection(512);test_selection(4096);
+    test_descriptor(512);test_descriptor(4096);
+    test_descriptor_versions(512);test_descriptor_versions(4096);
+    test_selection(512);test_selection(4096);
     test_saving(512);test_saving(4096);test_faults(512);test_faults(4096);
     puts("PASS storage_config: descriptor, identity, enums, sequences, write bounds, partial/flush/readback faults (512/4096)");
     return 0;

@@ -3,6 +3,7 @@
 #include <storage_ufs.h>
 #include <storage_settings.h>
 #include <storage_ab.h>
+#include <update_trial_store.h>
 /* Zero-initialize once. All members, arena and preflight context must remain
  * alive through the menu. Never clear an unsafe or owned backend. */
 struct kshim_ufs_settings {
@@ -28,3 +29,18 @@ int kshim_ufs_settings_open(struct kshim_ufs_settings *,
 bool kshim_ufs_settings_handoff_safe(const struct kshim_ufs_settings *);
 int kshim_ufs_settings_ab(struct kshim_ufs_settings *, struct kshim_ab_status *,
                            bool change, unsigned target, unsigned expected_current);
+/* Mark the expected current slot SUCCESS (clear RETRIES/UNBOOTABLE on the
+ * backup first, read back). No boot-LUN switch. expected_current<=1. */
+int kshim_ufs_settings_ab_mark_success(struct kshim_ufs_settings *,
+                                        unsigned expected_current);
+/* Load the current update-trial record. Claims via preflight, revalidates the
+ * medium identity, reads, and always releases. Caller outputs are only
+ * written on verified success. */
+int kshim_ufs_settings_trial_load(struct kshim_ufs_settings *b,
+    struct kshim_update_trial *record, unsigned *selected);
+/* Append the next trial record via compare-and-swap against
+ * expected_sequence. Claims, revalidates, writes one slot, and always
+ * releases. *written is only set on verified success. */
+int kshim_ufs_settings_trial_save(struct kshim_ufs_settings *b,
+    uint64_t expected_sequence, const struct kshim_update_trial *next,
+    unsigned *written);
