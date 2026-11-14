@@ -25,7 +25,7 @@ $ git submodule update --init --recursive
 
 ```console
 $ just build-edl-package \
-    docker://ghcr.io/mydanyi/armadaos-freedom:testing \
+    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
     sha256:DIGEST \
     FULL_SOURCE_COMMIT \
     EXACT_OCI_VERSION
@@ -33,7 +33,7 @@ $ just build-edl-package \
 
 | Argument | Value |
 |---|---|
-| `IMAGE` | Registry reference that includes a real accepted channel (`stable`, `beta`, or `testing`), e.g. `docker://ghcr.io/mydanyi/armadaos-freedom:testing`. A `docker://` prefix is accepted but not required, because the wrapper also takes a bare registry reference. The build derives the signed image origin from the channel, and `staging` cannot derive an accepted signed origin. |
+| `IMAGE` | Registry reference that includes a real accepted channel (`stable`, `beta`, or `testing`), e.g. `docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing`. A `docker://` prefix is accepted but not required, because the wrapper also takes a bare registry reference. The build derives the signed image origin from the channel, and `staging` cannot derive an accepted signed origin. |
 | `DIGEST` | Exact `sha256:` OCI manifest digest of that reference, supplied separately from the tag. |
 | `REVISION` | Full 40-character lowercase commit SHA the image was built from. |
 | `VERSION` | Exact `org.opencontainers.image.version` label value of that image. |
@@ -45,18 +45,30 @@ labels must match `REVISION` and `VERSION`. The build stops on a mismatch.
 A channel name or tag is not a version, and an older commit may not be paired
 with a newer image.
 
-The recipe takes exactly these four positional arguments and forwards no model
-or configuration options, so it packages every profile registered in
-`build_files/edl-devices.json`. It writes the package to `output/edl/<version>/`
-and uses a fresh `_build-edl.*` work directory under the checkout, which is
-ignored by Git.
+The recipe takes these four positional arguments and, by default, forwards no
+model or configuration options, so it packages every profile registered in
+`build_files/edl-devices.json` exactly as before. Because that set includes
+`TB710FU`, the default package is install-only. Setting
+`EDL_PACKAGE_PROFILE=release` selects the closed, validated pair `TB322FC` and
+`TB323FU` instead; that is the only profile that may declare offline-upgrade.
+Any other value fails before the build starts. It writes the package to
+`output/edl/<version>/` and uses a fresh `_build-edl.*` work directory under
+the checkout, which is ignored by Git.
+
+```console
+$ EDL_PACKAGE_PROFILE=release just build-edl-package \
+    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
+    sha256:DIGEST \
+    FULL_SOURCE_COMMIT \
+    EXACT_OCI_VERSION
+```
 
 To package a subset, or to use another configuration file, call the wrapper
 directly with the same four values:
 
 ```console
 $ bash /PATH/TO/repo/build_files/build-edl-package.sh \
-    --oci docker://ghcr.io/mydanyi/armadaos-freedom:testing \
+    --oci docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
     --manifest-digest sha256:DIGEST \
     --source-commit FULL_SOURCE_COMMIT \
     --version EXACT_OCI_VERSION \
@@ -78,10 +90,14 @@ which is how the `just` recipe uses `_build-edl.*` and `output/edl` there. The
 full ZIP stays in the work directory; only the split volumes, their checksums,
 and the package README are written to the output directory.
 
-Each selected model needs one runtime. If `--runtime MODEL=ABSOLUTE_FILE` is
-given, it must cover every selected model exactly once and no runtime is built;
-otherwise every selected runtime is built in a container from the runtime
-snapshot that the configuration names.
+The OCI image contains the model runtimes built when the system image is built.
+EDL packaging reuses the embedded payload and verifies its manifest, kernel,
+initramfs, DTBs, and configuration. Each selected model needs one runtime. If
+`--runtime MODEL=ABSOLUTE_FILE` is given, it must cover every selected model
+exactly once, and each supplied runtime must have exactly the same hash and
+length as the embedded runtime; it cannot override that runtime. Images lacking
+the required manifest or components fail packaging and must be rebuilt from
+matching source and image inputs.
 
 ## Package a locally built image
 
@@ -94,7 +110,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 `ORIGIN` is the signed origin the installed system updates from. A local
 image has no channel to derive it from, and the wrapper only accepts
-`ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:` followed by
+`ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:` followed by
 `stable`, `beta` or `testing` (optionally `@sha256:...`). `IMAGE` and `TAG`
 default to the image `just build` writes. The recipe reads the version and
 revision labels with `skopeo`, copies the image from local container storage
@@ -155,6 +171,10 @@ Packaging an adapted device still requires working Linux kernel support and a
 matching device tree in the deployed image, a runtime profile in the runtime
 snapshot, and a matching model registration in the Windows installer. A
 configuration entry alone does not make arbitrary Android hardware supported.
+A profile outside the shipped package contract can be packaged for first
+installation only; the build never advertises offline-upgrade or recovery for
+it, and selecting such a profile together with the default models makes the
+whole package install-only.
 
 ## Bundled plugin sources
 
@@ -184,17 +204,100 @@ does not silently refresh the bundled contents later.
 
 The build also runs automatically. On `main`, the `build_edl_package` job in
 [`Build images`](../.github/workflows/build.yml) follows the container image
-job and builds the EDL package from the image it just pushed, using the
-`testing` channel, that image's digest, its actual source revision, and its
-`org.opencontainers.image.version` label. The package is uploaded as the
-`edl-package-<run id>` workflow artifact next to the unchanged SD image path.
-Nothing is published as a GitHub Release, and the SD image publication is
-unchanged.
+job and builds two EDL package variants from the image it just pushed, using
+the `testing` channel, that image's digest, its actual source revision, and its
+`org.opencontainers.image.version` label. The two variants run on separate
+runners with independent checkouts, work directories, output directories, and
+signatures:
+
+- `edl-package-<run id>` is built with `EDL_PACKAGE_PROFILE=release`, so it
+  contains only `TB322FC` and `TB323FU`. Its signed descriptor declares both
+  `install` and `offline-upgrade`. This is the official multi-model update
+  artifact and the only artifact **Publish update channel** accepts.
+- `edl-install-package-<run id>` is built with the universal default, so it
+  contains every registered profile, including `TB710FU`. Its signed descriptor
+  declares `install` only. Use it for first installation with the Windows
+  installer; it is never published to an update channel.
+
+Both artifacts stay in the workflow run until an operator publishes the release
+artifact; no release and no update channel changes automatically. The SD image
+path remains available; its automatic R2 publication is enabled separately as
+described below.
 
 [`Build EDL package`](../.github/workflows/build-edl-package.yml) can also be
 started by hand. It takes the same four values as the recipe, checks out the
-requested revision with submodules, and uploads the split volumes, `parts.json`,
-`SHA256SUMS`, and the package README as a workflow artifact.
+requested revision with submodules, and runs the same two variants, uploading
+each split package, `parts.json`, `SHA256SUMS`, and the package README under its
+own artifact name.
+
+## Publish an update channel
+
+The image ships `/etc/armada/updates/channels.json`, which points every channel
+at the signed documents on the `update-channels` branch:
+`https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/<channel>.json`
+and its `.json.sig`. All three channels are listed so the service can select
+them, but a channel stays unavailable until an operator publishes it: the
+device fetches that document, verifies its signature, and has no fallback to
+another channel or source.
+
+The flow is build, publish testing, then promote.
+
+1. Build the package: `Build images` on `main`, or `Build EDL package` by hand.
+2. Run **Publish update channel** with the completed run ID and `testing`. It
+   checks that the run belongs to this repository, that it completed
+   successfully, and that it produced `edl-package-<run id>`. The install-only
+   `edl-install-package-<run id>` artifact is not accepted, even though its
+   descriptor is signed, because it does not declare `offline-upgrade`. It then
+   verifies the descriptor signature, the split parts, the parts manifest, the
+   `offline-upgrade` capability, and that the OCI digest resolves to the signed
+   image built from the descriptor's source revision. It creates the draft
+   release `<releaseId>`, uploads the split parts, the parts manifest, the
+   descriptor, and the descriptor signature, publishes the release only after
+   every asset is present, and only then signs and commits `testing.json` with
+   `testing.json.sig`.
+3. Run **Promote release** with `source: testing` and `target: beta` or
+   `stable`. Promotion first verifies the published source channel and its
+   descriptor signature, then takes the immutable OCI digest recorded in that
+   channel, inspects the image at that digest, and requires its revision label
+   and Cosign signature to match before writing any tag. The moving `:testing`
+   tag is never read, so a newer build that re-pointed the source tag does not
+   block promoting the older release the channel still names. The target
+   channel then points at the same release assets. Nothing is rebuilt, and a
+   source channel without a valid signed publication fails before any tag is
+   written.
+
+Nothing is replaced in place. A published release must match the verified
+package exactly, while an existing draft — even an empty one — is completed:
+only the missing assets are uploaded, and an asset that is already present is
+hashed against the signed plan rather than replaced. A release whose content
+differs fails the run. The channel document and its signature reach the
+`update-channels` branch as one commit per channel; updates are serialized and
+never force-pushed.
+
+Before a release is created, resumed, or published, its Git tag is bound to the
+verified `SOURCE_REVISION`. An existing tag is resolved to the commit it peels
+to, including an annotated tag; a missing tag counts as absent only when GitHub
+returns a genuine 404, never on an authentication, permission, or server error.
+A draft that has no tag yet is bound through its `target_commitish`, resolved
+to an exact commit SHA. Any mismatch stops the run before an asset or the
+release is written, and the tag target is never changed.
+
+Publishing a build from the current commit keeps using the workflow's
+`GITHUB_TOKEN`. For a historical build the release tag targets a commit that
+can differ from the workflow run; GitHub's create-release documentation states
+that `GITHUB_TOKEN` cannot create such a release when that commit changes
+`.github/workflows`, because it never holds Workflows write. The official REST
+update-a-release documentation imposes the same requirement when an existing
+historical draft is published. The optional `ARMADA_RELEASE_TOKEN` secret is
+used for that historical `gh release create` and for both
+`gh release edit --draft=false` paths that publish a draft. When it is
+configured, those steps use it; when it is not, they attempt `GITHUB_TOKEN`,
+which may succeed where GitHub permits it. If GitHub denies that permission and
+the workflow contents differ between the tag target and the run, a dedicated
+token with **Contents** and **Workflows** write is required. Checkout, artifact
+download, verification, release reads, asset upload, and channel publication
+all keep `GITHUB_TOKEN` without retargeting. The tag target is always the
+verified build revision — never the current branch head.
 
 ## Package layout
 
@@ -245,16 +348,92 @@ numbered volumes from that folder. The installer does not read `parts.json`.
 
 A package records its source as provenance: one exact nonzero lowercase
 40-character commit SHA, read without trimming or normalizing. The
-[Windows installer](https://github.com/mydanyi/armadaos-freedom-installer)
+[Windows installer](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer)
 validates that provenance and selects the matching model before writing.
 
 The installer creates the tablet-specific 2 GiB `ARMADA_BACKUP` image from
 verified local recovery material. It is not part of the shared Linux payload.
 Version 0.7.4 creates recovery images with the v3 settings area in the final
 64 KiB; support for reading or saving settings remains model-specific. See the
-[recovery image contract](https://github.com/mydanyi/armadaos-freedom-installer/blob/main/docs/package-contract.md).
+[recovery image contract](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer/blob/main/docs/package-contract.md).
 
 The legacy SD card image and its manual installation flow remain available.
+
+## Publication configuration
+
+Official images use `ghcr.io/armadaos-freedom/armadaos-freedom`. The
+`Build images` workflow publishes a signed `testing` image from `main`;
+`Promote release` verifies the same digest before assigning `beta` or
+`stable`. Configure the encrypted Cosign key as `SIGNING_SECRET` and its
+password as `SIGNING_PASSWORD`. Its matching public key is shipped at
+`system_files/etc/pki/containers/armadaos-freedom.pub`. Keep private keys
+outside the source tree.
+
+GHCR packages must be public and grant this repository Actions access. The
+workflow checks anonymous image access before publishing channel tags. A
+built package stays in its `edl-package-<run-id>` artifact until **Publish
+update channel** turns it into a release and a signed `testing` channel; beta
+and stable follow only through **Promote release**. The install-only
+`edl-install-package-<run-id>` artifact is kept for first installation only and
+never becomes a channel document. The shipped
+`system_files/etc/armada/updates/channels.json` names all three channels, and
+each becomes usable only once its document exists on the `update-channels`
+branch. Legacy disk-image publication to R2 is opt-in: set the repository
+variable `ARMADA_PUBLISH_DISK=true` only after configuring the R2 endpoint,
+bucket and credentials.
+
+Windows installer 0.7.32 and later accepts the organization namespace and
+pre-transfer packages from the old `mydanyi` namespace. Upgrade the installer
+before using a new organization package; older installers reject that unknown
+origin. New packages and update targets use the organization namespace;
+historical packages are not silently relabeled.
+
+## Signed package descriptors
+
+The build wrapper creates a .zip.update.json sidecar from the completed archive
+and its split files. It binds the release identity, source revision, OCI digest,
+OSTree commit, supported models, payload paths, compressed and expanded sizes,
+and SHA-256 digests. Shared system files are listed once.
+
+The local wrapper leaves this descriptor unsigned. The EDL Actions workflow
+signs its original UTF-8 bytes with the release key, verifies the result with
+the fixed public key, and uploads .zip.update.json.sig alongside the volumes.
+Each matrix variant signs its own descriptor on its own runner: the release
+variant must verify as install and offline-upgrade, and the install variant as
+install-only, before either artifact is uploaded. SHA256SUMS and parts.json do
+not replace this signature. A downloaded public key supplied by the package
+cannot establish trust in that package.
+
+The producer checks that the deployed image carries the normal-Linux updater and
+then declares both install and offline-upgrade; a package built from an image
+without that updater fails the build instead of being relabeled. A package whose
+selected models include a profile outside the shipped contract is built
+install-only: the wrapper never requests offline-upgrade for it, and it passes
+that configured model identifier explicitly so validation accepts the install
+package while still rejecting offline-upgrade and recovery for it. The offline
+upgrade keeps user data and writes both boot slots from the verified payload;
+the online OCI update instead rotates only the non-current slot. A signature
+alone does not make a package upgrade-capable: the descriptor must declare
+offline-upgrade and the installed updater must meet `minimumUpdaterVersion`.
+
+Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
+(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) may
+still appear in the universal initial-install package, but its update slot
+backend is not implemented yet, so being listed in a package is not
+offline-upgrade support for that model.
+
+Recovery manifests describe the RAM rescue path and are not a prerequisite here:
+this package ships no rescue artifacts, and the object may be absent or partial.
+Every entry that is present is still validated against the same schema and file
+records. The channel generator refuses install-only descriptors.
+
+.github/scripts/make-update-channel.py prepares an unsigned channel document
+from an already signed upgrade-capable descriptor. Promotion retains the same
+release, source, OCI, OSTree and package identities; it does not rebuild the
+system. Its verify command authenticates both documents and checks their
+binding. Generating or verifying a document does not publish a channel or
+retag an image: publishing signs that document with `SIGNING_SECRET` and
+commits it with its signature, as described above.
 
 ## Tests
 

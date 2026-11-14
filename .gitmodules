@@ -1,4 +1,4 @@
 [submodule "freedom-control"]
 	path = decky/freedom-control
-	url = https://github.com/mydanyi/freedom-control.git
+	url = https://github.com/ArmadaOS-Freedom/freedom-control.git
 	branch = main

@@ -38,8 +38,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Approved configuration values.
-CANONICAL_IMAGE = "ghcr.io/mydanyi/armadaos-freedom"
-CANONICAL_OWNER = "mydanyi"
+CANONICAL_IMAGE = "ghcr.io/armadaos-freedom/armadaos-freedom"
+CANONICAL_OWNER = "ArmadaOS-Freedom"
 CANONICAL_REPO = "armadaos-freedom"
 SIGNING_PUBLIC_KEY = "system_files/etc/pki/containers/armadaos-freedom.pub"
 LEGACY_PUBLIC_KEY = "system_files/etc/pki/containers/armada.pub"
@@ -66,6 +66,7 @@ class UnrenderedExpression(Exception):
 def _expr_values():
     """Explicit, harmless substitution table for the known workflow expressions."""
     return {
+        "github.repository": f"{CANONICAL_OWNER}/{CANONICAL_REPO}",
         "github.repository_owner": CANONICAL_OWNER,
         "github.event.repository.name": CANONICAL_REPO,
         "github.event.repository.fork": "false",
@@ -76,9 +77,10 @@ def _expr_values():
         "runner.temp": "/tmp/fixture-runner-temp",
         "secrets.GITHUB_TOKEN": "fixture-token",
         "secrets.SIGNING_SECRET": PRIVATE_VALUE,
+        "secrets.SIGNING_PASSWORD": "fixture-password",
         "secrets.COSIGN_PRIVATE_KEY": PRIVATE_VALUE,
         "env.IMAGE_NAME": CANONICAL_REPO,
-        "env.IMAGE_REGISTRY": "ghcr.io/" + CANONICAL_OWNER,
+        "env.IMAGE_REGISTRY": "ghcr.io/" + CANONICAL_OWNER.lower(),
         "env.ARMADA_CANONICAL_IMAGE": CANONICAL_IMAGE,
         "env.ARMADA_SIGNING_PUBLIC_KEY": SIGNING_PUBLIC_KEY,
         "env.HAVE_SIGNING_SECRET": "true",
@@ -90,6 +92,8 @@ def _expr_values():
         "steps.metadata.outputs.tags": "testing",
         "steps.channel.outputs.tag": "testing",
         "steps.channel.outputs.channel": "preview",
+        "steps.channel.outputs.digest": SHA256_DIGEST,
+        "steps.channel.outputs.revision": "0" * 40,
         "steps.chunkah_output.outputs.ref": "oci:/tmp/fixture-runner-temp/chunked",
         "steps.chunkah_config.outputs.base_image": "quay.io/fedora/fedora-bootc@sha256:" + "0" * 64,
         "steps.chunkah_config.outputs.config": "{}",
@@ -113,9 +117,12 @@ def render(text, overrides=None):
 
     def replace(match):
         key = match.group(1)
-        if key not in values:
-            raise UnrenderedExpression(key)
-        return values[key]
+        if key in values:
+            return values[key]
+        comparison = re.fullmatch(r"(.+?)\s*!=\s*''", key)
+        if comparison and comparison.group(1) in values:
+            return "false" if values[comparison.group(1)] == "" else "true"
+        raise UnrenderedExpression(key)
 
     return _EXPR_RE.sub(replace, text)
 
@@ -151,6 +158,34 @@ class Workflow:
 
     def step_offset(self, name):
         return self.text.index(f"      - name: {name}\n")
+
+    def step_env(self, name):
+        """Parse the step-level ``env:`` block of a named step into a dict.
+
+        Workflows pass ``${{ ... }}`` values through step ``env:`` instead of
+        interpolating them into the shell command, so the fixture must export
+        those values before running the step body, exactly like a runner does.
+        """
+        marker = f"      - name: {name}\n"
+        if marker not in self.text:
+            raise KeyError(f"workflow has no step named {name!r}")
+        step = self.text.split(marker, 1)[1]
+        lines = step.split("\n")
+        result = {}
+        for index, line in enumerate(lines):
+            if line.startswith("      - name:"):
+                break
+            if line != "        env:":
+                continue
+            for entry in lines[index + 1:]:
+                if not entry.startswith("          "):
+                    break
+                key, sep, value = entry.strip().partition(":")
+                if not sep:
+                    break
+                result[key.strip()] = value.strip().strip('"').strip("'")
+            break
+        return result
 
     def step_script(self, name):
         """Return the dedented body of the ``run: |`` block of a named step."""
@@ -248,8 +283,19 @@ JQ_STUB = """#!/usr/bin/env bash
 set -u
 log="${STUB_LOG:?STUB_LOG is required}"
 printf 'jq\\n' >> "$log"
+filter=""
+for arg in "$@"; do
+  case "$arg" in
+    .*) filter="$arg"; break ;;
+  esac
+done
 cat > /dev/null 2>&1 || true
-printf 'true\\n'
+case "$filter" in
+  *.Digest*) printf '%s\\n' "${STUB_DIGEST:?STUB_DIGEST is required}" ;;
+  *org.opencontainers.image.revision*)
+    printf '%s\\n' "${STUB_REVISION:?STUB_REVISION is required}" ;;
+  *) printf 'true\\n' ;;
+esac
 exit 0
 """
 
@@ -352,6 +398,10 @@ class Harness(unittest.TestCase):
         for key, value in self.workflow.env().items():
             env[key] = render(value, overrides) if "${{" in value else value
 
+        # These step tests start after the runner has applied GITHUB_ENV.
+        env["IMAGE_REGISTRY"] = env["IMAGE_REGISTRY"].lower()
+        env["IMAGE_NAME"] = env["IMAGE_NAME"].lower()
+
         for name in ("github_output", "github_env", "summary"):
             (self.tmp / name).write_text("")
         (self.tmp / "home").mkdir(exist_ok=True)
@@ -359,8 +409,10 @@ class Harness(unittest.TestCase):
         env.update({
             "STUB_LOG": str(self.log),
             "STUB_DIGEST": SHA256_DIGEST,
+            "STUB_REVISION": "0" * 40,
             "STUB_IDENTITY": CANONICAL_IMAGE,
             "STUB_VERIFY_FAIL": "0",
+            "COSIGN_PASSWORD": "fixture-password",
             "GITHUB_OUTPUT": str(self.tmp / "github_output"),
             "GITHUB_ENV": str(self.tmp / "github_env"),
             "GITHUB_STEP_SUMMARY": str(self.tmp / "summary"),
@@ -388,12 +440,26 @@ class Harness(unittest.TestCase):
         across steps, so a failing sign or verify aborts before the later
         publish/promotion step can run -- exactly like GitHub's per-step
         shells.
+
+        Step ``env:`` values override the workflow-level ``env:`` defaults, as
+        they do on a runner.  Only keys the caller passed in ``extra_env`` are
+        protected: those simulated secrets and fixture values win over the
+        step, so a case that withholds a value is not undone by the workflow.
         """
+        protected = set(extra_env or {})
         lines = self._dispatch_prelude()
         lines += self._dispatch_assertions()
         lines.append("set -eo pipefail")
         for name in names:
             lines.append(f"# ---- step: {name} ----")
+            for key, value in self.workflow.step_env(name).items():
+                rendered = shlex.quote(render(value, overrides))
+                if key in protected:
+                    lines.append(
+                        f'if [ -z "${{{key}+x}}" ]; then export {key}={rendered}; fi'
+                    )
+                else:
+                    lines.append(f"export {key}={rendered}")
             lines.append(render(self.workflow.step_script(name), overrides))
         script = "\n".join(lines) + "\n"
         return subprocess.run(
@@ -405,8 +471,59 @@ class Harness(unittest.TestCase):
             stdin=subprocess.DEVNULL,
         )
 
+    def run_step(self, name, overrides=None, extra_env=None):
+        """Run one real step with the same environment rules as run_chain."""
+        return self.run_chain([name], overrides=overrides, extra_env=extra_env)
+
     def commands(self):
         return [line.split() for line in self.log.read_text().splitlines() if line.strip()]
+
+
+WORKFLOW_ENV_FIXTURE = """\
+---
+name: Step env fixture
+on: workflow_dispatch
+env:
+  IMAGE_REGISTRY: ghcr.io/Fixture-Owner
+  IMAGE_NAME: Fixture-Repo
+  WORKFLOW_DEFAULT: workflow-default
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report step env
+        env:
+          WORKFLOW_DEFAULT: step-value
+          STEP_ONLY: step-only
+        run: |
+          printf '%s\\n' "$WORKFLOW_DEFAULT" > "$GITHUB_OUTPUT"
+          printf '%s\\n' "$STEP_ONLY" >> "$GITHUB_OUTPUT"
+"""
+
+
+class StepEnvPrecedenceTest(Harness):
+    """A step ``env:`` value is a runner override, not a default to preserve."""
+
+    def setUp(self):
+        super().setUp()
+        path = self.tmp / "workflow.yml"
+        path.write_text(WORKFLOW_ENV_FIXTURE, encoding="utf-8")
+        self.workflow = Workflow(path)
+
+    def _outputs(self):
+        return (self.tmp / "github_output").read_text().splitlines()
+
+    def test_step_env_overrides_workflow_level_defaults(self):
+        result = self.run_step("Report step env")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._outputs(), ["step-value", "step-only"])
+
+    def test_explicit_extra_env_wins_over_step_env(self):
+        result = self.run_step(
+            "Report step env", extra_env={"WORKFLOW_DEFAULT": "explicit"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._outputs(), ["explicit", "step-only"])
 
 
 # --------------------------------------------------------------------------
@@ -431,7 +548,7 @@ class ConfigContractTest(unittest.TestCase):
         # canonical constant names, in both workflows.
         for workflow in (BUILD, PROMOTE):
             env = workflow.env()
-            derived = f"{render(env['IMAGE_REGISTRY'])}/{render(env['IMAGE_NAME'])}"
+            derived = f"{render(env['IMAGE_REGISTRY'])}/{render(env['IMAGE_NAME'])}".lower()
             self.assertEqual(derived, env.get("ARMADA_CANONICAL_IMAGE"))
             self.assertEqual(derived, CANONICAL_IMAGE)
 
@@ -475,6 +592,14 @@ class BuildSigningKeyTest(Harness):
 
     def test_missing_private_signing_value_fails(self):
         result = self.run_check(private="")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_signing_password_fails(self):
+        self.write_key(SIGNING_PUBLIC_KEY)
+        result = self.run_chain(
+            ["Check signing key"],
+            extra_env={"COSIGN_PRIVATE_KEY": PRIVATE_VALUE, "COSIGN_PASSWORD": ""},
+        )
         self.assertNotEqual(result.returncode, 0)
 
 
@@ -533,6 +658,17 @@ class BuildSigningFlowTest(Harness):
 class BuildRepositoryGuardTest(Harness):
     workflow = BUILD
 
+    def test_prepare_normalizes_organization_name_for_ghcr(self):
+        result = self.run_chain(
+            ["Prepare environment"],
+            extra_env={"IMAGE_REGISTRY": "ghcr.io/ArmadaOS-Freedom",
+                       "IMAGE_NAME": "armadaos-freedom"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = (self.tmp / "github_env").read_text().splitlines()
+        self.assertIn("IMAGE_REGISTRY=ghcr.io/armadaos-freedom", exported)
+        self.assertIn("IMAGE_NAME=armadaos-freedom", exported)
+
     def test_wrong_repository_fails_before_registry_use(self):
         self.write_key(SIGNING_PUBLIC_KEY)
         self.write_key(LEGACY_PUBLIC_KEY)
@@ -554,7 +690,7 @@ class BuildRepositoryGuardTest(Harness):
 class PromoteGuardTest(Harness):
     workflow = PROMOTE
 
-    CHAIN = ["Prepare environment", "Verify source container signature", "Publish release tags"]
+    CHAIN = ["Prepare environment", "Verify the source image by digest", "Publish release tags"]
 
     def promote_env(self, extra=None):
         env = {"COSIGN_PRIVATE_KEY": PRIVATE_VALUE}
@@ -589,7 +725,7 @@ class PromoteGuardTest(Harness):
         self.assertNotEqual(result.returncode, 0)
         commands = self.commands()
         self.assertNotEqual(first_index(commands, lambda c: c[:2] == ["skopeo", "inspect"]), -1,
-                            "the source digest should have been resolved before verifying")
+                            "the immutable channel digest should have been inspected before verifying")
         verifies = [c for c in tool_calls(commands, "cosign") if c[1:2] == ["verify"]]
         self.assertTrue(verifies)
         self.assertTrue(all(arg_value(v, "--key") == SIGNING_PUBLIC_KEY for v in verifies),

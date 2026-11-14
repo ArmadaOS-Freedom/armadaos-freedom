@@ -1,0 +1,381 @@
+---
+name: Publish update channel
+
+# Publishes one already-built EDL package as an immutable GitHub release and
+# then points the testing update channel at it. Beta and stable are reached
+# only through Promote release from a published testing channel.
+#
+# The package build run must be a completed run of Build EDL package or Build
+# images in this repository; nothing is rebuilt here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run ID of the completed Build EDL package / Build images run in this repository"
+        type: string
+        required: true
+      channel:
+        description: "Update channel to publish; promote beta and stable from a published testing channel"
+        type: choice
+        options: [testing]
+        default: testing
+
+permissions:
+  actions: read
+  contents: write
+  packages: read
+
+concurrency:
+  # Publication and promotion both write the update-channels branch, so they
+  # share one queue and never cancel a run that is midway through a commit.
+  group: update-channels
+  cancel-in-progress: false
+
+env:
+  ARMADA_CANONICAL_REPOSITORY: "ArmadaOS-Freedom/armadaos-freedom"
+  ARMADA_CANONICAL_IMAGE: "ghcr.io/armadaos-freedom/armadaos-freedom"
+  ARMADA_SIGNING_PUBLIC_KEY: "system_files/etc/pki/containers/armadaos-freedom.pub"
+  ARMADA_CHANNEL_BRANCH: "update-channels"
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.channel }} package release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Validate request
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          if [ "${REPOSITORY}" != "${ARMADA_CANONICAL_REPOSITORY}" ]; then
+            echo "::error::This workflow only publishes ${ARMADA_CANONICAL_REPOSITORY}, not ${REPOSITORY}."
+            exit 1
+          fi
+          case "${RUN_ID}" in
+            ''|*[!0-9]*)
+              echo "::error::run_id must be a numeric workflow run ID."
+              exit 1 ;;
+          esac
+          if [ "${CHANNEL}" != testing ]; then
+            echo "::error::Publish the package to testing first, then promote beta and stable with Promote release."
+            exit 1
+          fi
+
+      - name: Check signing secrets
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ] || [ -z "${COSIGN_PASSWORD:-}" ]; then
+            echo "::error::SIGNING_SECRET and SIGNING_PASSWORD are required before any release is written."
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.3'
+
+      # Prove the private key is the counterpart of the key devices trust
+      # before any release is written. The shared helper compares the derived
+      # and trusted public keys locally; no signature, transparency-log entry,
+      # registry, or release is touched, and no secret is printed.
+      - name: Prove the signing key matches the trusted public key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: bash .github/scripts/verify-signing-key.sh
+
+      - name: Install registry tools
+        run: |
+          set -euo pipefail
+          need=""
+          for tool in jq skopeo; do
+            command -v "$tool" >/dev/null || need="$need $tool"
+          done
+          [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
+
+      - name: Verify package build run and artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/update-publication.py verify-run \
+            --repository "${REPOSITORY}" \
+            --run-id "${RUN_ID}" \
+            --out "${SCRATCH}/run.json"
+
+      - name: Download package artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          gh run download "${RUN_ID}" \
+            --repo "${REPOSITORY}" \
+            --name "edl-package-${RUN_ID}" \
+            --dir "${SCRATCH}/package"
+
+      - name: Verify signed package and parts
+        id: package
+        env:
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/update-publication.py verify-package \
+            --directory "${SCRATCH}/package" \
+            --run "${SCRATCH}/run.json" \
+            --trusted-key "${ARMADA_SIGNING_PUBLIC_KEY}" \
+            --out "${SCRATCH}/plan.json"
+          {
+            echo "digest=$(jq -r '.ociDigest' "${SCRATCH}/plan.json")"
+            echo "revision=$(jq -r '.sourceRevision' "${SCRATCH}/plan.json")"
+            echo "version=$(jq -r '.version' "${SCRATCH}/plan.json")"
+            echo "tag=$(jq -r '.releaseTag' "${SCRATCH}/plan.json")"
+            echo "release_id=$(jq -r '.releaseId' "${SCRATCH}/plan.json")"
+            echo "package_dir=$(jq -r '.packageDir' "${SCRATCH}/plan.json")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the package refers to this signed image
+        env:
+          OCI_DIGEST: ${{ steps.package.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.package.outputs.revision }}
+          OCI_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "${ARMADA_SIGNING_PUBLIC_KEY}" ] || [ ! -s "${ARMADA_SIGNING_PUBLIC_KEY}" ]; then
+            echo "::error::Freedom signing public key missing or empty: ${ARMADA_SIGNING_PUBLIC_KEY}"
+            exit 1
+          fi
+          image="${ARMADA_CANONICAL_IMAGE}@${OCI_DIGEST}"
+          inspection="$(skopeo inspect "docker://${image}")"
+          resolved="$(jq -er '.Digest' <<<"${inspection}")"
+          if [ "${resolved}" != "${OCI_DIGEST}" ]; then
+            echo "::error::The descriptor digest does not resolve to the same immutable manifest."
+            exit 1
+          fi
+          revision="$(jq -er '.Labels["org.opencontainers.image.revision"]' <<<"${inspection}")"
+          version="$(jq -er '.Labels["org.opencontainers.image.version"]' <<<"${inspection}")"
+          if [ "${revision}" != "${SOURCE_REVISION}" ] || [ "${version}" != "${OCI_VERSION}" ]; then
+            echo "::error::The package identity does not match the image labels (revision ${revision}, version ${version})."
+            exit 1
+          fi
+          cosign verify --key "${ARMADA_SIGNING_PUBLIC_KEY}" "${image}"
+
+      - name: Reconcile the package release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARMADA_RELEASE_TOKEN: ${{ secrets.ARMADA_RELEASE_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+          SOURCE_REVISION: ${{ steps.package.outputs.revision }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # release-view reads every page of the release listing, which returns
+          # drafts to this write-capable token, so an existing empty or partial
+          # draft is resumed instead of being created again. "present: false"
+          # means a completed listing had no release with this tag; malformed
+          # responses and API, network, or auth failures abort here instead.
+          python3 .github/scripts/update-publication.py release-view \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --out "${SCRATCH}/release.json"
+          # Bind the existing tag, or a draft's target_commitish when the tag
+          # does not exist yet, to the verified build revision before any
+          # asset or release write. An annotated tag is peeled to its commit,
+          # and only a genuine 404 means "no tag"; authentication, permission,
+          # and server failures abort instead. The tag target is never moved.
+          python3 .github/scripts/update-publication.py release-binding \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --release "${SCRATCH}/release.json" \
+            --source-revision "${SOURCE_REVISION}" \
+            --out "${SCRATCH}/release-binding.json"
+          # Only assets that actually exist are hashed; missing ones are listed.
+          python3 .github/scripts/update-publication.py release-state \
+            --plan "${SCRATCH}/plan.json" \
+            --release "${SCRATCH}/release.json" \
+            --repository "${REPOSITORY}" \
+            --verify-remote \
+            --out "${SCRATCH}/release-state.json"
+          state="$(jq -r '.state' "${SCRATCH}/release-state.json")"
+          echo "state=${state}" >> "${GITHUB_OUTPUT}"
+
+          # GitHub's create-release documentation: the default GITHUB_TOKEN
+          # cannot create a release whose tag targets a commit that differs
+          # from this workflow run in .github/workflows, because that needs
+          # Workflows write. The REST update-a-release documentation imposes
+          # the same requirement when publishing an existing historical draft.
+          # Historical builds can still succeed with the built-in token
+          # whenever that permission is not required, so the dedicated token is
+          # optional: when present, it is used for release creation and for
+          # both draft-publication edits below. It is never used for checkout,
+          # artifact processing, asset upload, or channel publication, which
+          # keep the default token. The tag target is always the verified
+          # SOURCE_REVISION, never the current branch head.
+          historical=false
+          if [ "${SOURCE_REVISION}" != "${GITHUB_SHA}" ]; then
+            historical=true
+          fi
+          create_token="${GH_TOKEN}"
+          if [ "${historical}" = true ] && [ -n "${ARMADA_RELEASE_TOKEN:-}" ]; then
+            create_token="${ARMADA_RELEASE_TOKEN}"
+          fi
+
+          # A draft may store a branch target, so both publication edits below
+          # restate the verified SOURCE_REVISION; an existing tag is never moved.
+          case "${state}" in
+            absent)
+              if ! GH_TOKEN="${create_token}" gh release create "${TAG}" \
+                --repo "${REPOSITORY}" \
+                --draft \
+                --target "${SOURCE_REVISION}" \
+                --title "ArmadaOS Freedom ${RELEASE_ID}" \
+                --notes "Signed Freedom update package ${RELEASE_ID}."; then
+                echo "::error::Creating release ${TAG} at ${SOURCE_REVISION} failed. No release was published and the channel was not updated."
+                if [ "${historical}" = true ]; then
+                  echo "::error::If this was a permissions error, GITHUB_TOKEN cannot create a historical release whose tag target changes .github/workflows. Add the optional ARMADA_RELEASE_TOKEN secret with Contents and Workflows write and rerun; see docs/edl-package.md. This workflow never changes the tag target or modifies secrets."
+                else
+                  echo "::error::Check that GITHUB_TOKEN has Contents write for ${REPOSITORY}."
+                fi
+                exit 1
+              fi
+              ;;
+            incomplete)
+              echo "Resuming draft release ${TAG}; existing assets are kept."
+              ;;
+            matching)
+              if [ "$(jq -r '.isDraft' "${SCRATCH}/release.json")" = "true" ]; then
+                GH_TOKEN="${create_token}" gh release edit "${TAG}" \
+                  --repo "${REPOSITORY}" --draft=false \
+                  --target "${SOURCE_REVISION}"
+              fi
+              ;;
+            *)
+              echo "::error::Release ${TAG} is ${state}; refusing to replace or extend it."
+              exit 1 ;;
+          esac
+
+          if [ "${state}" != "matching" ]; then
+            # Upload exactly the verified assets the release does not have.
+            mapfile -t uploads < <(
+              jq -r --slurpfile st "${SCRATCH}/release-state.json" \
+                '.assets[] | select(.name as $n | $st[0].missing | index($n)) | .path' \
+                "${SCRATCH}/plan.json"
+            )
+            if [ "${#uploads[@]}" -eq 0 ]; then
+              echo "::error::No verified assets to upload for a ${state} release."
+              exit 1
+            fi
+            gh release upload "${TAG}" --repo "${REPOSITORY}" "${uploads[@]}"
+            GH_TOKEN="${create_token}" gh release edit "${TAG}" \
+              --repo "${REPOSITORY}" --draft=false \
+              --target "${SOURCE_REVISION}"
+          fi
+
+      - name: Verify the published release before the channel changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.package.outputs.tag }}
+          SOURCE_REVISION: ${{ steps.package.outputs.revision }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # Re-read the public release and re-verify every asset against the
+          # signed plan: exact names, sizes, and SHA256 (API digest when GitHub
+          # reports one, bounded streaming otherwise).
+          python3 .github/scripts/update-publication.py release-view \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --out "${SCRATCH}/published.json"
+          # The published release's tag must now peel to the verified build
+          # revision as well, so a tag created or moved by anything else is
+          # rejected before the channel moves.
+          python3 .github/scripts/update-publication.py release-binding \
+            --repository "${REPOSITORY}" \
+            --tag "${TAG}" \
+            --release "${SCRATCH}/published.json" \
+            --source-revision "${SOURCE_REVISION}" \
+            --out "${SCRATCH}/published-binding.json"
+          if [ "$(jq -r '.present' "${SCRATCH}/published.json")" != "true" ]; then
+            echo "::error::Release ${TAG} disappeared before the channel update."
+            exit 1
+          fi
+          if [ "$(jq -r '.isDraft' "${SCRATCH}/published.json")" != "false" ]; then
+            echo "::error::Release ${TAG} is still a draft."
+            exit 1
+          fi
+          python3 .github/scripts/update-publication.py release-state \
+            --plan "${SCRATCH}/plan.json" \
+            --release "${SCRATCH}/published.json" \
+            --repository "${REPOSITORY}" \
+            --verify-remote \
+            --out "${SCRATCH}/published-state.json"
+          if [ "$(jq -r '.state' "${SCRATCH}/published-state.json")" != "matching" ]; then
+            echo "::error::Release ${TAG} is not complete; the channel was not updated."
+            exit 1
+          fi
+          python3 .github/scripts/update-publication.py plan-release \
+            --plan "${SCRATCH}/plan.json" \
+            --repository "${REPOSITORY}" \
+            --out "${SCRATCH}/urls.json"
+
+      - name: Publish signed update channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          CHANNEL: ${{ inputs.channel }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_KEY: "system_files/etc/pki/containers/armadaos-freedom.pub"
+          CHANNEL_BRANCH: "update-channels"
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # Secrets were checked before any release was written.
+          # Paths come from the verified plan, not from shell interpolation.
+          DESCRIPTOR="$(jq -r '.descriptor' "${SCRATCH}/plan.json")"
+          DESCRIPTOR_SIGNATURE="$(jq -r '.descriptorSignature' "${SCRATCH}/plan.json")"
+          EXPECTED_OCI_DIGEST="$(jq -r '.ociDigest' "${SCRATCH}/plan.json")"
+          DESCRIPTOR_URL="$(jq -r '.descriptorUrl' "${SCRATCH}/urls.json")"
+          SIGNATURE_URL="$(jq -r '.signatureUrl' "${SCRATCH}/urls.json")"
+          WORK_DIR="${SCRATCH}/channel"
+          export DESCRIPTOR DESCRIPTOR_SIGNATURE EXPECTED_OCI_DIGEST
+          export DESCRIPTOR_URL SIGNATURE_URL WORK_DIR
+          bash .github/scripts/publish-signed-channel.sh
+
+      - name: Summarize
+        env:
+          TAG: ${{ steps.package.outputs.tag }}
+          CHANNEL: ${{ inputs.channel }}
+          OCI_DIGEST: ${{ steps.package.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.package.outputs.revision }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          {
+            echo "### Published ${CHANNEL} update channel"
+            echo ""
+            echo "- package run: ${RUN_ID}"
+            echo "- release: \`${TAG}\`"
+            echo "- OCI digest: \`${OCI_DIGEST}\`"
+            echo "- source revision: \`${SOURCE_REVISION}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

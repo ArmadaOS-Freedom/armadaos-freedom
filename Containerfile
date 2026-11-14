@@ -96,10 +96,80 @@ RUN npm ci
 COPY decky/armada-store/ ./
 RUN npm run build
 
+FROM mcr.microsoft.com/dotnet/sdk:10.0.401 AS boot-tool-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /boot-tool-src
+ARG BOOT_TOOL_SOURCE=_build-boot-tool
+COPY ${BOOT_TOOL_SOURCE}/ ./
+RUN python3 tools/publish-boot-tool.py \
+        --rid linux-arm64 \
+        --inputs tools/boot-tool-inputs \
+        --output /boot-tool-output \
+    && python3 tools/verify-boot-tool.py /boot-tool-output
+
+FROM scratch AS update-boot-tool
+COPY --from=boot-tool-builder /boot-tool-output/ /usr/libexec/armada/boot-tool/
+COPY --from=boot-tool-builder /boot-tool-src/boot-tool-source.json /usr/share/armada/updates/boot-tool-source.json
+
+FROM ubuntu:24.04 AS update-runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        coreutils \
+        findutils \
+        grep \
+        sed \
+        tar \
+        git \
+        cmake \
+        ninja-build \
+        gcc-aarch64-linux-gnu \
+        g++-aarch64-linux-gnu \
+        binutils-aarch64-linux-gnu \
+        binutils \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/kconfig \
+    && /opt/kconfig/bin/pip install --no-cache-dir --disable-pip-version-check kconfiglib==14.1.0
+
+ENV PATH="/opt/kconfig/bin:${PATH}"
+
+COPY build_files/build-edl-runtime.sh build_files/edl_device_config.py build_files/edl-devices.json /runtime-source/build_files/
+COPY build_files/update_ab_inspect.c build_files/update_ufs_boot.c build_files/update_ufs_boot.h /runtime-source/build_files/
+COPY devices/lenovo-tb323fu/boot/kshim-success-source /runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source
+
+RUN bash /runtime-source/build_files/build-edl-runtime.sh --source /runtime-source --work /runtime-build --jobs 4
+
+RUN aarch64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+        -fPIC -fvisibility=hidden -shared -Wl,-z,relro,-z,now \
+        -I/runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source/src/include \
+        /runtime-source/build_files/update_ab_inspect.c \
+        /runtime-source/build_files/update_ufs_boot.c \
+        /runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source/src/core/storage_ab.c \
+        /runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source/src/core/storage_block.c \
+        -o /runtime-build/libarmada-update-ab.so
+
 FROM scratch AS ctx
 COPY build_files /build_files/
+COPY --from=update-runtime /runtime-build/runtimes/ /armada-runtimes/
 COPY decky /decky/
 COPY system_files /system_files/
+COPY --from=update-boot-tool / /system_files/
+COPY --from=update-runtime /runtime-build/libarmada-update-ab.so /system_files/usr/libexec/armada/libarmada-update-ab.so
 COPY --chmod=0755 system_files/usr/bin/armada-reboot-edl /system_files/usr/bin/armada-reboot-edl
 # TB323FU's two connectors share one controller. Reuse its tested routing
 # components in the common image; the helper checks the board compatible.

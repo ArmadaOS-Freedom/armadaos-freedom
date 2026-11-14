@@ -39,7 +39,7 @@ ArmadaOS Freedom is a community-maintained tablet branch based on
 [ArmadaOS](https://github.com/armada-os/armada). It retains the upstream gaming
 and desktop foundation while adapting boot, display, power, and peripherals to
 tablet hardware, and ships
-[Freedom Control](https://github.com/mydanyi/freedom-control) as its control
+[Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) as its control
 plugin.
 
 Highlights of the current adaptation:
@@ -52,7 +52,7 @@ Highlights of the current adaptation:
 - Dual-USB support, plus battery and temperature reporting.
 - Tablet touch input, plus G9 / G9 2026 controller mapping, RGB control, and
   double-Home quick access.
-- Tablet-aware [Freedom Control](https://github.com/mydanyi/freedom-control),
+- Tablet-aware [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control),
   including hiding fan controls on fanless devices.
 
 Feature availability varies by device; see the device pages below for details.
@@ -113,7 +113,7 @@ for their build paths.
 | Inspect the installed boot tools | [kShimC packaging tools](packages/kshim-tools/README.md) |
 | Check component origins and versions | [Gen 4 sources](devices/lenovo-tb322fc/README.md#源码与来源) · [Gen 5 sources](devices/lenovo-tb323fu/docs/SOURCES.md) |
 | Learn the upstream system | [Using ArmadaOS](https://armadaos.dev/using-armada/) |
-| Report a tablet-branch issue | [Freedom issues](https://github.com/mydanyi/armadaos-freedom/issues) |
+| Report a tablet-branch issue | [Freedom issues](https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues) |
 
 Upstream installation instructions describe upstream-supported devices. Use the
 model-specific documentation here for tablet installation and boot.
@@ -144,7 +144,7 @@ one local package. `just packages` intentionally rebuilds every package.
 ### Freedom Control
 
 The control plugin ships from the pinned
-[Freedom Control](https://github.com/mydanyi/freedom-control) dependency at
+[Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) dependency at
 `decky/freedom-control`. This repository no longer maintains an inline copy of
 the plugin source, so a fresh clone needs the pinned revision:
 
@@ -176,7 +176,7 @@ and OTA support status.
 - System foundation: [ArmadaOS](https://github.com/armada-os/armada), built on
   [Fedora bootc](https://github.com/bootc-dev/bootc).
 - Boot menu: [kShimC](https://github.com/sunflower2333/kShimC/tree/feature/2610).
-- Control plugin: [Freedom Control](https://github.com/mydanyi/freedom-control).
+- Control plugin: [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control).
 - Armada logo: [Rax](https://github.com/Raxcoms).
 
 See the [upstream credits](https://armadaos.dev/project/credits/) for more

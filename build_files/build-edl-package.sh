@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 # Host wrapper for the Freedom EDL raw package build.
 #
-# Builds the two task images, resolves the OCI input, builds or accepts one EDL
-# runtime per device profile taken from the devices config, runs the raw
-# producer with only the loop devices it needs, then splits the archive and
-# publishes the part checksums plus a short bilingual readme. The source tree is
-# only ever mounted read-only. Both image tags are task-temporary and are
-# removed again when the wrapper exits.
+# Builds the tools task image, resolves the OCI input and its embedded EDL
+# runtimes, runs the raw producer with only the loop devices it needs, then
+# splits the archive and publishes the part checksums plus a short bilingual
+# readme. A selected profile outside the shipped package contract, or without
+# the dual-slot upgrade backend, is packaged install-only. The source tree is
+# only ever mounted read-only. The tools image
+# tag is task-temporary and is removed again when the wrapper exits.
 set -euo pipefail
 umask 022
 
 readonly TASK_PREFIX="freedom-edl-package"
-readonly SIGNED_ORIGIN_RE='^ostree-image-signed:docker://ghcr\.io/mydanyi/armadaos-freedom:(stable|beta|testing)(@sha256:[0-9a-f]{64})?$'
+readonly SIGNED_ORIGIN_RE='^ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:(stable|beta|testing)(@sha256:[0-9a-f]{64})?$'
 readonly GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+# Models the shipped package contract accepts for installation. Any other
+# profile registered in the devices config is packaged install-only and is
+# passed to the descriptor builder as an explicit install model. Keep this
+# list in sync with
+# system_files/usr/lib/armada/updates/package_contract.py.
+readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
+# Models whose installed systems have the physical dual-slot backend the
+# offline upgrade drives. The descriptor carries one package-level operations
+# list, so upgrade is advertised only when every selected model is in this
+# set; TB710FU and any custom model are always install-only. Keep this list in
+# sync with package_contract.py OFFLINE_UPGRADE_MODELS.
+readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -44,15 +57,19 @@ Options:
   --devices-config PATH     device profile config
                             (default: SOURCE/build_files/edl-devices.json)
   --model ID                package only this device profile; repeatable
-                            (default: every profile registered in the config)
+                            (default: every profile registered in the config;
+                            a profile outside the shipped contract, and any
+                            model without the dual-slot upgrade backend, is
+                            packaged install-only)
   --origin ORIGIN           ostree-image-signed origin; required unless the OCI
-                            input is ghcr.io/mydanyi/armadaos-freedom:stable|beta|testing
+                            input is ghcr.io/armadaos-freedom/armadaos-freedom:stable|beta|testing
   --boot-uuid GUID          boot filesystem UUID (default: generated)
   --root-uuid GUID          root filesystem UUID (default: generated)
   --root-image-gib 32|48    root image size in GiB (default: 32)
-  --runtime MODEL=ABS_FILE  prebuilt runtime for a selected profile; give exactly
-                            one for every selected profile; when omitted every
-                            selected runtime is built in a container
+  --runtime MODEL=ABS_FILE  optional exact-match cross-check runtime for a
+                              selected profile; when given, provide exactly one
+                              for every selected profile; never overrides the
+                              runtimes embedded in the OCI input
   -h, --help                show this help
 
 The full ZIP stays in WORK/archive. Only the split parts, their checksums and a
@@ -151,23 +168,27 @@ fi
 [[ -d $source_arg ]] || die "source is not a directory: $source_arg"
 source_dir="$(cd -- "$source_arg" && pwd -P)"
 
-for relative in \
-    build_files/make-edl-raw-package.py \
-    build_files/split-package-archive.py \
-    build_files/edl_device_config.py \
-    system_files/usr/libexec/armada/armada-installer; do
+preflight_sources=(
+    build_files/make-edl-raw-package.py
+    build_files/split-package-archive.py
+    build_files/edl_device_config.py
+    build_files/edl_boot_requirements.py
+    build_files/make-universal-update-descriptor.py
+    build_files/universal_package.py
+    build_files/Containerfile.edl-tools
+    tests/update-oci-pull-test.py
+    system_files/usr/lib/armada/updates/__init__.py
+    system_files/usr/lib/armada/updates/signature.py
+    system_files/usr/lib/armada/updates/package_contract.py
+    system_files/usr/lib/armada/updates/package_media.py
+    system_files/usr/lib/armada/updates/recovery_manifest.py
+    system_files/usr/lib/armada/updates/boot_payload.py
+    system_files/usr/libexec/armada/armada-installer
+)
+for relative in "${preflight_sources[@]}"; do
     [[ -f $source_dir/$relative ]] || die "source is missing $relative"
 done
 [[ -e $source_dir/.git ]] || die "source must be a git checkout with .git: $source_dir"
-
-if ((${#runtime_args[@]} == 0)); then
-    [[ -f $source_dir/build_files/build-edl-runtime.sh ]] \
-        || die "source is missing build_files/build-edl-runtime.sh"
-    [[ -f $source_dir/build_files/Containerfile.edl-runtime ]] \
-        || die "source is missing build_files/Containerfile.edl-runtime"
-    [[ -f $source_dir/build_files/Containerfile.edl-tools ]] \
-        || die "source is missing build_files/Containerfile.edl-tools"
-fi
 
 # --- device profiles --------------------------------------------------------
 
@@ -198,6 +219,24 @@ for model_id in "${selected_models[@]}"; do
         || die "unusable model id in the devices config: $model_id"
     [[ -z ${selected_model_set[$model_id]:-} ]] || die "duplicate model id: $model_id"
     selected_model_set[$model_id]=1
+done
+
+# A profile outside the shipped contract may be packaged for first installation
+# only; it never gains offline-upgrade or recovery. The extra identifiers are
+# passed explicitly to the descriptor builder so the default contract stays
+# closed on devices. A contract model without the dual-slot backend (TB710FU)
+# needs no allowance but still blocks the package-level upgrade claim.
+install_only_models=()
+upgrade_blocked_models=()
+for model_id in "${selected_models[@]}"; do
+    case " $AUTHORIZED_MODELS " in
+        *" $model_id "*) ;;
+        *) install_only_models+=("$model_id") ;;
+    esac
+    case " $OFFLINE_UPGRADE_MODELS " in
+        *" $model_id "*) ;;
+        *) upgrade_blocked_models+=("$model_id") ;;
+    esac
 done
 
 readme_output="$(python3 -B "$helper" --config "$devices_config" --format readme \
@@ -275,7 +314,7 @@ esac
 origin=""
 if [[ -n $origin_arg ]]; then
     [[ $origin_arg =~ $SIGNED_ORIGIN_RE ]] \
-        || die "--origin must be ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:(stable|beta|testing)[@sha256:<hex>]"
+        || die "--origin must be ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:(stable|beta|testing)[@sha256:<hex>]"
     origin="$origin_arg"
 fi
 
@@ -313,10 +352,10 @@ if [[ -n $input_ref ]]; then
         *[!A-Za-z0-9_.-]*) die "--oci has an invalid image tag: $registry_tag" ;;
     esac
     if [[ -z $origin ]] \
-        && [[ $registry_repo == "ghcr.io/mydanyi/armadaos-freedom" ]]; then
+        && [[ $registry_repo == "ghcr.io/armadaos-freedom/armadaos-freedom" ]]; then
         case "$registry_tag" in
             stable|beta|testing)
-                origin="ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:$registry_tag"
+                origin="ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:$registry_tag"
                 ;;
         esac
     fi
@@ -326,7 +365,7 @@ if [[ -n $local_oci ]]; then
     [[ -n $origin ]] || die "--origin is required for a local OCI layout directory"
 else
     [[ -n $origin ]] \
-        || die "--origin is required unless --oci is exactly ghcr.io/mydanyi/armadaos-freedom:(stable|beta|testing)"
+        || die "--origin is required unless --oci is exactly ghcr.io/armadaos-freedom/armadaos-freedom:(stable|beta|testing)"
 fi
 
 # --- task bookkeeping -------------------------------------------------------
@@ -335,7 +374,6 @@ host_uid="$(id -u)"
 host_gid="$(id -g)"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 tools_image="$TASK_PREFIX-tools:$run_id"
-runtime_image="$TASK_PREFIX-runtime:$run_id"
 task_containers=()
 built_images=()
 
@@ -422,52 +460,18 @@ fi
 # --- runtimes ---------------------------------------------------------------
 
 config_mount=(-v "$devices_config:/config/edl-devices.json:ro")
-
-if ((${#runtime_files[@]} > 0)); then
-    note "using the prebuilt runtimes for ${selected_models[*]}"
-else
-    note "building the runtime image $runtime_image"
-    docker build \
-        --file "$source_dir/build_files/Containerfile.edl-runtime" \
-        --tag "$runtime_image" \
-        "$source_dir/build_files"
-    built_images+=("$runtime_image")
-    mkdir -p -- "$work_dir/runtime"
-
-    runtime_builder_args=(
-        bash /source/build_files/build-edl-runtime.sh
-        --source /source
-        --work /work
-        --jobs 4
-        --devices-config /config/edl-devices.json
-    )
-    for model_id in "${selected_models[@]}"; do
-        runtime_builder_args+=(--model "$model_id")
-    done
-
-    note "building the runtimes for ${selected_models[*]}"
-    run_container "$TASK_PREFIX-runtime-$run_id" \
-        --cpus 4 \
-        --memory 6g \
-        -v "$source_dir:/source:ro" \
-        -v "$work_dir/runtime:/work" \
-        "${config_mount[@]}" \
-        "$runtime_image" \
-        "${runtime_builder_args[@]}"
-
-    for model_id in "${selected_models[@]}"; do
-        runtime_files[$model_id]="$work_dir/runtime/runtimes/$model_id.bin"
-    done
-fi
-
 runtime_mounts=()
 producer_runtime_args=()
-for model_id in "${selected_models[@]}"; do
-    [[ -f ${runtime_files[$model_id]:-} ]] \
-        || die "runtime image is missing: ${runtime_files[$model_id]:-<unset>}"
-    runtime_mounts+=(-v "${runtime_files[$model_id]}:/runtime/$model_id.bin:ro")
-    producer_runtime_args+=(--runtime "$model_id=/runtime/$model_id.bin")
-done
+
+if ((${#runtime_files[@]} > 0)); then
+    note "cross-checking the supplied runtimes for ${selected_models[*]}"
+    for model_id in "${selected_models[@]}"; do
+        runtime_mounts+=(-v "${runtime_files[$model_id]}:/runtime/$model_id.bin:ro")
+        producer_runtime_args+=(--runtime "$model_id=/runtime/$model_id.bin")
+    done
+else
+    note "taking the runtimes from the OCI input for ${selected_models[*]}"
+fi
 
 # --- loop devices -----------------------------------------------------------
 
@@ -500,6 +504,18 @@ note "using $loop_a and $loop_b for the file-backed images"
 
 mkdir -p -- "$work_dir/tmp"
 
+note "running the real bootc/OSTree OCI protocol regression tests"
+run_container "$TASK_PREFIX-oci-protocol-$run_id" \
+    --cpus 2 \
+    --memory 1g \
+    --network none \
+    -v "$source_dir:/source:ro" \
+    -v "$work_dir:/work" \
+    -e TMPDIR=/work/tmp \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    "$tools_image" \
+    python3 -B /source/tests/update-oci-pull-test.py
+
 producer_args=(
     python3 -B /source/build_files/make-edl-raw-package.py
     --source /source
@@ -515,12 +531,19 @@ producer_args=(
     --work /work/producer
     --out /work/archive
 )
+if ((${#upgrade_blocked_models[@]} == 0)); then
+    producer_args+=(--offline-upgrade)
+fi
 for model_id in "${selected_models[@]}"; do
     producer_args+=(--model "$model_id")
 done
 producer_args+=("${producer_runtime_args[@]}")
 
-note "producing the raw EDL package for ${selected_models[*]}"
+if ((${#upgrade_blocked_models[@]} == 0)); then
+    note "producing the raw EDL package for ${selected_models[*]}"
+else
+    note "producing the install-only raw EDL package for ${selected_models[*]} (no offline upgrade for ${upgrade_blocked_models[*]})"
+fi
 run_container "$TASK_PREFIX-producer-$run_id" \
     --cpus 4 \
     --memory 6g \
@@ -568,6 +591,35 @@ run_container "$TASK_PREFIX-split-$run_id" \
 parts_manifest="$output_dir/$zip_name.parts.json"
 [[ -f $parts_manifest ]] || die "the splitter did not write $parts_manifest"
 
+# --- update descriptor -----------------------------------------------------
+
+update_descriptor="$output_dir/$zip_name.update.json"
+note "producing the unsigned update descriptor $zip_name.update.json"
+# When upgrade is requested, the producer has already verified the deployed
+# image carries the normal-Linux updater. The descriptor format declares
+# operations once per package, so a package may declare install and
+# offline-upgrade only when every selected model has the dual-slot upgrade
+# backend. A package containing TB710FU, or a configured custom model, is built
+# install-only: custom identifiers are passed explicitly as trusted install
+# models and the contract still keeps offline-upgrade and recovery restricted
+# to its authorized set.
+descriptor_args=(
+    python3 -B /source/build_files/make-universal-update-descriptor.py make
+    --archive "/work/archive/$zip_name"
+    --parts-manifest "/output/$zip_name.parts.json"
+    --release-id "$version"
+    --output "/output/$zip_name.update.json"
+)
+if ((${#upgrade_blocked_models[@]} == 0)); then
+    descriptor_args+=(--offline-upgrade)
+else
+    for model_id in "${install_only_models[@]}"; do
+        descriptor_args+=(--install-model "$model_id")
+    done
+fi
+run_container "$TASK_PREFIX-descriptor-$run_id" --cpus 4 --memory 6g --network none --user "$host_uid:$host_gid" -v "$source_dir:/source:ro" -v "$work_dir:/work:ro" -v "$output_dir:/output" "$tools_image" "${descriptor_args[@]}"
+[[ -f $update_descriptor ]] || die "the descriptor tool did not write $update_descriptor"
+
 command -v python3 >/dev/null 2>&1 \
     || die "python3 is required on the host to read the parts manifest"
 
@@ -593,6 +645,20 @@ sys.stdout.write("".join(lines))
 PY
 mv -f -- "$output_dir/.SHA256SUMS.part" "$output_dir/SHA256SUMS"
 
+if ((${#upgrade_blocked_models[@]} == 0)); then
+    descriptor_identity="unsigned install and upgrade identity"
+    descriptor_scope_en="The descriptor declares first installation and a normal-Linux offline upgrade
+that keeps user data and both boot slots. That upgrade runs from an installed
+system; memory-rescue tools are not part of this package."
+    descriptor_scope_zh="描述文件同时声明首次安装与保留用户数据及两个启动槽的正常 Linux 离线升级；该升级在已安装系统中执行，本包不包含内存救援工具。"
+else
+    descriptor_identity="unsigned install-only identity"
+    descriptor_scope_en="The descriptor declares first installation only. One or more packaged models
+are outside this package's offline-upgrade support, so this package advertises
+no upgrade capability and carries no rescue tools."
+    descriptor_scope_zh="描述文件仅声明首次安装。本包中至少一个机型不在本包的离线升级支持范围内，因此本包不声明升级能力，也不包含内存救援工具。"
+fi
+
 cat > "$output_dir/README.zh-en.txt" <<EOF
 ArmadaOS Freedom - EDL raw package $version
 ============================================
@@ -604,8 +670,16 @@ $readme_output
 Files:
   ArmadaOS-Freedom-$version.zip.001 ...      split parts of one archive
   ArmadaOS-Freedom-$version.zip.parts.json   split metadata
+  ArmadaOS-Freedom-$version.zip.update.json  $descriptor_identity
   SHA256SUMS                                 checksums of the split parts
   README.zh-en.txt                           this file
+
+The .update.json file is unsigned and only describes this package. Published
+packages additionally carry a .update.json.sig that installers verify against
+the trusted release public key; without that signature these files carry no
+authenticity.
+
+$descriptor_scope_en
 
 Keep all parts in the same folder. SHA256SUMS checks the parts:
   sha256sum -c SHA256SUMS        (Linux)
@@ -618,6 +692,7 @@ No manual extraction, merging or recompression is needed.
 [中文]
 本包包含上方列出的机型配置。请将所有分卷放在同一文件夹内，SHA256SUMS 用于校验各分卷。
 在支持本包的 ArmadaOS Freedom 安装器中直接选择 .001 分卷，安装器会自动使用与所识别机型匹配的文件，无需手动解压、合并或重新压缩。
+$descriptor_scope_zh
 EOF
 
 # --- summary ----------------------------------------------------------------
@@ -627,6 +702,3 @@ printf 'output: %s\n' "$output_dir"
 printf 'parts manifest: %s\n' "$parts_manifest"
 printf 'full archive: %s\n' "$work_dir/archive/$zip_name"
 printf 'tools image (removed on exit): %s\n' "$tools_image"
-if [[ -n $runtime_image && -d $work_dir/runtime ]]; then
-    printf 'runtime image (removed on exit): %s\n' "$runtime_image"
-fi

@@ -1,6 +1,11 @@
 ---
 name: Promote release
 
+# Promotes the exact digest a published signed update channel describes. The
+# channel and descriptor signatures are verified first, the image is inspected
+# at that immutable digest, and its revision label must match before anything
+# is tagged. The moving :source tag is never consulted.
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,7 +15,7 @@ on:
         options: [beta, stable]
         required: true
       source:
-        description: "Source tag to promote from (e.g. staging or testing)"
+        description: "Published channel to promote from (testing or beta)"
         type: string
         default: testing
       version:
@@ -19,13 +24,17 @@ on:
         default: ""
 
 env:
-  ARMADA_CANONICAL_IMAGE: "ghcr.io/mydanyi/armadaos-freedom"
+  ARMADA_CANONICAL_IMAGE: "ghcr.io/armadaos-freedom/armadaos-freedom"
+  ARMADA_CANONICAL_REPOSITORY: "ArmadaOS-Freedom/armadaos-freedom"
   ARMADA_SIGNING_PUBLIC_KEY: "system_files/etc/pki/containers/armadaos-freedom.pub"
+  ARMADA_CHANNEL_BRANCH: "update-channels"
   IMAGE_NAME: ${{ github.event.repository.name }}
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.target }}
+  # Publication and promotion both write the update-channels branch, so they
+  # share one queue and never cancel a run that is midway through a commit.
+  group: update-channels
   cancel-in-progress: false
 
 jobs:
@@ -34,12 +43,62 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate request
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TARGET: ${{ inputs.target }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          if [ "${REPOSITORY}" != "${ARMADA_CANONICAL_REPOSITORY}" ]; then
+            echo "::error::Freedom repository mismatch: this workflow only promotes ${ARMADA_CANONICAL_REPOSITORY}, not ${REPOSITORY}."
+            exit 1
+          fi
+          case "${SOURCE}" in
+            testing|beta) ;;
+            *)
+              echo "::error::source must be a published channel: testing or beta."
+              exit 1 ;;
+          esac
+          case "${TARGET}" in
+            beta|stable) ;;
+            *)
+              echo "::error::target must be beta or stable."
+              exit 1 ;;
+          esac
+          if [ "${SOURCE}" = "${TARGET}" ]; then
+            echo "::error::source and target must differ."
+            exit 1
+          fi
+
+      # The optional version becomes an immutable image tag, so it must be a
+      # real Docker tag and must not shadow a floating channel alias. This is
+      # checked before any registry or channel write.
+      - name: Validate release version tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/update-publication.py check-version \
+            --version "${VERSION}"
+
+      - name: Check signing secrets
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ] || [ -z "${COSIGN_PASSWORD:-}" ]; then
+            echo "::error::SIGNING_SECRET and SIGNING_PASSWORD are required before any tag is written."
+            exit 1
+          fi
 
       - name: Prepare environment
         run: |
@@ -56,11 +115,57 @@ jobs:
         with:
           cosign-release: 'v2.6.3'
 
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Prove the private key is the counterpart of the key devices trust
+      # before any tag is written. The shared helper compares the derived and
+      # trusted public keys locally; no signature, transparency-log entry,
+      # registry, or channel is touched, and no secret is printed.
+      - name: Prove the signing key matches the trusted public key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: bash .github/scripts/verify-signing-key.sh
 
-      - name: Verify source container signature
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "${GHCR_TOKEN}" | skopeo login ghcr.io -u "${ACTOR}" --password-stdin
+
+      # Promotion starts from the signed publication, not from the moving
+      # :source tag. A newer independent build may have re-pointed :source
+      # after this release was published and must not block promoting the
+      # release the channel still names. The channel and descriptor
+      # signatures bind an immutable digest, which everything below uses.
+      - name: Verify the published source channel
+        id: channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE: ${{ inputs.source }}
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # A source channel without a valid signed publication must fail
+          # here, before any tag is written.
+          python3 .github/scripts/update-publication.py fetch-channel \
+            --repository "${REPOSITORY}" \
+            --channel "${SOURCE}" \
+            --branch "${ARMADA_CHANNEL_BRANCH}" \
+            --trusted-key "${ARMADA_SIGNING_PUBLIC_KEY}" \
+            --workdir "${SCRATCH}/channel-source" \
+            --out "${SCRATCH}/channel-source.json"
+          digest="$(jq -er '.ociDigest' "${SCRATCH}/channel-source.json")"
+          revision="$(jq -er '.sourceRevision' "${SCRATCH}/channel-source.json")"
+          {
+            echo "digest=${digest}"
+            echo "revision=${revision}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the source image by digest
         id: resolve
+        env:
+          DIGEST: ${{ steps.channel.outputs.digest }}
+          REVISION: ${{ steps.channel.outputs.revision }}
         run: |
           set -euo pipefail
           REPO="${IMAGE_REGISTRY}/${IMAGE_NAME}"
@@ -72,28 +177,69 @@ jobs:
             echo "::error::Freedom signing public key missing or empty: ${ARMADA_SIGNING_PUBLIC_KEY}"
             exit 1
           fi
-          # Pin to the digest so verify and the retag below act on the same image
-          # even if a concurrent build re-points the source tag in between.
-          DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${REPO}:${{ inputs.source }}")
+          # Inspect the digest the signed channel names, never :source, so a
+          # concurrent or independent build cannot substitute another image.
+          INSPECTION=$(skopeo inspect "docker://${REPO}@${DIGEST}")
+          RESOLVED=$(jq -er '.Digest' <<<"${INSPECTION}")
+          if [ "${RESOLVED}" != "${DIGEST}" ]; then
+            echo "::error::The published channel digest does not resolve to the same immutable manifest."
+            exit 1
+          fi
+          LABEL_REVISION=$(jq -er '.Labels["org.opencontainers.image.revision"]' <<<"${INSPECTION}")
+          if [ "${LABEL_REVISION}" != "${REVISION}" ]; then
+            echo "::error::The published channel revision does not match the image labels."
+            exit 1
+          fi
           # Fail closed: never promote an unsigned build into beta/stable.
           cosign verify --key "${ARMADA_SIGNING_PUBLIC_KEY}" "${REPO}@${DIGEST}"
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${REVISION}" >> "${GITHUB_OUTPUT}"
 
       - name: Publish release tags
+        env:
+          TARGET: ${{ inputs.target }}
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
           set -euxo pipefail
           REPO="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          SRC="${REPO}@${{ steps.resolve.outputs.digest }}"
+          SRC="${REPO}@${DIGEST}"
           promote() { skopeo copy --all "docker://${SRC}" "docker://${REPO}:$1"; }
 
-          promote "${{ inputs.target }}"
+          promote "${TARGET}"
 
           # stable doubles as :latest for tooling that expects it.
-          if [ "${{ inputs.target }}" = stable ]; then
+          if [ "${TARGET}" = stable ]; then
             promote latest
           fi
 
           # Tag the release.
-          if [ -n "${{ inputs.version }}" ]; then
-            promote "${{ inputs.version }}"
+          if [ -n "${VERSION}" ]; then
+            promote "${VERSION}"
           fi
+
+      - name: Publish the target update channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          REPOSITORY: ${{ github.repository }}
+          CHANNEL: ${{ inputs.target }}
+          TRUSTED_KEY: "system_files/etc/pki/containers/armadaos-freedom.pub"
+          CHANNEL_BRANCH: "update-channels"
+          SCRATCH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # Secrets were checked before any tag was written.
+          # The descriptor, its signature and its URLs come from the verified
+          # source channel, so promotion reuses one package identity.
+          DESCRIPTOR="$(jq -r '.descriptorPath' "${SCRATCH}/channel-source.json")"
+          DESCRIPTOR_SIGNATURE="$(jq -r '.signaturePath' "${SCRATCH}/channel-source.json")"
+          DESCRIPTOR_URL="$(jq -r '.descriptorUrl' "${SCRATCH}/channel-source.json")"
+          SIGNATURE_URL="$(jq -r '.signatureUrl' "${SCRATCH}/channel-source.json")"
+          EXPECTED_OCI_DIGEST="$(jq -r '.ociDigest' "${SCRATCH}/channel-source.json")"
+          WORK_DIR="${SCRATCH}/channel"
+          export DESCRIPTOR DESCRIPTOR_SIGNATURE DESCRIPTOR_URL SIGNATURE_URL
+          export EXPECTED_OCI_DIGEST WORK_DIR
+          bash .github/scripts/publish-signed-channel.sh

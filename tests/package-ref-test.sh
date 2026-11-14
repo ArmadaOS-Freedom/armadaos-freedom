@@ -141,7 +141,7 @@ assert_calls() {
 
 pkg=armada/pkg
 hash=abc123
-primary=ghcr.io/mydanyi/armada/pkg
+primary=ghcr.io/armadaos-freedom/armada/pkg
 fallback=ghcr.io/armada-os/armada/pkg
 
 # 1. Primary hit stops lookup.

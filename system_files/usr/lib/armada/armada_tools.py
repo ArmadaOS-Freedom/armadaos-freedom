@@ -11,9 +11,12 @@ import sys
 PRIVILEGED_HELPER = "/usr/libexec/armada/armada-tools-priv"
 TOOLS = "/usr/bin/armada-tools"
 PRIVILEGED_TIMEOUT = 90
-# The helper waits up to 120 s for the update service to finish a channel
-# change, so the desktop side must outlast that wait.
-CHANNEL_TIMEOUT = 150
+# A channel change snapshots the booted system (15 s) and resolves the update
+# target (60 s), then waits on the update service: the client's initial D-Bus
+# call (10 s), the job wait (120 s) and one final status poll (10 s).  The
+# outer timeout must outlast that sequential sum plus snapshot and process
+# margin.
+CHANNEL_TIMEOUT = 240
 # get-os snapshots the booted system (15 s), resolves the update target
 # (60 s) and then queries the update service (120 s) sequentially.  The
 # outer timeout must outlast their sum plus snapshot and process margin.

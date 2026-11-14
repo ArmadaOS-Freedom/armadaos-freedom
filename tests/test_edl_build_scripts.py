@@ -8,9 +8,9 @@ appended to that copy of the config, so the default selection covers every
 profile the copied config happens to define plus that synthetic one. The exact
 configured set is read back from the copied document and carried on the
 fixture, so no case depends on a hardcoded model list. Only the source files
-the preflight stats are created and every used model gets an empty placeholder
-runtime file outside the source tree, so no image, container, archive, mount or
-device work is started.
+the preflight stats are created, and tests supplying explicit runtimes use empty
+placeholder files outside the source tree, so no image, container, archive,
+mount or device work is started.
 
 A minimal fake ``docker`` sits first on the fixture PATH. It appends its argv
 as one JSON line per call and then exits with a distinctive nonzero status.
@@ -24,8 +24,10 @@ Standard library only; run with ``python3 -m unittest`` or directly.
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -37,12 +39,13 @@ BUILD_FILES = REPO_ROOT / "build_files"
 REAL_WRAPPER = BUILD_FILES / "build-edl-package.sh"
 REAL_HELPER = BUILD_FILES / "edl_device_config.py"
 REAL_DEVICES_CONFIG = BUILD_FILES / "edl-devices.json"
+REAL_JUSTFILE = REPO_ROOT / "Justfile"
 
 # An arbitrary ID the copied config is extended with, never shipped by it.
 THIRD_MODEL = "THIRD-DEVICE"
 UNKNOWN_MODEL = "NO-SUCH-DEVICE"
 
-OCI_INPUT = "ghcr.io/mydanyi/armadaos-freedom:stable"
+OCI_INPUT = "ghcr.io/armadaos-freedom/armadaos-freedom:stable"
 MANIFEST_DIGEST = "sha256:" + "0123456789abcdef" * 4
 SOURCE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 PACKAGE_VERSION = "20261024"
@@ -127,10 +130,37 @@ def build_fixture():
             json.dumps(document, indent=2) + "\n", encoding="utf-8"
         )
 
-        for name in ("make-edl-raw-package.py", "split-package-archive.py"):
+        for name in (
+            "make-edl-raw-package.py",
+            "split-package-archive.py",
+            "make-universal-update-descriptor.py",
+            "universal_package.py",
+            "edl_boot_requirements.py",
+            "Containerfile.edl-tools",
+        ):
             (build_files / name).write_text(
                 "# placeholder: the preflight only stats this file\n", encoding="utf-8"
             )
+
+        for name in (
+            "__init__",
+            "signature",
+            "package_contract",
+            "package_media",
+            "recovery_manifest",
+            "boot_payload",
+        ):
+            module = source / ("system_files/usr/lib/armada/updates/" + name + ".py")
+            module.parent.mkdir(parents=True, exist_ok=True)
+            module.write_text(
+                "# placeholder: the preflight only stats this file\n", encoding="utf-8"
+            )
+
+        protocol_test = source / "tests/update-oci-pull-test.py"
+        protocol_test.parent.mkdir(parents=True)
+        protocol_test.write_text(
+            "# placeholder: the preflight only stats this file\n", encoding="utf-8"
+        )
 
         installer = source / "system_files/usr/libexec/armada/armada-installer"
         installer.parent.mkdir(parents=True)
@@ -218,6 +248,87 @@ def _diagnostics(result):
 
 
 class WrapperPreflightTests(unittest.TestCase):
+    @staticmethod
+    def _wrapper_models(name):
+        match = re.search(
+            r'^readonly %s="([^"]*)"$' % name,
+            REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n"),
+            re.MULTILINE,
+        )
+        if match is None:
+            raise AssertionError("the wrapper must define %s" % name)
+        return set(match.group(1).split())
+
+    @staticmethod
+    def _contract_models():
+        module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
+        sys.path.insert(0, module_root)
+        try:
+            from updates import package_contract
+        finally:
+            sys.path.remove(module_root)
+        return package_contract
+
+    def test_authorized_model_list_matches_the_package_contract(self):
+        # The wrapper passes custom profiles to the descriptor as explicit
+        # install models, so this list must stay the same closed set the
+        # shipped descriptor contract accepts by default.
+        contract = self._contract_models()
+        self.assertEqual(
+            self._wrapper_models("AUTHORIZED_MODELS"),
+            set(contract.AUTHORIZED_MODELS),
+        )
+
+    def test_offline_upgrade_model_list_matches_the_package_contract(self):
+        # The wrapper decides the package-level upgrade claim from this list.
+        contract = self._contract_models()
+        self.assertEqual(
+            self._wrapper_models("OFFLINE_UPGRADE_MODELS"),
+            set(contract.OFFLINE_UPGRADE_MODELS),
+        )
+
+    def test_tb710fu_is_authorized_for_install_only(self):
+        authorized = self._wrapper_models("AUTHORIZED_MODELS")
+        upgrade = self._wrapper_models("OFFLINE_UPGRADE_MODELS")
+        self.assertIn("TB710FU", authorized)
+        self.assertNotIn("TB710FU", upgrade)
+        self.assertEqual(upgrade, {"TB322FC", "TB323FU"})
+        self.assertLessEqual(upgrade, authorized)
+
+    def test_wrapper_gates_both_upgrade_flags_on_the_upgrade_models(self):
+        # Neither the producer bundle flag nor the descriptor flag may depend on
+        # the wider install set: TB710FU is installed but never upgraded.
+        text = REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        for flag in ("producer_args", "descriptor_args"):
+            self.assertIn(
+                "if ((${#upgrade_blocked_models[@]} == 0)); then\n"
+                "    %s+=(--offline-upgrade)" % flag,
+                text,
+            )
+
+    def test_recipe_release_profile_matches_the_wrapper_upgrade_models(self):
+        # The release variant selects exactly the models the wrapper and the
+        # shipped contract allow to advertise offline-upgrade. The universal
+        # default carries no --model, so every configured profile stays in the
+        # install-only artifact.
+        text = REAL_JUSTFILE.read_text(encoding="utf-8").replace("\r\n", "\n")
+        match = re.search(
+            r"^build-edl-package [^\n]*:\n(?P<body>(?:(?:[ \t]+.*)?\n)*)",
+            text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "the Justfile must define build-edl-package")
+        body = match.group("body")
+        models = set(
+            re.findall(r"--model ([A-Za-z0-9][A-Za-z0-9._-]*)", body)
+        )
+        self.assertEqual(models, self._wrapper_models("OFFLINE_UPGRADE_MODELS"))
+        self.assertEqual(
+            models, set(self._contract_models().OFFLINE_UPGRADE_MODELS)
+        )
+        self.assertIn("universal) model_args=()", body)
+        self.assertIn('${model_args[@]+"${model_args[@]}"}', body)
+
     def _assert_stopped_at_docker_preflight(self, fixture, result):
         self.assertEqual(1, result.returncode, _diagnostics(result))
         calls = read_docker_log(fixture)
@@ -260,9 +371,22 @@ class WrapperPreflightTests(unittest.TestCase):
             )
             self._assert_stopped_at_docker_preflight(fixture, result)
 
+    def test_default_selection_uses_oci_embedded_runtimes(self):
+        # With no --runtime, all selected models use the OCI-embedded runtimes.
+        with build_fixture() as fixture:
+            result = run_wrapper(fixture, base_arguments(fixture))
+            self._assert_stopped_at_docker_preflight(fixture, result)
+
+    def test_subset_selection_uses_oci_embedded_runtimes(self):
+        # The default runtime path also applies to an explicitly selected subset.
+        with build_fixture() as fixture:
+            result = run_wrapper(
+                fixture, base_arguments(fixture, models=(THIRD_MODEL,))
+            )
+            self._assert_stopped_at_docker_preflight(fixture, result)
+
     def test_unknown_model_is_rejected_by_the_helper(self):
-        # A runtime argument keeps the source fixture minimal: with a --runtime
-        # present the wrapper does not require the runtime Containerfiles.
+        # The devices helper rejects the model before runtime cross-checks.
         with build_fixture() as fixture:
             result = run_wrapper(
                 fixture,
@@ -293,6 +417,63 @@ class WrapperPreflightTests(unittest.TestCase):
             )
             self._assert_rejected_before_docker(
                 fixture, result, "not selected by the devices config"
+            )
+
+    def test_missing_update_descriptor_cli_is_rejected(self):
+        # The descriptor CLI is a required source file: without it the wrapper
+        # must fail in the preflight, before docker is ever looked up.
+        with build_fixture() as fixture:
+            (fixture.source / "build_files/make-universal-update-descriptor.py").unlink()
+            result = run_wrapper(
+                fixture,
+                base_arguments(
+                    fixture,
+                    runtime_models=fixture.registered_models + (THIRD_MODEL,),
+                ),
+            )
+            self._assert_rejected_before_docker(
+                fixture,
+                result,
+                "source is missing build_files/make-universal-update-descriptor.py",
+            )
+
+    def test_missing_recovery_manifest_is_rejected(self):
+        # Recovery manifest validation is required by the descriptor builder.
+        with build_fixture() as fixture:
+            (
+                fixture.source
+                / "system_files/usr/lib/armada/updates/recovery_manifest.py"
+            ).unlink()
+            result = run_wrapper(fixture, base_arguments(fixture))
+            self._assert_rejected_before_docker(
+                fixture,
+                result,
+                "source is missing system_files/usr/lib/armada/updates/recovery_manifest.py",
+            )
+
+    def test_missing_boot_payload_is_rejected(self):
+        # The trusted boot payload is required even when runtimes come from OCI.
+        with build_fixture() as fixture:
+            (
+                fixture.source
+                / "system_files/usr/lib/armada/updates/boot_payload.py"
+            ).unlink()
+            result = run_wrapper(fixture, base_arguments(fixture))
+            self._assert_rejected_before_docker(
+                fixture,
+                result,
+                "source is missing system_files/usr/lib/armada/updates/boot_payload.py",
+            )
+
+    def test_missing_oci_protocol_test_is_rejected(self):
+        # The real protocol test must be present before any Docker work starts.
+        with build_fixture() as fixture:
+            (fixture.source / "tests/update-oci-pull-test.py").unlink()
+            result = run_wrapper(fixture, base_arguments(fixture))
+            self._assert_rejected_before_docker(
+                fixture,
+                result,
+                "source is missing tests/update-oci-pull-test.py",
             )
 
     def test_duplicate_runtime_for_a_selected_model_is_rejected(self):

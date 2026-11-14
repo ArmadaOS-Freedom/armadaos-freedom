@@ -54,7 +54,7 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 
 引导构建见[四代引导说明](boot/README.md)，其中分别介绍原厂 Android 基座打包和机身 Linux／诊断环境打包。四代使用 `tb322fc_android_defconfig` 启动器配置，不能直接套用五代的 DTB 和离线打包布局。
 
-系统更新目标为 Freedom 的 `ghcr.io/mydanyi/armadaos-freedom`，支持 `stable`、`beta`、`testing` 渠道。四代的引导同步由 [`armada-kshim-sync`](../../system_files/usr/libexec/armada/armada-kshim-sync) 及其配套工具处理；渠道配置与完整 OTA 验证是两项工作，当前验证范围见上方已知问题。
+系统更新目标为 Freedom 的 `ghcr.io/armadaos-freedom/armadaos-freedom`，支持 `stable`、`beta`、`testing` 渠道。四代的引导同步由 [`armada-kshim-sync`](../../system_files/usr/libexec/armada/armada-kshim-sync) 及其配套工具处理；渠道配置与完整 OTA 验证是两项工作，当前验证范围见上方已知问题。
 
 ## 源码与来源
 

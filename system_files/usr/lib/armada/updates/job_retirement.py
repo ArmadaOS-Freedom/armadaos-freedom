@@ -22,6 +22,17 @@ alone, and links found inside a proven artifact tree are unlinked without
 touching their targets.  Repeating the call after a successful retirement is a
 no-op, so a retried confirmation stays safe.
 
+A job that fails before it ever enters the mirrored boot write leaves a
+complete download, trust, materials and candidate tree behind, and the private
+pointer moves on to the next job, so the finalized-only path above can never
+reach it again.  ``retire_failed_prewrite_job`` is called once, inline, by the
+transaction's own failure handler while it still holds the update lock: the
+job must be the pointer-named one, its persisted ``status.json`` must report
+that this transaction failed with ``bootWriteState`` still ``not_started`` in a
+phase that precedes the boot write, and the caller has already re-proved the
+recovery journal unchanged and free of this transaction.  Only then are the
+known artifact trees unlinked; every compact document and the pointer stay.
+
 A confirmed offline session keeps the same problem one level deeper: the
 uploaded signed payload under its private ``incoming`` directory plus a fixed
 set of bulky build files below ``transaction/materials`` and
@@ -60,6 +71,15 @@ ARTIFACT_NAMES = (
 
 _MAX_DOCUMENT_BYTES = 64 * 1024
 _MAX_TREE_DEPTH = 8
+
+# Status phases written by ``_run_transaction`` before the mirrored boot write
+# starts.  A failed job may only be cleaned up while its persisted receipt
+# still names one of these phases and ``bootWriteState`` says ``not_started``;
+# the caller additionally proves in memory that the writer was never entered,
+# because a restored ``not_needed`` boot failure also reports ``not_started``.
+_PREWRITE_PHASES = frozenset({
+    'preflight', 'preparing', 'downloading', 'capturing_boot_trust',
+    'deploying', 'preparing_materials', 'preparing_candidates'})
 
 # Private offline-session layout: the pending pointer names one session, and
 # only the fixed bulky regular files of that session are dead once confirmed.
@@ -165,19 +185,35 @@ def _status_is_finalized(status, job, transaction_id, plan_sha256):
     )
 
 
-def _job_directory(transaction_id, plan_sha256, state_root):
-    """Return the pointer-named job only if it provably owns the transaction."""
-    transaction_id = _canonical_uuid(transaction_id)
-    if transaction_id is None or not _sha256(plan_sha256):
-        return None
+def _failed_prewrite_status(status, job, transaction_id):
+    """Require the job's own receipt to be this transaction's pre-write failure."""
+    return (
+        isinstance(status, dict)
+        and type(status.get('schemaVersion')) is int
+        and status['schemaVersion'] == 1
+        and status.get('component') == 'system'
+        and status.get('workDir') == str(job)
+        and status.get('transactionId') == transaction_id
+        and status.get('state') == 'failed'
+        and status.get('phase') in _PREWRITE_PHASES
+        and status.get('requiresReboot') is False
+        and status.get('bootWriteState') == 'not_started'
+    )
+
+
+def _apply_root(state_root):
+    """Return the trusted apply state root, or ``None``."""
     if state_root is None:
         root = APPLY_STATE_ROOT
     elif isinstance(state_root, Path):
         root = state_root
     else:
         return None
-    if not _trusted_root(root):
-        return None
+    return root if _trusted_root(root) else None
+
+
+def _pointer_job_directory(root):
+    """Return the pointer-named job directory after canonical checks."""
     job_id = _pointer_job(root)
     if job_id is None:
         return None
@@ -196,11 +232,45 @@ def _job_directory(transaction_id, plan_sha256, state_root):
         or info.st_mode & 0o022
     ):
         return None
+    return job
+
+
+def _job_directory(transaction_id, plan_sha256, state_root):
+    """Return the pointer-named job only if it provably owns the transaction."""
+    transaction_id = _canonical_uuid(transaction_id)
+    if transaction_id is None or not _sha256(plan_sha256):
+        return None
+    root = _apply_root(state_root)
+    if root is None:
+        return None
+    job = _pointer_job_directory(root)
+    if job is None:
+        return None
     try:
         status = _document(job / STATUS_NAME)
     except (OSError, RuntimeError, TypeError, ValueError):
         return None
     if not _status_is_finalized(status, job, transaction_id, plan_sha256):
+        return None
+    return job
+
+
+def _failed_prewrite_job(transaction_id, state_root):
+    """Return the pointer-named job only if it provably failed before writing."""
+    transaction_id = _canonical_uuid(transaction_id)
+    if transaction_id is None:
+        return None
+    root = _apply_root(state_root)
+    if root is None:
+        return None
+    job = _pointer_job_directory(root)
+    if job is None:
+        return None
+    try:
+        status = _document(job / STATUS_NAME)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _failed_prewrite_status(status, job, transaction_id):
         return None
     return job
 
@@ -222,18 +292,8 @@ def _remove_tree(path, depth=0):
     os.rmdir(os.fspath(path))
 
 
-def retire_finalized_job(transaction_id, *, plan_sha256, state_root=None):
-    """Remove the large artifacts of the job that wrote *transaction_id*.
-
-    Returns ``True`` when at least one artifact tree was removed.  ``False``
-    covers every unproven case -- unknown pointer, foreign transaction, active
-    or failed job, symlinked path, unreadable document -- and leaves the job
-    untouched.  Individual unlink failures are swallowed so a finalization
-    that is already durable is never reported as incomplete.
-    """
-    job = _job_directory(transaction_id, plan_sha256, state_root)
-    if job is None:
-        return False
+def _retire_artifacts(job):
+    """Remove the known artifact directories below one proven job."""
     retired = False
     for name in ARTIFACT_NAMES:
         path = job / name
@@ -253,6 +313,41 @@ def retire_finalized_job(transaction_id, *, plan_sha256, state_root=None):
             continue
         retired = True
     return retired
+
+
+def retire_finalized_job(transaction_id, *, plan_sha256, state_root=None):
+    """Remove the large artifacts of the job that wrote *transaction_id*.
+
+    Returns ``True`` when at least one artifact tree was removed.  ``False``
+    covers every unproven case -- unknown pointer, foreign transaction, active
+    or failed job, symlinked path, unreadable document -- and leaves the job
+    untouched.  Individual unlink failures are swallowed so a finalization
+    that is already durable is never reported as incomplete.
+    """
+    job = _job_directory(transaction_id, plan_sha256, state_root)
+    if job is None:
+        return False
+    return _retire_artifacts(job)
+
+
+def retire_failed_prewrite_job(transaction_id, *, state_root=None):
+    """Remove the large artifacts of a job that failed before its boot write.
+
+    The caller has already proved in memory that this job never entered the
+    mirrored boot writer and has re-read the recovery journal unchanged with
+    no reference to *transaction_id*.  This only re-binds that decision to
+    the private pointer and the job's own persisted failed status, then
+    removes the known artifact trees.  ``True`` means at least one tree went;
+    ``False`` covers every unproven case -- foreign pointer, mismatched job or
+    transaction, a status that is not a pre-write failure, an untrusted,
+    symlinked or writable path, or an unreadable document.  Compact documents
+    and the pointer are always kept, and unlink failures are swallowed so the
+    original transaction error is never masked.
+    """
+    job = _failed_prewrite_job(transaction_id, state_root)
+    if job is None:
+        return False
+    return _retire_artifacts(job)
 
 
 def _record_bounds(record):

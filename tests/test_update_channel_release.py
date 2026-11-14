@@ -9,12 +9,14 @@ import unittest
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import test_update_package_contract as fixture  # noqa: E402
+import updates.channel_release as channel_release  # noqa: E402
 from updates.catalog import CatalogError  # noqa: E402
 from updates.channel_release import bind_package, make_channel  # noqa: E402
 from updates.package_contract import validate_package  # noqa: E402
@@ -192,6 +194,55 @@ class ChannelReleaseTest(unittest.TestCase):
             mutated[field] = value
             with self.assertRaises(CatalogError):
                 bind_package(mutated, self.pkg_bytes, self.pkg_sig, trusted_key=self.pub_key)
+
+    def test_bytearray_document_is_snapshotted_before_hash_and_verifier(self):
+        def mutate_caller(caller, verified):
+            def verifier(document, signature, trusted_key):
+                # Simulate the caller's buffer changing while the package is
+                # authenticated: both the authenticated and the hashed content
+                # must stay the bytes supplied at entry.
+                caller[:] = b"\x00" * len(caller)
+                verified.append((type(document), bytes(document)))
+                return self.pkg_dict
+            return verifier
+
+        make_caller = bytearray(self.pkg_bytes)
+        make_seen = []
+        with mock.patch.object(
+                channel_release, "_upgrade_package",
+                side_effect=mutate_caller(make_caller, make_seen)):
+            made = make_channel(
+                make_caller, self.pkg_sig, channel="stable", descriptor_url=_DESC_URL,
+                signature_url=_SIG_URL, published_at=_PUBLISHED_AT,
+                expected_oci_digest=self.oci_digest, trusted_key=self.pub_key,
+            )
+        self.assertNotEqual(make_caller, self.pkg_bytes)
+        self.assertEqual(make_seen, [(bytes, self.pkg_bytes)])
+        self.assertEqual(made["packageDescriptor"]["bytes"], len(self.pkg_bytes))
+        self.assertEqual(made["packageDescriptor"]["sha256"], sha256(self.pkg_bytes).hexdigest())
+
+        # Build the expected channel before patching: the patched verifier must
+        # be invoked by bind_package alone, not by make_channel while preparing
+        # the fixture (which would zero bind_caller before bind_package starts).
+        bind_channel = self._make()
+        bind_caller = bytearray(self.pkg_bytes)
+        bind_seen = []
+        with mock.patch.object(
+                channel_release, "_upgrade_package",
+                side_effect=mutate_caller(bind_caller, bind_seen)):
+            bound = bind_package(
+                bind_channel, bind_caller, self.pkg_sig, trusted_key=self.pub_key)
+        self.assertNotEqual(bind_caller, self.pkg_bytes)
+        self.assertEqual(bind_seen, [(bytes, self.pkg_bytes)])
+        self.assertEqual(bound["ociDigest"], self.oci_digest)
+
+    def test_make_channel_rejects_non_bytes_document(self):
+        with self.assertRaisesRegex(CatalogError, "original bytes or bytearray"):
+            make_channel(
+                "not-bytes", self.pkg_sig, channel="stable", descriptor_url=_DESC_URL,
+                signature_url=_SIG_URL, published_at=_PUBLISHED_AT,
+                expected_oci_digest=self.oci_digest, trusted_key=self.pub_key,
+            )
 
 
 if __name__ == "__main__":

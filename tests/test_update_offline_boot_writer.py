@@ -14,6 +14,7 @@ for entry in (ROOT / 'system_files/usr/lib/armada', ROOT / 'tests'):
 
 import test_update_boot_writer as boot_fixture
 from updates import boot_context
+from updates import boot_sources
 from updates import boot_writer
 from updates import offline_boot_writer as offline
 from updates import physical_slots as slots
@@ -525,6 +526,95 @@ class OfflineBootWriterTests(unittest.TestCase):
             self.assertEqual(calls[1][1], payloads[order[1]])
             self.assertEqual(calls[2][1], payloads[order[1]])
             self.assertEqual(calls[1][0], calls[2][0])
+            expected = list(before)
+            for slot in order:
+                lun, offset, size = extents[slot]
+                expected[lun] = (expected[lun][:offset] + payloads[slot] +
+                                 expected[lun][offset + size:])
+            self.assertEqual([p.read_bytes() for p in env.images], expected)
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
+
+    def test_transient_running_readback_eof_is_retried_once(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            writes = []
+            def track(fd, data, pos):
+                writes.append((fd, bytes(data), pos))
+                return REAL_PWRITE(fd, data, pos)
+            stack.enter_context(mock.patch.object(
+                offline.os, 'pwrite', side_effect=track))
+            readbacks = []
+            real_rehash = offline._rehash_region
+            def eof_once(fd, offset, size):
+                # ``_rehash_region`` raises BootSourcesError on a short read, so
+                # a readback EOF must reach the same bounded retry as an OSError.
+                if len(writes) >= 2:
+                    rw_fd, _data, running_offset = writes[1]
+                    if fd == rw_fd and offset == running_offset:
+                        readbacks.append((fd, offset, size))
+                        if len(readbacks) == 1:
+                            raise boot_sources.BootSourcesError(
+                                f'short read rehashing region at {offset}')
+                return real_rehash(fd, offset, size)
+            stack.enter_context(mock.patch.object(
+                offline, '_rehash_region', side_effect=eof_once))
+            result = offline.write_offline_boots(trust, cands, commit=lambda: None)
+            self.assertEqual(result['phase'], 'dual_boots_written')
+            self.assertEqual(result['writes'][order[1]]['readbackSha256'],
+                             cands[order[1]]['candidate']['sha256'])
+            # The inactive slot is written once; the running slot's candidate
+            # is written twice through the same descriptor with identical bytes.
+            self.assertEqual([call[1] for call in writes],
+                             [payloads[order[0]], payloads[order[1]],
+                              payloads[order[1]]])
+            self.assertEqual(writes[1], writes[2])
+            self.assertEqual([call[:2] for call in readbacks],
+                             [(writes[1][0], writes[1][2])] * 2)
+            expected = list(before)
+            for slot in order:
+                lun, offset, size = extents[slot]
+                expected[lun] = (expected[lun][:offset] + payloads[slot] +
+                                 expected[lun][offset + size:])
+            self.assertEqual([p.read_bytes() for p in env.images], expected)
+            self.assertEqual({p: p.read_bytes() for p in caps}, caps)
+            self.assert_closed(env)
+
+    def test_repeated_running_readback_eof_preserves_committed_images(self):
+        with boot_fixture.contextlib_stack() as stack:
+            env, trust, cands, before, caps, originals, payloads, extents = self._prepare(stack)
+            order = [trust['physical']['inactiveSlot'], trust['physical']['actualSlot']]
+            writes = []
+            def track(fd, data, pos):
+                writes.append((fd, bytes(data), pos))
+                return REAL_PWRITE(fd, data, pos)
+            stack.enter_context(mock.patch.object(
+                offline.os, 'pwrite', side_effect=track))
+            readbacks = []
+            real_rehash = offline._rehash_region
+            def eof_always(fd, offset, size):
+                if len(writes) >= 2:
+                    rw_fd, _data, running_offset = writes[1]
+                    if fd == rw_fd and offset == running_offset:
+                        readbacks.append((fd, offset, size))
+                        raise boot_sources.BootSourcesError(
+                            f'short read rehashing region at {offset}')
+                return real_rehash(fd, offset, size)
+            stack.enter_context(mock.patch.object(
+                offline, '_rehash_region', side_effect=eof_always))
+            with self.assertRaisesRegex(
+                    boot_writer.BootWriteError,
+                    'failed twice after the durable journal commit.*preserved') as ctx:
+                offline.write_offline_boots(trust, cands, commit=lambda: None)
+            self.assertEqual(ctx.exception.restore_status, 'not_restored')
+            self.assertEqual(ctx.exception.commit_state, 'committed')
+            self.assertEqual(ctx.exception.slot_results[order[0]]['status'], 'preserved')
+            self.assertEqual(ctx.exception.slot_results[order[1]]['status'], 'writing')
+            self.assertIn('readback failed', str(ctx.exception))
+            # The readback is retried exactly once and nothing is restored.
+            self.assertEqual(len(readbacks), 2)
+            self.assertEqual(len(writes), 3)
             expected = list(before)
             for slot in order:
                 lun, offset, size = extents[slot]

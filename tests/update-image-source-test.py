@@ -97,8 +97,8 @@ class ImageSourceIntegrationTests(unittest.TestCase):
         self.store = store_fix.DeploymentStoreIntegrationTests(
             "test_two_updates_merges_retains_and_reuses"
         )
-        self.store.setUp()
         self.addCleanup(self.store.doCleanups)
+        self.store.setUp()
         self.tmp = tempfile.TemporaryDirectory(prefix="imgsrc-work-")
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)

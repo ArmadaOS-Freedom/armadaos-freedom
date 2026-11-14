@@ -19,7 +19,7 @@ $ git submodule update --init --recursive
 
 ```console
 $ just build-edl-package \
-    docker://ghcr.io/mydanyi/armadaos-freedom:testing \
+    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
     sha256:DIGEST \
     FULL_SOURCE_COMMIT \
     EXACT_OCI_VERSION
@@ -27,20 +27,28 @@ $ just build-edl-package \
 
 | 参数 | 取值 |
 |---|---|
-| `IMAGE` | 包含真实可接受渠道（`stable`、`beta` 或 `testing`）的镜像引用，例如 `docker://ghcr.io/mydanyi/armadaos-freedom:testing`。`docker://` 前缀可以保留但并非必需，封装脚本也接受不带前缀的裸仓库引用。构建据渠道推导签名镜像来源；`staging` 无法推导出可接受的签名来源。 |
+| `IMAGE` | 包含真实可接受渠道（`stable`、`beta` 或 `testing`）的镜像引用，例如 `docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing`。`docker://` 前缀可以保留但并非必需，封装脚本也接受不带前缀的裸仓库引用。构建据渠道推导签名镜像来源；`staging` 无法推导出可接受的签名来源。 |
 | `DIGEST` | 该引用的准确 `sha256:` OCI 清单摘要，与标签分开提供。 |
 | `REVISION` | 镜像构建时对应的完整 40 位小写提交 SHA。 |
 | `VERSION` | 该镜像 `org.opencontainers.image.version` 标签的准确取值。 |
 
 四个参数必须描述同一次构建：检出的 `HEAD` 必须等于 `REVISION`，摘要必须解析到所请求的镜像，镜像的 `org.opencontainers.image.revision` 和 `org.opencontainers.image.version` 标签必须分别匹配 `REVISION` 与 `VERSION`。不一致时构建会停止。渠道名或标签不能当作版本使用，也不能用旧提交搭配新镜像。
 
-该配方只接收这四个位置参数，不会传递机型或配置选项，因此会打包 `build_files/edl-devices.json` 中登记的全部机型配置。部署包输出到 `output/edl/<version>/`，临时工作目录使用检出目录下新建的 `_build-edl.*`，该名称已被 Git 忽略。
+该配方接收这四个位置参数；默认不传递任何机型或配置选项，因此会像以前一样打包 `build_files/edl-devices.json` 中登记的全部机型配置。由于该集合包含 `TB710FU`，默认产物只具备首次安装能力。设置 `EDL_PACKAGE_PROFILE=release` 时，只选择经过校验的封闭机型对 `TB322FC` 与 `TB323FU`；只有该配置可以声明离线升级。其他取值会在构建开始前直接失败。部署包输出到 `output/edl/<version>/`，临时工作目录使用检出目录下新建的 `_build-edl.*`，该名称已被 Git 忽略。
+
+```console
+$ EDL_PACKAGE_PROFILE=release just build-edl-package \
+    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
+    sha256:DIGEST \
+    FULL_SOURCE_COMMIT \
+    EXACT_OCI_VERSION
+```
 
 如需只打包部分机型，或改用其他配置文件，请用同样的四个值直接调用封装脚本：
 
 ```console
 $ bash /PATH/TO/repo/build_files/build-edl-package.sh \
-    --oci docker://ghcr.io/mydanyi/armadaos-freedom:testing \
+    --oci docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
     --manifest-digest sha256:DIGEST \
     --source-commit FULL_SOURCE_COMMIT \
     --version EXACT_OCI_VERSION \
@@ -55,7 +63,7 @@ $ bash /PATH/TO/repo/build_files/build-edl-package.sh \
 
 `--work` 与 `--output` 必须是绝对路径，且必须是新建或空目录。两者都不能是源码树根目录，也不能包含源码树；两者之间也不能相同或互相嵌套。允许使用源码树内部的新建目录，`just` 配方就是这样使用其中的 `_build-edl.*` 与 `output/edl`。完整 ZIP 保留在工作目录中；输出目录只写入分卷、分卷校验信息和部署包 README。
 
-每个选中的机型都需要一份 runtime。若给出 `--runtime MODEL=绝对文件路径`，则必须为每个选中机型各提供一次，且不再构建 runtime；否则所有选中的 runtime 都会在容器中依据配置指定的 runtime 快照构建。
+OCI 镜像包含构建系统镜像时生成的各机型 runtime。EDL 打包会复用内嵌载荷，并验证其 manifest、内核、initramfs、DTB 和配置。每个选中的机型都需要一份 runtime。若给出 `--runtime MODEL=绝对文件路径`，则必须为每个选中机型各提供一次，且每份所提供的 runtime 必须与内嵌 runtime 的哈希值和长度完全一致，不能覆盖内嵌 runtime。缺少所需 manifest 或组件的镜像将无法打包，必须使用匹配的源码和镜像输入重新构建。
 
 ## 打包本地构建的镜像
 
@@ -65,7 +73,7 @@ $ bash /PATH/TO/repo/build_files/build-edl-package.sh \
 $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 ```
 
-`ORIGIN` 是装好的系统用来更新的签名来源。本地镜像没有渠道，无法自动推导；封装脚本只接受 `ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:` 加 `stable`、`beta` 或 `testing`（可带 `@sha256:...`）。`IMAGE` 与 `TAG` 默认就是 `just build` 写出的镜像。配方用 `skopeo` 读取版本和修订标签，把镜像从本地容器存储复制成临时 OCI 布局（生成器按 `oci:<dir>:latest` 读取；这份副本有几 GB，结束后会删除），再用该布局、其清单摘要、两个标签和 `ORIGIN` 调用 `build-edl-package`。与该配方一样，检出的 `HEAD` 必须是构建镜像时的提交，并会打包全部已登记的机型。没有这两个标签的镜像（例如直接用 `podman build` 构建的）在复制前就会被拒绝。
+`ORIGIN` 是装好的系统用来更新的签名来源。本地镜像没有渠道，无法自动推导；封装脚本只接受 `ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:` 加 `stable`、`beta` 或 `testing`（可带 `@sha256:...`）。`IMAGE` 与 `TAG` 默认就是 `just build` 写出的镜像。配方用 `skopeo` 读取版本和修订标签，把镜像从本地容器存储复制成临时 OCI 布局（生成器按 `oci:<dir>:latest` 读取；这份副本有几 GB，结束后会删除），再用该布局、其清单摘要、两个标签和 `ORIGIN` 调用 `build-edl-package`。与该配方一样，检出的 `HEAD` 必须是构建镜像时的提交，并会打包全部已登记的机型。没有这两个标签的镜像（例如直接用 `podman build` 构建的）在复制前就会被拒绝。
 
 本地主机与 CI 运行器有几处不同：
 
@@ -93,7 +101,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 | `bootPartitionBytes` | 写入机型清单的声明启动分区大小。 |
 | `diagnosticMode` | `rd-break` 或 `verbose`。 |
 
-适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。
+适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。不在随附约定机型列表中的配置只能构建首次安装包；构建不会为它声明离线升级或恢复能力，且当它与默认机型一同选中时，整个包只声明首次安装。
 
 ## 内置插件来源
 
@@ -109,9 +117,30 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 ## 持续构建
 
-该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建 EDL 部署包，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。部署包作为 `edl-package-<运行编号>` 工作流产物上传，与未改动的 SD 镜像流程并存。不会自动创建 GitHub Release，SD 镜像发布行为保持不变。
+该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建两个 EDL 部署包变体，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。两个变体在各自独立的运行器上执行，检出目录、工作目录、输出目录和签名互不共享：
 
-也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并把分卷、`parts.json`、`SHA256SUMS` 和部署包 README 作为工作流产物上传。
+- `edl-package-<运行编号>` 使用 `EDL_PACKAGE_PROFILE=release` 构建，只包含 `TB322FC` 与 `TB323FU`。其签名描述同时声明 `install` 与 `offline-upgrade`，是正式的多机型更新产物，也是 **Publish update channel** 唯一接受的产物。
+- `edl-install-package-<运行编号>` 使用默认的 universal 配置构建，包含全部已登记机型（含 `TB710FU`）。其签名描述只声明 `install`，用于配合 Windows 安装器完成首次安装，绝不会发布到更新渠道。
+
+两个产物都会保留在工作流运行中，直到运维人员发布更新产物；不会自动创建 Release，也不会自动改动任何更新渠道。SD 镜像流程继续保留，其自动发布需按下文配置 R2 并启用。
+
+也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并运行同样的两个变体，把各自的分卷、`parts.json`、`SHA256SUMS` 和部署包 README 以独立名称上传。
+
+## 发布更新渠道
+
+镜像自带 `/etc/armada/updates/channels.json`，把每个渠道指向 `update-channels` 分支上的签名文档：`https://raw.githubusercontent.com/ArmadaOS-Freedom/armadaos-freedom/update-channels/<渠道>.json` 及其 `.json.sig`。三个渠道都会列出，但只有运维人员真正发布后渠道才可用：设备拉取该文档并校验签名，不会回退到其它渠道或来源。
+
+流程是：构建 → 发布 testing → 晋升。
+
+1. 构建部署包：`main` 上的 `Build images`，或手动运行 `Build EDL package`。
+2. 用已完成的运行编号和 `testing` 运行 **Publish update channel**。它会确认该运行属于本仓库、已成功，并产出了 `edl-package-<运行编号>`。仅首次安装的 `edl-install-package-<运行编号>` 产物即使描述已签名也不会被接受，因为它没有声明 `offline-upgrade`。随后校验描述签名、分卷、分卷清单、`offline-upgrade` 能力，以及 OCI 摘要确实解析到由该源码修订构建的签名镜像。然后创建草稿 Release `<releaseId>`，上传分卷、分卷清单、描述文件和描述签名，等全部资产到位后才公开 Release，最后才签名并提交 `testing.json` 与 `testing.json.sig`。
+3. 运行 **Promote release**，`source: testing`，`target: beta` 或 `stable`。晋升先校验已发布的源渠道文档及其描述签名，再从该渠道取得不可变的 OCI 摘要，按该摘要检视镜像，并要求其修订标签与 Cosign 签名均匹配后才写入任何标签。晋升从不读取会移动的 `:testing` 标签，因此源标签被更新的、独立构建的版本重新指向时，不会阻止晋升渠道仍然指向的旧发布。随后把目标渠道指向同一批 Release 资产。全程不重新构建；源渠道没有有效的签名发布时，会在写入任何标签之前失败。
+
+不会就地替换：已公开的 Release 必须与校验过的部署包完全一致；草稿 Release 即使是空的也会就地补全——只上传缺失的资产，已存在的资产按签名计划做哈希校验而不是覆盖；内容不一致的 Release 会直接失败。渠道文档与签名以一次提交写入 `update-channels` 分支的对应文件，更新串行执行，绝不强制推送。
+
+在创建、续传或公开 Release 之前，其 Git 标签会绑定到已校验的 `SOURCE_REVISION`。已存在的标签会解析到其最终指向的提交（包括附注标签）；只有 GitHub 返回真正的 404 才视为标签不存在，认证、权限或服务器错误都会中止。尚无标签的草稿通过其 `target_commitish` 绑定，并解析为确切的提交 SHA。任何不一致都会在写入资产或 Release 之前终止运行，且绝不更改标签目标。
+
+从当前提交发布构建时始终使用工作流的 `GITHUB_TOKEN`。历史构建的 Release 标签指向的提交可能与工作流运行不同；GitHub 创建 Release 的文档说明，当该提交改动了 `.github/workflows` 时 `GITHUB_TOKEN` 无法创建该 Release，因为它从不具备 Workflows 写权限。GitHub REST 的更新 Release 文档对公开已存在的历史草稿也提出同样的 Workflows 写权限要求。可选的 `ARMADA_RELEASE_TOKEN` 密钥用于该历史 `gh release create`，以及两个公开草稿的 `gh release edit --draft=false` 路径：已配置时这些步骤使用它，未配置时这些步骤尝试 `GITHUB_TOKEN`，在 GitHub 允许的情况下可以成功；若权限被拒绝且标签提交与本次运行的工作流内容不同，则需要具备 **Contents** 与 **Workflows** 写权限的专用令牌。检出、下载产物、校验、读取 Release、上传资产和发布渠道，均继续使用 `GITHUB_TOKEN`，不切换令牌，也不重设标签目标。标签目标始终是已校验的构建修订，绝不是当前分支末端。
 
 ## 部署包结构
 
@@ -138,11 +167,33 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 把同一个部署包的所有分卷放在同一文件夹中，不要改名，并在匹配的安装器中选择 `.zip.001`；安装器会从该文件夹读取连续编号的分卷，不读取 `parts.json`。
 
-部署包把源码记录为来源信息：一个准确、非全零的 40 位小写提交 SHA，读取时不裁剪、不做规范化。[Windows 安装器](https://github.com/mydanyi/armadaos-freedom-installer)负责校验该来源信息，并选择与目标平板匹配的型号配置。
+部署包把源码记录为来源信息：一个准确、非全零的 40 位小写提交 SHA，读取时不裁剪、不做规范化。[Windows 安装器](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer)负责校验该来源信息，并选择与目标平板匹配的型号配置。
 
-安装器使用本机已校验的恢复资料生成平板专属的 2 GiB `ARMADA_BACKUP`，它不属于共用 Linux 镜像。安装器 0.7.4 新建恢复镜像采用 v3，在最后 64 KiB 留出启动设置区域；各型号能否读取或保存设置仍由各自的启动器实现决定。详见[恢复区约定](https://github.com/mydanyi/armadaos-freedom-installer/blob/main/docs/package-contract.md)。
+安装器使用本机已校验的恢复资料生成平板专属的 2 GiB `ARMADA_BACKUP`，它不属于共用 Linux 镜像。安装器 0.7.4 新建恢复镜像采用 v3，在最后 64 KiB 留出启动设置区域；各型号能否读取或保存设置仍由各自的启动器实现决定。详见[恢复区约定](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer/blob/main/docs/package-contract.md)。
 
 原有的 SD 卡镜像及其手动安装流程仍然可用。
+
+## 发布配置
+
+正式镜像地址为 `ghcr.io/armadaos-freedom/armadaos-freedom`。`Build images` 从 `main` 发布签名后的 `testing` 镜像；`Promote release` 核验同一镜像摘要后，再设置 `beta` 或 `stable` 标签。将加密的 Cosign 私钥配置为 `SIGNING_SECRET`，密码配置为 `SIGNING_PASSWORD`；对应公钥位于 `system_files/etc/pki/containers/armadaos-freedom.pub`。私钥不得放入源码。
+
+GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `edl-package-<run-id>` 产物中，由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。仅首次安装的 `edl-install-package-<run-id>` 产物只用于首刷，不会成为渠道文档。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
+
+Windows 安装器 0.7.32 起识别组织地址，并继续兼容迁移前 `mydanyi` 镜像地址的安装包。使用新组织地址的包之前，请先升级安装器；旧版会拒绝尚不认识的来源。新包和更新目标使用组织地址，不改写历史包的来源记录。
+
+## 包签名与升级能力
+
+构建封装脚本在归档及分卷生成后，输出 .zip.update.json 描述文件，绑定发布版本、源码提交、OCI 摘要、OSTree 提交、支持机型、有效载荷路径、压缩及展开大小和完整摘要；共用系统文件只记录一份。
+
+本地封装脚本输出的描述尚未签名。EDL Actions 工作流对其原始 UTF-8 字节使用发行密钥签名，以固定公钥核验后，把 .zip.update.json.sig 与分卷一起上传。矩阵中的每个变体都在各自的运行器上为自己的描述签名：更新变体必须核验为 install 与 offline-upgrade，仅安装变体必须核验为 install-only，之后才会上传产物。SHA256SUMS 和 parts.json 不能替代发行签名，也不能信任安装包自行提供的公钥。
+
+生成器先确认部署镜像带有正常 Linux 更新器，随后声明 install 与 offline-upgrade；镜像缺少该更新器时构建直接失败，不会被改标为可升级。当所选机型包含随附约定之外的配置时，构建只生成首次安装包：封装脚本不会为它请求 offline-upgrade，而是把该已注册机型显式传给描述生成器，使构建产物通过校验，同时仍拒绝为它声明离线升级或恢复能力。离线升级保留用户数据，并用已校验的载荷写入两个启动槽；在线 OCI 更新只轮换非当前槽。签名本身不使包具备升级能力：描述必须声明 offline-upgrade，且已安装更新器版本不低于 `minimumUpdaterVersion`。
+
+离线升级目前仅支持联想 Legion Y700 四代（TB322FC）与五代（TB323FU）。联想小新 Pad Pro GT（TB710FU）仍可能出现在通用首次安装包中，但其更新槽后端尚未实现，因此出现在部署包的机型列表中并不代表该机型支持离线升级。
+
+恢复描述属于内存救援路径，不是本包的前提：本包不附带救援产物，该对象可以缺省或不完整；凡出现的条目仍按同一模式与文件记录逐项校验。渠道生成工具仍会拒绝只有首次安装能力的描述。
+
+.github/scripts/make-update-channel.py 从已签名且具备升级能力的描述生成待签名渠道文件。提升渠道时保留同一个发布版本、源码提交、OCI 摘要、OSTree 提交和包身份，不重新构建系统；verify 子命令分别验证渠道和包的签名，再检查两者绑定关系。生成或核验文件本身不会发布渠道或修改镜像标签；实际发布时用 `SIGNING_SECRET` 对渠道文档签名，并把文档与签名一起提交到 `update-channels` 分支，如上文所述。
 
 ## 测试
 
@@ -151,3 +202,11 @@ $ just test-edl-package
 ```
 
 该命令运行 EDL 文件系统测试，需要 Docker 以特权方式访问 loop 设备与 btrfs。该配方与 `just test` 分开。
+
+## 系统更新引导工具的构建来源
+
+正式镜像通过 `build_files/prepare-boot-tool-source.py` 从安装器仓库的 `main` 取得 BootTool 所需源码，先固定实际提交，再生成文件摘要清单。引导重打包和签名逻辑由安装器 Core 复用；不会另维护一份系统侧实现。所需源码缺失时构建失败，不能静默生成缺少更新引导工具的镜像。
+
+`Containerfile` 的 `update-boot-tool` 阶段把包含运行时的 ARM64 工具安装到 `/usr/libexec/armada/boot-tool/`，并在 `/usr/share/armada/updates/boot-tool-source.json` 保存来源记录。`just build` 和镜像 CI 均包含这一步，SDK 只留在构建阶段。
+
+离线开发可通过 `ARMADA_BOOT_TOOL_LOCAL_SOURCE` 为 `just build` 指定本地安装器源码；来源记录会明确标为 `local`，不把它冒充已发布提交。正式 CI 使用远端源码。跨仓库更新需先合入安装器端 BootTool 源码，再合入系统侧依赖它的构建变更。

@@ -1098,6 +1098,84 @@ test('15: Restart device refetches GetStatus and requires fresh idle system and 
   assert.equal(await stale.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
 });
 
+test('16: restart refused while Steam turns busy after confirmation stays visible, disabled, then retries exactly once', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+
+  await page.evaluate(() => {
+    window.fixture.state.checkResult.available = true;
+    window.fixture.state.applyResult.eresult = 1;
+    window.fixture.state.applyResult.requires_client_restart = true;
+    return window.ArmadaUpdatesPage.refresh();
+  });
+
+  const row = page.locator('.armada-row[data-comp="client"]');
+  const primary = row.locator('.armada-btn-primary');
+  await primary.waitFor({ state: 'visible' });
+  assert.match(await primary.textContent(), /Restart Steam/);
+  assert.equal(await primary.isEnabled(), true);
+
+  await primary.click();
+  await row.locator('.armada-btn-danger').waitFor({ state: 'visible' });
+
+  // Steam turns busy after the page snapshot but before the dispatch; no
+  // restart may be requested and no automatic retry may follow.
+  await page.evaluate(() => {
+    window.UpdateStore.m_updater.m_updateState.state = 3;
+    document.querySelector('.armada-row[data-comp="client"] .armada-btn-danger').click();
+  });
+
+  const error = row.locator('.armada-error-box');
+  await error.waitFor({ state: 'visible' });
+  assert.match(await error.textContent(), /already checking or applying updates/i);
+  assert.equal(await page.evaluate(() => window.fixture.state.startRestartCalls.length), 0);
+
+  // The accepted restart requirement stays visible but disabled while busy.
+  // The status pill follows the live busy state first, so it reports the
+  // native applying state instead of the accepted restart requirement.
+  await primary.waitFor({ state: 'visible' });
+  assert.match(await primary.textContent(), /Restart Steam/);
+  assert.equal(await primary.isEnabled(), false);
+  assert.equal(await row.locator('.armada-status-pill').textContent(),
+               'Applying update...');
+
+  await page.waitForTimeout(300);
+  const busyCalls = await page.evaluate(() => window.fixture.state.bridgeCalls.map(c => c.method));
+  for (const method of ['StartCheck', 'StartSystemUpdate', 'StartDeckyAction']) {
+    assert.equal(busyCalls.includes(method), false, `unexpected ${method} while busy`);
+  }
+  assert.equal(await page.evaluate(() => window.fixture.state.nativeCheckCalls), 0);
+  assert.equal(await page.evaluate(() => window.fixture.state.startRestartCalls.length), 0);
+
+  // Becoming idle makes the same requirement directly retryable with the
+  // reason still visible and no header re-check required.
+  await page.evaluate(() => {
+    window.UpdateStore.m_updater.m_updateState.state = 2;
+    return window.ArmadaUpdatesPage.refresh();
+  });
+  await page.waitForFunction(() => {
+    const btn = document.querySelector('.armada-row[data-comp="client"] .armada-btn-primary');
+    return btn && !btn.disabled && /Restart Steam/.test(btn.textContent);
+  }, null, { timeout: 5000 });
+  assert.match(await error.textContent(), /already checking or applying updates/i);
+  assert.equal(await page.evaluate(() => window.fixture.state.nativeCheckCalls), 0);
+
+  // The eventual explicit confirmation dispatches exactly once.
+  await primary.click();
+  await row.locator('.armada-btn-danger').click();
+  await page.waitForFunction(() => window.fixture.state.startRestartCalls.length === 1,
+    null, { timeout: 5000 });
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => window.fixture.state.startRestartCalls.length), 1);
+  assert.equal(await page.evaluate(() => window.fixture.state.startRestartCalls[0]), false);
+  assert.equal(await page.evaluate(() => window.fixture.state.restartPCCalls), 0);
+  assert.equal(await page.evaluate(() => window.fixture.state.nativeCheckCalls), 0);
+  const settledCalls = await page.evaluate(() => window.fixture.state.bridgeCalls.map(c => c.method));
+  for (const method of ['StartCheck', 'StartSystemUpdate', 'StartDeckyAction']) {
+    assert.equal(settledCalls.includes(method), false, `unexpected ${method} after retry`);
+  }
+});
+
 test('client row stays actionable after an unreadable apply baseline and retries directly', async (t) => {
   const { page } = await createTestPage(t, 'en-US');
   await setupSyntheticSteamDom(page);

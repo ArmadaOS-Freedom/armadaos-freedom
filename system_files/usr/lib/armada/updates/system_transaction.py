@@ -10,6 +10,12 @@ new journal plus at least one complete matching image.  It never selects an
 Android boot slot, marks slot success, arms a retry/priority LUN, or writes
 Android boot-control state: the Android bootloader keeps owning slot selection
 and raw boot state.
+
+A failure before the mirrored boot writer is entered removes only this job's
+known bulky artifact trees, inline and while the update lock is still held,
+after the failed status is durable and the recovery journal is re-read
+unchanged.  Once the writer has been entered nothing is removed, even if the
+device reports that the failed write was restored or never started.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from . import (
     boot_trust,
     deployment_store,
     image_source,
+    job_retirement,
     offline_boot_writer,
     physical_slots,
     recovery_device,
@@ -273,6 +280,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
     with trial_confirmation._locked():
         work = Path(work_dir)
         created = False
+        boot_write_started = False
         status = {'schemaVersion': 1, 'component': 'system', 'state': 'failed',
                   'phase': 'preflight', 'requiresReboot': False,
                   'bootPolicy': BOOT_POLICY, 'slotControlState': 'not_issued',
@@ -444,6 +452,10 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
 
             if mode == 'rollback':
                 _recheck_rollback_snapshot(expected_checksum, new)
+            # Set before the phase is persisted or the writer is called: every
+            # failure from here on must preserve the job even when its status
+            # would report ``not_started`` after a restored boot attempt.
+            boot_write_started = True
             status.update(phase='writing_boot', bootWriteState='writing')
             _save_json(work, 'status.json', status)
 
@@ -505,11 +517,31 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 status['state'] = 'recovery_required'
                 status['journalCommitState'] = 'committed'
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
+            persisted = False
             if created:
                 try:
                     _save_json(work, 'status.json', status)
                 except Exception as save_exc:
                     status['persistenceError'] = '%s: %s' % (type(save_exc).__name__, save_exc)
+                else:
+                    persisted = True
+            if created and persisted and not boot_write_started:
+                # The failed status is durable and the mirrored boot writer was
+                # never entered.  Re-read the journal while the update lock is
+                # still held: only the exact pre-job snapshot with no reference
+                # to this transaction permits removing the dead artifact trees.
+                # Every read or identity mismatch preserves all of them, and a
+                # cleanup failure must never replace the original error.
+                try:
+                    current_journal = _check_recovery(initial, old)
+                    unreferenced = (
+                        current_journal.record is None or
+                        current_journal.record.transaction_uuid != uuid.UUID(tx).bytes)
+                    if current_journal == journal and unreferenced:
+                        job_retirement.retire_failed_prewrite_job(
+                            tx, state_root=work.parent)
+                except Exception:
+                    pass
             raise SystemTransactionError(str(exc), status) from exc
 
 

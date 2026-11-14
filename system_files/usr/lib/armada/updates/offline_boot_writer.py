@@ -58,7 +58,14 @@ def _write_candidate(fd, data, offset, claim, slot):
     """
     _pwrite_all(fd, data, offset)
     os.fsync(fd)
-    readback = _rehash_region(fd, offset, len(data))
+    try:
+        readback = _rehash_region(fd, offset, len(data))
+    except boot_sources.BootSourcesError as error:
+        # A short read back from this attempt's own extent is an I/O failure of
+        # the write, not a pre-write trust problem.  Normalize it here so both
+        # the first try and the bounded running-slot retry handle it exactly
+        # like any other readback failure.
+        raise BootWriteError(f'boot_{slot} readback failed: {error}') from error
     if readback != claim['sha256']:
         raise BootWriteError(f'boot_{slot} readback digest mismatch')
     return readback

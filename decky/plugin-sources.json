@@ -13,7 +13,7 @@
       "name": "Freedom Control",
       "directory": "armada-control",
       "path": "decky/freedom-control",
-      "repository": "mydanyi/freedom-control",
+      "repository": "ArmadaOS-Freedom/freedom-control",
       "branch": "main",
       "packagePath": "decky/armada-control/package.json"
     }

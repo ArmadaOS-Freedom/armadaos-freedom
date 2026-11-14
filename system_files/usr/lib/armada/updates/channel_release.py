@@ -27,6 +27,11 @@ def make_channel(document: bytes, signature: bytes, *, channel: str,
                  descriptor_url: str, signature_url: str, published_at: str,
                  expected_oci_digest: str, withdrawn: bool = False,
                  trusted_key=DEFAULT_TRUSTED_KEY) -> dict:
+    if not isinstance(document, (bytes, bytearray)):
+        raise CatalogError("package document must be original bytes or bytearray")
+    # Snapshot the caller's buffer once: verification and hashing must see the
+    # same immutable content even if a bytearray is mutated meanwhile.
+    document = bytes(document)
     package = _upgrade_package(document, signature, trusted_key)
     if not isinstance(expected_oci_digest, str) or not expected_oci_digest:
         raise CatalogError("expected_oci_digest must be a nonempty string")
@@ -59,11 +64,14 @@ def make_channel(document: bytes, signature: bytes, *, channel: str,
 
 def bind_package(channel_document: dict, document: bytes, signature: bytes, *,
                  trusted_key=DEFAULT_TRUSTED_KEY) -> dict:
+    if not isinstance(document, (bytes, bytearray)):
+        raise CatalogError("package document must be original bytes or bytearray")
+    # Same snapshot as make_channel: the digest check and the package verifier
+    # must both see the content the caller supplied at entry.
+    document = bytes(document)
     if not isinstance(channel_document, dict):
         raise CatalogError("channel must be an object")
     channel = validate_channel(channel_document, channel_document.get("channel"))
-    if not isinstance(document, (bytes, bytearray)):
-        raise CatalogError("package document must be original bytes or bytearray")
 
     descriptor = channel["packageDescriptor"]
     if len(document) != descriptor["bytes"]:

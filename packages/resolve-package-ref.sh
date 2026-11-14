@@ -4,7 +4,7 @@
 # Usage: bash packages/resolve-package-ref.sh PACKAGE HASH [REGISTRY ...]
 #
 # When no REGISTRY args are given, the primary registry defaults to
-# ${ARMADA_PKG_REGISTRY:-ghcr.io/mydanyi/armada/pkg} and the fallback to
+# ${ARMADA_PKG_REGISTRY:-ghcr.io/armadaos-freedom/armada/pkg} and the fallback to
 # ${ARMADA_PKG_FALLBACK_REGISTRY-ghcr.io/armada-os/armada/pkg}. An explicitly
 # empty fallback disables fallback lookup.
 #
@@ -45,7 +45,7 @@ if [[ $# -gt 0 ]]; then
         [[ -n $n ]] && registries+=("$n")
     done
 else
-    primary=${ARMADA_PKG_REGISTRY:-ghcr.io/mydanyi/armada/pkg}
+    primary=${ARMADA_PKG_REGISTRY:-ghcr.io/armadaos-freedom/armada/pkg}
     fallback=${ARMADA_PKG_FALLBACK_REGISTRY-ghcr.io/armada-os/armada/pkg}
     n=$(normalize_registry "$primary")
     [[ -n $n ]] && registries+=("$n")

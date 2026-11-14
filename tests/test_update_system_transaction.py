@@ -82,7 +82,7 @@ class SystemTransactionTests(unittest.TestCase):
         (sysroot / 'ostree').mkdir(parents=True, exist_ok=True)
         (sysroot / 'boot').mkdir(parents=True, exist_ok=True)
         lock_path = root / 'update.lock'
-        work_dir = root / 'tx_work'
+        work_dir = root / str(uuid.uuid4())
 
         trust = copy.deepcopy(case.trust)
         donor = trust['trust'][target]
@@ -298,6 +298,206 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertEqual(res['bootWriteState'], 'not_started')
             self.assertEqual(json.loads((work / 'status.json').read_bytes()), res)
 
+    def test_download_failure_reclaims_large_prewrite_artifacts(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+
+            captured = {}
+
+            def fail_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (2 << 20))
+                captured['pointer'] = (work.parent / 'current.json').read_bytes()
+                raise RuntimeError('net down')
+
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fail_download))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+
+            result = ctx.exception.result
+            self.assertEqual(result['state'], 'failed')
+            self.assertEqual(result['phase'], 'downloading')
+            self.assertEqual(result['bootWriteState'], 'not_started')
+            self.assertFalse((work / 'download').exists())
+            self.assertTrue(work.is_dir())
+            self.assertEqual(
+                json.loads((work / 'status.json').read_bytes()), result)
+            self.assertEqual(
+                (work.parent / 'current.json').read_bytes(), captured['pointer'])
+            act_test._assert_all_closed(case)
+
+    def test_preparation_failure_reclaims_download_trust_and_materials(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+
+            def fake_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (2 << 20))
+                return {
+                    'package': copy.deepcopy(PACKAGE), 'commit': 'b' * 64,
+                    'originRef': 'armada/stable',
+                }
+
+            def fake_trust(**kwargs):
+                directory = kwargs['output_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'trust.bin').write_bytes(b't' * (1 << 20))
+                return copy.deepcopy(trust)
+
+            def fail_materials(**kwargs):
+                directory = kwargs['output_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'kernel.img').write_bytes(b'k' * (4 << 20))
+                raise RuntimeError('materials failed')
+
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fake_download))
+            stack.enter_context(mock.patch.object(
+                boot_trust, 'capture_boot_trust', side_effect=fake_trust))
+            stack.enter_context(mock.patch.object(
+                boot_materials, 'prepare_boot_materials',
+                side_effect=fail_materials))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+
+            result = ctx.exception.result
+            self.assertEqual(result['state'], 'failed')
+            self.assertEqual(result['phase'], 'preparing_materials')
+            for name in ('download', 'trust', 'materials'):
+                self.assertFalse((work / name).exists(), name)
+            self.assertTrue((work / 'status.json').is_file())
+            self.assertEqual(
+                json.loads((work / 'status.json').read_bytes()), result)
+            act_test._assert_all_closed(case)
+
+    def test_changed_recovery_journal_preserves_prewrite_artifacts(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+            check = tx_mod._check_recovery
+            calls = {'n': 0}
+
+            def changed(initial, old):
+                calls['n'] += 1
+                snapshot = check(initial, old)
+                if calls['n'] == 2:
+                    return dataclasses.replace(
+                        snapshot, record=case.journal.sample(sequence=1))
+                return snapshot
+
+            def fail_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (1 << 20))
+                raise RuntimeError('net down')
+
+            stack.enter_context(mock.patch.object(
+                tx_mod, '_check_recovery', side_effect=changed))
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fail_download))
+            retire = stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, 'retire_failed_prewrite_job'))
+            with self.assertRaises(tx_mod.SystemTransactionError):
+                self._run(sysroot, work)
+
+            retire.assert_not_called()
+            self.assertTrue((work / 'download' / 'image.bin').is_file())
+
+    def test_unreadable_recovery_journal_preserves_prewrite_artifacts(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+            real_load = store.load
+            calls = {'n': 0}
+
+            def load(fd, partuuid, board):
+                calls['n'] += 1
+                if calls['n'] == 2:
+                    raise OSError('journal read failed')
+                return real_load(fd, partuuid, board)
+
+            def fail_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (1 << 20))
+                raise RuntimeError('net down')
+
+            stack.enter_context(mock.patch.object(store, 'load', side_effect=load))
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fail_download))
+            retire = stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, 'retire_failed_prewrite_job'))
+            with self.assertRaises(tx_mod.SystemTransactionError):
+                self._run(sysroot, work)
+
+            retire.assert_not_called()
+            self.assertTrue((work / 'download' / 'image.bin').is_file())
+
+    def test_prewrite_cleanup_waits_for_persisted_failure(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+            real_save = tx_mod._save_json
+
+            def save_json(directory, name, value):
+                if name == 'status.json' and value.get('state') == 'failed':
+                    raise OSError('status disk full')
+                return real_save(directory, name, value)
+
+            def fail_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (1 << 20))
+                raise RuntimeError('net down')
+
+            stack.enter_context(mock.patch.object(
+                tx_mod, '_save_json', side_effect=save_json))
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fail_download))
+            retire = stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, 'retire_failed_prewrite_job'))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+
+            self.assertIn('persistenceError', ctx.exception.result)
+            retire.assert_not_called()
+            self.assertTrue((work / 'download' / 'image.bin').is_file())
+
+    def test_prewrite_cleanup_failure_keeps_original_error(self) -> None:
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, '_owned_by_root', return_value=True))
+
+            def fail_download(**kwargs):
+                directory = kwargs['work_dir']
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'image.bin').write_bytes(b'x' * (1 << 20))
+                raise RuntimeError('net down')
+
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image', side_effect=fail_download))
+            retire = stack.enter_context(mock.patch.object(
+                tx_mod.job_retirement, 'retire_failed_prewrite_job',
+                side_effect=OSError('cleanup failed')))
+            with self.assertRaisesRegex(
+                    tx_mod.SystemTransactionError, 'net down') as ctx:
+                self._run(sysroot, work)
+
+            retire.assert_called_once()
+            self.assertEqual(ctx.exception.result['state'], 'failed')
+            self.assertTrue((work / 'download' / 'image.bin').is_file())
+
     def test_boot_write_failure_never_reports_ready(self) -> None:
         for restore, expected_state, expected_write in (
             ('not_needed', 'failed', 'not_started'),
@@ -306,11 +506,24 @@ class SystemTransactionTests(unittest.TestCase):
         ):
             with self.subTest(restore=restore), ExitStack() as stack:
                 act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
-                cause = offline_boot_writer.BootWriteError('write boom', restore)
+                cause = offline_boot_writer.BootWriteError(
+                    'write boom', restore)
+
+                def fail_write(*args, **kwargs):
+                    directory = work / 'trust'
+                    directory.mkdir(exist_ok=True)
+                    (directory / 'blob.bin').write_bytes(b'x' * 4096)
+                    raise cause
+
                 stack.enter_context(mock.patch.object(
-                    offline_boot_writer, 'write_offline_boots', side_effect=cause))
+                    offline_boot_writer, 'write_offline_boots',
+                    side_effect=fail_write))
+                retire = stack.enter_context(mock.patch.object(
+                    tx_mod.job_retirement, 'retire_failed_prewrite_job'))
                 with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
                     self._run(sysroot, work)
+                retire.assert_not_called()
+                self.assertTrue((work / 'trust' / 'blob.bin').is_file())
                 self.assertIs(ctx.exception.__cause__, cause)
                 res = ctx.exception.result
                 self.assertEqual(res['state'], expected_state)
@@ -999,7 +1212,7 @@ class SystemTransactionTests(unittest.TestCase):
             reboot(self._confirm_record(case))
 
             second_deployment = 'armada/%s.0' % ('c' * 64)
-            second_work = work.parent / 'tx_work_second'
+            second_work = work.parent / str(uuid.uuid4())
             second = run_update('c' * 64, second_deployment, second_work)
             self.assertEqual(second['state'], 'awaiting_reboot')
             self.assertEqual(second['bootWriteState'], 'written')
@@ -1028,7 +1241,7 @@ class SystemTransactionTests(unittest.TestCase):
             })
             stack.enter_context(mock.patch.object(
                 armada_os, 'snapshot', return_value=repo_snapshot))
-            rollback_work = work.parent / 'tx_work_rollback'
+            rollback_work = work.parent / str(uuid.uuid4())
             fetch = stack.enter_context(mock.patch.object(
                 image_source, 'fetch_online_image'))
             final = tx_mod.run_rollback_transaction(

@@ -23,15 +23,33 @@ check: test
     just --unstable --fmt --check -f Justfile
 
 [group('Test')]
+test-update-deployment:
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-deployment-store-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-image-source-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-source-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-image-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-offline-payload-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-deployment-options-test.py
+    sudo env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B tests/update-boot-materials-test.py
+
+[group('Test')]
 test:
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
+    # Exit status 77 is the suite's "skipped: precondition unavailable" code and
+    # exit status 0 is success; only those keep the run going. Any other status
+    # is a real failure, so the loop stops there and exits with that code before
+    # the Python tests run, keeping the first failure from being masked.
     for test_file in tests/*-test.sh; do
         echo "Running test: ${test_file}"
-        bash "${test_file}"
+        bash "${test_file}" || { status=$?; if [[ "${status}" -ne 77 ]]; then echo "FAIL: ${test_file} exited ${status}" >&2; exit "${status}"; fi; echo "Skipped test: ${test_file} (exit 77)"; }
     done
     python3 -m unittest discover -s tests -p test_plugin_sources.py
+    python3 -m unittest discover -s tests -p 'test_decky_*.py'
+    python3 -m unittest discover -s tests -p 'test_update_*.py'
+    python3 tests/organization-migration-test.py
+    python3 tests/ci-signing-test.py
 
 # EDL filesystem tests; needs privileged containers, separate from `just test`
 [group('Test')]
@@ -121,7 +139,7 @@ sudoif command *args:
     sudoif {{ command }} {{ args }}
 
 # Registry holding published package images (override to use a fork's)
-export pkg_registry := env("ARMADA_PKG_REGISTRY", "ghcr.io/mydanyi/armada/pkg")
+export pkg_registry := env("ARMADA_PKG_REGISTRY", "ghcr.io/armadaos-freedom/armada/pkg")
 
 # Registry consulted when a package is absent from pkg_registry
 # (override to use another source)
@@ -190,14 +208,24 @@ build $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    REFS="$(mktemp)"
+    BOOT_TOOL_SOURCE="$(mktemp -d _build-boot-tool.XXXXXX)"
+    trap 'rm -f "${REFS}" && rm -rf -- "${BOOT_TOOL_SOURCE}"' EXIT
+
+    BOOT_TOOL_SOURCE_ARGS=()
+    if [[ -n "${ARMADA_BOOT_TOOL_LOCAL_SOURCE:-}" ]]; then
+        BOOT_TOOL_SOURCE_ARGS+=("--local-source" "${ARMADA_BOOT_TOOL_LOCAL_SOURCE}")
+    fi
+    python3 build_files/prepare-boot-tool-source.py \
+        --output "${BOOT_TOOL_SOURCE}" \
+        "${BOOT_TOOL_SOURCE_ARGS[@]}"
+
     # Resolve the latest bundled plugin sources before any package lookup or
     # image build, so the layers never come from a cached earlier resolution.
     python3 build_files/resolve-plugin-sources.py
 
     # Resolve every package to an image: one built locally if present, else
     # the published one for that content hash.
-    REFS="$(mktemp)"
-    trap 'rm -f "${REFS}"' EXIT
     for dir in packages/*/; do
         pkg="$(basename "${dir}")"
         [ -f "${dir}/build.sh" ] || continue
@@ -235,6 +263,7 @@ build $target_image=image_name $tag=default_tag:
     podman build \
         --build-arg "ARMADA_VERSION=${ARMADA_VERSION}" \
         --build-arg "ARMADA_REVISION=${ARMADA_REVISION}" \
+        --build-arg "BOOT_TOOL_SOURCE=${BOOT_TOOL_SOURCE}" \
         --build-arg-file "${REFS}" \
         "${SECRET_ARGS[@]}" \
         --platform linux/arm64 \
@@ -378,16 +407,34 @@ build-armada-image $target_image=("localhost/" + image_name) $tag=default_tag: (
 # Build the 9008/EDL package from IMAGE (OCI ref with channel, or an absolute
 # OCI layout directory), DIGEST, REVISION and VERSION; ORIGIN is required for a
 # layout directory. Output: ./output/edl/<version>/
+# EDL_PACKAGE_PROFILE=universal (the default) packages every registered profile;
+# EDL_PACKAGE_PROFILE=release selects only the closed TB322FC/TB323FU pair that
+# may declare offline-upgrade.
 [group('Armada')]
 build-edl-package $image $digest $revision $version $origin="":
     #!/usr/bin/env bash
     set -euo pipefail
 
     source="$(git rev-parse --show-toplevel)"
+    output="${source}/output/edl/${version}"
+
+    # The release profile is the closed, validated set whose models have the
+    # dual-slot offline-upgrade backend. The universal default forwards no
+    # --model, so every registered profile keeps being packaged exactly as
+    # before; any other value fails instead of silently widening the release.
+    profile="${EDL_PACKAGE_PROFILE:-universal}"
+    case "${profile}" in
+        universal) model_args=() ;;
+        release) model_args=(--model TB322FC --model TB323FU) ;;
+        *)
+            echo "Unsupported EDL_PACKAGE_PROFILE '${profile}': expected universal or release." >&2
+            exit 1
+            ;;
+    esac
+
     # The wrapper needs a fresh work path that does not exist yet, so create
     # only the parent; both names are covered by the _build* ignore rule.
     build_parent="$(mktemp -d "${source}/_build-edl.XXXXXX")"
-    output="${source}/output/edl/${version}"
 
     # The wrapper owns Docker, its tools/runtime images, the OCI pull and the
     # volume split; the recipe only supplies the source, work and output paths.
@@ -399,11 +446,12 @@ build-edl-package $image $digest $revision $version $origin="":
         ${origin:+--origin "${origin}"} \
         --source "${source}" \
         --work "${build_parent}/work" \
-        --output "${output}"
+        --output "${output}" \
+        ${model_args[@]+"${model_args[@]}"}
 
 # Build the 9008/EDL package from a locally built image (just build), using the
 # image's own version and revision labels. ORIGIN is the signed origin the
-# devices update from (ostree-image-signed:docker://ghcr.io/mydanyi/
+# devices update from (ostree-image-signed:docker://ghcr.io/armadaos-freedom/
 # armadaos-freedom:stable|beta|testing). Output: ./output/edl/<version>/
 [group('Armada')]
 build-edl-package-local $origin $target_image=("localhost/" + image_name) $tag=default_tag:

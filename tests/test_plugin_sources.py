@@ -36,7 +36,7 @@ STORE_VERSION = "2.4.1"
 
 LSFG_REPOSITORY = "mydanyi/decky-lsfg-vk-arm64"
 CLASH_REPOSITORY = "chenx-dust/DeckyClash"
-FREEDOM_CONTROL_REPOSITORY = "mydanyi/freedom-control"
+FREEDOM_CONTROL_REPOSITORY = "ArmadaOS-Freedom/freedom-control"
 
 LEGACY_ARCHIVE = "decky/bundled-plugins/assets/LSFG-VK-ARM64-0.14.4-r16-full.zip"
 LEGACY_BYTES = b"legacy r16 archive from a previous build\n"
@@ -117,7 +117,8 @@ def _plugin_zip(directory, version):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         for relative, text in files.items():
-            archive.writestr("%s/%s" % (directory, relative), text)
+            entry = zipfile.ZipInfo("%s/%s" % (directory, relative), (2026, 1, 1, 0, 0, 0))
+            archive.writestr(entry, text)
     return buffer.getvalue()
 
 
