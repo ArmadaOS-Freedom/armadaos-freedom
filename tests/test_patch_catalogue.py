@@ -2,8 +2,9 @@
 
 The tests are intentionally limited to the documented contract in each
 package's PATCHES.md: an active series entry must have one catalogue record
-with a source, a documented patch that is not in the series must say so, and
-the gamescope-session records must name the files that actually exist.
+with a source, every patch file that is not in the series must have a
+catalogue record that says so, and the gamescope-session records must name
+the files that actually exist.
 """
 
 import re
@@ -78,18 +79,19 @@ class KernelCatalogueTest(unittest.TestCase):
 
     def test_inactive_documented_patches_are_marked(self):
         active = set(self.active)
-        for name, record in self.records.items():
-            if not name.startswith("patches/"):
+        for path in sorted(self.patch_dir.glob("*.patch")):
+            if path.name in active:
                 continue
-            patch_name = name.split("/", 1)[1]
-            if patch_name in active:
-                continue
-            if not (self.patch_dir / patch_name).is_file():
-                continue
+            documented = f"patches/{path.name}"
+            self.assertIn(
+                documented,
+                self.records,
+                f"{path.name} is present in patches but has no catalogue record",
+            )
             self.assertIn(
                 "not enabled",
-                record["notes"].lower(),
-                f"{name} is documented but not in series and is not marked "
+                self.records[documented]["notes"].lower(),
+                f"{documented} is present but not in series and is not marked "
                 "as not enabled",
             )
 
