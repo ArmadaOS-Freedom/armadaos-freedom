@@ -42,3 +42,16 @@ this repository and `notes` name the header author and commit.
   source: https://github.com/ArmadaOS-Freedom/armadaos-freedom/blob/b75a6d48e006782b886627dc2dee2b8691aa64f6/packages/gamescope-session/patches/0009-fix-konkr-fit-refresh-rates.patch
   upstream: unknown
   notes: Header author FeralAI, header commit `3629c715113b875a1da8e8a4e0cc16953fb0209e`. Extends the KONKR Pocket FIT refresh-rate list to 60, 90, 120 and 144 Hz; upstream repository could not be established.
+
+## Historical source records
+
+These filenames do not exist in the current patch directory. The rows below retain
+the upstream attributions previously recorded for them; they are not enabled patch
+entries, and they are not a verified origin of the same-numbered files listed above.
+
+| Former filename | Upstream commit | Status |
+| --- | --- | --- |
+| `patches/0004-add-device-quirks.patch` | https://github.com/OpenGamingCollective/gamescope-session/commit/2e3dd1ad5f50e2efc5a554bd5fda0e27c2d131a0 | absent from current directory |
+| `patches/0005-update-AYANEO-Pocket-DMG-scaling.patch` | https://github.com/OpenGamingCollective/gamescope-session/commit/6a6f8216c36836fdf38571c259a811a105e55033 | absent from current directory |
+| `patches/0006-add-KONKR-Pocket-FIT-Elite.patch` | https://github.com/OpenGamingCollective/gamescope-session/commit/b45f0ad079d48f021faae4a9bb859ce66933c774 | absent from current directory |
+| `patches/0007-add-Retroid-Pocket-Nova.patch` | https://github.com/OpenGamingCollective/gamescope-session/commit/c01b4bff0eba5a64455b610c212265c76e339b62 | absent from current directory |
