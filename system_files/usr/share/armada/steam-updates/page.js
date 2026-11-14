@@ -521,12 +521,18 @@
     }
 
     function isRetryableAdapterError(err) {
-      return !!(err && err.retryable === true && err.code === 'apply_baseline_unknown');
+      return !!(err && err.retryable === true &&
+        (err.code === 'apply_baseline_unknown' || err.code === 'restart_predispatch_busy'));
+    }
+
+    function isRestartPredispatchError(err) {
+      return !!(err && err.code === 'restart_predispatch_busy');
     }
 
     function clearRetryableClientError() {
       if (!state.client || !state.client.retryableError) return;
       state.client.retryableError = null;
+      state.client.retryableCode = null;
       state.client.error = null;
     }
 
@@ -549,18 +555,37 @@
 
     function syncClientSnapshot() {
       if (!adapter) return;
+      var previous = state.client;
       var snap = adapter.snapshot();
-      if (snap && state.client && state.client.localError) {
+      if (snap && previous && previous.localError) {
         snap.state = 'failed';
-        snap.error = state.client.error;
+        snap.error = previous.error;
         snap.localError = true;
-      } else if (snap && state.client && state.client.retryableError &&
-                 snap.state === 'available' && !snap.error) {
-        // A retryable pre-dispatch refusal leaves the accepted check and its
-        // available update intact. Keep the real reason visible without
-        // locking the row or asking the user for an unrelated header check.
-        snap.error = state.client.retryableError;
-        snap.retryableError = state.client.retryableError;
+      } else if (snap && previous && previous.retryableError && !snap.error) {
+        if (previous.retryableCode === 'restart_predispatch_busy') {
+          // The refusal dispatched nothing, so the adapter's restart evidence
+          // is still real. Keep the requirement and its reason visible; while
+          // Steam is busy the row is shown but disabled, and it becomes
+          // directly retryable once Steam turns idle again.
+          if (snap.state === 'restart_required' && snap.requiresClientRestart === true) {
+            snap.error = previous.retryableError;
+            snap.retryableError = previous.retryableError;
+            snap.retryableCode = previous.retryableCode;
+          } else if (snap.state === 'native_busy') {
+            snap.state = 'restart_required';
+            snap.requiresClientRestart = true;
+            snap.busy = true;
+            snap.error = previous.retryableError;
+            snap.retryableError = previous.retryableError;
+            snap.retryableCode = previous.retryableCode;
+          }
+        } else if (snap.state === 'available') {
+          // A retryable pre-dispatch refusal leaves the accepted check and its
+          // available update intact. Keep the real reason visible without
+          // locking the row or asking the user for an unrelated header check.
+          snap.error = previous.retryableError;
+          snap.retryableError = previous.retryableError;
+        }
       }
       state.client = snap;
     }
@@ -633,11 +658,16 @@
     }
 
     function determineAction(comp, s) {
-      if (!s || s.localError || s.busy === true) return null;
+      if (!s || s.localError) return null;
       if (comp === 'client') {
-        if (s.state === 'available') return 'update_client';
+        if (s.state === 'available') return s.busy === true ? null : 'update_client';
+        // An accepted client restart requirement stays visible while Steam is
+        // busy; isActionLocked() disables the button until it is idle again.
         if (s.state === 'restart_required' && s.requiresClientRestart === true) return 'restart_steam';
-      } else if (comp === 'system') {
+        return null;
+      }
+      if (s.busy === true) return null;
+      if (comp === 'system') {
         if (s.state === 'update_available') return 'update_system';
         if (s.state === 'awaiting_reboot' && s.requiresReboot === true) return 'restart_device';
       } else if (comp === 'decky') {
@@ -658,10 +688,27 @@
       }).catch(function(err) {
         if (disposed) return;
         if (isRetryableAdapterError(err)) {
-          // Nothing was dispatched and the adapter's previous check is still
-          // accepted, so the row must stay actionable for a direct retry.
           var snap = adapter.snapshot();
-          if (snap && snap.state === 'available' && !snap.error) {
+          var restartRefusal = isRestartPredispatchError(err) && snap && !snap.error &&
+            (snap.state === 'native_busy' ||
+              (snap.state === 'restart_required' && snap.requiresClientRestart === true));
+          if (restartRefusal) {
+            // The adapter refused the restart because Steam became busy; no
+            // native restart was requested, so its restart evidence is still
+            // real. Keep that evidence and the reason, and let the finally
+            // block render it; the row stays disabled until Steam is idle.
+            var previous = state.client || {};
+            previous.error = errorText(err);
+            previous.retryableError = previous.error;
+            previous.retryableCode = err.code;
+            previous.localError = false;
+            state.client = previous;
+            return;
+          }
+          if (!isRestartPredispatchError(err) && snap &&
+              snap.state === 'available' && !snap.error) {
+            // Nothing was dispatched and the adapter's previous check is still
+            // accepted, so the row must stay actionable for a direct retry.
             snap.error = errorText(err);
             snap.retryableError = snap.error;
             snap.localError = false;

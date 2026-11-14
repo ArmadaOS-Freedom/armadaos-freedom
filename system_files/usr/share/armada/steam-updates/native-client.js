@@ -192,10 +192,31 @@
     function pendingRestart() {
       return restartEvidence() !== null;
     }
-    function guard() {
+    function guardBase() {
       if (!available()) throw new Error('Steam client update adapter is unavailable');
       if (operation) throw new Error('Another client update operation is active');
+    }
+    function guard() {
+      guardBase();
       if (nativeBusy()) throw new Error('Steam is already checking or applying updates');
+    }
+    // Steam can turn busy after the page's last snapshot and before this
+    // dispatch.  A restart refused there requested nothing, so the accepted
+    // client-restart evidence still stands and the recovery is simply to wait
+    // for idle and retry.  Only that refusal is marked retryable; a
+    // missing-evidence refusal and every uncertain native outcome keep the
+    // durable failure behavior.
+    function restartRefusedWhileBusy() {
+      var error = new Error('Steam is already checking or applying updates');
+      error.code = 'restart_predispatch_busy';
+      error.retryable = true;
+      return error;
+    }
+    function guardRestart() {
+      guardBase();
+      if (!nativeBusy()) return;
+      if (restartEvidence() !== null) throw restartRefusedWhileBusy();
+      throw new Error('Steam is already checking or applying updates');
     }
     function progress() {
       if (operation !== 'apply') return null;
@@ -315,7 +336,7 @@
       return snapshot();
     }
     async function restartClient() {
-      guard();
+      guardRestart();
       syncLateApply();
       var result = restartEvidence();
       if (!result) throw new Error('Client-specific restart evidence is required');

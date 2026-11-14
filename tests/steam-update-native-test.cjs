@@ -847,3 +847,57 @@ test('changed evidence during a pending apply is not consumed and still surfaces
   await adapter.restartClient();
   assert.deepEqual(h.data.calls.restart, [false]);
 });
+
+test('a restart refused because Steam turns busy before dispatch keeps its evidence and retries once', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  assert.equal((await adapter.apply()).state, 'restart_required');
+
+  // Steam becomes busy after the page snapshot but before the dispatch.
+  h.UpdateStore.m_updater.m_updateState.state = 3;
+  await assert.rejects(adapter.restartClient(), (error) => {
+    assert.equal(error.code, 'restart_predispatch_busy');
+    assert.equal(error.retryable, true);
+    assert.match(error.message, /already checking or applying updates/);
+    return true;
+  });
+  assert.deepEqual(h.data.calls.restart, []);
+  const busy = adapter.snapshot();
+  assert.equal(busy.state, 'native_busy');
+  assert.equal(busy.busy, true);
+
+  // Becoming idle makes the same accepted requirement retryable exactly once.
+  h.UpdateStore.m_updater.m_updateState.state = 2;
+  const idle = adapter.snapshot();
+  assert.equal(idle.state, 'restart_required');
+  assert.equal(idle.requiresClientRestart, true);
+  assert.equal(idle.error, null);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+  assert.equal(h.data.calls.restart.length, 1);
+});
+
+test('a restart refused while busy without restart evidence is not marked retryable', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  h.UpdateStore.m_updater.m_updateState.state = 5;
+  await assert.rejects(adapter.restartClient(), (error) => {
+    assert.equal(error.code, undefined);
+    assert.notEqual(error.retryable, true);
+    assert.match(error.message, /already checking or applying updates/);
+    return true;
+  });
+  assert.deepEqual(h.data.calls.restart, []);
+
+  // Missing evidence stays a locked refusal once Steam is idle again.
+  h.UpdateStore.m_updater.m_updateState.state = 2;
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+});
