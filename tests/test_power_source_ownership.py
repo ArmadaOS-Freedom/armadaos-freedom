@@ -124,8 +124,15 @@ def copy_instructions(text: str):
     from the path Docker copies; only the known boot-tool seed is tolerated and
     every other variable is rejected.  A wildcard source could likewise slip
     past the ownership checks, so any source containing *, ? or [ is rejected.
-    A --from reference must name a stage, because a numeric index silently
-    points at whichever stage happens to come first.
+    A --from reference must name a stage: a numeric index is resolved by
+    position, so what it refers to depends on the order of the stages, and
+    this guard requires a named reference it can compare directly.
+
+    A destination in the ctx stage must be absolute.  The guard does not
+    evaluate WORKDIR, so it needs an absolute destination to compare and
+    project the protected paths below; it cannot infer which directory a
+    relative destination would land in.  Other, unrelated builder stages keep
+    relative destinations, which are meaningful against their own root.
     """
     stage = None
     for line in logical_lines(text):
@@ -172,6 +179,18 @@ def copy_instructions(text: str):
                 "ownership guard requires explicit COPY destination paths; "
                 f"unresolved variable in COPY destination {dest}: use a "
                 "literal path"
+            )
+        if (
+            stage is not None
+            and stage.casefold() == CTX_STAGE
+            and not posixpath.isabs(dest)
+        ):
+            raise ValueError(
+                "ownership guard requires an absolute COPY destination in the "
+                f"ctx stage; {dest} is relative, and the guard does not "
+                "evaluate WORKDIR, so it cannot compare or project protected "
+                "paths against a relative destination: use an absolute path "
+                "such as /decky"
             )
         yield Copy(stage, from_stage, tuple(sources), dest)
 
@@ -337,7 +356,11 @@ class PowerSourceOwnershipTests(unittest.TestCase):
         # A directory COPY from an ancestor of the control tree copies its
         # contents, so a fixture can land on its shipped path without the
         # source naming system_files at all (e.g. decky/freedom-control to /,
-        # including read back out of the ctx stage).
+        # including read back out of the ctx stage).  Projecting that onto the
+        # protected paths needs an absolute destination: the guard does not
+        # resolve WORKDIR, so a relative destination is rejected as input it
+        # cannot evaluate.  That is a requirement on the guard's input, not a
+        # Docker restriction.
         for copied in self.copies:
             for source in copied.sources:
                 directory = context_source(copied, source)
@@ -347,6 +370,13 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     directory + "/"
                 ):
                     continue
+                self.assertTrue(
+                    posixpath.isabs(copied.dest),
+                    f"Control ancestor COPY {source} {copied.dest} from "
+                    f"{source_origin(copied)} into stage {copied.stage} "
+                    "requires an absolute destination to project the Control "
+                    "contents onto the stage root",
+                )
                 for relative in FIXTURES:
                     projected = normalize(
                         posixpath.join(
