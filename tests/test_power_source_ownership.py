@@ -247,6 +247,35 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     "counts",
                 )
 
+        # A directory COPY from an ancestor of the control tree copies its
+        # contents, so a fixture can land on its shipped path without the
+        # source naming system_files at all (e.g. decky/freedom-control to /).
+        for copied in self.copies:
+            if copied.from_stage is not None:
+                continue
+            for source in copied.sources:
+                directory = normalize(source)
+                if directory != "." and not SOURCE_PREFIX.startswith(
+                    directory + "/"
+                ):
+                    continue
+                for relative in FIXTURES:
+                    projected = normalize(
+                        posixpath.join(
+                            copied.dest,
+                            posixpath.relpath(
+                                f"{SOURCE_PREFIX}/{relative}", directory
+                            ),
+                        )
+                    )
+                    self.assertNotEqual(
+                        projected,
+                        normalize(f"/system_files/{relative}"),
+                        f"Containerfile COPY {source} {copied.dest} in the "
+                        f"ctx stage overwrites the shipped fixture "
+                        f"{relative} at {projected}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
