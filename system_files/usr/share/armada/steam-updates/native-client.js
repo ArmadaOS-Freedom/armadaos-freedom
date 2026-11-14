@@ -30,6 +30,16 @@
     function errorText(error) {
       return error && error.message ? String(error.message) : String(error || 'Unknown native error');
     }
+    // The one pre-dispatch refusal that is safe to repeat unchanged: no native
+    // apply was started and the accepted check still stands.  The marker keeps
+    // consumers from flattening it into an ordinary, permanently guarded
+    // failure; every other error keeps the fail/guard behavior.
+    function baselineUnknownError() {
+      var error = new Error('Client apply baseline is unknown; refusing to start the apply');
+      error.code = 'apply_baseline_unknown';
+      error.retryable = true;
+      return error;
+    }
     function checkResult() {
       try {
         var r = parts().updater.GetCheckResult(1);
@@ -112,7 +122,23 @@
     function failed(phase, error) {
       local = { state: 'failed', phase: phase, error: errorText(error), restart: false };
     }
+    // While this adapter's own apply is in flight the native status may still
+    // be unpublished, so a poll can read a value that predates or belongs to
+    // the in-flight operation.  A changed result there is not this apply's
+    // outcome and must never advance the baseline token: doing so would make
+    // the identical terminal publication that follows look unchanged and mask
+    // it forever.  An actually observed absence is different.  Remembering
+    // that gap is exactly what lets the same value republished after the apply
+    // count as fresh evidence.  A throwing/unknown read proves nothing, so it
+    // is not a gap.
+    function observePendingApplyGap() {
+      if (readApplyResult().kind === 'absent') applyEvidenceAbsent = true;
+    }
     function syncLateApply() {
+      if (operation === 'apply' && local && local.state === 'applying') {
+        observePendingApplyGap();
+        return;
+      }
       if (operation || !local || local.state !== 'awaiting_status') return;
       var priorError = local.error || null;
       var raw = observeApplyResult();
@@ -256,10 +282,12 @@
       // Refuse before any native apply side effect: an unreadable baseline
       // leaves the pre-apply publication unknown, so one stable terminal
       // result could neither be confirmed as fresh nor ruled out as stale and
-      // awaiting_status could stick forever.  Throwing here leaves the
-      // accepted check intact, so a plain retry is the recovery.
-      if (recordApplyBaseline() === 'unknown')
-        throw new Error('Client apply baseline is unknown; refusing to start the apply');
+      // awaiting_status could stick forever.  Nothing was dispatched, so the
+      // accepted check and its available update remain valid and a plain retry
+      // is the recovery.  Mark the refusal as retryable so a consumer can
+      // surface the real reason without turning the row into a locked local
+      // failure that would require an unrelated check to clear.
+      if (recordApplyBaseline() === 'unknown') throw baselineUnknownError();
       operation = 'apply';
       local = { state: 'applying', phase: 'apply', error: null, restart: false };
       try {

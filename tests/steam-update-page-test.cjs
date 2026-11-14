@@ -1097,3 +1097,56 @@ test('15: Restart device refetches GetStatus and requires fresh idle system and 
   assert.match(await staleErr.textContent(), /system is not freshly awaiting reboot/i);
   assert.equal(await stale.page.evaluate(() => window.fixture.state.restartPCCalls), 0);
 });
+
+test('client row stays actionable after an unreadable apply baseline and retries directly', async (t) => {
+  const { page } = await createTestPage(t, 'en-US');
+  await setupSyntheticSteamDom(page);
+
+  await page.evaluate(() => {
+    window.fixture.state.checkResult.available = true;
+    window.fixture.state.applyCalls = 0;
+    const apply = window.UpdateStore.m_updater.ApplyUpdate;
+    window.UpdateStore.m_updater.ApplyUpdate = function(a, b, c) {
+      window.fixture.state.applyCalls++;
+      return apply(a, b, c);
+    };
+    return window.ArmadaUpdatesPage.refresh();
+  });
+
+  const row = page.locator('.armada-row[data-comp="client"]');
+  const primary = row.locator('.armada-btn-primary');
+  await primary.waitFor({ state: 'visible' });
+  assert.match(await primary.textContent(), /Update/);
+
+  // The pre-dispatch baseline becomes unreadable while the accepted check and
+  // its available update are still valid.
+  await page.evaluate(() => {
+    window.__armadaOriginalApplyResult = window.UpdateStore.m_updater.GetApplyResult;
+    window.UpdateStore.m_updater.GetApplyResult = function() {
+      throw new Error('native read failed');
+    };
+  });
+
+  await primary.click();
+  await row.locator('.armada-btn-danger').click();
+
+  const error = row.locator('.armada-error-box');
+  await error.waitFor({ state: 'visible' });
+  assert.match(await error.textContent(), /baseline is unknown/i);
+  assert.equal(await page.evaluate(() => window.fixture.state.applyCalls), 0);
+  assert.equal(await primary.isVisible(), true);
+  assert.equal(await primary.isEnabled(), true);
+  assert.match(await primary.textContent(), /Update/);
+
+  // Recovery needs no header re-check: clicking Update dispatches the apply
+  // directly once the baseline is readable again.
+  await page.evaluate(() => {
+    window.UpdateStore.m_updater.GetApplyResult = window.__armadaOriginalApplyResult;
+  });
+
+  await primary.click();
+  await row.locator('.armada-btn-danger').click();
+  await page.waitForFunction(() => window.fixture.state.applyCalls === 1,
+    null, { timeout: 5000 });
+  assert.equal(await page.evaluate(() => window.fixture.state.nativeCheckCalls), 0);
+});

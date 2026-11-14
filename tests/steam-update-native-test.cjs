@@ -773,3 +773,77 @@ test('late OS-only apply evidence keeps awaiting busy and blocks new checks', as
   await assert.rejects(adapter.restartClient(), /restart evidence/);
   assert.deepEqual(h.data.calls.restart, []);
 });
+
+test('an absence observed during a pending apply lets the same value count after completion', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  // The native result disappears while ApplyUpdate is still in flight.
+  h.data.apply = null;
+  assert.equal(adapter.snapshot().state, 'applying');
+  // Identical to the recorded baseline: only the observed gap can make it
+  // fresh evidence after the apply completes.
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  gate.resolve();
+
+  const snap = await pending;
+  assert.equal(snap.state, 'up_to_date');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('an unknown read during a pending apply is not an observed gap', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  const readable = h.UpdateStore.m_updater.GetApplyResult;
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    throw new Error('native read failed');
+  };
+  assert.equal(adapter.snapshot().state, 'applying');
+  h.UpdateStore.m_updater.GetApplyResult = readable;
+  gate.resolve();
+
+  // A throw proves nothing, so the unchanged baseline value that follows is
+  // still not new evidence.
+  const snap = await pending;
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('changed evidence during a pending apply is not consumed and still surfaces after completion', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
+  };
+  // Mid-call evidence must not advance the baseline token.
+  assert.equal(adapter.snapshot().state, 'applying');
+  gate.resolve();
+
+  const snap = await pending;
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});

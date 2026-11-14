@@ -520,6 +520,16 @@
       return String(err && err.message ? err.message : err).slice(0, 2000);
     }
 
+    function isRetryableAdapterError(err) {
+      return !!(err && err.retryable === true && err.code === 'apply_baseline_unknown');
+    }
+
+    function clearRetryableClientError() {
+      if (!state.client || !state.client.retryableError) return;
+      state.client.retryableError = null;
+      state.client.error = null;
+    }
+
     function markLocalError(comp, err) {
       var previous = state[comp] || { component: comp };
       previous.state = 'failed';
@@ -544,6 +554,13 @@
         snap.state = 'failed';
         snap.error = state.client.error;
         snap.localError = true;
+      } else if (snap && state.client && state.client.retryableError &&
+                 snap.state === 'available' && !snap.error) {
+        // A retryable pre-dispatch refusal leaves the accepted check and its
+        // available update intact. Keep the real reason visible without
+        // locking the row or asking the user for an unrelated header check.
+        snap.error = state.client.retryableError;
+        snap.retryableError = state.client.retryableError;
       }
       state.client = snap;
     }
@@ -632,6 +649,7 @@
 
     function executeNativeAction(method) {
       if (disposed || !adapter || typeof adapter[method] !== 'function' || isActionLocked('client')) return;
+      clearRetryableClientError();
       pendingAction.client = { method: method };
       render();
       Promise.resolve().then(function() {
@@ -639,6 +657,19 @@
         return adapter[method]();
       }).catch(function(err) {
         if (disposed) return;
+        if (isRetryableAdapterError(err)) {
+          // Nothing was dispatched and the adapter's previous check is still
+          // accepted, so the row must stay actionable for a direct retry.
+          var snap = adapter.snapshot();
+          if (snap && snap.state === 'available' && !snap.error) {
+            snap.error = errorText(err);
+            snap.retryableError = snap.error;
+            snap.localError = false;
+            state.client = snap;
+            render();
+            return;
+          }
+        }
         markLocalError('client', err);
       }).finally(function() {
         if (disposed) return;
@@ -740,6 +771,7 @@
           state.client = adapter.snapshot();
           if (state.client) {
             state.client.localError = false;
+            state.client.retryableError = null;
             state.client.error = null;
           }
           render();
