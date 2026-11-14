@@ -94,3 +94,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0042-steamcompmgr-skip-redundant-steam-placeholder.patch`
   source: armadaos-freedom
   notes: Avoids reserving or drawing a transparent Steam placeholder when a visible external overlay already exists. Real Steam menus and the no-overlay fallback are preserved. This removes a redundant plane that can force GPU composition on rotated outputs. Regression: `python3 tests/test_steam_overlay_placeholder.py` in the patched source tree.
+
+- `patches/0043-drm-mirror-internal-screen-sleep-to-the-lease-companion.patch`
+  source: armada
+  notes: Steam sleeps the internal panel through `gamescope_control`, which only reaches the broker, so a lease companion's panel stayed lit during low-power downloads and suspend. The broker now forwards its internal screen sleep state over the lease socket, including to a companion that connects while it is already asleep. Locally fixed on top of upstream: reconnect replay uses a mutex-protected cached state; failed Sleep/Wake sends shut down the socket so the companion can reconnect; a separate atomic companion override sleeps both internal and external leased connectors without overwriting their independent screen settings. Original upstream 0029 renumbered to 0043 with these fixes.

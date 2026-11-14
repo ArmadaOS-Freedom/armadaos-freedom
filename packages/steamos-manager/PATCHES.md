@@ -37,3 +37,6 @@ upstream and dropped out.
 - `patches/0012-wifi-Always-write-wpa_supplicant-as-the-backend.patch`
   source: armada
   notes: Steam derives the backend it wants from its own `steamos_wifi_force_wpa_supplicant` setting and only skips the write when the current value already matches, so no NetworkManager config can refuse it. With the setting off it writes `iwd` on every launch. Pinning it in the daemon is the only place the request can be declined.
+- `patches/0013-Allow-LowPowerMode1-to-be-served-by-a-remote-interfa.patch`
+  source: armada
+  notes: Steam's `CSleepController` only offers low-power downloads (screen off, finish the download, then sleep) when `LowPowerMode1` is on the bus. Upstream only registers it with a `tdp_limit.download_mode_limit`, which Qualcomm has no knob for, so `armada-powerd` serves it instead. The local `Fd<'_>` return becomes `OwnedFd` so the relay can pass the remote's handle straight through.
