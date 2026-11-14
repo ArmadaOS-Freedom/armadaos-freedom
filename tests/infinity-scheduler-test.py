@@ -24,7 +24,9 @@ import armada_control.system as system  # noqa: E402
 def load_powerd():
     from importlib.machinery import SourceFileLoader
 
-    path = ROOT / "system_files/usr/libexec/armada/armada-powerd"
+    # The image ships the daemon from Freedom Control and the old root copy is
+    # gone, so tests must load that same canonical file.
+    path = ROOT / "decky/freedom-control/system_files/usr/libexec/armada/armada-powerd"
     loader = SourceFileLoader("armada_powerd_testmod", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
