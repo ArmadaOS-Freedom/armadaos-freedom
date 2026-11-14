@@ -21,9 +21,14 @@ One discovered test is held back by default, by exact name:
 
 It creates a real ext4/btrfs pair through loop devices, so it needs root,
 `/dev/loop-control`, mount, and the btrfs tools. The default run lists it with
-that prerequisite and leaves it out. In a privileged environment, include it:
+that prerequisite and leaves it out. In a privileged environment, include it.
+The runner also requires `TEST_ARTIFACT_ROOT` to name a directory that already
+exists and is writable, so replace `/path/to/test-output` below with the
+writable artifact directory you choose, create it, and export it first:
 
 ```bash
+export TEST_ARTIFACT_ROOT="/path/to/test-output"
+mkdir -p "$TEST_ARTIFACT_ROOT"
 /usr/bin/python3 tests/run_unit_tests.py --integration
 ```
 
@@ -47,8 +52,12 @@ test in the repository, so the issue stays open.
 ## Running locally
 
 Install the same dependencies as the workflow, then run from the repository
-root:
+root. Set `TEST_ARTIFACT_ROOT` to an existing writable directory first, again
+replacing `/path/to/test-output` with the writable artifact directory you
+choose:
 
 ```bash
+export TEST_ARTIFACT_ROOT="/path/to/test-output"
+mkdir -p "$TEST_ARTIFACT_ROOT"
 /usr/bin/python3 tests/run_unit_tests.py
 ```
