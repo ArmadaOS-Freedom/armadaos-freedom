@@ -69,6 +69,21 @@ class DeploymentStoreIntegrationTests(unittest.TestCase):
         payload_fixture.UpdateBootPayloadFixture.tearDownClass()
 
     def setUp(self) -> None:
+        # OSTree marks deployment directories immutable, which the privileged
+        # CI runner cannot remove. Its own test harness exports this flag so
+        # cleanup works; it must be visible before any sysroot is created.
+        debug_flags = [
+            flag
+            for flag in os.environ.get("OSTREE_SYSROOT_DEBUG", "").split(":")
+            if flag
+        ]
+        if "mutable-deployments" not in debug_flags:
+            debug_flags.append("mutable-deployments")
+        debug_env = mock.patch.dict(
+            os.environ, {"OSTREE_SYSROOT_DEBUG": ":".join(debug_flags)}
+        )
+        debug_env.start()
+        self.addCleanup(debug_env.stop)
         self.payload = payload_fixture.UpdateBootPayloadFixture()
         self.addCleanup(self.payload.doCleanups)
         tmp = tempfile.TemporaryDirectory(
