@@ -198,8 +198,11 @@ COPY devices/lenovo-tb323fu/rootfs/usr/share/wireplumber/wireplumber.conf.d/61-t
 # at build time against devices/lenovo-tb710fu/firmware/SHA256SUMS and
 # installed at the paths its device tree names.
 COPY devices/lenovo-tb710fu/firmware/ /tb710fu-firmware/
-# Selected SM8850 companions come from Freedom Control; shared defaults and
-# performance helpers remain owned by this repository.
+# Power ownership split: Freedom Control provides the daemon, the TB323FU
+# board profile and the SM8850 chip layer. Shared defaults and runtime helpers
+# (armada_perf.py, power-profiles.conf, game-tweaks.json) stay owned here.
+# The former root copies of these paths have been removed; these COPY layers
+# install the canonical files straight from Freedom Control.
 COPY decky/freedom-control/system_files/usr/libexec/armada/armada-powerd /system_files/usr/libexec/armada/armada-powerd
 COPY decky/freedom-control/system_files/usr/lib/armada/devices/lenovo-tb323fu.conf /system_files/usr/lib/armada/devices/lenovo-tb323fu.conf
 COPY decky/freedom-control/system_files/usr/share/armada/power-profiles-SM8850.conf /system_files/usr/share/armada/power-profiles-SM8850.conf

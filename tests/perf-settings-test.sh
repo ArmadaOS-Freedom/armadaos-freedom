@@ -52,6 +52,7 @@ printf '{"global":{}}\n' > "$TWEAKS_FIXTURE"
 }
 
 python3 - "$ROOT" "$WORK" <<'PYEOF'
+import configparser
 import importlib.machinery
 import importlib.util
 import json
@@ -86,10 +87,14 @@ def check(name, condition):
 
 
 def load_script(name):
+    # armada-powerd is owned by Freedom Control and the old root copy is gone,
+    # so load the canonical file the image actually installs.
+    base = (os.path.join(ROOT, "decky/freedom-control/system_files/usr/libexec/armada")
+            if name == "armada-powerd" else LIBEXEC)
     spec = importlib.util.spec_from_loader(
         name.replace("-", "_"),
         importlib.machinery.SourceFileLoader(
-            name.replace("-", "_"), os.path.join(LIBEXEC, name)),
+            name.replace("-", "_"), os.path.join(base, name)),
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -576,7 +581,28 @@ parsed = power.parse_config()
  suspend_config, system_config) = parsed
 check("factory default profile", default_profile == "balanced")
 check("factory has 3 fan curves", len(fan_curves) == 3)
-check("profiles keep governor", profile_config["performance"]["cpu_governor"] == "performance")
+# The shipped file is the source of truth for governors: read it with a plain
+# INI parser and require the daemon's view to reproduce it, so a factory edit
+# cannot leave a stale literal behind in this test.
+factory_raw = configparser.ConfigParser()
+factory_raw.read(factory)
+check("profile governors roundtrip the shipped config",
+      {name: profile_config[name]["cpu_governor"] for name in
+       ("eco", "balanced", "performance", "extreme")} ==
+      {name: factory_raw.get(f"profile.{name}", "cpu_governor") for name in
+       ("eco", "balanced", "performance", "extreme")})
+check("eco and performance share a governor, extreme does not",
+      profile_config["eco"]["cpu_governor"] ==
+      profile_config["performance"]["cpu_governor"] and
+      profile_config["extreme"]["cpu_governor"] !=
+      profile_config["performance"]["cpu_governor"])
+check("factory cpu_max tiers roundtrip and stay strictly ascending",
+      [profile_config[name]["cpu_max"] for name in
+       ("eco", "balanced", "performance", "extreme")] ==
+      [float(factory_raw.get(f"profile.{name}", "cpu_max")) for name in
+       ("eco", "balanced", "performance", "extreme")] and
+      profile_config["eco"]["cpu_max"] < profile_config["balanced"]["cpu_max"]
+      < profile_config["performance"]["cpu_max"] < profile_config["extreme"]["cpu_max"])
 check("no [system] -> irq auto", system_config["irq_cores"] == "auto")
 check("underclock tables parsed", "SM8550" in underclocks and "SM8750" in underclocks)
 
@@ -924,7 +950,15 @@ plugin_power.FACTORY_POWER_CONFIG = plugin_power.Path(factory)
 plugin_power.POWER_CONFIG = plugin_power.Path(os.path.join(WORK, "etc-armada-power.conf"))
 data = plugin_power.parse_power()
 factory_data = plugin_power.parse_power(plugin_power.FACTORY_POWER_CONFIG)
-check("governor exposed in parse", data["profiles"]["eco"]["cpu_governor"] == "conservative")
+check("plugin exposes the shipped eco governor unmodified",
+      data["profiles"]["eco"]["cpu_governor"] ==
+      factory_raw.get("profile.eco", "cpu_governor") ==
+      factory_data["profiles"]["eco"]["cpu_governor"])
+check("plugin keeps the factory eco/performance/extreme split",
+      data["profiles"]["eco"]["cpu_governor"] ==
+      data["profiles"]["performance"]["cpu_governor"] and
+      data["profiles"]["extreme"]["cpu_governor"] !=
+      data["profiles"]["performance"]["cpu_governor"])
 
 # untouched config renders no /etc profile sections (factory keeps tracking /usr)
 rendered = plugin_power.render_power(data, factory_data)
