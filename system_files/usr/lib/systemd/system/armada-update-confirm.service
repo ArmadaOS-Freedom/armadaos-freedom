@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=Armada Linux update trial confirmation
+ConditionPathExists=/sys/firmware/devicetree/base/chosen/armada,update-transaction
+After=local-fs.target dbus.service systemd-logind.service
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
+[Service]
+# Type=exec completes the graphical.target start job at exec time, so the
+# bounded readiness retry in the CLI never blocks the desktop.  A genuine
+# failure still exits non-zero and is restarted under the StartLimit policy
+# above, which keeps restart behaviour bounded without exhausting the limit
+# while waiting for the first Wayland login.
+Type=exec
+User=root
+WorkingDirectory=/
+Environment=PYTHONPATH=/usr/lib/armada
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m updates.trial_confirmation
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=graphical.target

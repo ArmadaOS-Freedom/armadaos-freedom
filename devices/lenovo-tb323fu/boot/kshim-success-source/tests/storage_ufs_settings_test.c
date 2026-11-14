@@ -326,21 +326,23 @@ static void trial_load_save(void){
     struct kshim_update_trial t1=make_trial();
     assert(kshim_ufs_settings_trial_save(&backend,0,&t1,&written)==KSHIM_STORAGE_OK);
     assert(written==0&&last_writes==1&&!backend.host.owned&&kshim_ufs_settings_handoff_safe(&backend));
-    assert(preflights==p0+2&&claims==c0+2&&releases==r0+2&&internal.writes==w0+1);
+    /* The initial anchor writes the empty marker to copy B, then the record
+     * to copy A. */
+    assert(preflights==p0+2&&claims==c0+2&&releases==r0+2&&internal.writes==w0+2);
     memset(&out,0,sizeof(out));sel=99;
     assert(kshim_ufs_settings_trial_load(&backend,&out,&sel)==KSHIM_STORAGE_OK);
     assert(sel==0&&last_writes==0);assert_trial_equal(&out,&t1);
-    assert(!backend.host.owned&&preflights==p0+3&&claims==c0+3&&releases==r0+3&&internal.writes==w0+1);
+    assert(!backend.host.owned&&preflights==p0+3&&claims==c0+3&&releases==r0+3&&internal.writes==w0+2);
     struct kshim_update_trial t2=t1;
     t2.sequence=2;t2.state=KSHIM_UPDATE_TRIAL_TRIAL;t2.remaining=2;
     written=99;
     assert(kshim_ufs_settings_trial_save(&backend,1,&t2,&written)==KSHIM_STORAGE_OK);
     assert(written==1&&last_writes==1&&!backend.host.owned&&kshim_ufs_settings_handoff_safe(&backend));
-    assert(preflights==p0+4&&claims==c0+4&&releases==r0+4&&internal.writes==w0+2);
+    assert(preflights==p0+4&&claims==c0+4&&releases==r0+4&&internal.writes==w0+3);
     memset(&out,0,sizeof(out));sel=99;
     assert(kshim_ufs_settings_trial_load(&backend,&out,&sel)==KSHIM_STORAGE_OK);
     assert(sel==1&&last_writes==0);assert_trial_equal(&out,&t2);
-    assert(preflights==p0+5&&claims==c0+5&&releases==r0+5&&internal.writes==w0+2);
+    assert(preflights==p0+5&&claims==c0+5&&releases==r0+5&&internal.writes==w0+3);
     assert(backend.settings.sequence==1&&backend.settings.values.default_target==2&&backend.settings.values.language==1);
     assert(memcmp(snap_cfg,internal.tail+4096,8192)==0);
     assert(memcmp(snap_logs,internal.tail+12288,16384)==0);

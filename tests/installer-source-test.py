@@ -28,7 +28,7 @@ SourceImage = module["SourceImage"]
 Error = module["Error"]
 EXT = ["bootc", "internals", "ostree-ext", "container", "image"]
 ORIGIN = "ostree-image-signed:docker://ghcr.io/armada-os/armada:beta"
-FREEDOM = "ghcr.io/mydanyi/armadaos-freedom"
+FREEDOM = "ghcr.io/armadaos-freedom/armadaos-freedom"
 FREEDOM_ORIGIN = "ostree-image-signed:docker://" + FREEDOM + ":testing"
 
 

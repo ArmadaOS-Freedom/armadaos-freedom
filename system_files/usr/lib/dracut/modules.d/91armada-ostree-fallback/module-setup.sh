@@ -12,10 +12,12 @@ depends() {
 }
 
 install() {
-    inst_multiple mkdir mount umount rm
+    inst_multiple mkdir mount umount rm readlink
 
     inst_script "$moddir/armada-ostree-fallback.sh" \
         /usr/libexec/armada/armada-ostree-fallback
+    inst_script "$moddir/armada-bound-deployment.sh" \
+        /usr/libexec/armada/armada-bound-deployment
 
     # Inside prepare-root's start job: ordered after sysroot.mount by its own unit.
     mkdir -p "$initdir/$systemdsystemunitdir/ostree-prepare-root.service.d"

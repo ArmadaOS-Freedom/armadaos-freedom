@@ -203,6 +203,35 @@ int kshim_update_trial_encode(const struct kshim_update_trial *record,
     return KSHIM_STORAGE_OK;
 }
 
+int kshim_update_trial_empty_marker(void *buffer, size_t size)
+{
+    uint8_t *out = (uint8_t *)buffer;
+
+    if (!buffer || size != KSHIM_UPDATE_TRIAL_RECORD_BYTES)
+        return KSHIM_STORAGE_ARG;
+    memset(out, 0, KSHIM_UPDATE_TRIAL_RECORD_BYTES);
+    out[KSHIM_UPDATE_TRIAL_EMPTY_MARKER_OFFSET] =
+        (uint8_t)KSHIM_UPDATE_TRIAL_EMPTY_MARKER_BYTE;
+    return KSHIM_STORAGE_OK;
+}
+
+int kshim_update_trial_is_empty_marker(const void *buffer, size_t size)
+{
+    const uint8_t *in = (const uint8_t *)buffer;
+    size_t i;
+
+    if (!buffer || size != KSHIM_UPDATE_TRIAL_RECORD_BYTES)
+        return 0;
+    for (i = 0; i < KSHIM_UPDATE_TRIAL_RECORD_BYTES; ++i) {
+        uint8_t want = (i == KSHIM_UPDATE_TRIAL_EMPTY_MARKER_OFFSET)
+                           ? (uint8_t)KSHIM_UPDATE_TRIAL_EMPTY_MARKER_BYTE
+                           : 0u;
+        if (in[i] != want)
+            return 0;
+    }
+    return 1;
+}
+
 int kshim_update_trial_decode(const void *buffer, size_t size,
                               const uint8_t partition_uuid[16],
                               const uint8_t installation_uuid[16],
@@ -330,6 +359,22 @@ int kshim_update_trial_select(const void *a, const void *b, size_t size,
     }
 
     if (rc_a == KSHIM_STORAGE_EMPTY && rc_b == KSHIM_STORAGE_EMPTY)
+        return KSHIM_STORAGE_EMPTY;
+
+    /*
+     * Logical-empty sentinel: exactly the fixed marker in copy B and copy A
+     * either blank or CRC-damaged (a torn initial write).  The sentinel only
+     * ever belongs in copy B, so an exact marker in A is a writer fault and
+     * stays a format error: accepting a marker pair as empty could otherwise
+     * hide that the record copy was overwritten with the sentinel.  A
+     * complete CRC-valid image in A -- foreign identity, unsupported version,
+     * unknown policy -- decodes to FORMAT/CONFLICT and must stay a hard
+     * error; it is never downgraded to empty.  A marker anywhere else is
+     * ordinary junk.
+     */
+    if (kshim_update_trial_is_empty_marker(b, size) &&
+        !kshim_update_trial_is_empty_marker(a, size) &&
+        (rc_a == KSHIM_STORAGE_EMPTY || rc_a == KSHIM_STORAGE_CRC))
         return KSHIM_STORAGE_EMPTY;
 
     return KSHIM_STORAGE_FORMAT;

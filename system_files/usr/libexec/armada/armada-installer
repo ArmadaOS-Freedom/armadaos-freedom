@@ -459,7 +459,7 @@ class SourceImage:
         if not isinstance(expected_manifest_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_manifest_digest):
             raise Error(f"Invalid expected seed manifest digest: {expected_manifest_digest!r}")
         if not isinstance(origin_ref, str) or not re.fullmatch(
-                r"ostree-image-signed:docker://ghcr\.io/mydanyi/armadaos-freedom:(?:stable|beta|testing)(?:@sha256:[0-9a-f]{64})?", origin_ref):
+                r"ostree-image-signed:docker://ghcr\.io/armadaos-freedom/armadaos-freedom:(?:stable|beta|testing)(?:@sha256:[0-9a-f]{64})?", origin_ref):
             raise Error(f"Unsupported seed origin: {origin_ref!r}")
         origin = GLib.KeyFile.new()
         origin.set_string("origin", "container-image-reference", origin_ref)

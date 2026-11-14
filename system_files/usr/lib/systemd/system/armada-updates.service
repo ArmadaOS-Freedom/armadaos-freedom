@@ -1,0 +1,19 @@
+[Unit]
+Description=Freedom system and plugin platform updates
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.armada.Updates
+ExecStart=/usr/bin/python3 -m updates.dbus_service
+Environment=PYTHONPATH=/usr/lib/armada
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/
+User=root
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=15min
+
+[Install]
+WantedBy=multi-user.target

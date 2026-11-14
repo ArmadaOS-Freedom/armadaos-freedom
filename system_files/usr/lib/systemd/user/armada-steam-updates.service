@@ -1,0 +1,15 @@
+[Unit]
+Description=Independent Steam updates page
+PartOf=gamescope-session-plus@steam.service graphical-session.target
+# The bridge publishes privileged update requests, so it must not be started
+# unless the system guard has proved the loopback isolation is installed for
+# this user. A missing proof disables only this UI bridge.
+ConditionPathExists=/run/armada-steam-guard/ready
+
+[Service]
+ExecStart=/usr/libexec/armada/armada-steam-updates
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

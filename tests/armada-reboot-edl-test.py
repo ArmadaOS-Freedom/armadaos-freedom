@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-import contextlib,importlib.util,importlib.machinery,io,json,os,struct,tempfile,unittest,uuid,zlib
+import contextlib,importlib.util,importlib.machinery,io,json,os,struct,tempfile,unittest,uuid,zlib,sys
 from pathlib import Path
 from unittest.mock import patch
 root=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(root/'system_files/usr/lib/armada'))
 loader=importlib.machinery.SourceFileLoader('edl',str(root/'system_files/usr/bin/armada-reboot-edl'))
 spec=importlib.util.spec_from_loader(loader.name,loader);edl=importlib.util.module_from_spec(spec);loader.exec_module(edl)
 PART='11111111-2222-4333-8444-555555555555';INSTALL='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 def seal(b):struct.pack_into('<I',b,4092,zlib.crc32(b[:4092]))
-def fixture(version=1):
+def fixture(version=1,descriptor_version=1):
     meta={'kind':'armada-board-recovery-image','schemaVersion':3,'imageBytes':edl.SIZE,'headerBytes':65536,'payloadOffset':65536,'compressedBytes':1024,'installationId':INSTALL,'configRegionOffset':edl.REGION_OFFSET,'configRegionBytes':65536,'configPartitionUuid':PART,'configBoardId':1}
     header=json.dumps(meta).encode().ljust(65536,b' ')
-    d=bytearray(4096);d[:8]=b'KSCFGV3\0';struct.pack_into('<IIQQQII',d,8,1,4096,edl.SIZE,65536+1024,edl.REGION_OFFSET,65536,4096)
-    d[48:64]=uuid.UUID(PART).bytes;d[64:80]=uuid.UUID(INSTALL).bytes;struct.pack_into('<III',d,80,4096,8192,1);seal(d)
+    d=bytearray(4096);d[:8]=b'KSCFGV3\0';struct.pack_into('<IIQQQII',d,8,descriptor_version,4096,edl.SIZE,65536+1024,edl.REGION_OFFSET,65536,4096)
+    d[48:64]=uuid.UUID(PART).bytes;d[64:80]=uuid.UUID(INSTALL).bytes;struct.pack_into('<III',d,80,4096,8192,1)
+    if descriptor_version==3:struct.pack_into('<III',d,92,28672,32768,4096)
+    seal(d)
     rec=bytearray(4096);rec[:8]=b'KSCFGR1\0';struct.pack_into('<IIQ',rec,8,version,4096,7);rec[24:40]=d[48:64];rec[40:56]=d[64:80]
     struct.pack_into('<5I',rec,56,0,2 if version==1 else 4,1,2 if version>=2 else 0,0);seal(rec)
-    return header,bytes(d+rec+bytes(65536-8192))
+    region=bytearray(65536);region[:4096]=d;region[4096:8192]=rec
+    if descriptor_version>=2:region[12288:28672]=b'\xa5'*16384
+    if descriptor_version==3:region[28672:36864]=b'\x5a'*8192
+    return header,bytes(region)
 class Tests(unittest.TestCase):
     def test_supported_board_soc_pairs(self):
         for compatible in (
@@ -38,10 +44,30 @@ class Tests(unittest.TestCase):
                 with patch.object(edl.Path,'read_bytes',return_value=compatible):
                     with self.assertRaisesRegex(edl.Refuse,'Unsupported board'):
                         edl.device_context()
-    def makefile(self,version=1):
+    def makefile(self,version=1,descriptor_version=1):
         f=tempfile.NamedTemporaryFile(dir=os.environ['TMPDIR']);f.truncate(edl.SIZE)
-        h,r=fixture(version);os.pwrite(f.fileno(),h,0);os.pwrite(f.fileno(),b'backup payload stays',65536);os.pwrite(f.fileno(),r,edl.REGION_OFFSET)
+        h,r=fixture(version,descriptor_version);os.pwrite(f.fileno(),h,0);os.pwrite(f.fileno(),b'backup payload stays',65536);os.pwrite(f.fileno(),r,edl.REGION_OFFSET)
         self.addCleanup(f.close);return f,h,r
+    def test_descriptor_versions_and_opaque_regions(self):
+        for dver in (1,2,3):
+            with self.subTest(dver=dver):
+                f,h,r=self.makefile(3,dver);fd=f.fileno();store=edl.parse_store(h,r,PART,1)
+                real_write=os.pwrite;writes=[]
+                def traced(fd,data,offset):writes.append((offset,len(data)));return real_write(fd,data,offset)
+                with patch.object(edl.os,'pwrite',side_effect=traced):self.assertEqual(edl.set_request(fd,store,1),8)
+                self.assertEqual(writes,[(edl.REGION_OFFSET+8192,4096)])
+                self.assertEqual(os.pread(fd,65536,0),h);self.assertEqual(os.pread(fd,20,65536),b'backup payload stays')
+                current=os.pread(fd,65536,edl.REGION_OFFSET);self.assertEqual(current[:8192],r[:8192]);self.assertEqual(current[12288:],r[12288:])
+                armed=edl.parse_store(h,current,PART,1);self.assertEqual(armed['best']['values'][4],1)
+        for bad_ver in (0,4):
+            h,r=fixture(3,1);bad=bytearray(r);d=bytearray(bad[:4096]);struct.pack_into('<I',d,8,bad_ver);seal(d);bad[:4096]=d
+            with self.assertRaises(edl.Refuse):edl.parse_store(h,bytes(bad),PART,1)
+        for dver,tail,doff in ((2,28672,92),(3,36864,92),(3,36864,96),(3,36864,100),(3,36864,104)):
+            h,r=fixture(3,dver)
+            bad_tail=bytearray(r);bad_tail[tail]=1
+            with self.assertRaises(edl.Refuse):edl.parse_store(h,bytes(bad_tail),PART,1)
+            bad_d=bytearray(r);d=bytearray(bad_d[:4096]);d[doff]^=1;seal(d);bad_d[:4096]=d
+            with self.assertRaises(edl.Refuse):edl.parse_store(h,bytes(bad_d),PART,1)
     def test_old_records_and_bounded_roundtrip(self):
         for version in (1,2,3):
             with self.subTest(version=version):

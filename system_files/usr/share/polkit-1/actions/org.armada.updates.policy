@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <action id="org.armada.updates.check">
+    <description>Check for system and plugin updates</description>
+    <description xml:lang="zh_CN">检查系统和插件更新</description>
+    <message>Authentication is required to check for system and plugin updates</message>
+    <message xml:lang="zh_CN">检查系统和插件更新需要身份验证</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+  <action id="org.armada.updates.system">
+    <description>Apply validated system updates</description>
+    <description xml:lang="zh_CN">应用已验证的系统更新</description>
+    <message>Authentication is required to apply validated system updates</message>
+    <message xml:lang="zh_CN">应用已验证的系统更新需要身份验证</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+  <action id="org.armada.updates.decky">
+    <description>Update Decky from the official source</description>
+    <description xml:lang="zh_CN">从官方来源更新 Decky</description>
+    <message>Authentication is required to update Decky from the official source</message>
+    <message xml:lang="zh_CN">从官方来源更新 Decky 需要身份验证</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+  <action id="org.armada.updates.channel">
+    <description>Select the system update channel</description>
+    <description xml:lang="zh_CN">选择系统更新频道</description>
+    <message>Authentication is required to select the system update channel</message>
+    <message xml:lang="zh_CN">选择系统更新频道需要身份验证</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

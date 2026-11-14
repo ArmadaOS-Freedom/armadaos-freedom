@@ -1,9 +1,10 @@
 #!/bin/bash
 # Shared helpers for the armada update hooks (steamos-update, steamos-select-branch).
 
-# Freedom is the only update target. The two old upstream origins are still
-# recognized so booted deployments can migrate onto Freedom.
-ARMADA_CANONICAL_REGISTRY="ghcr.io/mydanyi/armadaos-freedom"
+# Freedom is the only update target. Pre-transfer Freedom and old upstream
+# origins are recognized so booted deployments can select the current target.
+ARMADA_CANONICAL_REGISTRY="ghcr.io/armadaos-freedom/armadaos-freedom"
+ARMADA_PREVIOUS_FREEDOM_REGISTRY="ghcr.io/mydanyi/armadaos-freedom"
 ARMADA_UPSTREAM_REGISTRY="ghcr.io/armada-os/armada"
 ARMADA_LEGACY_REGISTRY="ghcr.io/virtudude/armada"
 ARMADA_UPDATE_POLICY="${ARMADA_UPDATE_POLICY:-/etc/containers/policy.json}"
@@ -52,7 +53,7 @@ armada_registry_from_ref() {
     r="${r%%@*}"
     [[ "${r##*/}" == *:* ]] && r="${r%:*}"
     case "$r" in
-        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") echo "$r" ;;
+        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_PREVIOUS_FREEDOM_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") echo "$r" ;;
     esac
 }
 
@@ -137,7 +138,7 @@ armada_ref_parts() {
 armada_steam_channels_apply() {
     local channel
     case "$1" in
-        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") ;;
+        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_PREVIOUS_FREEDOM_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") ;;
         *) return 1 ;;
     esac
     for channel in ${ARMADA_CHANNELS}; do
@@ -350,7 +351,7 @@ armada_update_target() {
     booted="$(armada_tag_from_ref "$ref")"
     repository="$(armada_repository_from_ref "$ref")" || return 1
     case "$repository" in
-        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") ;;
+        "$ARMADA_CANONICAL_REGISTRY"|"$ARMADA_PREVIOUS_FREEDOM_REGISTRY"|"$ARMADA_UPSTREAM_REGISTRY"|"$ARMADA_LEGACY_REGISTRY") ;;
         *) return 1 ;;
     esac
     if [[ -n "$booted" ]] && ! armada_steam_channels_apply "$repository" "$booted"; then

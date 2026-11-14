@@ -7,6 +7,18 @@ loader_src=/usr/share/decky-loader/PluginLoader
 loader_version_src=/usr/share/decky-loader/.loader.version
 src=/usr/share/decky-plugins
 plugin_seed=/usr/lib/decky-loader/armada-plugin-seed.py
+update_lock=/run/lock/armada-update.lock
+update_state=/var/lib/armada/updates/decky
+
+exec 9>"${update_lock}"
+if ! flock -w 30 9; then
+    printf 'armada-decky-sync: update lock busy (%s)\n' "${update_lock}" >&2
+    exit 75
+fi
+
+loader_managed() {
+    [[ -e "${update_state}/managed.json" || -L "${update_state}/managed.json" || -e "${update_state}/pending.json" || -L "${update_state}/pending.json" ]]
+}
 
 elf_machine() {
     python3 - "$1" <<'PY'
@@ -59,14 +71,16 @@ install -d -m 0755 "${homebrew}/services"
 install -d -m 0755 "${homebrew}/plugins"
 install -d -m 0755 "${homebrew}/settings"
 
-# Decky owns self-updates; the image copy seeds installs and newer OS-bundled loaders.
-if loader_needs_seed && [[ -x "${loader_src}" ]]; then
-    install -Dpm 0755 "${loader_src}" "${homebrew}/services/PluginLoader"
-    [[ ! -f "${loader_version_src}" ]] || install -Dpm 0644 "${loader_version_src}" "${homebrew}/services/.loader.version"
-fi
+# Seed or upgrade unmanaged loaders from the OS image; leave externally managed or pending state untouched.
+if ! loader_managed; then
+    if loader_needs_seed && [[ -x "${loader_src}" ]]; then
+        install -Dpm 0755 "${loader_src}" "${homebrew}/services/PluginLoader"
+        [[ ! -f "${loader_version_src}" ]] || install -Dpm 0644 "${loader_version_src}" "${homebrew}/services/.loader.version"
+    fi
 
-if [[ -x "${homebrew}/services/PluginLoader" ]]; then
-    chcon -t bin_t "${homebrew}/services/PluginLoader" >/dev/null 2>&1 || true
+    if [[ -x "${homebrew}/services/PluginLoader" ]]; then
+        chcon -t bin_t "${homebrew}/services/PluginLoader" >/dev/null 2>&1 || true
+    fi
 fi
 
 if [[ ! -f "${homebrew}/settings/loader.json" ]]; then
@@ -80,6 +94,8 @@ if [[ -d "$src" ]]; then
 fi
 
 chown "${user_name}:${user_name}" "${homebrew}"
-chown -R "${user_name}:${user_name}" "${homebrew}/services"
+if ! loader_managed; then
+    chown -R "${user_name}:${user_name}" "${homebrew}/services"
+fi
 chown -R "${user_name}:${user_name}" "${homebrew}/plugins"
 [[ ! -d "${homebrew}/settings" ]] || chown -R "${user_name}:${user_name}" "${homebrew}/settings"

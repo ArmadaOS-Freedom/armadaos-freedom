@@ -10,6 +10,8 @@ from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 import armada_tools as backend
 
+UPDATE_WATCH_MS = 2000
+
 
 class OperationDialog(Adw.Window):
     def __init__(self, parent, title, on_restart=None):
@@ -73,12 +75,16 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.window = window
         self.state = None
         self.loading = False
+        self.watching = False
         self.requesting = False
         self.updating = False
+        self.closed = False
         self.job = backend.CommandJob()
         self.result = ""
+        self.error = ""
         self.channels = []
         self.confirmation = None
+        self.watch_id = None
         self.current = Adw.ActionRow(title="Current Version", subtitle="Checking…")
         self.previous = Adw.ActionRow(title="Previous Version", subtitle="Checking…")
         for row in (self.current, self.previous):
@@ -92,7 +98,8 @@ class UpdatesGroup(Adw.PreferencesGroup):
                                     use_subtitle=True, subtitle_lines=0, sensitive=False)
         self.channel.connect("notify::selected", self.change_channel)
         self.update = Gtk.Button(label="Update", sensitive=False, valign=Gtk.Align.CENTER)
-        self.update.connect("clicked", lambda *_: self.confirm_update())
+        self.update.connect("clicked", lambda *_: self.confirm_restart()
+                            if self.state.get("reboot_ready") else self.confirm_update())
         self.update.set_tooltip_text("Install the latest OS version from the selected channel")
         self.channel.add_suffix(self.update)
         self.add(self.channel)
@@ -121,14 +128,39 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.update.set_sensitive(enabled)
         self.channel.set_sensitive(enabled)
 
-    def refresh(self):
-        if self.loading or self.requesting:
+    def start_watch(self):
+        if self.watch_id is None and not self.closed and self.window.get_visible():
+            self.watch_id = GLib.timeout_add(UPDATE_WATCH_MS, self.watch_tick)
+
+    def stop_watch(self):
+        if self.watch_id is not None:
+            GLib.source_remove(self.watch_id)
+            self.watch_id = None
+
+    def watch_tick(self):
+        if self.closed or not self.window.get_visible():
+            self.watch_id = None
+            return GLib.SOURCE_REMOVE
+        if self.requesting or self.loading:
+            return GLib.SOURCE_CONTINUE
+        self.refresh(automatic=True)
+        return GLib.SOURCE_CONTINUE
+
+    def refresh(self, automatic=False):
+        if self.closed or self.loading or self.requesting:
             return
         self.loading = True
+        self.watching = automatic
         self.controls(False)
 
         def completed(state, error):
             self.loading = False
+            self.watching = False
+            if self.closed:
+                # The window may close while an automatic background read is
+                # still in flight. The destroyed widgets must not be touched
+                # and the watch must not be reopened by this late callback.
+                return GLib.SOURCE_REMOVE
             if error:
                 self.controls(False)
                 self.show_message(self.result + "\nCould not read OS state: " + error)
@@ -140,11 +172,11 @@ class UpdatesGroup(Adw.PreferencesGroup):
 
     def render(self, state):
         self.state = state
-        idle = not self.requesting and not self.loading
+        idle = not self.requesting and not self.loading and not state.get("update_busy", False)
         self.current.set_subtitle(state["booted"]["version"])
         previous = state["rollback"]
         self.previous.set_subtitle(previous["version"] if previous else "No previous version available")
-        self.rollback.set_sensitive(idle and bool(previous) and not previous["incompatible"] and not state["rollback_queued"])
+        self.rollback.set_sensitive(idle and state.get("rollback_allowed", False))
         if self.operation and not self.operation.running:
             self.operation.restart_button.set_visible(idle and self.operation.succeeded and state["reboot_ready"])
         self.updating = True
@@ -160,26 +192,55 @@ class UpdatesGroup(Adw.PreferencesGroup):
         self.channel.set_sensitive(idle)
         self.channel.set_activatable(idle and bool(self.channels))
         self.channel.set_enable_search(False)
-        self.update.set_sensitive(idle and bool(state["repository"]))
-        if self.result:
-            self.show_message(self.result)
+        update_allowed = (state["update_allowed"] if "update_allowed" in state
+                          else bool(state["repository"]))
+        reboot_ready = state["reboot_ready"]
+        self.update.set_label("Restart" if reboot_ready else "Update")
+        self.update.set_tooltip_text("Restart to apply the queued OS changes" if reboot_ready
+                                     else "Install the latest OS version from the selected channel")
+        self.update.set_sensitive(idle and (reboot_ready or update_allowed))
+        if self.error:
+            # A failed request stays visible until the next request, even while
+            # the service keeps reporting its previous outcome.
+            self.show_message(self.error)
+        elif state.get("update_message"):
+            self.show_message(state["update_message"])
         elif state["rollback_queued"]:
-            self.show_message("Rollback ready. Restart to apply.")
+            self.show_message("A rollback may be pending, but it is unverified. Repair or verify the OS state before restarting.")
+        elif state.get("update_target"):
+            if state["reboot_ready"]:
+                self.show_message("Update installed. Restart to apply.")
+            else:
+                self.show_message(f"Pending update to {state['update_target']}.")
         elif state["staged"]:
             if state["reboot_ready"]:
                 self.show_message("Update installed. Restart to apply.")
             else:
                 self.show_message(
                     f"Unsupported pending update from {state['staged']['image']}.")
+        elif self.result:
+            # Informational results never displace newer state from the service.
+            self.show_message(self.result)
         else:
             self.show_message("")
         if hasattr(self.window, "repair_button"):
             self.window.set_steam_sensitive(idle and not self.window.repair_running)
+        if state.get("update_busy", False) or self.awaiting_confirmation(state):
+            self.start_watch()
+        else:
+            self.stop_watch()
+
+    @staticmethod
+    def awaiting_confirmation(state):
+        # An update trial confirmed outside this window only becomes reboot
+        # ready later, so keep polling until that state resolves.
+        return (state.get("update") or {}).get("state") == "awaiting_confirmation"
 
     def request(self, action, *arguments):
         if self.state is None or self.requesting or self.loading or self.window.repair_running:
             return
         self.result = ""
+        self.error = ""
         if action in {"update-os", "rollback-os"}:
             self.operation = OperationDialog(self.window, "OS Update" if action == "update-os" else "OS Rollback",
                                              on_restart=self.confirm_restart)
@@ -193,7 +254,7 @@ class UpdatesGroup(Adw.PreferencesGroup):
         else:
             def completed(result, error):
                 self.requesting = False
-                self.result = error or ""
+                self.error = error or ""
                 self.refresh()
                 return GLib.SOURCE_REMOVE
             self.window.background(lambda: backend.privileged_request(action, *arguments), completed)
@@ -227,10 +288,9 @@ class UpdatesGroup(Adw.PreferencesGroup):
         target = self.state["rollback"]
         if not target:
             return
-        pending = " The pending update will be discarded." if self.state["staged"] else ""
-        self.confirm("Roll Back Armada?", f"Restore version {target['version']} and its system settings. "
-                     "Games and personal files are kept."
-                     f"{pending}\n\nA restart is required.", "Roll Back", "rollback-os", target["checksum"])
+        self.confirm("Roll Back Armada?", f"Restore version {target['version']}. "
+                     "Games and personal files are kept. A matching boot is prepared in the other slot."
+                     "\n\nA restart is required.", "Roll Back", "rollback-os", target["checksum"])
 
     def confirm_restart(self):
         self.confirm("Restart Now?", "Save your work and close any running games before restarting.", "Restart", "restart-os")
@@ -484,13 +544,15 @@ class ToolsWindow(Adw.ApplicationWindow):
         if self.repair_running:
             self.repair_dialog.present()
             return True
-        if self.updates.requesting or self.updates.loading:
+        if self.updates.requesting or (self.updates.loading and not self.updates.watching):
             if self.updates.operation and self.updates.operation.running:
                 self.updates.operation.present()
             return True
         if self.ssh_busy:
             self.ssh_row.set_subtitle("Please wait for SSH settings to finish updating.")
             return True
+        self.updates.closed = True
+        self.updates.stop_watch()
         self.get_application().window = None
         return False
 

@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euxo pipefail
 
+# The Steam bridge loopback guard is enforced with nftables. Refuse to build an
+# image that would ship the bridge without the tool that installs its
+# kernel-side guard; the guard also fails closed at boot.
+command -v nft >/dev/null 2>&1 \
+    || { echo "ERROR: nft is required for armada-steam-bridge-guard" >&2; exit 1; }
+
 cp -a /ctx/system_files/. /
 install -Dpm 0755 /packages/extest/libextest.so /usr/lib/extest/libextest.so
 
@@ -146,12 +152,18 @@ systemctl enable armada-installer-visibility.service
 systemctl enable armada-steamapps.service
 systemctl enable armada-als-bridge.service
 systemctl enable armada-powerd.service
+systemctl enable armada-updates.service
+# Kernel-side loopback isolation must be established before any user session
+# can start the Steam update bridge.
+systemctl enable armada-steam-bridge-guard.service
+systemctl enable armada-update-confirm.service
 systemctl enable armada-control.service
 systemctl enable steamos-manager.service
 systemctl --global enable steamos-manager.service
 systemctl --global enable steamos-manager-session-cleanup.service
 systemctl --global enable armada-steam-default-session.service
 systemctl --global enable armada-steam-charging-eta.service
+systemctl --global enable armada-steam-updates.service
 systemctl --global enable armada-steam-pinyin.service
 systemctl enable armada-bootimg-sync.service
 systemctl enable armada-esp-rename.service

@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-only
+"""Offline-update entry point, always invoked as: python3 -I <this file> ..."""
+
+import sys
+
+sys.path.insert(0, "/usr/lib/armada")
+
+from updates.offline_rpc import main  # noqa: E402
+
+raise SystemExit(main())

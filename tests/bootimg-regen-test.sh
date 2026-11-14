@@ -66,12 +66,20 @@ assert_eq "supported-dtbs Gen4 entry count" "$elden_entries" "1"
 
 # --- armada-bootimg-update: snapshot + DTB list resolution -------------------
 
-# Neutralize the two things a test cannot provide: a mounted ESP and a
-# lock under /run. Everything else runs as shipped.
+# Neutralize the three things a test cannot provide: a mounted ESP, a lock
+# under /run, and the installed medium gate at its fixed path. The copy still
+# runs the real gate helper, with its device-tree root pointed at a synthetic
+# unrelated board, so the gate keeps the legacy writer instead of refusing a
+# missing installed medium; production keeps the fixed paths untouched.
 ESP="$WORK/esp"; BOOT="$WORK/boot"; SYS="$WORK/sysroot"
-mkdir -p "$ESP"
+mkdir -p "$ESP" "$WORK/device-tree"
+printf 'lenovo,tb710fu\0qcom,sm8650\0' > "$WORK/device-tree/compatible"
+sed "s|/sys/firmware/devicetree/base|$WORK/device-tree|" \
+    "$ARMADA_LIB/boot-medium-gate" > "$WORK/boot-medium-gate"
 sed -e 's|findmnt -rn "${ESP}"|true "${ESP}"|' \
-    -e "s|/run/armada-bootimg.lock|$WORK/lock|" "$UPDATE" > "$WORK/update.sh"
+    -e "s|/run/armada-bootimg.lock|$WORK/lock|" \
+    -e "s|/usr/lib/armada/boot-medium-gate|$WORK/boot-medium-gate|" \
+    "$UPDATE" > "$WORK/update.sh"
 
 run_update() {
     ESP="$ESP" BOOTROOT="$BOOT" SYSROOT="$SYS" \

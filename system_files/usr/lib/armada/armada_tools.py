@@ -10,6 +10,14 @@ import sys
 
 PRIVILEGED_HELPER = "/usr/libexec/armada/armada-tools-priv"
 TOOLS = "/usr/bin/armada-tools"
+PRIVILEGED_TIMEOUT = 90
+# The helper waits up to 120 s for the update service to finish a channel
+# change, so the desktop side must outlast that wait.
+CHANNEL_TIMEOUT = 150
+# get-os snapshots the booted system (15 s), resolves the update target
+# (60 s) and then queries the update service (120 s) sequentially.  The
+# outer timeout must outlast their sum plus snapshot and process margin.
+GET_OS_TIMEOUT = 240
 
 
 def privileged_command(action, *arguments):
@@ -21,8 +29,14 @@ def privileged_operation(action, *arguments):
 
 
 def privileged_request(action, *arguments):
+    if action.startswith("channel-"):
+        timeout = CHANNEL_TIMEOUT
+    elif action == "get-os":
+        timeout = GET_OS_TIMEOUT
+    else:
+        timeout = PRIVILEGED_TIMEOUT
     result = subprocess.run(privileged_command(action, *arguments),
-                            capture_output=True, text=True, timeout=90, check=False)
+                            capture_output=True, text=True, timeout=timeout, check=False)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Armada Tools operation failed")
     return json.loads(result.stdout)
@@ -168,16 +182,21 @@ def print_status(only=None):
                               "Previous Version": (state["rollback"] or {}).get("version", "No previous version available"),
                               "Update Channel": state["channel"] or "Unavailable"}
                     channel = values.pop("Update Channel")
-                    if state["rollback_queued"] and state["rollback"]:
-                        # An explicit rollback always wins and names its target.
+                    if state["rollback_queued"] and state["rollback"] and state["reboot_ready"]:
+                        # A ready explicit rollback always wins and names its target.
                         values["After Restart"] = state["rollback"]["version"]
+                    elif state["reboot_ready"] and state.get("update_target"):
+                        values["After Restart"] = state["update_target"]
                     elif state["staged"] and state["reboot_ready"]:
-                        # The backend has already validated the staged source/channel.
                         values["After Restart"] = state["staged"]["version"]
+                    elif state.get("update_target"):
+                        values["Pending Update"] = state["update_target"]
                     elif state["staged"]:
                         values["Pending Update"] = (
                             f"Unsupported pending update from {state['staged']['image']}")
                     values["Update Channel"] = channel
+                    if state.get("update_message"):
+                        values["Update Status"] = state["update_message"]
                 for key, value in values.items():
                     print(f"  {key}: {value}")
             except Exception as error:

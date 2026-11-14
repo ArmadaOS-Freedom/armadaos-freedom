@@ -19,67 +19,63 @@ install_plugin armada-control /packages/decky-dist /ctx/decky/freedom-control/de
 install_plugin armada-store /packages/decky-store-dist
 chmod 0755 /usr/lib/decky-loader/armada-decky-sync
 
-decky_release_jq='
-            [.[] | select(.draft != true and .prerelease == true)]
-            | if length == 0
-              then error("no Decky Loader preview release found")
-              else max_by(.published_at)
-              end
-        '
-if [[ -e /run/secrets/decky_releases ]]; then
-    decky_release="$(jq -ce "${decky_release_jq}" /run/secrets/decky_releases)"
-else
-    decky_release="$(
-        curl --retry 12 --retry-delay 10 -fsSL \
-            'https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100' |
-            jq -ce "${decky_release_jq}"
-    )"
-fi
-decky_version="$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"${decky_release}")"
-[[ "${decky_version}" =~ ^[A-Za-z0-9._+-]+$ ]]
-[[ "$(jq -r '.draft // false' <<<"${decky_release}")" == "false" ]]
-[[ "$(jq -r '.prerelease // false' <<<"${decky_release}")" == "true" ]]
-
-decky_asset="$(
-    jq -c '[.assets[]? | select(.name == "PluginLoader-arm64")] | if length == 1 then .[0] else empty end' \
-        <<<"${decky_release}"
-)"
-[[ -n "${decky_asset}" ]]
-decky_url="$(jq -er '.browser_download_url | select(type == "string" and length > 0)' <<<"${decky_asset}")"
-decky_digest="$(jq -er '.digest | select(type == "string" and length > 0)' <<<"${decky_asset}")"
-[[ "${decky_digest}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
-decky_service_url="https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/${decky_version}/dist/plugin_loader-prerelease.service"
-
-install -d -m 0755 /usr/share/decky-loader
-decky_loader_tmp="$(mktemp)"
-decky_service_tmp="$(mktemp)"
+decky_tmp_dir="$(mktemp -d)"
 cleanup_decky_tmp() {
-    rm -f "${decky_loader_tmp}" "${decky_service_tmp}"
+    rm -rf -- "${decky_tmp_dir}"
 }
 trap cleanup_decky_tmp EXIT
 
-curl --retry 12 --retry-delay 10 -fL -o "${decky_loader_tmp}" "${decky_url}"
-printf '%s  %s\n' "${decky_digest#sha256:}" "${decky_loader_tmp}" | sha256sum -c -
-python3 - "${decky_loader_tmp}" <<'PY'
-import struct
+decky_releases_json="${decky_tmp_dir}/releases.json"
+decky_release_json="${decky_tmp_dir}/release.json"
+decky_loader_tmp="${decky_tmp_dir}/PluginLoader-arm64"
+decky_service_tmp="${decky_tmp_dir}/plugin_loader.service"
+
+if [[ -e /run/secrets/decky_releases ]]; then
+    cp /run/secrets/decky_releases "${decky_releases_json}"
+else
+    curl --retry 12 --retry-delay 10 --proto '=https' --proto-redir '=https' -fsSL \
+        -o "${decky_releases_json}" \
+        'https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
+fi
+
+PYTHONPATH=/usr/lib/armada python3 - "${decky_releases_json}" "${decky_release_json}" <<'PY'
+from dataclasses import asdict
+import json
 import sys
 
-with open(sys.argv[1], "rb") as handle:
-    header = handle.read(20)
-if (
-    len(header) != 20
-    or header[:4] != b"\x7fELF"
-    or header[4] != 2
-    or header[5] != 1
-    or struct.unpack_from("<H", header, 18)[0] != 183
-):
-    raise SystemExit("Decky PluginLoader payload is not a 64-bit little-endian AArch64 ELF")
+from updates.decky_release import select_preview
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    release = select_preview(json.load(handle))
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(asdict(release), handle)
+    handle.write("\n")
+PY
+
+decky_version="$(jq -er '.tag' "${decky_release_json}")"
+decky_url="$(jq -er '.url' "${decky_release_json}")"
+decky_service_url="https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/${decky_version}/dist/plugin_loader-prerelease.service"
+
+install -d -m 0755 /usr/share/decky-loader
+
+curl --retry 12 --retry-delay 10 --proto '=https' --proto-redir '=https' -fL \
+    -o "${decky_loader_tmp}" "${decky_url}"
+PYTHONPATH=/usr/lib/armada python3 - "${decky_release_json}" "${decky_loader_tmp}" <<'PY'
+import json
+import sys
+
+from updates.decky_release import DeckyRelease, verify_payload
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    release = DeckyRelease(**json.load(handle))
+verify_payload(release, sys.argv[2])
 PY
 
 install -m 0755 "${decky_loader_tmp}" /usr/share/decky-loader/PluginLoader
 printf '%s\n' "${decky_version}" > /usr/share/decky-loader/.loader.version
+install -m 0644 "${decky_release_json}" /usr/share/decky-loader/release.json
 
-curl --retry 12 --retry-delay 10 -fsSL "${decky_service_url}" |
+curl --retry 12 --retry-delay 10 --proto '=https' --proto-redir '=https' -fsSL "${decky_service_url}" |
     sed 's#${HOMEBREW_FOLDER}#/var/home/armada/homebrew#g' \
         >"${decky_service_tmp}"
 install -D -m 0644 "${decky_service_tmp}" /etc/systemd/system/plugin_loader.service

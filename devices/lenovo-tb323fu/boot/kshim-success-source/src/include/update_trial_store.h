@@ -14,7 +14,11 @@ int kshim_update_trial_load(struct kshim_config_store *s,
 
 /* Compare-and-swap append. On verified success only, *written is the slot
  * written. Failure may change target-slot bytes but never overwrites the
- * preceding valid slot. Runtime policy and health decisions are separate. */
+ * preceding valid slot. Before the first record (sequence 1 into copy A) the
+ * exact logical-empty marker is persisted in copy B, flushed and read back, so
+ * a torn initial write still loads as empty and can be retried. The marker is
+ * never accepted while a real record selects and is replaced by the second
+ * record write. Runtime policy and health decisions are separate. */
 int kshim_update_trial_save(struct kshim_config_store *s,
                             uint64_t expected_sequence,
                             const struct kshim_update_trial *next,

@@ -12,13 +12,16 @@ import sys
 import uuid
 import zlib
 
-SIZE = 2 * 1024**3
-REGION_BYTES = 65536
-REGION_OFFSET = SIZE - REGION_BYTES
-SLOT_BYTES = 4096
-
-class Refuse(RuntimeError):
-    pass
+sys.path.insert(0, "/usr/lib/armada")
+from updates.recovery_device import locate_recovery_partition
+from updates.recovery_layout import (
+    SIZE,
+    REGION_BYTES,
+    REGION_OFFSET,
+    SLOT_BYTES,
+    parse_layout,
+    RecoveryLayoutError as Refuse,
+)
 
 def require(condition, message):
     if not condition:
@@ -31,26 +34,9 @@ def u64(data, offset):
     return struct.unpack_from('<Q', data, offset)[0]
 
 def parse_store(header, region, partition_uuid, board):
-    require(len(header) == REGION_BYTES and len(region) == REGION_BYTES, 'Short settings read')
-    meta = json.loads(header.decode('utf-8'))
-    part = uuid.UUID(partition_uuid).bytes
-    installation = uuid.UUID(meta['installationId']).bytes
-    require(meta['kind'] == 'armada-board-recovery-image' and meta['schemaVersion'] == 3,
-            'Backup has no provisioned launcher settings region')
-    require(meta['imageBytes'] == SIZE and meta['headerBytes'] == REGION_BYTES and
-            meta['payloadOffset'] == REGION_BYTES and meta['configRegionOffset'] == REGION_OFFSET and
-            meta['configRegionBytes'] == REGION_BYTES and meta['configBoardId'] == board and
-            uuid.UUID(meta['configPartitionUuid']).bytes == part,
-            'Backup metadata does not match the internal partition')
-    require(0 < meta['compressedBytes'] <= REGION_OFFSET - REGION_BYTES, 'Invalid backup payload bounds')
-    d = region[:SLOT_BYTES]
-    require(d[:8] == b'KSCFGV3\0' and u32(d, 8) == 1 and u32(d, 12) == SLOT_BYTES and
-            zlib.crc32(d[:4092]) == u32(d, 4092), 'Invalid settings descriptor')
-    require(u64(d, 16) == SIZE and u64(d, 24) == REGION_BYTES + meta['compressedBytes'] and
-            u64(d, 32) == REGION_OFFSET and u32(d, 40) == REGION_BYTES and u32(d, 44) == SLOT_BYTES and
-            u32(d, 80) == SLOT_BYTES and u32(d, 84) == 2 * SLOT_BYTES and u32(d, 88) == board and
-            d[48:64] == part and d[64:80] == installation and any(part) and any(installation) and
-            not any(d[92:4092]) and not any(region[3*SLOT_BYTES:]), 'Settings descriptor identity or layout mismatch')
+    layout = parse_layout(header, region, partition_uuid, board)
+    part = layout.partition_uuid
+    installation = layout.installation_uuid
     valid = []
     for index in (0, 1):
         raw = region[(index+1)*SLOT_BYTES:(index+2)*SLOT_BYTES]
@@ -96,40 +82,7 @@ def set_request(fd, store, action):
     return sequence
 
 def device_context():
-    dt = Path('/proc/device-tree')
-    compatible = (dt/'compatible').read_bytes().split(b'\0')
-    profiles = [(b'lenovo,elden', (b'qcom,sm8750',), 1),
-                (b'lenovo,baldur', (b'qcom,sm8850', b'qcom,kaanapali'), 2)]
-    matches = [board for name, socs, board in profiles
-               if name in compatible and any(soc in compatible for soc in socs)]
-    require(len(matches) == 1, 'Unsupported board')
-    board = matches[0]
-    chosen = dt/'chosen'
-    require((chosen/'kshim,edl-request-version').read_bytes() == struct.pack('>I', 1),
-            'Installed launcher does not support Linux EDL requests')
-    report = (chosen/'kshim,settings-v1').read_bytes()
-    require(len(report) == 64, 'Missing native settings report')
-    v = struct.unpack('>16I', report)
-    require(v[0] == 1 and v[1] == board and v[2] == 0 and v[3] == 0 and v[4] == 0 and
-            v[5] == 1 and v[12] == 0 and v[13] == 1, 'Launcher has not verified usable internal settings')
-    result = subprocess.run(['blkid', '-t', 'PARTLABEL=ARMADA_BACKUP', '-o', 'device'],
-                            capture_output=True, text=True, check=True)
-    candidates = []
-    for name in result.stdout.splitlines():
-        dev = Path(name).resolve()
-        info = dev.stat()
-        require(stat.S_ISBLK(info.st_mode), 'Backup path is not a block device')
-        node = Path('/sys/dev/block/%d:%d' % (os.major(info.st_rdev), os.minor(info.st_rdev))).resolve()
-        if not any(part.endswith('.ufs') for part in node.parts):
-            continue
-        require((node/'partition').is_file() and int((node/'size').read_text())*512 == SIZE,
-                'Internal backup partition is not exactly2GiB')
-        block = int((node.parent/'queue/logical_block_size').read_text())
-        require(block in (512, 4096), 'Unsupported logical block size')
-        part_uuid = subprocess.check_output(['blkid', '-s', 'PARTUUID', '-o', 'value', str(dev)], text=True).strip()
-        candidates.append((dev, part_uuid, board, info.st_rdev))
-    require(len(candidates) == 1, 'Expected one internal UFS ARMADA_BACKUP partition')
-    return candidates[0]
+    return locate_recovery_partition(require_edl=True)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)

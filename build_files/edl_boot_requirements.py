@@ -538,7 +538,7 @@ def verify_tree(root, kver, requirements):
     return None
 
 
-def verify_initramfs(image, kver, requirements, work_parent=None):
+def verify_initramfs(image, kver, requirements, work_parent=None, *, expected_files=None):
     """Unpack *image* with lsinitrd into a temporary dir and verify the tree."""
     image_path = Path(image)
     if not image_path.is_absolute():
@@ -578,6 +578,39 @@ def verify_initramfs(image, kver, requirements, work_parent=None):
             ) from error
 
         verify_tree(Path(workdir), kver, requirements)
+        if expected_files is not None:
+            if not isinstance(expected_files, dict):
+                raise ValueError("expected_files must be a mapping")
+            root = Path(workdir).resolve()
+            for relative, item in expected_files.items():
+                try:
+                    _check_relative_firmware(relative)
+                except ValueError as error:
+                    raise ValueError(f"invalid expected initramfs path {relative!r}: {error}") from error
+                if (
+                    not isinstance(item, (tuple, list))
+                    or len(item) != 2
+                    or not isinstance(item[0], bytes)
+                    or not isinstance(item[1], bool)
+                ):
+                    raise ValueError(
+                        f"expected_files[{relative!r}] must be (bytes, executable_bool)"
+                    )
+                expected_bytes, executable = item
+                candidate = root / PurePosixPath(relative)
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(root)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise ValueError(
+                        f"expected initramfs file {relative!r} is missing or escapes the extracted root"
+                    ) from error
+                if not resolved.is_file():
+                    raise ValueError(f"expected initramfs file {relative!r} is not regular")
+                if resolved.read_bytes() != expected_bytes:
+                    raise ValueError(f"expected initramfs file {relative!r} has stale content")
+                if executable and not resolved.stat().st_mode & 0o111:
+                    raise ValueError(f"expected initramfs script {relative!r} is not executable")
     return None
 
 

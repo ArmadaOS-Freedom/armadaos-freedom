@@ -81,12 +81,14 @@ os_state = {
     "booted": {"version": "20260919.current"},
     "rollback": {"version": "20260907.previous", "checksum": "b" * 64, "incompatible": False},
     "staged": None, "rollback_queued": False, "reboot_ready": False,
+    "rollback_allowed": True,
     "channel": "stable", "channels": ["stable", "beta", "preview"],
-    "repository": "ghcr.io/mydanyi/armadaos-freedom",
+    "repository": "ghcr.io/armadaos-freedom/armadaos-freedom",
 }
 os_calls = []
 operation_script = None
 fail_operation = False
+fail_channel = False
 
 
 def os_command(action, *arguments):
@@ -101,18 +103,25 @@ def os_request(action, *arguments):
     if action == "get-os":
         return copy.deepcopy(os_state)
     if action.startswith("channel-"):
+        if fail_channel:
+            raise RuntimeError("Could not change the update channel")
         os_state["channel"] = action.removeprefix("channel-")
         return {"ok": True}
     if action == "update-os":
         channel = "testing" if os_state["channel"] == "preview" else os_state["channel"]
         os_state["staged"] = {"version": "20260920.next",
-                              "image": f"ghcr.io/mydanyi/armadaos-freedom:{channel}"}
+                              "image": f"ghcr.io/armadaos-freedom/armadaos-freedom:{channel}"}
         os_state["reboot_ready"] = True
+        os_state["rollback_allowed"] = False
         return {"ok": True, "started": 124}
     if action == "rollback-os":
         os_state["staged"] = None
-        os_state["rollback_queued"] = True
+        os_state["rollback_queued"] = False
+        os_state["rollback_allowed"] = False
         os_state["reboot_ready"] = True
+        os_state["update_allowed"] = False
+        os_state["update_target"] = os_state["rollback"]["version"]
+        os_state["update_message"] = "Rollback ready. Restart to apply."
         return {"ok": True, "started": 125}
     if action == "restart-os":
         return {"ok": True}
@@ -305,11 +314,20 @@ with tempfile.TemporaryDirectory() as directory, \
     assert not updates.operation.restart_button.get_visible()
     updates.render(os_state.copy())
     assert updates.message.get_text() == "Update installed. Restart to apply."
+    assert not updates.rollback.get_sensitive()
+    os_state.update(staged=None, reboot_ready=False, rollback_allowed=True,
+                    update_allowed=True, update_target=None, update_message=None)
+    updates.result = ""
+    updates.render(os_state.copy())
+    assert updates.rollback.get_sensitive()
     updates.rollback.emit("clicked")
     assert updates.confirmation.get_heading() == "Roll Back Armada?"
     assert "20260907.previous" in updates.confirmation.get_body()
+    assert "Games and personal files are kept." in updates.confirmation.get_body()
+    assert "matching boot is prepared in the other slot" in updates.confirmation.get_body()
+    assert "A restart is required." in updates.confirmation.get_body()
     check_confirmation(updates.confirmation)
-    assert "discarded" in updates.confirmation.get_body()
+    assert "discarded" not in updates.confirmation.get_body()
     respond(updates.confirmation, "cancel")
     assert not any(call[0] == "rollback-os" for call in os_calls)
     updates.rollback.emit("clicked")
@@ -340,8 +358,12 @@ with tempfile.TemporaryDirectory() as directory, \
     fail_operation = False
     updates.result = ""
     os_state["rollback"] = None
+    os_state["rollback_allowed"] = False
     os_state["rollback_queued"] = False
     os_state["reboot_ready"] = False
+    os_state["update_allowed"] = True
+    os_state["update_target"] = None
+    os_state["update_message"] = None
     updates.refresh()
     wait_for(lambda: not updates.loading)
     assert not updates.rollback.get_sensitive()
@@ -371,6 +393,169 @@ with tempfile.TemporaryDirectory() as directory, \
     resize(980, 560)
     assert window.sections[0].compute_bounds(window.sections_grid)[1].get_x() < window.sections[2].compute_bounds(window.sections_grid)[1].get_x()
 
-    window.close()
-    assert not window.get_visible()
-print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, and narrow layout checks passed")
+    original_operation = updates.operation
+    original_result = updates.result
+    original_error = updates.error
+    original_os_state = os_state.copy()
+    updates.operation = None
+    try:
+        awaiting = os_state.copy()
+        awaiting.update(staged=None, rollback_queued=False, rollback_allowed=False,
+                        update_busy=False, update_allowed=False, reboot_ready=True,
+                        update_target="20261001.restart",
+                        update_message="Update installed. Restart to apply.")
+        updates.result = "Stale local result."
+        updates.render(awaiting)
+        assert updates.update.get_label() == "Restart"
+        assert updates.update.get_visible()
+        assert updates.update.get_sensitive()
+        assert updates.message.get_text() == awaiting["update_message"]
+        assert not updates.rollback.get_sensitive()
+        with patch.object(updates, "confirm_restart") as restart, \
+                patch.object(updates, "confirm_update") as update:
+            updates.update.emit("clicked")
+            restart.assert_called_once_with()
+            update.assert_not_called()
+        assert updates.operation is None
+
+        busy = os_state.copy()
+        busy.update(staged=None, rollback_queued=False, rollback_allowed=False,
+                    update_busy=True, update_allowed=True, reboot_ready=False,
+                    update_target="20261001.restart",
+                    update_message="Downloading update (42%).")
+        updates.render(busy)
+        assert not updates.update.get_sensitive()
+        assert not updates.channel.get_sensitive()
+        assert not updates.rollback.get_sensitive()
+        assert updates.message.get_text() == "Downloading update (42%)."
+
+        finalizing = busy.copy()
+        finalizing.update(update_busy=False, update_allowed=False,
+                          update_target=None, update_message="Finalizing update…")
+        updates.render(finalizing)
+        assert updates.update.get_label() == "Update"
+        assert not updates.update.get_sensitive()
+        assert not updates.rollback.get_sensitive()
+        assert updates.message.get_text() == "Finalizing update…"
+
+        confirmed = os_state.copy()
+        confirmed.update(staged=None, rollback_queued=False, rollback_allowed=True,
+                         rollback={"version": "20260907.previous", "checksum": "b" * 64,
+                                   "incompatible": False},
+                         update_busy=False, update_allowed=True, reboot_ready=False,
+                         update_target=None, update_message="Update confirmed.")
+        updates.render(confirmed)
+        assert updates.update.get_label() == "Update"
+        assert updates.update.get_sensitive()
+        assert updates.message.get_text() == "Update confirmed."
+        assert updates.rollback.get_sensitive()
+        assert "Pending" not in updates.message.get_text()
+        updates.update.emit("clicked")
+        wait_for(lambda: updates.confirmation is not None)
+        assert "currently selected channel" in updates.confirmation.get_body()
+        respond(updates.confirmation, "cancel")
+
+        missing = confirmed.copy()
+        missing.pop("rollback_allowed")
+        updates.render(missing)
+        assert not updates.rollback.get_sensitive()
+
+        uncertain = confirmed.copy()
+        uncertain.update(rollback_allowed=False, update_busy=False, update_allowed=False,
+                         update_message="Update status is uncertain; try again later.")
+        updates.render(uncertain)
+        assert not updates.update.get_sensitive()
+        assert not updates.rollback.get_sensitive()
+        assert updates.message.get_visible()
+        assert updates.message.get_text() == uncertain["update_message"]
+
+        updates.result = ""
+        updates.error = ""
+        fail_channel = True
+        updates.render(confirmed)
+        updates.channel.set_selected(0)
+        wait_for(lambda: not updates.requesting and not updates.loading)
+        assert "Could not change the update channel" in updates.message.get_text()
+        assert updates.message.get_text() != confirmed["update_message"]
+
+        updates.error = ""
+        updates.result = "No new image was needed."
+        ready = confirmed.copy()
+        ready.update(update_target="20261001.restart", update_message=None, reboot_ready=True)
+        updates.render(ready)
+        assert updates.message.get_text() == "Update installed. Restart to apply."
+        fail_channel = False
+    finally:
+        fail_channel = False
+        updates.operation = original_operation
+        updates.result = original_result
+        updates.error = original_error
+        os_state.clear()
+        os_state.update(original_os_state)
+        updates.render(os_state.copy())
+
+    busy_watch = os_state.copy()
+    busy_watch.update(update_busy=True, update_allowed=False, reboot_ready=False,
+                      update_target=None, update_message="Downloading update (42%).")
+    assert updates.watch_id is None
+    updates.render(busy_watch)
+    watch_id = updates.watch_id
+    assert watch_id is not None
+    updates.render(busy_watch)
+    assert updates.watch_id == watch_id
+    with patch.object(updates, "refresh") as duplicate:
+        updates.requesting = True
+        assert updates.watch_tick() == ui.GLib.SOURCE_CONTINUE
+        duplicate.assert_not_called()
+        updates.requesting = False
+    updates.render(os_state.copy())
+    assert updates.watch_id is None
+
+    os_state["update_busy"] = True
+    os_state["update_message"] = "Downloading update (42%)."
+    updates.render(os_state.copy())
+    assert updates.watch_id is not None
+    os_state["update_busy"] = False
+    os_state["update_message"] = "Update installed. Restart to apply."
+    os_state["reboot_ready"] = True
+    updates.watch_tick()
+    wait_for(lambda: not updates.loading)
+    assert updates.watch_id is None
+    assert updates.message.get_text() == "Update installed. Restart to apply."
+    os_state["update_message"] = None
+    os_state["reboot_ready"] = False
+    updates.result = ""
+
+    assert updates.watch_id is None
+    confirming = os_state.copy()
+    confirming.update(update_busy=False, update={"state": "awaiting_confirmation", "requiresReboot": False},
+                      update_message="Update is awaiting confirmation.")
+    updates.render(confirming)
+    assert updates.watch_id is not None
+    resolved = confirming.copy()
+    resolved.update(update={"state": "installed", "requiresReboot": False},
+                    update_message="Update confirmed.")
+    updates.render(resolved)
+    assert updates.watch_id is None
+
+    # A watcher-driven read may still be in flight when the user closes the
+    # window: allow the close, stop the watcher, and ignore the late result
+    # instead of touching the destroyed widgets or restarting the watch.
+    with patch.object(updates.window, "background") as background:
+        updates.render(busy_watch)
+        assert updates.watch_id is not None
+        assert updates.watch_tick() == ui.GLib.SOURCE_CONTINUE
+        assert updates.loading and updates.watching
+        late = background.call_args[0][1]
+        with patch.object(updates, "render") as render:
+            window.close()
+            assert not window.get_visible()
+            assert updates.closed
+            assert updates.watch_id is None
+            late(busy_watch, None)
+            render.assert_not_called()
+        assert not updates.loading
+        assert not updates.watching
+        assert updates.watch_id is None
+    assert updates.watch_id is None
+print("Native window, manual entry, SSH state/toggle/errors, repair confirmation/results, wait before closing, OS channels/update/rollback/restart, external-update and awaiting-confirmation watch, request-error precedence, close during background watch and narrow layout checks passed")

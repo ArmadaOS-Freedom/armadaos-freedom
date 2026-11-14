@@ -35,6 +35,23 @@
  *  364..4091 reserved (zero)
  * 4092..4095 crc32 of bytes 0..4091 (integrity check only, not authentication)
  *
+ * Logical-empty sentinel.  Before the first real record is written into copy
+ * A, the writer durably stores an all-zero copy B with exactly one bit set:
+ * byte EMPTY_MARKER_OFFSET == EMPTY_MARKER_BYTE.  The marker can never be
+ * decoded as a record (its stored CRC stays zero while the computed CRC over
+ * the marked body is not) and is only recognised in copy B, only after a real
+ * record failed to select, and only when copy A is blank or CRC-damaged.  An
+ * exact marker in copy A is itself an error: the sentinel belongs to copy B
+ * alone, so a marker pair is never treated as empty.  A
+ * complete CRC-valid image, a foreign/incompatible record, a conflicting pair
+ * or any other non-marker pair stays an error.  The marker exists only in the
+ * window between the initial anchor write and the second journal write, so it
+ * requires a reader that knows it; older readers fail closed on it (they never
+ * boot a Linux candidate from a marker pair).  This also limits producers:
+ * only the current writer anchors an initial journal, and a journal created by
+ * an older writer keeps the old, unanchored behaviour.  Once a real record is
+ * durable it always wins and the next write replaces the marker.
+ *
  * Journal offsets below are relative to the 64 KiB mutable tail, not partition
  * start. Callers must verify descriptor version/capabilities and manage I/O
  * durability; this codec never reads, writes, or activates storage.
@@ -48,6 +65,10 @@
 #define KSHIM_UPDATE_TRIAL_TAIL_OFFSET_B 32768u
 #define KSHIM_UPDATE_TRIAL_ATTEMPT_MAX 7u
 #define KSHIM_UPDATE_TRIAL_OS_NAME_MAX 64u
+#define KSHIM_UPDATE_TRIAL_EMPTY_MARKER_COPY 1u
+#define KSHIM_UPDATE_TRIAL_EMPTY_MARKER_OFFSET \
+    (KSHIM_UPDATE_TRIAL_RECORD_BYTES - 5u)
+#define KSHIM_UPDATE_TRIAL_EMPTY_MARKER_BYTE 0x01u
 
 enum kshim_update_policy {
     KSHIM_UPDATE_POLICY_ONLINE_SINGLE = 0,
@@ -96,6 +117,12 @@ struct kshim_update_trial_decision {
 
 int kshim_update_trial_encode(const struct kshim_update_trial *record,
                               void *buffer, size_t size);
+
+/* Build the exact logical-empty sentinel image (all zero except one fixed
+ * byte) or test a record-sized buffer for that exact image.  The test is a
+ * full-image comparison, never a "nonzero and short" heuristic. */
+int kshim_update_trial_empty_marker(void *buffer, size_t size);
+int kshim_update_trial_is_empty_marker(const void *buffer, size_t size);
 
 int kshim_update_trial_decode(const void *buffer, size_t size,
                               const uint8_t partition_uuid[16],
