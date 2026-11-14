@@ -257,6 +257,150 @@ class TestDeckyTransaction(unittest.TestCase):
         self.assertFalse(tx.pending.exists())
         self.assert_new()
 
+    def race_copy(self, tx, name, swap):
+        """Swap the source path in the window between _backup's lstat and _copy's open."""
+        original = tx._copy
+
+        def raced(source, destination, expected=None):
+            if Path(source) == self.target(name):
+                swap()
+            return original(source, destination, expected)
+
+        tx._copy = raced
+
+    def backup_txdir(self, tx, suffix="a"):
+        txdir = tx.txroot / (suffix * 32)
+        txdir.mkdir(mode=0o700)
+        return txdir
+
+    def assert_no_bytes(self, needle, *roots):
+        for root in roots:
+            for path in Path(root).rglob("*"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                self.assertNotIn(needle, path.read_bytes(), str(path))
+
+    def test_backup_symlink_swap_between_lstat_and_open_is_rejected(self):
+        secret = self.root / "root-secret"
+        secret.write_bytes(b"root-only-secret")
+        secret.chmod(0o600)
+        service = Service()
+        tx = self.transaction(service)
+        tx._setup()
+        txdir = self.backup_txdir(tx)
+        loader = self.target("PluginLoader")
+
+        def swap():
+            loader.unlink()
+            loader.symlink_to(secret)
+
+        self.race_copy(tx, "PluginLoader", swap)
+        with self.assertRaises((OSError, RuntimeError)):
+            tx._backup(txdir)
+        self.assertEqual(list(txdir.iterdir()), [])
+        self.assert_no_bytes(b"root-only-secret", txdir, self.state)
+        self.assertEqual(secret.read_bytes(), b"root-only-secret")
+        self.assertEqual(service.calls, [])
+
+    def test_backup_regular_inode_swap_between_lstat_and_open_is_rejected(self):
+        secret = self.root / "root-secret"
+        secret.write_bytes(b"root-only-secret")
+        service = Service()
+        tx = self.transaction(service)
+        tx._setup()
+        txdir = self.backup_txdir(tx)
+        loader = self.target("PluginLoader")
+
+        def swap():
+            replacement = self.root / "replacement"
+            shutil.copyfile(secret, replacement)
+            os.replace(replacement, loader)
+
+        self.race_copy(tx, "PluginLoader", swap)
+        with self.assertRaisesRegex(RuntimeError, "source changed"):
+            tx._backup(txdir)
+        self.assertEqual(list(txdir.iterdir()), [])
+        self.assert_no_bytes(b"root-only-secret", txdir, self.state)
+        self.assertEqual(service.calls, [])
+
+    def test_install_backup_race_fails_closed_without_secret_or_restart(self):
+        secret = self.root / "root-secret"
+        secret.write_bytes(b"root-only-secret")
+        secret.chmod(0o600)
+        service = Service()
+        tx = self.transaction(service)
+        loader = self.target("PluginLoader")
+
+        def swap():
+            loader.unlink()
+            loader.symlink_to(secret)
+
+        self.race_copy(tx, "PluginLoader", swap)
+        result = tx.install(self.release, self.payload)
+        self.assertEqual(result["state"], "failed")
+        self.assertFalse(result["rollback_files_restored"])
+        self.assertFalse(result["rollback_service_healthy"])
+        # Fail closed: the loader was stopped before the backup, and
+        # _recover/_check_targets refuses to touch or restart a symlinked
+        # target, so the journal survives for operator-driven recovery.
+        self.assertEqual(service.calls, ["is_active", "stop"])
+        self.assertFalse(service.active)
+        self.assertIn("Refusing symlink target", result.get("rollback_error", ""))
+        self.assertTrue(tx.pending.exists())
+        self.assertTrue(loader.is_symlink())
+        self.assertEqual(self.target(".loader.version").read_bytes(), OLD[".loader.version"])
+        self.assertEqual(self.target("managed.json").read_bytes(), OLD["managed.json"])
+        self.assert_no_bytes(b"root-only-secret", self.services, self.state)
+        self.assertEqual(secret.read_bytes(), b"root-only-secret")
+
+    def test_backup_rejects_fifo_before_and_after_lstat_without_blocking(self):
+        service = Service()
+        tx = self.transaction(service)
+        tx._setup()
+        loader = self.target("PluginLoader")
+        loader.unlink()
+        os.mkfifo(loader)
+        txdir = self.backup_txdir(tx, "a")
+        with self.assertRaisesRegex(RuntimeError, "Unsafe backup source"):
+            tx._backup(txdir)
+        self.assertEqual(list(txdir.iterdir()), [])
+
+        loader.unlink()
+        loader.write_bytes(OLD["PluginLoader"])
+        txdir = self.backup_txdir(tx, "b")
+
+        def swap():
+            loader.unlink()
+            os.mkfifo(loader)
+
+        self.race_copy(tx, "PluginLoader", swap)
+        with self.assertRaisesRegex(RuntimeError, "Unsafe copy source"):
+            tx._backup(txdir)
+        self.assertEqual(list(txdir.iterdir()), [])
+        self.assertEqual(service.calls, [])
+
+    def test_backup_manifest_and_restore_preserve_source_metadata(self):
+        tx = self.transaction(Service())
+        tx._setup()
+        txdir = self.backup_txdir(tx)
+        self.target("PluginLoader").chmod(0o4755)
+        entries = tx._backup(txdir)
+        expected_modes = dict(MODES, PluginLoader=0o4755)
+        for name, data in OLD.items():
+            entry = entries[name]
+            self.assertTrue(entry["exists"])
+            self.assertEqual(entry["mode"], expected_modes[name])
+            self.assertEqual((entry["uid"], entry["gid"]), (os.geteuid(), os.getegid()))
+            self.assertEqual(entry["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(json.loads((txdir / "backups.json").read_text())["files"], entries)
+        tx._restore(txdir, entries)
+        for name, data in OLD.items():
+            path = self.target(name)
+            info = path.lstat()
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(stat.S_IMODE(info.st_mode), expected_modes[name])
+            self.assertEqual((info.st_uid, info.st_gid), (os.geteuid(), os.getegid()))
+
     def test_lock_busy_and_malformed_or_symlink_journal(self):
         fd = os.open(self.lock, os.O_RDWR | os.O_CREAT, 0o600)
         try:

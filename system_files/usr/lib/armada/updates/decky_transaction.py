@@ -49,17 +49,31 @@ class DeckyTransaction:
         return digest.hexdigest()
 
     @staticmethod
-    def _copy(source, destination):
-        with source.open("rb") as src, destination.open("xb") as dst:
-            shutil.copyfileobj(src, dst, 1024 * 1024)
-            dst.flush()
-        destination.chmod(0o600)
-        fd = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW)
+    def _copy(source, destination, expected=None):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(source, flags)
         try:
-            os.fsync(fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"Unsafe copy source: {source}")
+            if expected is not None and (info.st_dev, info.st_ino) != tuple(expected):
+                raise RuntimeError(f"Copy source changed: {source}")
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "rb", closefd=False) as src, destination.open("xb") as dst:
+                for block in iter(lambda: src.read(1024 * 1024), b""):
+                    digest.update(block)
+                    dst.write(block)
+                dst.flush()
         finally:
             os.close(fd)
+        destination.chmod(0o600)
+        out = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(out)
+        finally:
+            os.close(out)
         DeckyTransaction._fsync_dir(destination.parent)
+        return info, digest.hexdigest()
 
     def _atomic(self, path, data, mode, uid=None, gid=None):
         fd, temporary = tempfile.mkstemp(prefix=".armada-", dir=path.parent)
@@ -163,10 +177,10 @@ class DeckyTransaction:
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                     raise RuntimeError(f"Unsafe backup source: {path}")
                 backup = txdir / (name + ".backup")
-                self._copy(path, backup)
-                entries[name] = {"exists": True, "mode": stat.S_IMODE(info.st_mode),
-                                 "uid": info.st_uid, "gid": info.st_gid,
-                                 "sha256": self._sha256(backup)}
+                opened, digest = self._copy(path, backup, (info.st_dev, info.st_ino))
+                entries[name] = {"exists": True, "mode": stat.S_IMODE(opened.st_mode),
+                                 "uid": opened.st_uid, "gid": opened.st_gid,
+                                 "sha256": digest}
             else:
                 entries[name] = {"exists": False, "mode": None, "uid": None,
                                  "gid": None, "sha256": None}
