@@ -99,8 +99,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends python3-websocket
               npm install --prefix /tmp/armada-steam-ui --cache /tmp/armada-steam-ui-cache --no-save --no-audit --no-fund playwright@1.58.2
-              export NODE_PATH=/tmp/armada-steam-ui/node_modules
-              node --test tests/steam-update-page-test.cjs tests/steam-update-cdp-test.cjs
+              runuser -u pwuser -- env NODE_PATH=/tmp/armada-steam-ui/node_modules node --test tests/steam-update-page-test.cjs tests/steam-update-cdp-test.cjs
             '
       - name: Check desktop update interface
         run: |
