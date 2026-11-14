@@ -18,8 +18,8 @@ env:
   BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
   IMAGE_DESC: "Armada: a gaming-focused, SteamOS-like Fedora bootc image for ARM64 handhelds"
   IMAGE_NAME: "${{ github.event.repository.name }}"
-  FREEDOM_PKG: "ghcr.io/mydanyi/armada/pkg"
-  FREEDOM_CACHE: "ghcr.io/mydanyi/armada/buildcache"
+  FREEDOM_PKG: "ghcr.io/armadaos-freedom/armada/pkg"
+  FREEDOM_CACHE: "ghcr.io/armadaos-freedom/armada/buildcache"
   UPSTREAM_PKG: "ghcr.io/armada-os/armada/pkg"
   UPSTREAM_CACHE: "ghcr.io/armada-os/armada/buildcache"
 
