@@ -4,6 +4,7 @@
 #include <storage_settings.h>
 #include <stdbool.h>
 #include <storage_ab.h>
+#include <update_trial.h>
 int storage_settings_native_open(enum device_board actual_board,
                                   const struct kshim_config_values *defaults);
 /* Records the selected system after UI teardown, preserving incoming MMU
@@ -15,3 +16,9 @@ int storage_settings_native_export(void *fdt);
 bool storage_settings_native_ab_supported(void);
 int storage_settings_native_ab_status(struct kshim_ab_status *);
 int storage_settings_native_ab_select(unsigned target,unsigned expected_current);
+int storage_settings_native_ab_mark_success(unsigned expected_current);
+int storage_settings_native_trial_load(struct kshim_update_trial *record,
+                                       unsigned *selected);
+int storage_settings_native_trial_save(uint64_t expected_sequence,
+                                       const struct kshim_update_trial *next,
+                                       unsigned *written);

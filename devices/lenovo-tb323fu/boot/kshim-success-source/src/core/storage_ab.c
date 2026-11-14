@@ -173,6 +173,34 @@ int kshim_ab_inspect(const struct kshim_ab_media *m,struct kshim_ab_status *s)
     struct capture *c=calloc(1,sizeof(*c));if(!c)return KSHIM_STORAGE_OVERFLOW;
     int rc=load(m,c);if(!rc)*s=c->status;release(c);free(c);return rc;
 }
+int kshim_ab_find_partition(const struct kshim_ab_media *m,const char *label,
+                            unsigned *lun,struct kshim_partition *partition)
+{
+    unsigned found_lun=0;int rc;
+    if(!m||!label||!lun||!partition)return KSHIM_STORAGE_ARG;
+    for(unsigned n=0;;++n){
+        unsigned char ch=(unsigned char)label[n];
+        if(!ch){if(n<1)return KSHIM_STORAGE_ARG;break;}
+        if(n>=36||ch<32||ch>126)return KSHIM_STORAGE_ARG;
+    }
+    struct capture *c=calloc(1,sizeof(*c));if(!c)return KSHIM_STORAGE_OVERFLOW;
+    if((rc=load(m,c)))goto done;
+    {
+        uint8_t *e=find(c,label,&found_lun);
+        const uint8_t *u;
+        if(!e){rc=KSHIM_STORAGE_CONFLICT;goto done;}
+        partition->first_lba=r64(e+32);partition->last_lba=r64(e+40);
+        /* GPT unique partition GUID is at e+16 (mixed-endian); emit RFC 4122. */
+        u=e+16;
+        for(unsigned i=0;i<4;++i)partition->uuid[i]=u[3-i];
+        for(unsigned i=0;i<2;++i)partition->uuid[4+i]=u[5-i];
+        for(unsigned i=0;i<2;++i)partition->uuid[6+i]=u[7-i];
+        memcpy(partition->uuid+8,u+8,8);
+        *lun=found_lun;
+    }
+done:
+    release(c);free(c);return rc;
+}
 static uint8_t *candidate(struct capture *c,unsigned l,uint8_t *entry)
 { return c->table[l].next+(entry-c->table[l].entries[0]); }
 static void plan(struct capture *c,unsigned target)
@@ -243,6 +271,28 @@ int kshim_ab_select(const struct kshim_ab_media *m,unsigned target,unsigned expe
         int lun=m->set_boot_lun(m->ctx,c->boot_lun_id);
         int check=m->get_boot_lun(m->ctx,&actual);
         if(undo||lun||check||actual!=c->boot_lun_id)rc=KSHIM_AB_UNCERTAIN;
+    }
+done:
+    release(c);free(c);return rc;
+}
+int kshim_ab_mark_success(const struct kshim_ab_media *m,unsigned expected_current)
+{
+    if(!m||!m->get_boot_lun||expected_current>1)return KSHIM_STORAGE_ARG;
+    struct capture *c=calloc(1,sizeof(*c));if(!c)return KSHIM_STORAGE_OVERFLOW;
+    int rc=load(m,c);if(rc)goto done;
+    if(c->status.current!=expected_current||!c->status.bootable[expected_current]){
+        rc=KSHIM_STORAGE_CONFLICT;goto done;
+    }
+    {
+        uint8_t *e=candidate(c,c->boot_lun[expected_current],c->boot[expected_current]);
+        uint64_t a=r64(e+48),want=(a|SUCCESS)&~(RETRIES|UNBOOTABLE);
+        if(a!=want){
+            w64(e+48,want);
+            rc=write_tables(m,c,0);
+            if(rc){
+                if(write_tables(m,c,1))rc=KSHIM_AB_UNCERTAIN;
+            }
+        }
     }
 done:
     release(c);free(c);return rc;
