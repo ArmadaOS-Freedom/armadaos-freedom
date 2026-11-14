@@ -15,8 +15,11 @@ from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 AUTHORIZED_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
 
 # Models whose installed systems have the physical dual-slot backend the
-# offline upgrade drives. A package may advertise offline-upgrade, and carry
-# recovery manifests, only when every supported model is in this set.
+# offline upgrade drives. A package may advertise offline-upgrade when at least
+# one of its supported models is in this set and every supported model is a
+# shipped contract model; ``require_operation`` still rejects an upgrade
+# request for a selected model outside this set. Recovery manifests remain
+# restricted to packages whose supported models are all in this set.
 OFFLINE_UPGRADE_MODELS = frozenset(("TB322FC", "TB323FU"))
 _OPERATIONS = frozenset(("install", "offline-upgrade", "decky-repair"))
 _ROLES = frozenset((
@@ -208,8 +211,13 @@ def _validate(data: dict, install_models=frozenset()) -> None:
     supported = set(data["supportedModels"])
     if not extra_models <= supported:
         raise PackageError("install_models must be listed in supportedModels")
-    if "offline-upgrade" in data["operations"] and not supported <= OFFLINE_UPGRADE_MODELS:
-        raise PackageError("offline-upgrade is restricted to models with dual-slot support")
+    if "offline-upgrade" in data["operations"]:
+        # A mixed package of shipped models may advertise upgrade as long as
+        # at least one selected model drives the dual-slot backend. A custom
+        # install-only allowance keeps the whole package install-only, and a
+        # selection with no eligible model may not claim upgrade.
+        if extra_models or not supported & OFFLINE_UPGRADE_MODELS:
+            raise PackageError("offline-upgrade is restricted to models with dual-slot support")
 
     archive = data["archive"]
     _archive_member(archive, "archive", None)
@@ -304,6 +312,10 @@ def require_operation(package: dict, model: str, operation: str, *,
         raise PackageError("model is not supported by this package")
     if operation not in validated["operations"]:
         raise PackageError("operation is not declared by this package")
+    if operation == "offline-upgrade" and model not in OFFLINE_UPGRADE_MODELS:
+        raise PackageError(
+            "offline-upgrade is restricted to models with dual-slot support"
+        )
     if installer_version is None and updater_version is None:
         raise PackageError("at least one installer or updater version is required")
     for label, field, current in (

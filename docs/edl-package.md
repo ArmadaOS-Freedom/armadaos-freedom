@@ -45,23 +45,14 @@ labels must match `REVISION` and `VERSION`. The build stops on a mismatch.
 A channel name or tag is not a version, and an older commit may not be paired
 with a newer image.
 
-The recipe takes these four positional arguments and, by default, forwards no
-model or configuration options, so it packages every profile registered in
-`build_files/edl-devices.json` exactly as before. Because that set includes
-`TB710FU`, the default package is install-only. Setting
-`EDL_PACKAGE_PROFILE=release` selects the closed, validated pair `TB322FC` and
-`TB323FU` instead; that is the only profile that may declare offline-upgrade.
-Any other value fails before the build starts. It writes the package to
-`output/edl/<version>/` and uses a fresh `_build-edl.*` work directory under
-the checkout, which is ignored by Git.
-
-```console
-$ EDL_PACKAGE_PROFILE=release just build-edl-package \
-    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
-    sha256:DIGEST \
-    FULL_SOURCE_COMMIT \
-    EXACT_OCI_VERSION
-```
+The recipe takes these four positional arguments and forwards no model or
+configuration options, so it packages one artifact containing every profile
+registered in `build_files/edl-devices.json`. That single package installs all
+of them, including `TB710FU`, and its descriptor also declares
+`offline-upgrade` for the selected models with the dual-slot backend (the
+Lenovo Legion Y700 models). It writes the package to `output/edl/<version>/`
+and uses a fresh `_build-edl.*` work directory under the checkout, which is
+ignored by Git.
 
 To package a subset, or to use another configuration file, call the wrapper
 directly with the same four values:
@@ -173,7 +164,7 @@ snapshot, and a matching model registration in the Windows installer. A
 configuration entry alone does not make arbitrary Android hardware supported.
 A profile outside the shipped package contract can be packaged for first
 installation only; the build never advertises offline-upgrade or recovery for
-it, and selecting such a profile together with the default models makes the
+it, and selecting such a profile together with any other models makes the
 whole package install-only.
 
 ## Bundled plugin sources
@@ -204,31 +195,27 @@ does not silently refresh the bundled contents later.
 
 The build also runs automatically. On `main`, the `build_edl_package` job in
 [`Build images`](../.github/workflows/build.yml) follows the container image
-job and builds two EDL package variants from the image it just pushed, using
-the `testing` channel, that image's digest, its actual source revision, and its
-`org.opencontainers.image.version` label. The two variants run on separate
-runners with independent checkouts, work directories, output directories, and
-signatures:
+job and builds one EDL package from the image it just pushed, using the
+`testing` channel, that image's digest, its actual source revision, and its
+`org.opencontainers.image.version` label. The artifact is
+`edl-package-<run id>`. It contains every registered profile, including
+`TB710FU`, and its signed descriptor declares both `install` and
+`offline-upgrade`: installation is available for every listed model, while an
+offline-upgrade request is accepted only for the selected models with the
+dual-slot backend. This is the official artifact, and **Publish update
+channel** accepts it as before. The descriptor is signed on the same runner
+that built it, so there is only one package to sign.
 
-- `edl-package-<run id>` is built with `EDL_PACKAGE_PROFILE=release`, so it
-  contains only `TB322FC` and `TB323FU`. Its signed descriptor declares both
-  `install` and `offline-upgrade`. This is the official multi-model update
-  artifact and the only artifact **Publish update channel** accepts.
-- `edl-install-package-<run id>` is built with the universal default, so it
-  contains every registered profile, including `TB710FU`. Its signed descriptor
-  declares `install` only. Use it for first installation with the Windows
-  installer; it is never published to an update channel.
-
-Both artifacts stay in the workflow run until an operator publishes the release
-artifact; no release and no update channel changes automatically. The SD image
+The artifact stays in the workflow run until an operator publishes the
+release; no release and no update channel changes automatically. The SD image
 path remains available; its automatic R2 publication is enabled separately as
 described below.
 
 [`Build EDL package`](../.github/workflows/build-edl-package.yml) can also be
 started by hand. It takes the same four values as the recipe, checks out the
-requested revision with submodules, and runs the same two variants, uploading
-each split package, `parts.json`, `SHA256SUMS`, and the package README under its
-own artifact name.
+requested revision with submodules, and runs the same all-profile build,
+uploading the split package, `parts.json`, `SHA256SUMS`, and the package
+README under `edl-package-<run id>`.
 
 ## Publish an update channel
 
@@ -245,9 +232,7 @@ The flow is build, publish testing, then promote.
 1. Build the package: `Build images` on `main`, or `Build EDL package` by hand.
 2. Run **Publish update channel** with the completed run ID and `testing`. It
    checks that the run belongs to this repository, that it completed
-   successfully, and that it produced `edl-package-<run id>`. The install-only
-   `edl-install-package-<run id>` artifact is not accepted, even though its
-   descriptor is signed, because it does not declare `offline-upgrade`. It then
+   successfully, and that it produced `edl-package-<run id>`. It then
    verifies the descriptor signature, the split parts, the parts manifest, the
    `offline-upgrade` capability, and that the OCI digest resolves to the signed
    image built from the descriptor's source revision. It creates the draft
@@ -373,9 +358,7 @@ GHCR packages must be public and grant this repository Actions access. The
 workflow checks anonymous image access before publishing channel tags. A
 built package stays in its `edl-package-<run-id>` artifact until **Publish
 update channel** turns it into a release and a signed `testing` channel; beta
-and stable follow only through **Promote release**. The install-only
-`edl-install-package-<run-id>` artifact is kept for first installation only and
-never becomes a channel document. The shipped
+and stable follow only through **Promote release**. The shipped
 `system_files/etc/armada/updates/channels.json` names all three channels, and
 each becomes usable only once its document exists on the `update-channels`
 branch. Legacy disk-image publication to R2 is opt-in: set the repository
@@ -398,29 +381,34 @@ and SHA-256 digests. Shared system files are listed once.
 The local wrapper leaves this descriptor unsigned. The EDL Actions workflow
 signs its original UTF-8 bytes with the release key, verifies the result with
 the fixed public key, and uploads .zip.update.json.sig alongside the volumes.
-Each matrix variant signs its own descriptor on its own runner: the release
-variant must verify as install and offline-upgrade, and the install variant as
-install-only, before either artifact is uploaded. SHA256SUMS and parts.json do
-not replace this signature. A downloaded public key supplied by the package
-cannot establish trust in that package.
+It signs the one package the workflow builds, and before upload it checks that
+the descriptor's `supportedModels` exactly match the configured profiles and
+that the descriptor declares `install` and `offline-upgrade`. SHA256SUMS and
+parts.json do not replace this signature. A downloaded public key supplied by
+the package cannot establish trust in that package.
 
-The producer checks that the deployed image carries the normal-Linux updater and
-then declares both install and offline-upgrade; a package built from an image
-without that updater fails the build instead of being relabeled. A package whose
-selected models include a profile outside the shipped contract is built
-install-only: the wrapper never requests offline-upgrade for it, and it passes
-that configured model identifier explicitly so validation accepts the install
-package while still rejecting offline-upgrade and recovery for it. The offline
-upgrade keeps user data and writes both boot slots from the verified payload;
-the online OCI update instead rotates only the non-current slot. A signature
-alone does not make a package upgrade-capable: the descriptor must declare
-offline-upgrade and the installed updater must meet `minimumUpdaterVersion`.
+The producer checks that the deployed image carries the normal-Linux updater
+and then declares both `install` and `offline-upgrade` for the all-profile
+package; a package built from an image without that updater fails the build
+instead of being relabeled. The operation list is package-level: every listed
+model can be installed, while an offline-upgrade request is accepted only for
+a selected model with the dual-slot backend. A package whose selected models
+include a profile outside the shipped contract is built install-only: the
+wrapper never requests offline-upgrade for it, and it passes that configured
+model identifier explicitly so validation accepts the install package while
+still rejecting offline-upgrade and recovery for it. The offline upgrade keeps
+user data and writes both boot slots from the verified payload; the online OCI
+update instead rotates only the non-current slot. A signature alone does not
+make a package upgrade-capable: the descriptor must declare offline-upgrade,
+the requested model must be eligible, and the installed updater must meet
+`minimumUpdaterVersion`.
 
 Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
-(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) may
-still appear in the universal initial-install package, but its update slot
-backend is not implemented yet, so being listed in a package is not
-offline-upgrade support for that model.
+(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part
+of the same all-profile package for installation, but its update slot backend
+is not implemented yet; being listed in the package is not offline-upgrade
+support for that model, and an upgrade request naming it is rejected before
+any slot work.
 
 Recovery manifests describe the RAM rescue path and are not a prerequisite here:
 this package ships no rescue artifacts, and the object may be absent or partial.
