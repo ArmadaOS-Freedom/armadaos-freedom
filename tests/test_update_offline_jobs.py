@@ -718,17 +718,6 @@ class OfflineJobTests(OfflineJobRecoveryCases, OfflineJobFixtureMixin,
                          'prepare_queued')
         self.assertFalse(self.launches())
 
-        # dispatch_uncertain is never retried.
-        sid = self.queued_prepare_session()
-        with self.store.session_lock(sid) as session:
-            receipt = self.store.read_receipt(session)
-            receipt['state'] = 'dispatch_uncertain'
-            self.store.update_receipt(session, receipt)
-        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
-        self.assertEqual(self.manager().submit_prepare(sid)['state'],
-                         'dispatch_uncertain')
-        self.assertFalse(self.launches())
-
     def test_duplicate_dispatch_of_a_running_unit_is_not_uncertain(self):
         sid = self.session()
         self.runner.side_effect = self.dispatch_runner(
@@ -745,6 +734,160 @@ class OfflineJobTests(OfflineJobRecoveryCases, OfflineJobFixtureMixin,
             load_state='not-found', launch_ok=False)
         self.assertEqual(self.manager().submit_prepare(sid)['state'],
                          'dispatch_uncertain')
+
+    def _uncertain_dispatch(self, operation):
+        """Return a session whose explicit systemd-run failed with no unit."""
+        if operation == 'prepare':
+            sid = self.session()
+            self.runner.side_effect = subprocess.TimeoutExpired('systemd-run', 30)
+            receipt = self.manager().submit_prepare(sid)
+        else:
+            sid = self.prepared_session()
+            self.runner.side_effect = subprocess.TimeoutExpired('systemd-run', 30)
+            receipt = self.manager().submit_execute(sid, self.ack(sid))
+        self.assertEqual(receipt['state'], 'dispatch_uncertain')
+        self.assertIn('dispatch failed', receipt['error'])
+        self.runner.reset_mock()
+        self.runner.side_effect = None
+        return sid
+
+    def test_uncertain_prepare_dispatch_relaunches_once_after_proof(self):
+        sid = self._uncertain_dispatch('prepare')
+        self.assertFalse(self.launches())
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+
+        result = self.manager().submit_prepare(sid)
+        self.assertEqual(result['state'], 'prepare_queued')
+        self.assertEqual(result['jobOperation'], 'prepare')
+        self.assertNotIn('error', result)
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(self.launches()[0].args[0][-3:],
+                         ['--worker', 'prepare', sid])
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            self.assertEqual(receipt['state'], 'prepare_queued')
+            self.assertNotIn('error', receipt)
+
+        with mock.patch('updates.offline_prepare.prepare_offline_update',
+                        side_effect=self.prepared):
+            self.assertEqual(self.manager().run_job('prepare', sid)['state'],
+                             'prepared')
+
+    def test_uncertain_execute_dispatch_relaunches_once_with_saved_ack(self):
+        sid = self._uncertain_dispatch('execute')
+        ack = self.ack(sid)
+        with self.store.session_lock(sid) as session:
+            ack_before = (session / 'ack.json').read_bytes()
+        pointer = self.store.base / 'pending' / (TX + '.json')
+        pointer_before = pointer.read_bytes()
+        self.assertFalse(self.launches())
+
+        # The acknowledgement gate still runs before any relaunch decision.
+        with self.assertRaises(ValueError):
+            self.manager().submit_execute(sid, dict(ack, transactionId=OTHER_TX))
+        self.assertFalse(self.launches())
+
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_execute(sid, ack)
+        self.assertEqual(result['state'], 'execute_queued')
+        self.assertNotIn('error', result)
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(self.launches()[0].args[0][-3:],
+                         ['--worker', 'execute', sid])
+        with self.store.session_lock(sid) as session:
+            self.assertEqual((session / 'ack.json').read_bytes(), ack_before)
+        self.assertEqual(pointer.read_bytes(), pointer_before)
+
+        with mock.patch('updates.offline_execute.execute_offline_update',
+                        return_value={'state': 'awaiting_reboot'}) as execute:
+            self.assertEqual(self.manager().run_job('execute', sid)['state'],
+                             'awaiting_reboot')
+        self.assertEqual(execute.call_args.kwargs['recovery_ack'], ack)
+
+    def test_uncertain_dispatch_never_relaunches_loaded_unknown_or_partial_work(self):
+        # A loaded or unreadable unit may still claim the receipt.
+        for load_state in ('loaded', None):
+            with self.subTest(load_state=load_state):
+                sid = self._uncertain_dispatch('prepare')
+                self.runner.side_effect = self.dispatch_runner(
+                    load_state=load_state)
+                before = self.receipt_bytes(sid)
+                receipt = self.manager().submit_prepare(sid)
+                self.assertEqual(receipt['state'], 'dispatch_uncertain')
+                self.assertEqual(self.receipt_bytes(sid), before)
+                self.assertFalse(self.launches())
+
+        # Prepare output proves the worker already started.
+        sid = self._uncertain_dispatch('prepare')
+        with self.store.session_lock(sid) as session:
+            (session / 'transaction').mkdir()
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        before = self.receipt_bytes(sid)
+        self.assertEqual(self.manager().submit_prepare(sid)['state'],
+                         'dispatch_uncertain')
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.assertFalse(self.launches())
+
+        # Execute output proves the worker already started.
+        sid = self._uncertain_dispatch('execute')
+        ack = self.ack(sid)
+        with self.store.session_lock(sid) as session:
+            (session / 'transaction/recovery-ack.json').write_bytes(b'{}')
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        before = self.receipt_bytes(sid)
+        self.assertEqual(self.manager().submit_execute(sid, ack)['state'],
+                         'dispatch_uncertain')
+        self.assertEqual(self.receipt_bytes(sid), before)
+        self.assertFalse(self.launches())
+
+    def test_uncertain_dispatch_adopts_durable_result_without_relaunch(self):
+        sid = self.interrupted_prepare(receipt_state='dispatch_uncertain')
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_prepare(sid)
+        self.assertEqual(result['state'], 'prepared')
+        self.assertEqual(result['result']['state'], 'awaiting_recovery_export')
+        self.assertNotIn('error', result)
+        self.assertFalse(self.launches())
+
+        sid = self.interrupted_execute(receipt_state='dispatch_uncertain')
+        self.runner.reset_mock()
+        self.trial.return_value = self.evidence(sid)
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+        result = self.manager().submit_execute(sid, self.ack(sid))
+        self.assertEqual(result['state'], 'awaiting_reboot')
+        self.assertNotIn('error', result)
+        self.assertFalse(self.launches())
+        self.reboot.assert_not_called()
+
+    def test_prepare_reconnect_after_uncertain_execute_dispatch_is_idempotent(self):
+        sid = self._uncertain_dispatch('execute')
+        pointer = self.store.base / 'pending' / (TX + '.json')
+        pointer_before = pointer.read_bytes()
+        with self.store.session_lock(sid) as session:
+            ack_before = (session / 'ack.json').read_bytes()
+        before = self.receipt_bytes(sid)
+        self.runner.side_effect = self.dispatch_runner(load_state='not-found')
+
+        # A prepare reconnect is not a way to resume an execute submission: the
+        # receipt is reported as it is, twice, without any dispatch, ack or
+        # pointer rewrite, or fallback to a prepare queue.
+        for _ in range(2):
+            result = self.manager().submit_prepare(sid)
+            self.assertEqual(result['state'], 'dispatch_uncertain')
+            self.assertEqual(result['jobOperation'], 'execute')
+            self.assertIn('dispatch failed', result['error'])
+            self.assertEqual(self.receipt_bytes(sid), before)
+        self.assertFalse(self.launches())
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            self.assertEqual(receipt['state'], 'dispatch_uncertain')
+            self.assertEqual(receipt['jobOperation'], 'execute')
+            self.assertIn('dispatch failed', receipt['error'])
+            self.assertEqual((session / 'ack.json').read_bytes(), ack_before)
+            self.assertFalse(
+                (session / 'transaction/write-report.json').exists())
+        self.assertEqual(pointer.read_bytes(), pointer_before)
+        self.reboot.assert_not_called()
 
     def test_status_never_relaunches_a_never_started_queue(self):
         sid = self.queued_prepare_session()

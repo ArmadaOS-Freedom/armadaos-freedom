@@ -117,6 +117,23 @@ class JobRetirementTest(unittest.TestCase):
         return jr.retire_finalized_job(
             transaction_id, plan_sha256=plan_sha256, state_root=self.state_root)
 
+    def seed_failed_job(self, *, job_id=JOB, pointer_job=None,
+                        with_pointer=True, status=None):
+        body = {
+            "state": "failed",
+            "phase": "preparing_candidates",
+            "requiresReboot": False,
+            "bootWriteState": "not_started",
+        }
+        body.update(status or {})
+        return self.seed_job(
+            job_id=job_id, pointer_job=pointer_job,
+            with_pointer=with_pointer, status=body)
+
+    def retire_failed(self, transaction_id=TX):
+        return jr.retire_failed_prewrite_job(
+            transaction_id, state_root=self.state_root)
+
     def test_removes_artifacts_and_keeps_compact_documents(self):
         job = self.seed_job()
         before = {name: (job / name).read_bytes() for name in COMPACT_DOCUMENTS}
@@ -286,6 +303,133 @@ class JobRetirementTest(unittest.TestCase):
             self.assertFalse(self.retire())
             self.assertTrue((job / "download").is_dir())
         status.write_text(valid_status)
+
+    def test_failed_prewrite_job_removes_only_artifact_trees(self):
+        job = self.seed_failed_job()
+        before = {name: (job / name).read_bytes() for name in COMPACT_DOCUMENTS}
+        pointer = (self.state_root / jr.POINTER_NAME).read_bytes()
+
+        self.assertTrue(self.retire_failed())
+
+        for name in jr.ARTIFACT_NAMES:
+            self.assertFalse((job / name).exists(), name)
+            self.assertFalse((job / name).is_symlink(), name)
+        for name in COMPACT_DOCUMENTS:
+            self.assertEqual((job / name).read_bytes(), before[name], name)
+        self.assertEqual(
+            (self.state_root / jr.POINTER_NAME).read_bytes(), pointer)
+        self.assertTrue(job.is_dir())
+        self.assertFalse(self.retire_failed())
+
+    def test_failed_prewrite_job_requires_a_prewrite_status(self):
+        cases = (
+            ("writing", {"phase": "writing_boot",
+                         "bootWriteState": "writing"}),
+            ("written", {"phase": "writing_boot",
+                         "bootWriteState": "written"}),
+            ("uncertain", {"phase": "writing_boot",
+                           "bootWriteState": "uncertain"}),
+            ("restored", {"phase": "writing_boot",
+                          "bootWriteState": "restored"}),
+            ("restored not needed", {"phase": "writing_boot",
+                                     "bootWriteState": "not_started"}),
+            ("recovery required", {"state": "recovery_required",
+                                   "phase": "writing_boot"}),
+            ("reboot required", {"requiresReboot": True}),
+            ("active", {"state": "preparing", "phase": "downloading"}),
+            ("finalized", {"state": "awaiting_reboot",
+                           "phase": "awaiting_reboot",
+                           "requiresReboot": True,
+                           "bootWriteState": "written"}),
+        )
+        for name, status in cases:
+            with self.subTest(case=name):
+                self.doCleanups()
+                self.setUp()
+                job = self.seed_failed_job(status=status)
+                self.assertFalse(self.retire_failed())
+                for artifact in jr.ARTIFACT_NAMES:
+                    self.assertTrue((job / artifact).is_dir(), artifact)
+
+    def test_failed_prewrite_identity_and_pointer_must_match(self):
+        job = self.seed_failed_job(status={"transactionId": OTHER_TX})
+        self.assertFalse(self.retire_failed())
+        self.assertTrue((job / "download").is_dir())
+
+        self.doCleanups()
+        self.setUp()
+        job = self.seed_failed_job(status={"workDir": str(self.outside)})
+        self.assertFalse(self.retire_failed())
+        self.assertTrue((job / "download").is_dir())
+
+        self.doCleanups()
+        self.setUp()
+        job = self.seed_failed_job(pointer_job=OTHER_JOB)
+        self.assertFalse(self.retire_failed())
+        self.assertTrue((job / "download").is_dir())
+
+        self.doCleanups()
+        self.setUp()
+        self.seed_failed_job(with_pointer=False)
+        self.assertFalse(self.retire_failed())
+        self.assertTrue((self.state_root / JOB / "download").is_dir())
+
+        self.doCleanups()
+        self.setUp()
+        job = self.seed_failed_job()
+        self.assertFalse(self.retire_failed(transaction_id=OTHER_TX))
+        self.assertFalse(self.retire_failed(transaction_id="not-a-uuid"))
+        self.assertTrue((job / "download").is_dir())
+
+    def test_failed_prewrite_malformed_status_is_ignored(self):
+        job = self.seed_failed_job()
+        status = job / jr.STATUS_NAME
+        valid = status.read_text()
+        for raw in ("{", "[]", json.dumps({"schemaVersion": 2})):
+            status.write_text(raw)
+            self.assertFalse(self.retire_failed())
+            self.assertTrue((job / "download").is_dir())
+        status.write_text(valid)
+
+    def test_failed_prewrite_untrusted_paths_are_refused(self):
+        job = self.seed_failed_job()
+        os.chmod(self.state_root, 0o777)
+        try:
+            self.assertFalse(self.retire_failed())
+        finally:
+            os.chmod(self.state_root, 0o700)
+        self.assertTrue((job / "download").is_dir())
+
+        with mock.patch.object(jr, "_owned_by_root", return_value=False):
+            self.assertFalse(self.retire_failed())
+        self.assertTrue((job / "download").is_dir())
+
+        real = self.outside / "job-real"
+        job.rename(real)
+        job.symlink_to(real)
+        self.assertFalse(self.retire_failed())
+        for name in jr.ARTIFACT_NAMES:
+            self.assertTrue((real / name).is_dir(), name)
+
+        self.doCleanups()
+        self.setUp()
+        self.seed_failed_job()
+        real = self.outside / "state-real"
+        self.state_root.rename(real)
+        self.state_root.symlink_to(real)
+        self.assertFalse(self.retire_failed())
+        self.assertTrue((real / JOB / "download").is_dir())
+
+    def test_failed_prewrite_symlinks_are_unlinked_without_target_damage(self):
+        job = self.seed_failed_job()
+        precious = self.outside / "precious.bin"
+        precious.write_bytes(b"keep")
+        (job / "download" / "link").symlink_to(precious)
+        self.assertTrue(self.retire_failed())
+        self.assertFalse((job / "download").exists())
+        self.assertEqual(precious.read_bytes(), b"keep")
+        for name in COMPACT_DOCUMENTS:
+            self.assertTrue((job / name).is_file(), name)
 
     def test_confirmation_retires_both_artifact_stores_best_effort(self):
         from updates import trial_confirmation as tc

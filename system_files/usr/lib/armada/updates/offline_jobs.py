@@ -431,6 +431,29 @@ class OfflineJobManager:
             return False
         return self._never_started(session, operation, session_id)
 
+    def _resume_uncertain_dispatch(self, session, receipt, operation, session_id):
+        """Adopt a durable result, or restore and relaunch a proven unstarted dispatch.
+
+        A ``dispatch_uncertain`` receipt records a ``systemd-run`` that failed
+        with no owned unit, so the worker may or may not have claimed the
+        receipt in the meantime.  A durable terminal result is adopted instead
+        of a relaunch.  Only positive proof that nothing started (unclaimed
+        receipt, no worker output, no owned unit) returns the receipt to its
+        exact queued state, clearing the dispatch error durably, and permits
+        the caller's single explicit relaunch.  Everything else stays
+        ``dispatch_uncertain`` and is never replayed.
+        """
+        if self._adopt_interrupted(session, receipt):
+            self.store.update_receipt(session, receipt)
+            return False
+        if not self._never_started(session, operation, session_id):
+            return False
+        receipt['state'] = ('prepare_queued' if operation == 'prepare'
+                            else 'execute_queued')
+        receipt.pop('error', None)
+        self.store.update_receipt(session, receipt)
+        return True
+
     def _launch_job(self, session, operation, session_id, queued):
         """Dispatch a queued job, keeping an already-owned unit a success.
 
@@ -469,6 +492,22 @@ class OfflineJobManager:
                     raise offline_session.OfflineSessionError(
                         'session receipt has an unrecognized state')
                 if self._resume_queued(session, receipt, 'prepare', sessionId):
+                    self._launch_job(
+                        session, 'prepare', sessionId, 'prepare_queued')
+            elif (state == 'dispatch_uncertain' and
+                    receipt.get('jobOperation') == 'prepare'):
+                # A failed systemd-run leaves the receipt uncertain because a
+                # parallel or late worker may still claim it.  Only a durable
+                # result or positive proof that nothing started is answered;
+                # anything else stays uncertain instead of being replayed.
+                # An uncertain *execute* dispatch is not this method's to
+                # resume: it falls through to the idempotent status return
+                # below, exactly as before this relaunch branch existed, so a
+                # prepare reconnect never relaunches, rewrites or rolls back
+                # an execution.  An unknown operation still hits the fallback
+                # rejection.
+                if self._resume_uncertain_dispatch(
+                        session, receipt, 'prepare', sessionId):
                     self._launch_job(
                         session, 'prepare', sessionId, 'prepare_queued')
             elif state == 'uploading':
@@ -517,6 +556,15 @@ class OfflineJobManager:
                     raise ValueError('recovery acknowledgement differs from saved acknowledgement')
                 if state == 'execute_queued':
                     if self._resume_queued(
+                            session, receipt, 'execute', sessionId):
+                        self._launch_job(
+                            session, 'execute', sessionId, 'execute_queued')
+                elif state == 'dispatch_uncertain':
+                    # Same proof as prepare: adopt durable output, or restore
+                    # the exact queued state and relaunch only when the worker
+                    # provably never started.  The saved acknowledgement above
+                    # is still the only one this relaunch may use.
+                    if self._resume_uncertain_dispatch(
                             session, receipt, 'execute', sessionId):
                         self._launch_job(
                             session, 'execute', sessionId, 'execute_queued')
