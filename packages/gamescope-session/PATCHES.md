@@ -31,3 +31,9 @@ to a commit, or `armada` if it is original; a URL source with no `notes` is verb
   physical-size scaling.
 - `patches/0009-fix-konkr-fit-refresh-rates.patch`
   source: armada
+
+- `patches/0010-armada-display-orientation-override.patch`
+  source: armada
+  notes: Applies the saved Steam Game Mode display orientation after session and
+  environment configuration. With the override disabled, the existing device and
+  user defaults remain in effect.

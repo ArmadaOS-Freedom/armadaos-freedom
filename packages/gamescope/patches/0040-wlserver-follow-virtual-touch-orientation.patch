@@ -1,0 +1,93 @@
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 8f498a5..b4d3163 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -550,15 +550,44 @@ static void wlserver_touch_associate_connector(struct wlserver_touch *touch)
+ 		}
+ 		parent = udev_device_get_parent(parent);
+ 	}
++
++	// The virtual panel touch has no bus to walk to. Its udev rule tags it
++	// instead and keeps the desktop calibration on the device, so here it is
++	// associated with the internal panel and that calibration is undone later,
++	// before the output orientation is applied. Real buses and untagged
++	// devices never take this path, so their matrix is left untouched.
++	bool bUndoRightCalibration = false;
++	if (connector == nullptr) {
++		const char *pszCalibration = udev_device_get_property_value(dev, "GAMESCOPE_TOUCH_CALIBRATION");
++		if (pszCalibration != nullptr && strcmp(pszCalibration, "right") == 0) {
++			connector = GetBackend()->GetConnector(gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL);
++			bUndoRightCalibration = connector != nullptr;
++		}
++	}
+ 	udev_device_unref(dev);
+ 	if (connector != nullptr) {
+ 		touch->connector = connector;
++		touch->bUndoRightCalibration = bUndoRightCalibration;
+ 		wl_log.infof("associating connector %s (%s %s) with touch input device %s",
+ 			connector->GetName(), connector->GetMake(), connector->GetModel(),
+ 			libinput_device_get_name(lidev));
+ 	}
+ }
+ 
++// Undoes the landscape-right calibration the udev rule keeps for Desktop Mode,
++// so the output orientation applied by wlserver_touchdown/motion rotates the
++// touch exactly once.
++static void wlserver_touch_unapply_calibration(struct wlserver_touch *touch, double *x, double *y)
++{
++	if (!touch->bUndoRightCalibration || touch->connector == nullptr)
++		return;
++
++	const double tx = 1.0 - *y;
++	const double ty = *x;
++	*x = tx;
++	*y = ty;
++}
++
+ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
+ {
+ 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
+@@ -571,7 +600,12 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
+ 	}
+ 
+ 	wlserver_touch_associate_connector( touch );
+-	wlserver_touchdown( event->x, event->y, event->touch_id, event->time_msec, touch->connector );
++
++	double tx = event->x;
++	double ty = event->y;
++	wlserver_touch_unapply_calibration( touch, &tx, &ty );
++
++	wlserver_touchdown( tx, ty, event->touch_id, event->time_msec, touch->connector );
+ }
+ 
+ static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
+@@ -600,7 +634,12 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
+ 	}
+ 
+ 	wlserver_touch_associate_connector( touch );
+-	wlserver_touchmotion( event->x, event->y, event->touch_id, event->time_msec, false, touch->connector );
++
++	double tx = event->x;
++	double ty = event->y;
++	wlserver_touch_unapply_calibration( touch, &tx, &ty );
++
++	wlserver_touchmotion( tx, ty, event->touch_id, event->time_msec, false, touch->connector );
+ }
+ 
+ struct wlserver_keyboard {
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+index 5f9ccd6..68000fc 100644
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -254,6 +254,11 @@ struct wlserver_touch {
+     // matches --ignore-touch-device. Lets the companion own the touch
+     // exclusively in Game Mode without blackholing it in Desktop Mode.
+     bool bIgnoreWhileLeased;
++
++    // When true, the device carries the desktop landscape-right calibration
++    // from udev (GAMESCOPE_TOUCH_CALIBRATION="right") and that calibration is
++    // undone before the output orientation is applied.
++    bool bUndoRightCalibration;
+ };
+ 
+ void xwayland_surface_commit(struct wlr_surface *wlr_surface);

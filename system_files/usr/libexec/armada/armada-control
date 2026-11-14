@@ -26,6 +26,8 @@ CLIENT_TIMEOUT = 5
 CONTROLLER_TYPES = {"deck-uhid", "xbox-series", "xb360", "ds5"}
 INTERCEPT_MODES = {"overlay", "reset"}
 SWIPE_GESTURES_CONFIG = Path("/etc/armada/swipe-gestures.conf")
+DISPLAY_ORIENTATION_CONFIG = Path("/etc/armada/display-orientation.conf")
+DISPLAY_ORIENTATIONS = ("normal", "left", "right", "upsidedown")
 SLEEP_CONFIG = Path("/etc/armada/sleep.conf")
 SUSPEND_MODE_KEY = "suspend_mode"
 NM_IGNORE_SLEEP = Path("/etc/NetworkManager/ignore-sleep")
@@ -426,6 +428,57 @@ def action_set_sleep_mode(request):
     write_sleep_config(value)
     set_networkmanager_sleep_allowed(value != "fake")
     return {"value": value}
+
+
+def read_display_orientation():
+    try:
+        lines = DISPLAY_ORIENTATION_CONFIG.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    except UnicodeDecodeError:
+        return ""
+    orientation = ""
+    for line in lines:
+        match = re.match(r"\s*orientation\s*=\s*(.*)$", line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        # Later assignments win; an empty or malformed value disables the
+        # override instead of falling back to an earlier assignment.
+        orientation = value if value in DISPLAY_ORIENTATIONS else ""
+    return orientation
+
+
+def default_display_orientation():
+    try:
+        value = device_env().get("ARMADA_PANEL_ORIENTATION", "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "normal"
+    return value if value in DISPLAY_ORIENTATIONS else "normal"
+
+
+def display_orientation_state():
+    return {
+        "supported": True,
+        "orientation": read_display_orientation(),
+        "defaultOrientation": default_display_orientation(),
+    }
+
+
+def action_get_display_orientation(request):
+    return display_orientation_state()
+
+
+def action_set_display_orientation(request):
+    orientation = request.get("orientation")
+    # An empty string disables the override; the other values are the panel
+    # orientations. Missing, non-string, and unknown values are rejected.
+    if not isinstance(orientation, str) or (
+        orientation and orientation not in DISPLAY_ORIENTATIONS
+    ):
+        raise ValueError("invalid display orientation")
+    atomic_write(DISPLAY_ORIENTATION_CONFIG, f"orientation={orientation}\n")
+    return display_orientation_state()
 
 
 def read_swipe_gestures_config():
@@ -901,6 +954,8 @@ ACTIONS = {
     "set_bottom_screen_brightness": action_set_bottom_screen_brightness,
     "get_desktop_mode": action_get_desktop_mode,
     "set_desktop_mode": action_set_desktop_mode,
+    "get_display_orientation": action_get_display_orientation,
+    "set_display_orientation": action_set_display_orientation,
     "set_sleep_mode": action_set_sleep_mode,
     "write_config": action_write_config,
     "reapply_perf": action_reapply_perf,
