@@ -6,7 +6,9 @@ so a newly added file cannot slip in unregistered.
 """
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import unittest
 from pathlib import Path
 
@@ -41,11 +43,39 @@ def find_control() -> Path:
 
 def copy_instructions(text: str):
     for line in text.splitlines():
-        fields = line.split()
-        if not fields or fields[0] != "COPY":
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
             continue
-        fields = [field for field in fields[1:] if not field.startswith("--")]
+        instruction = stripped.split(None, 1)
+        if len(instruction) < 2 or instruction[0].upper() != "COPY":
+            continue
+        arguments = instruction[1].strip()
+        while arguments.startswith("--"):
+            option = arguments.split(None, 1)
+            if len(option) < 2:
+                arguments = ""
+                break
+            arguments = option[1].lstrip()
+        fields = _copy_arguments(arguments)
+        if len(fields) < 2:
+            continue
         yield fields[:-1], fields[-1]
+
+
+def _copy_arguments(arguments: str):
+    """Split COPY arguments in shell or JSON form, options already removed."""
+    if arguments.startswith("["):
+        try:
+            decoded = json.loads(arguments)
+        except ValueError:
+            decoded = None
+        if (
+            isinstance(decoded, list)
+            and len(decoded) >= 2
+            and all(isinstance(field, str) for field in decoded)
+        ):
+            return decoded
+    return shlex.split(arguments)
 
 
 def tree_files(root: Path) -> set[str]:
@@ -67,11 +97,6 @@ class PowerSourceOwnershipTests(unittest.TestCase):
         )
 
     def test_canonical_files_come_only_from_control(self):
-        installed = {
-            dest: srcs
-            for srcs, dest in self.copies
-            if srcs and all(src.startswith(SOURCE_PREFIX + "/") for src in srcs)
-        }
         for relative in CANONICAL:
             with self.subTest(relative=relative):
                 self.assertTrue(
@@ -83,11 +108,26 @@ class PowerSourceOwnershipTests(unittest.TestCase):
                     f"{relative} must not exist in this repository: nothing "
                     "at that path would ship",
                 )
-                self.assertEqual(
-                    installed.get(f"/system_files/{relative}"),
-                    [f"{SOURCE_PREFIX}/{relative}"],
+                destination = f"/system_files/{relative}"
+                expected = f"{SOURCE_PREFIX}/{relative}"
+                sources = [
+                    source
+                    for copied_sources, dest in self.copies
+                    if dest == destination
+                    for source in copied_sources
+                ]
+                self.assertIn(
+                    expected,
+                    sources,
                     f"Containerfile must COPY {relative} from Freedom Control "
                     "to its root path",
+                )
+                competing = sorted(set(sources) - {expected})
+                self.assertEqual(
+                    competing,
+                    [],
+                    f"Containerfile also COPYs {relative} from {competing} to "
+                    "its root path; only Freedom Control may own that file",
                 )
 
     def test_only_named_shared_fixtures_overlap(self):
