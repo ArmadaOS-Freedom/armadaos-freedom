@@ -108,6 +108,7 @@ class BootWriterTests(unittest.TestCase):
                     'material': {'baseImageSha256': '1' * 64},
                     'rootPublicKeySha256': '2' * 64,
                     'bootPublicKeySha256': '3' * 64,
+                    'metadataSha256': '4' * 64,
                 },
             },
         }
@@ -125,6 +126,7 @@ class BootWriterTests(unittest.TestCase):
             'baseImageSha256': '1' * 64,
             'rootPublicKeySha256': '2' * 64,
             'bootPublicKeySha256': '3' * 64,
+            'metadataSha256': '4' * 64,
             'payloadDigestMatchesSignedMetadata': payload_match,
         }
         part = snapshot['partitions'][f'boot_{target}']
@@ -221,6 +223,55 @@ class BootWriterTests(unittest.TestCase):
             pwrite_spy.assert_not_called()
             self.assertEqual([p.read_bytes() for p in env.images], disk_before)
             self._assert_all_closed(env)
+
+    def test_gbl_metadata_hash_bound_to_trusted_target_before_write(self):
+        cases = [
+            ('candidate_missing',
+             lambda t, c: c.pop('metadataSha256'),
+             'candidate metadataSha256 is missing or invalid'),
+            ('candidate_non_hex',
+             lambda t, c: c.__setitem__('metadataSha256', 'z' * 64),
+             'candidate metadataSha256 is missing or invalid'),
+            ('candidate_short',
+             lambda t, c: c.__setitem__('metadataSha256', 'f' * 63),
+             'candidate metadataSha256 is missing or invalid'),
+            ('candidate_mismatch',
+             lambda t, c: c.__setitem__('metadataSha256', 'f' * 64),
+             'candidate metadataSha256 mismatch'),
+            ('trusted_missing',
+             lambda t, c: t['trust'][t['physical']['inactiveSlot']].pop('metadataSha256'),
+             'authenticated metadataSha256 is invalid'),
+            ('trusted_non_hex',
+             lambda t, c: t['trust'][t['physical']['inactiveSlot']].__setitem__(
+                 'metadataSha256', 'g' * 64),
+             'authenticated metadataSha256 is invalid'),
+        ]
+        for name, mutate, pattern in cases:
+            with self.subTest(case=name), contextlib_stack() as stack:
+                (env, trust, cand, disk_before, _, _, _, _) = self._prepare(
+                    stack, mode='gbl-preserve-metadata')
+                mutate(trust, cand)
+                pwrite_spy = stack.enter_context(
+                    mock.patch.object(writer.os, 'pwrite', wraps=REAL_PWRITE))
+                with self.assertRaisesRegex(writer.BootWriteError, pattern) as ctx:
+                    writer.write_inactive_boot(trust, cand)
+                self.assertEqual(ctx.exception.restore_status, 'not_needed')
+                pwrite_spy.assert_not_called()
+                self.assertEqual([p.read_bytes() for p in env.images], disk_before)
+                self._assert_all_closed(env)
+
+        # aosp-resign keeps its existing rule: metadataSha256 is not consulted.
+        with contextlib_stack() as stack:
+            (env, trust, cand, _, _, _, cand_bytes, extent) = self._prepare(
+                stack, mode='aosp-resign')
+            trust['trust'][trust['physical']['inactiveSlot']]['metadataSha256'] = 'a' * 64
+            cand['metadataSha256'] = 'b' * 64
+            res = writer.write_inactive_boot(trust, cand)
+            self._assert_all_closed(env)
+            lun, offset, size = extent
+            self.assertEqual(res['readbackSha256'], cand['candidate']['sha256'])
+            self.assertEqual(
+                env.images[lun].read_bytes()[offset:offset + size], cand_bytes)
 
     def test_prewrite_binding_and_schema_rejections(self):
         with contextlib_stack() as stack:

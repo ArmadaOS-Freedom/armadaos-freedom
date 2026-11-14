@@ -16,6 +16,7 @@ from pathlib import Path
 import armada_os
 
 from . import system_manager
+from .finalization_receipt import _durable_ancestors
 from .system_transaction import (
     SystemTransactionError, run_online_transaction, run_rollback_transaction)
 
@@ -67,6 +68,12 @@ def _prepare_state_root():
     if info.st_mode & 0o022:
         raise PreflightError(
             f"State directory is group/world writable: {root}")
+    # The validated directory must be durable before any transaction creates
+    # boot backups or writes media.  The whole chain is re-flushed on every
+    # call, so a retry after a failed flush makes a previously created path
+    # durable instead of skipping straight to the boot writes.  A failure here
+    # propagates as a preflight error and stops the job.
+    _durable_ancestors(root)
     return root
 
 

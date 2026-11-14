@@ -107,17 +107,28 @@ class ReceiptFilesystemTests(unittest.TestCase):
 
     def test_symlinks_and_unsafe_modes_rejected_without_chmod(self):
         self.target.parent.mkdir(mode=0o755)
-        other = self.target.parent / "other.json"
-        other.write_text("{}")
-        self.target.symlink_to(other)
+        real = Path(self.tmp.name) / "real"
+        real.mkdir(mode=0o755)
+        real_target = real / "finalized.json"
+
+        # Seed a genuinely valid receipt through its real path and prove the
+        # same bytes read complete there.
+        with mock.patch.object(receipt, "STATE_PATH", real_target):
+            receipt.write(self.record)
+            self.assertEqual(receipt.read(self.record), {"state": "complete"})
+
+        # A file symlink alias to that valid receipt must still be pending.
+        self.target.symlink_to(real_target)
         self.assertEqual(receipt.read(self.record)["state"], "pending")
         self.target.unlink()
-        real = Path(self.tmp.name) / "real"
-        real.mkdir()
+
+        # A directory symlink alias to the valid receipt's directory is also
+        # pending even though the file reached through it is valid.
         link = Path(self.tmp.name) / "link"
         link.symlink_to(real, target_is_directory=True)
         with mock.patch.object(receipt, "STATE_PATH", link / "finalized.json"):
             self.assertEqual(receipt.read(self.record)["state"], "pending")
+
         unsafe = Path(self.tmp.name) / "unsafe"
         unsafe.mkdir(mode=0o777)
         unsafe.chmod(0o777)

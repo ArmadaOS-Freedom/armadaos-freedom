@@ -147,7 +147,7 @@ class DeckyService:
     def start(self) -> None:
         try:
             res = subprocess.run(
-                [CHCON, "-t", "bin_t", str(self._loader)],
+                [CHCON, "-h", "-t", "bin_t", str(self._loader)],
                 shell=False, check=False, capture_output=True, timeout=40,
             )
             if res.returncode != 0:

@@ -163,6 +163,22 @@ class TestStart(Base):
         self.patch_run(lambda cmd, **kw: ok())
         self.srv.start()
 
+    def test_chcon_uses_no_follow_for_final_symlink(self):
+        self.loader()
+        commands = []
+
+        def run(cmd, **kw):
+            commands.append(list(cmd))
+            return ok()
+
+        self.patch_run(run)
+        self.srv.start()
+        self.assertEqual(
+            commands[0],
+            ["/usr/bin/chcon", "-h", "-t", "bin_t",
+             str(self.svc / "PluginLoader")],
+        )
+
     def test_reset_failed_nonzero_raises(self):
         self.loader()
         self.patch_run(lambda cmd, **kw: bad() if cmd[1] == "reset-failed" else ok())

@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates.client import UpdateClient
 from updates.coordinator import Coordinator
-from updates import legacy_cli
+from updates import dbus_service, legacy_cli
 from updates.dbus_service import (
     BUS_NAME,
     IFACE,
@@ -683,6 +683,58 @@ class UpdateDBusTest(unittest.TestCase):
             [checksum, checksum, other_checksum],
         )
         self.assertEqual(self.decky_mgr.calls, ["check"])
+
+
+class UpdateDBusActivationTest(unittest.TestCase):
+    def test_activation_queues_no_synthetic_jobs(self):
+        starts = []
+
+        class FakeCoordinator:
+            def start(self, component, operation):
+                starts.append((component, operation))
+                return "unexpected-job"
+
+            def close(self):
+                pass
+
+        class FakeService:
+            def __init__(self, connection):
+                self.connection = connection
+                self.coordinator = FakeCoordinator()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeLoop:
+            def run(self):
+                pass
+
+            def quit(self):
+                pass
+
+        bus_calls = []
+
+        class FakeConnection:
+            def call_sync(self, bus_name, path, iface, method, *args):
+                bus_calls.append(method)
+                return (1,)
+
+        connection = FakeConnection()
+        with mock.patch.object(dbus_service.os, "geteuid", return_value=0), \
+                mock.patch.object(
+                    dbus_service.Gio, "bus_get_sync", return_value=connection), \
+                mock.patch.object(
+                    dbus_service, "UpdateDBusService", FakeService), \
+                mock.patch.object(
+                    dbus_service.GLib, "MainLoop", return_value=FakeLoop()), \
+                mock.patch.object(
+                    dbus_service.GLib, "unix_signal_add", return_value=1):
+            dbus_service.main()
+
+        self.assertEqual(starts, [])
+        self.assertEqual(bus_calls[0], "RequestName")
+        self.assertEqual(bus_calls[-1], "ReleaseName")
 
 
 if __name__ == "__main__":

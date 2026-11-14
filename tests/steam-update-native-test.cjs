@@ -311,6 +311,50 @@ test('late client restart evidence after awaiting status authorizes explicit res
   assert.deepEqual(h.data.calls.restart, [false]);
 });
 
+test('accepted client restart evidence survives a later absent native read', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  assert.equal((await adapter.apply()).state, 'restart_required');
+
+  h.data.apply = null;
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  assert.equal(snap.busy, false);
+  await assert.rejects(adapter.check(), /pending client restart/);
+  await assert.rejects(adapter.apply(), /pending client restart/);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('accepted client restart evidence survives a throwing native read', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  h.data.applyImpl = () => {
+    h.data.apply.requires_client_restart = true;
+    return h.data.applyReturn;
+  };
+  assert.equal((await adapter.apply()).state, 'restart_required');
+
+  h.UpdateStore.m_updater.GetApplyResult = () => {
+    throw new Error('native read failed');
+  };
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  assert.equal(snap.busy, false);
+  await assert.rejects(adapter.check(), /pending client restart/);
+  await assert.rejects(adapter.apply(), /pending client restart/);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
 test('restartClient directly reconciles late client restart evidence', async () => {
   const h = host();
   const adapter = createAdapter(h);
@@ -341,17 +385,77 @@ test('accepted apply with unpublished status awaits and later restart evidence s
   const snap = await adapter.apply();
   assert.equal(snap.state, 'awaiting_status');
   assert.equal(snap.error, null);
-  assert.equal(snap.busy, false);
+  assert.equal(snap.busy, true);
   assert.equal(snap.requiresClientRestart, false);
   assert.equal(snap.requiresReboot, false);
   assert.deepEqual(h.data.calls.restart, []);
-  await assert.rejects(adapter.apply(), /required/);
+  await assert.rejects(adapter.apply(), /awaiting|required/);
   assert.equal(h.data.calls.apply.length, 1);
 
   h.data.apply = { type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false };
   assert.equal(adapter.snapshot().state, 'restart_required');
   await adapter.restartClient();
   assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('awaiting unpublished apply blocks check and apply until late restart evidence permits explicit restart', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  const checksBefore = h.data.calls.check;
+  const awaiting = await adapter.apply();
+  assert.equal(awaiting.state, 'awaiting_status');
+  assert.equal(awaiting.busy, true);
+  assert.equal(awaiting.requiresClientRestart, false);
+  assert.equal(h.data.calls.apply.length, 1);
+
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  assert.equal(h.data.calls.check, checksBefore);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  assert.deepEqual(h.data.calls.restart, []);
+
+  h.data.apply = { type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false };
+  const ready = adapter.snapshot();
+  assert.equal(ready.state, 'restart_required');
+  assert.equal(ready.busy, false);
+  assert.equal(ready.requiresClientRestart, true);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('late completed nonrestart apply settles awaiting and unblocks an explicit check', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+  h.data.apply = { type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false };
+  const settled = adapter.snapshot();
+  assert.equal(settled.state, 'up_to_date');
+  assert.equal(settled.busy, false);
+  assert.equal(settled.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+  const snap = await adapter.check();
+  assert.equal(snap.state, 'available');
+  assert.equal(snap.busy, false);
+});
+
+test('unchanged false apply result stays awaiting and never authorizes restart', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
 });
 
 test('accepted apply with unpublished status awaits, so a late rejection is still shown', async () => {
@@ -383,6 +487,51 @@ test('explicit native apply failure ignores later successful client restart evid
   assert.deepEqual(h.data.calls.restart, []);
 });
 
+test('explicit apply rejection ignores later stale native restart evidence and can retry', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  h.data.applyReturn = { result: 2, message: 'disk full' };
+  h.data.applyImpl = () => h.data.applyReturn;
+  const rejected = await adapter.apply();
+  assert.equal(rejected.state, 'failed');
+  assert.match(rejected.error, /disk full/);
+  assert.equal(rejected.requiresClientRestart, false);
+
+  // A native restart flag shows up afterwards; it is stale evidence for a
+  // failed apply and must never authorize a restart or keep blocking.
+  h.data.apply.requires_client_restart = true;
+  assert.equal(h.data.apply.requires_client_restart, true);
+  assert.equal(adapter.snapshot().state, 'failed');
+  assert.equal(adapter.snapshot().requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  // The same stale flag is still published, yet a retry check must succeed.
+  h.data.checkImpl = () => {
+    h.data.check = {
+      type: 1, eresult: 1, available: true,
+      rtime_checked: h.data.check.rtime_checked + 1
+    };
+    return { result: 1, message: '' };
+  };
+  const checked = await adapter.check();
+  assert.equal(checked.state, 'available');
+  assert.equal(checked.requiresClientRestart, false);
+
+  // A retry apply may proceed after that available check.
+  h.data.applyImpl = null;
+  h.data.applyReturn = { result: 1, message: '' };
+  assert.equal(h.data.apply.requires_client_restart, true);
+  const applied = await adapter.apply();
+  assert.equal(h.data.calls.check, 2);
+  assert.equal(h.data.calls.apply.length, 2);
+  assert.equal(applied.state, 'awaiting_status');
+  assert.equal(applied.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
 test('late OS-only restart evidence leaves awaiting status unchanged', async () => {
   const h = host();
   const adapter = createAdapter(h);
@@ -411,4 +560,290 @@ test('malformed check timestamps cannot authorize snapshot or apply', async () =
     await assert.rejects(adapter.apply(), /required/);
     assert.equal(h.data.calls.apply.length, 0);
   }
+});
+
+test('an equivalent cloned historical apply result is not new evidence', async () => {
+  const h = host();
+  const cloned = () => (h.data.apply ? Object.assign({}, h.data.apply) : null);
+  h.UpdateStore.m_updater.GetApplyResult = (type) =>
+    type === 1 ? cloned() : { type, eresult: 2 };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('identical values republished after an observed gap are accepted as new evidence', async () => {
+  const h = host();
+  h.UpdateStore.m_updater.GetApplyResult = (type) =>
+    type === 1 ? (h.data.apply ? Object.assign({}, h.data.apply) : null) : { type, eresult: 2 };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  h.data.apply = null;
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  const settled = adapter.snapshot();
+  assert.equal(settled.state, 'up_to_date');
+  assert.equal(settled.busy, false);
+  assert.equal(settled.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('an unknown baseline refuses the apply before any native side effect', async () => {
+  const h = host();
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    throw new Error('native read failed');
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'available');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.equal(snap.error, null);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('a retry after a readable baseline settles from one stable terminal publication', async () => {
+  const h = host();
+  h.data.apply = null;
+  const readable = h.UpdateStore.m_updater.GetApplyResult;
+  let failBaseline = true;
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type === 1 && failBaseline) throw new Error('native read failed');
+    return readable(type);
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+
+  // The retry observes an explicit absence as its baseline, so the first
+  // stable terminal publication after the accepted apply is fresh evidence.
+  failBaseline = false;
+  h.data.applyImpl = () => {
+    h.data.apply = {
+      type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+    };
+    return h.data.applyReturn;
+  };
+  const snap = await adapter.apply();
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.equal(snap.state, 'up_to_date');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('a failed apply-result read is unknown, not an observed gap', async () => {
+  const h = host();
+  const historical = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  h.data.apply = historical;
+  let mode = 'result';
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    if (mode === 'throw') throw new Error('native read failed');
+    if (mode === 'reject')
+      return {
+        type: 1, eresult: 2,
+        requires_client_restart: false, requires_system_restart: false
+      };
+    return Object.assign({}, historical);
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  // A throw proves nothing, so the unchanged historical value that follows
+  // must still not count as fresh.
+  mode = 'throw';
+  assert.equal(adapter.snapshot().state, 'awaiting_status');
+  mode = 'result';
+  const unchanged = adapter.snapshot();
+  assert.equal(unchanged.state, 'awaiting_status');
+  assert.equal(unchanged.busy, true);
+
+  // A real change after the failed read is fresh and surfaces the rejection.
+  mode = 'reject';
+  const failed = adapter.snapshot();
+  assert.equal(failed.state, 'failed');
+  assert.match(failed.error, /Client apply failed \(2\)/);
+  assert.equal(failed.requiresClientRestart, false);
+});
+
+test('an unreadable baseline is refused even when an old rejection is published', async () => {
+  const h = host();
+  let mode = 'result';
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    if (mode === 'throw') throw new Error('native read failed');
+    return {
+      type: 1, eresult: 2,
+      requires_client_restart: false, requires_system_restart: false
+    };
+  };
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  // No comparison point exists, so the pre-apply publication cannot be
+  // attributed; refusing keeps a late rejection from being mistaken for the
+  // outcome of an apply that never started.
+  mode = 'throw';
+  await assert.rejects(adapter.apply(), /baseline is unknown/);
+  assert.equal(h.data.calls.apply.length, 0);
+  assert.equal(adapter.snapshot().state, 'available');
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('failed refresh while a client apply awaits preserves awaiting status and its error', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  assert.equal((await adapter.apply()).state, 'awaiting_status');
+
+  h.data.infoError = new Error('system info unavailable');
+  const snap = await adapter.refresh();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.match(snap.error, /system info unavailable/);
+  await assert.rejects(adapter.check(), /awaiting/);
+  assert.equal(h.data.calls.apply.length, 1);
+  assert.deepEqual(h.data.calls.restart, []);
+
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
+  };
+  const ready = adapter.snapshot();
+  assert.equal(ready.state, 'restart_required');
+  assert.equal(ready.requiresClientRestart, true);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
+});
+
+test('malformed refresh while a client apply awaits does not destroy awaiting status', async () => {
+  const h = host();
+  h.data.apply = null;
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+
+  h.data.info = { nSteamVersion: 0 };
+  const snap = await adapter.refresh();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.match(snap.error, /Malformed Steam version/);
+});
+
+test('late OS-only apply evidence keeps awaiting busy and blocks new checks', async () => {
+  const h = host();
+  const adapter = createAdapter(h);
+  await adapter.check();
+  await adapter.apply();
+
+  h.data.apply.requires_system_restart = true;
+  const snap = adapter.snapshot();
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresReboot, false);
+  await assert.rejects(adapter.check(), /awaiting/);
+  await assert.rejects(adapter.apply(), /awaiting/);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('an absence observed during a pending apply lets the same value count after completion', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  // The native result disappears while ApplyUpdate is still in flight.
+  h.data.apply = null;
+  assert.equal(adapter.snapshot().state, 'applying');
+  // Identical to the recorded baseline: only the observed gap can make it
+  // fresh evidence after the apply completes.
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: false, requires_system_restart: false
+  };
+  gate.resolve();
+
+  const snap = await pending;
+  assert.equal(snap.state, 'up_to_date');
+  assert.equal(snap.busy, false);
+  assert.equal(snap.requiresClientRestart, false);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('an unknown read during a pending apply is not an observed gap', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  const readable = h.UpdateStore.m_updater.GetApplyResult;
+  h.UpdateStore.m_updater.GetApplyResult = (type) => {
+    if (type !== 1) return { type, eresult: 2 };
+    throw new Error('native read failed');
+  };
+  assert.equal(adapter.snapshot().state, 'applying');
+  h.UpdateStore.m_updater.GetApplyResult = readable;
+  gate.resolve();
+
+  // A throw proves nothing, so the unchanged baseline value that follows is
+  // still not new evidence.
+  const snap = await pending;
+  assert.equal(snap.state, 'awaiting_status');
+  assert.equal(snap.busy, true);
+  assert.equal(snap.requiresClientRestart, false);
+  await assert.rejects(adapter.restartClient(), /restart evidence/);
+  assert.deepEqual(h.data.calls.restart, []);
+});
+
+test('changed evidence during a pending apply is not consumed and still surfaces after completion', async () => {
+  const h = host();
+  const gate = deferred();
+  h.data.applyImpl = () => gate.promise.then(() => h.data.applyReturn);
+  const adapter = createAdapter(h);
+  await adapter.check();
+
+  const pending = adapter.apply();
+  h.data.apply = {
+    type: 1, eresult: 1, requires_client_restart: true, requires_system_restart: false
+  };
+  // Mid-call evidence must not advance the baseline token.
+  assert.equal(adapter.snapshot().state, 'applying');
+  gate.resolve();
+
+  const snap = await pending;
+  assert.equal(snap.state, 'restart_required');
+  assert.equal(snap.requiresClientRestart, true);
+  await adapter.restartClient();
+  assert.deepEqual(h.data.calls.restart, [false]);
 });

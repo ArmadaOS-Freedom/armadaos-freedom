@@ -8,7 +8,10 @@ No Decky dependency; runs as an unprivileged user process.
 
 Every newly opened websocket is accepted only when the connected loopback peer
 is an established socket owned by this non-root user, as recorded in the
-network namespace's /proc tcp and tcp6 tables.
+network namespace's /proc tcp and tcp6 tables. On top of that same-uid peer
+check, the bridge refuses to run unless the root-installed nftables guard that
+keeps other local users away from TCP port 8080 is proven installed for this
+EUID.
 """
 
 from collections import OrderedDict
@@ -18,6 +21,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import sys
 import threading
 import urllib.parse
@@ -32,6 +36,16 @@ JS_BASE = "/usr/share/armada/steam-updates"
 JS_FILES = ("native-client.js", "page.js")
 PROC_NET_DIR = "/proc/self/net"
 NET_TABLE_MAX_BYTES = 1024 * 1024
+# Root-installed readiness proof and the policy identity it must name. The
+# proof directory and file are root-owned, so an unprivileged user cannot forge
+# them; the bridge only trusts the file when it still matches this boot.
+GUARD_PROOF_PATH = "/run/armada-steam-guard/ready"
+GUARD_PROOF_MAX_BYTES = 4096
+GUARD_PROOF_VERSION = "1"
+GUARD_PROOF_NAME = "armada-steam-bridge-guard"
+GUARD_PROOF_TABLE = "inet armada_steam_guard"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+BOOT_ID_RE = re.compile(r"^[0-9a-fA-F-]{1,64}$")
 TCP_ESTABLISHED = "01"
 BINDING_NAME = "__armadaUpdatesRequest"
 BINDING_EVENT = "Runtime.bindingCalled"
@@ -586,11 +600,110 @@ def _default_ws_factory(ws_url):
     return factory
 
 
+def _boot_id():
+    """Return the current kernel boot id used to expire a stale guard proof."""
+    try:
+        with open(BOOT_ID_PATH, "r", encoding="ascii") as handle:
+            value = handle.read(128).strip()
+    except OSError as exc:
+        raise BridgeError("boot id unavailable: %s" % exc)
+    if not BOOT_ID_RE.fullmatch(value):
+        raise BridgeError("malformed boot id")
+    return value.lower()
+
+
+def _read_guard_proof(path):
+    """Read a root-authored proof without following symlinks.
+
+    Trust rests on kernel-enforced filesystem ownership: the file must be a
+    regular root-owned file that no other user can write. A same-uid user can
+    read it, but cannot replace it, so readiness cannot be spoofed.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise BridgeError("guard proof unavailable: %s" % exc)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise BridgeError("guard proof is not a regular file")
+        if info.st_uid != 0:
+            raise BridgeError("guard proof is not owned by root")
+        if info.st_mode & 0o022:
+            raise BridgeError("guard proof is writable by non-root")
+        data = os.read(fd, GUARD_PROOF_MAX_BYTES + 1)
+    except OSError as exc:
+        raise BridgeError("guard proof unreadable: %s" % exc)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if len(data) > GUARD_PROOF_MAX_BYTES:
+        raise BridgeError("guard proof too large")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise BridgeError("guard proof is not UTF-8")
+    fields = {}
+    for line in text.splitlines():
+        if not line or "=" not in line:
+            raise BridgeError("malformed guard proof line")
+        key, value = line.split("=", 1)
+        if key in fields or not re.fullmatch(r"[a-z_]+", key):
+            raise BridgeError("malformed guard proof field")
+        fields[key] = value
+    return fields
+
+
+def _verify_guard(euid, path=GUARD_PROOF_PATH):
+    """Require a root-owned proof that the loopback guard matches this EUID.
+
+    The guard rejects loopback connections to TCP 8080 from every UID except
+    root and the shipped game user. The bridge runs as that game user, so a
+    proof naming a different uid means the kernel policy is not aimed at this
+    process and the bridge must stay disabled.
+    """
+    if not isinstance(euid, int) or euid <= 0:
+        raise BridgeError("guard verification requires a non-root uid")
+    parent = os.path.dirname(path)
+    try:
+        parent_info = os.lstat(parent)
+    except OSError as exc:
+        raise BridgeError("guard directory unavailable: %s" % exc)
+    if not stat.S_ISDIR(parent_info.st_mode):
+        raise BridgeError("guard directory is not a directory")
+    if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
+        raise BridgeError("guard directory is not root-only")
+    fields = _read_guard_proof(path)
+    if set(fields) != {"version", "guard", "table", "game_uid", "boot_id"}:
+        raise BridgeError("guard proof fields do not match")
+    if (fields["version"] != GUARD_PROOF_VERSION
+            or fields["guard"] != GUARD_PROOF_NAME
+            or fields["table"] != GUARD_PROOF_TABLE):
+        raise BridgeError("guard proof has an unexpected identity")
+    try:
+        proof_uid = int(fields["game_uid"])
+    except ValueError:
+        raise BridgeError("guard proof has a malformed game uid")
+    if proof_uid != euid:
+        raise BridgeError("guard is installed for a different uid")
+    if fields["boot_id"].lower() != _boot_id():
+        raise BridgeError("guard proof is from a previous boot")
+
+
 def main(argv=None):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     if os.geteuid() == 0:
         log.error("refusing to run as root")
+        return 1
+    try:
+        _verify_guard(os.geteuid())
+    except BridgeError as exc:
+        log.error("system guard is not established (%s); "
+                  "disabling the Steam update bridge", exc)
         return 1
     for path in (os.path.join(JS_BASE, name) for name in JS_FILES):
         if not os.path.isfile(path):
@@ -611,6 +724,12 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
+        try:
+            _verify_guard(os.geteuid())
+        except BridgeError as exc:
+            log.error("system guard is no longer established (%s); "
+                      "stopping the Steam update bridge", exc)
+            return 1
         try:
             _target_id, ws_url = discover_target()
             connection = SteamConnection(_default_ws_factory(ws_url), client,

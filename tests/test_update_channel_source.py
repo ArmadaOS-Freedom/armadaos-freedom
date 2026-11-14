@@ -3,6 +3,7 @@
 Real cryptographic signing/verification; only the HTTP opener is replaced.
 """
 
+import errno
 import io
 import json
 import sys
@@ -10,6 +11,8 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from socket import SHUT_RDWR
+from threading import Event
 from types import SimpleNamespace
 from unittest import mock
 from urllib.error import URLError
@@ -54,9 +57,49 @@ class FakeSocket:
 
     def __init__(self):
         self.timeouts = []
+        self.shutdowns = []
+        self.closed = False
 
     def settimeout(self, value):
+        if self.closed:
+            raise OSError(errno.EBADF, "Bad file descriptor")
         self.timeouts.append(value)
+
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+        if self.closed:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+    def close(self):
+        self.closed = True
+
+
+class FakeTimer:
+    """Inert stand-in for the per-response cancellation timer.
+
+    ``start`` only records the intent; ``fire`` runs the expiry callback
+    synchronously at the point a test chooses, so no thread is scheduled.
+    """
+
+    def __init__(self, interval, action):
+        self.interval = interval
+        self.action = action
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        self.joined = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def join(self):
+        self.joined = True
+
+    def fire(self):
+        self.action()
 
 
 class FakeResponse:
@@ -76,6 +119,7 @@ class FakeResponse:
         self._closed = closed
         self._chunk = chunk
         self._on_read = on_read
+        self._sock = sock
         self.fp = (
             SimpleNamespace(raw=SimpleNamespace(_sock=sock))
             if sock is not None
@@ -121,6 +165,56 @@ class FakeResponse:
     def __exit__(self, *exc):
         self.close()
         return False
+
+
+class CloseAfterFinalReadResponse(FakeResponse):
+    """Fixed-length body whose last data read closes fp and its socket.
+
+    ``http.client`` can call ``_close_conn()`` from inside a ``read1`` that
+    still returns the final body bytes, which unsets ``response.fp`` and
+    closes the descriptor while those bytes are already handed back. This
+    mock reproduces that ordering with an in-memory body only.
+    """
+
+    def read1(self, n=-1):
+        data = super().read1(n)
+        if data and self._buf.tell() >= len(self._buf.getvalue()):
+            self.fp = None
+            if self._sock is not None:
+                self._sock.close()
+        return data
+
+
+class ShutdownReleasesReadSocket(FakeSocket):
+    """Fake socket whose shutdown releases a blocked body read."""
+
+    def __init__(self):
+        super().__init__()
+        self.released = Event()
+
+    def shutdown(self, how):
+        super().shutdown(how)
+        self.released.set()
+
+
+class BlockedBodyResponse(FakeResponse):
+    """Body read that only completes once the socket is shut down.
+
+    The read fires the fake timer first, then waits for the fake socket's
+    shutdown to release it and returns EOF, mirroring a real blocked
+    ``read1`` that a deadline shutdown unblocks.
+    """
+
+    def __init__(self, url, sock, timers):
+        super().__init__(b"", url, sock=sock)
+        self._timers = timers
+
+    def read1(self, n=-1):
+        self._record(n)
+        self._timers[-1].fire()
+        if not self._sock.released.wait(1):
+            raise AssertionError("socket shutdown did not release the read")
+        return b""
 
 
 class FakeOpener:
@@ -188,9 +282,17 @@ class ChannelSourceTests(unittest.TestCase):
     def setUp(self):
         self.opener = FakeOpener(dict(self.base_routes))
         self.clock = FakeClock()
+        self.timers = []
+
+        def make_timer(interval, action):
+            timer = FakeTimer(interval, action)
+            self.timers.append(timer)
+            return timer
+
         patchers = (
             mock.patch("updates.channel_source.build_opener", return_value=self.opener),
             mock.patch("updates.channel_source.monotonic", new=self.clock),
+            mock.patch("updates.channel_source.Timer", new=make_timer),
         )
         for patcher in patchers:
             patcher.start()
@@ -374,6 +476,25 @@ class ChannelSourceTests(unittest.TestCase):
             all(a > b for a, b in zip(sock.timeouts, sock.timeouts[1:]))
         )
 
+    def test_socket_closed_by_final_read_still_returns_whole_body(self):
+        # The last read hands back the remaining bytes and closes the body
+        # socket, so response.fp is gone by the next iteration. The loop must
+        # look the socket up again and skip settimeout on the closed object
+        # instead of failing an otherwise complete fetch with EBADF.
+        sock = FakeSocket()
+        body = b"payload"
+        response = CloseAfterFinalReadResponse(
+            body, CH_URL, chunk=len(body), sock=sock,
+            on_read=lambda _response: self.clock.advance(0.5),
+        )
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 64, 5), body)
+        self.assertTrue(sock.closed)
+        self.assertIsNone(response.fp)
+        self.assertEqual(response.bytes_read, len(body))
+        self.assertEqual(len(sock.timeouts), 1)
+        self.assertAlmostEqual(sock.timeouts[0], 5.0)
+
     def test_chunked_reads_progress_before_deadline_and_respect_cap(self):
         body = b"z" * 40
         response = FakeResponse(
@@ -386,6 +507,112 @@ class ChannelSourceTests(unittest.TestCase):
         self.assertEqual(response.bytes_read, len(body))
         self.assertTrue(response.read_sizes)
         self.assertTrue(all(0 < size <= _READ_SIZE for size in response.read_sizes))
+
+    def test_blocked_body_read_is_released_by_deadline_shutdown(self):
+        # A read can be stuck inside several framing chunks and never reach
+        # the between-read check; the timer must shut the socket down and
+        # the resulting EOF must fail closed as a timeout.
+        sock = ShutdownReleasesReadSocket()
+        response = BlockedBodyResponse(CH_URL, sock, self.timers)
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "timed out after 5 seconds"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertEqual(sock.shutdowns, [SHUT_RDWR])
+        self.assertTrue(sock.released.is_set())
+        self.assertTrue(response.closed)
+        self.assertEqual(len(self.timers), 1)
+        timer = self.timers[0]
+        self.assertEqual(timer.interval, 5.0)
+        self.assertTrue(timer.daemon)
+        self.assertTrue(timer.cancelled)
+        self.assertTrue(timer.joined)
+
+    def test_shutdown_unblocked_read_error_fails_closed_as_timeout(self):
+        # Shutdown can unblock a read with an error instead of EOF; that
+        # must still be a timeout, not a generic transport failure.
+        sock = FakeSocket()
+
+        def expire_and_fail(_response):
+            self.timers[-1].fire()
+            raise OSError(errno.ECONNRESET, "reset")
+
+        response = FakeResponse(
+            b"abc", CH_URL, chunk=1, sock=sock, on_read=expire_and_fail
+        )
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "timed out after 5 seconds"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertEqual(sock.shutdowns, [SHUT_RDWR])
+        self.assertTrue(response.closed)
+        self.assertTrue(self.timers[0].cancelled)
+        self.assertTrue(self.timers[0].joined)
+
+    def test_shutdown_of_already_closed_socket_is_ignored(self):
+        # http.client may close the socket from inside read1. shutdown on
+        # the invalidated object raises EBADF and must be swallowed while
+        # the fetch still fails closed.
+        sock = FakeSocket()
+
+        def close_then_expire(_response):
+            sock.close()
+            self.timers[-1].fire()
+
+        response = FakeResponse(
+            b"abc", CH_URL, chunk=1, sock=sock, on_read=close_then_expire
+        )
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "timed out after 5 seconds"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertEqual(sock.shutdowns, [SHUT_RDWR])
+        self.assertTrue(response.closed)
+        self.assertTrue(self.timers[0].cancelled)
+        self.assertTrue(self.timers[0].joined)
+
+    def test_timer_is_stopped_after_fast_completion(self):
+        sock = FakeSocket()
+        response = FakeResponse(b"abc", CH_URL, chunk=3, sock=sock)
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 64, 5), b"abc")
+        self.assertTrue(response.closed)
+        self.assertEqual(sock.shutdowns, [])
+        self.assertEqual(len(self.timers), 1)
+        timer = self.timers[0]
+        self.assertEqual(timer.interval, 5.0)
+        self.assertTrue(timer.daemon)
+        self.assertTrue(timer.cancelled)
+        self.assertTrue(timer.joined)
+
+    def test_timer_is_stopped_when_cap_is_exceeded(self):
+        sock = FakeSocket()
+        response = FakeResponse(b"x" * 8, CH_URL, chunk=8, sock=sock)
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "exceeds 4 bytes"):
+            _fetch_bytes(CH_URL, 4, 5)
+        self.assertEqual(sock.shutdowns, [])
+        self.assertTrue(self.timers[0].cancelled)
+        self.assertTrue(self.timers[0].joined)
+
+    def test_timer_is_stopped_when_body_read_raises(self):
+        class BrokenReadResponse(FakeResponse):
+            def read1(self, n=-1):
+                self._record(n)
+                raise OSError(errno.ECONNRESET, "reset")
+
+        sock = FakeSocket()
+        response = BrokenReadResponse(b"", CH_URL, sock=sock)
+        self.opener.routes[CH_URL] = response
+        with self.assertRaisesRegex(CatalogError, "failed to fetch"):
+            _fetch_bytes(CH_URL, 64, 5)
+        self.assertEqual(sock.shutdowns, [])
+        self.assertTrue(self.timers[0].cancelled)
+        self.assertTrue(self.timers[0].joined)
+
+    def test_mocked_transport_without_socket_arms_no_timer(self):
+        response = FakeResponse(b"abc", CH_URL, chunk=3)
+        self.opener.routes[CH_URL] = response
+        self.assertEqual(_fetch_bytes(CH_URL, 64, 5), b"abc")
+        self.assertEqual(self.timers, [])
+        self.assertTrue(response.closed)
 
 
 if __name__ == "__main__":

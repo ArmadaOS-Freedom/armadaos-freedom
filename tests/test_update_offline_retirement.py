@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -459,37 +460,40 @@ class OfflineRetirementTest(unittest.TestCase):
         self.assert_preserved(snapshot)
 
     def test_unconfirmed_or_foreign_journal_is_retained(self):
-        for name, record in (
-            ("trial", make_record(state=trial_record.TRIAL)),
-            ("online", make_record(policy=trial_record.ONLINE_SINGLE)),
+        for name, changes in (
+            ("trial", {"state": trial_record.TRIAL}),
+            ("online", {"policy": trial_record.ONLINE_SINGLE}),
         ):
             with self.subTest(case=name):
                 self.fresh()
+                record = replace(self.record, **changes)
                 self.assertFalse(self.retire(record=record))
                 self.assert_retained()
 
     def test_record_identity_mismatches_are_refused(self):
         cases = (
-            ("other transaction", make_record(
-                transaction_uuid=uuid.UUID(OTHER_TX).bytes)),
-            ("other plan", make_record(plan_sha256=bytes.fromhex("77" * 32))),
-            ("other deployment", make_record(new_serial=3)),
-            ("other installation", make_record(
-                installation_uuid=uuid.UUID(
-                    "55555555-5555-4555-8555-555555555555").bytes)),
-            ("other partition", make_record(
-                partition_uuid=uuid.UUID(
-                    "66666666-6666-4666-8666-666666666666").bytes)),
-            ("other slots", make_record(from_slot=1, target_slot=0)),
+            ("other transaction",
+             {"transaction_uuid": uuid.UUID(OTHER_TX).bytes}),
+            ("other plan", {"plan_sha256": bytes.fromhex("77" * 32)}),
+            ("other deployment", {"new_serial": 3}),
+            ("other installation",
+             {"installation_uuid": uuid.UUID(
+                 "55555555-5555-4555-8555-555555555555").bytes}),
+            ("other partition",
+             {"partition_uuid": uuid.UUID(
+                 "66666666-6666-4666-8666-666666666666").bytes}),
+            ("other slots", {"from_slot": 1, "target_slot": 0}),
         )
-        for name, record in cases:
+        for name, changes in cases:
             with self.subTest(case=name):
                 self.fresh()
+                record = replace(self.record, **changes)
                 self.assertFalse(self.retire(record=record))
                 self.assert_retained()
 
     def test_receipt_and_pointer_must_describe_this_execute(self):
-        for state in ("execute_queued", "executing", "failed", "prepared"):
+        for state in ("execute_queued", "preparing", "dispatch_uncertain",
+                      "failed", "prepared"):
             with self.subTest(receipt=state):
                 self.fresh()
                 receipt = json.loads(
@@ -498,6 +502,12 @@ class OfflineRetirementTest(unittest.TestCase):
                 self._write_json(self.session, "receipt.json", receipt)
                 self.assertFalse(self.retire())
                 self.assert_retained()
+        self.fresh()
+        receipt = json.loads((self.session / "receipt.json").read_text())
+        receipt.update(state="executing", jobOperation="prepare")
+        self._write_json(self.session, "receipt.json", receipt)
+        self.assertFalse(self.retire())
+        self.assert_retained()
         for pointer in (
             {"schemaVersion": 1, "transactionId": OTHER_TX, "sessionId": SESSION},
             {"schemaVersion": 1, "transactionId": TX, "sessionId": SESSION,
@@ -508,6 +518,52 @@ class OfflineRetirementTest(unittest.TestCase):
                 self.fresh()
                 self._write_json(
                     self.base / "pending", TX + ".json", pointer)
+                self.assertFalse(self.retire())
+                self.assert_retained()
+
+    def _set_receipt_state(self, state):
+        receipt = json.loads((self.session / "receipt.json").read_text())
+        receipt["state"] = state
+        self._write_json(self.session, "receipt.json", receipt)
+
+    def test_stale_executing_receipt_after_physical_confirmation_is_retired(self):
+        # A power cut between the transaction status save and the receipt
+        # update leaves the receipt at executing even though the confirmed
+        # journal makes the terminal documents final.
+        self._set_receipt_state("executing")
+        snapshot = self.preserve()
+
+        self.assertTrue(self.retire())
+
+        for name in BULKY_FILES:
+            self.assertFalse((self.transaction / name).exists(), name)
+        self.assertFalse(self.payload.exists())
+        for name in TREES:
+            self.assertTrue((self.transaction / name).is_dir(), name)
+        for name in KEPT_FILES:
+            self.assertTrue((self.transaction / name).is_file(), name)
+        # Retirement never rewrites the receipt; the jobs path repairs it.
+        self.assert_preserved(snapshot)
+
+    def test_stale_executing_receipt_with_incomplete_evidence_is_retained(self):
+        def unfinished_status(transaction):
+            status = json.loads((transaction / "status.json").read_text())
+            status.update(state="writing_boot", phase="writing_boot",
+                          bootWriteState="writing", requiresReboot=False)
+            self._write_json(transaction, "status.json", status)
+
+        cases = (
+            ("missing write report",
+             lambda transaction: (transaction / "write-report.json").unlink()),
+            ("unfinished status", unfinished_status),
+            ("missing acknowledgement",
+             lambda transaction: (self.session / "ack.json").unlink()),
+        )
+        for name, tamper in cases:
+            with self.subTest(case=name):
+                self.fresh()
+                self._set_receipt_state("executing")
+                tamper(self.transaction)
                 self.assertFalse(self.retire())
                 self.assert_retained()
 
