@@ -177,7 +177,20 @@ assert_no_target beta \
 )
 
 UPDATE="$ROOT/system_files/usr/libexec/armada/armada-update"
-grep -Fq 'if armada_steam_channels_apply "$repository" "$desired"; then' "$UPDATE"
+LEGACY_CLI="$ROOT/system_files/usr/lib/armada/updates/legacy_cli.py"
+# The shipped entrypoint is a thin launcher that delegates the legacy update
+# protocol to the Python compatibility CLI. The retired shell implementation
+# and its channel-selection branch must not come back.
+if grep -Fq 'armada_steam_channels_apply' "$UPDATE"; then
+    echo "armada-update still contains the retired shell implementation" >&2
+    exit 1
+fi
+grep -Fq 'export PYTHONPATH=/usr/lib/armada' "$UPDATE"
+grep -Fq 'exec /usr/bin/python3 -m updates.legacy_cli "$@"' "$UPDATE"
+if [[ ! -f "$LEGACY_CLI" ]]; then
+    echo "delegated update module is missing: $LEGACY_CLI" >&2
+    exit 1
+fi
 
 python3 - "$ROOT" <<'PY'
 import json
