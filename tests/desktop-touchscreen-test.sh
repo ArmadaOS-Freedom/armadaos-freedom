@@ -11,9 +11,18 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BOOTSTRAP="$ROOT/system_files/usr/libexec/armada/desktop-bootstrap"
 LIB="$ROOT/system_files/usr/lib/armada/desktop-bootstrap-lib"
 DEVICE_ENV="$ROOT/system_files/usr/libexec/armada/device-env"
-DEVICES_DIR="$ROOT/system_files/usr/lib/armada/devices"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
+
+# device-env reads defaults.conf and the selected profile from one directory.
+# Assemble the shipped profiles and overlay the canonical FreedomControl
+# profile, which the image takes from the plugin source rather than the base
+# device tree.
+DEVICES_DIR="$TEST_ROOT/devices"
+mkdir -p "$DEVICES_DIR"
+cp "$ROOT"/system_files/usr/lib/armada/devices/*.conf "$DEVICES_DIR"/
+cp "$ROOT"/decky/freedom-control/system_files/usr/lib/armada/devices/lenovo-tb323fu.conf \
+    "$DEVICES_DIR"/
 
 IDENTITY_CALIBRATION='1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1'
 TOUCHSCREEN='NVTCapacitiveTouchScreen'
@@ -36,7 +45,7 @@ assert_contains() {
     fi
 }
 
-# Runs the real device-env against the repository profiles and prints one
+# Runs the real device-env against the assembled profiles and prints one
 # emitted variable value. device-env formats every value with printf %q, so the
 # selected value is decoded by a trusted Bash evaluation of that escaped text
 # (an empty value arrives as '' and must decode back to empty). A variable that
