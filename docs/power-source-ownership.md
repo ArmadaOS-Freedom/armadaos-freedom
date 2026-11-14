@@ -31,4 +31,8 @@ suite. This image does not install those copies; they are test fixtures or
 legacy copies and are not authoritative.
 
 Tests that exercise power behaviour load `armada-powerd` from the control
-submodule, so they check the daemon the image actually installs.
+submodule. The image workflows run the infinity scheduler test after
+`build_files/resolve-plugin-sources.py`, which checks the submodule out at the
+latest `main` commit, so it checks the daemon the image actually copies. A
+developer checkout still sits at the recorded gitlink, so run the resolver
+before relying on a local result.
