@@ -1252,25 +1252,20 @@ class ReleaseBindingTest(unittest.TestCase):
 
 
 class WorkflowConsistencyTest(unittest.TestCase):
-    def test_edl_package_workflow_builds_two_signed_variants(self):
+    def test_edl_package_workflow_builds_one_universal_signed_package(self):
         text = (ROOT / ".github/workflows/build-edl-package.yml").read_text(
             encoding="utf-8")
-        # Both variants must run even if one fails, each on its own runner.
-        self.assertIn("fail-fast: false", text)
-        self.assertIn("matrix:", text)
-        self.assertIn("variant: release", text)
-        self.assertIn("variant: install", text)
-        self.assertIn("artifact: edl-package", text)
-        self.assertIn("artifact: edl-install-package", text)
-        self.assertIn("name: ${{ matrix.artifact }}-${{ github.run_id }}", text)
-        self.assertIn(
-            "group: edl-package-${{ matrix.variant }}-${{ github.ref }}", text)
-        # The selected profile and the expected operation set travel with the
-        # variant; the signing step signs and verifies once per runner.
-        self.assertIn("EDL_PACKAGE_PROFILE: ${{ matrix.profile }}", text)
-        self.assertIn("EXPECT_OFFLINE_UPGRADE: ${{ matrix.offline_upgrade }}", text)
+        # One universal job replaces the release/install matrix.
+        self.assertNotIn("matrix:", text)
+        self.assertNotIn("fail-fast", text)
+        self.assertNotIn("edl-install-package", text)
+        self.assertIn("name: edl-package-${{ github.run_id }}", text)
+        self.assertIn("group: edl-package", text)
+        self.assertNotIn("matrix.variant", text)
+        # The one signed descriptor must cover every model and upgrade.
         self.assertEqual(text.count("cosign sign-blob"), 1)
-        self.assertIn("the signed descriptor is not the expected", text)
+        self.assertIn("offline-upgrade", text)
+        self.assertIn("supportedModels", text)
 
     def test_publication_workflow_uses_the_package_artifact(self):
         text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
@@ -1523,15 +1518,15 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("`gh release edit --draft=false` paths", english)
         self.assertIn("两个公开草稿的 `gh release edit --draft=false` 路径", chinese)
 
-    def test_docs_distinguish_release_and_install_only_artifacts(self):
+    def test_docs_describe_one_universal_package_artifact(self):
         english = (ROOT / "docs/edl-package.md").read_text(encoding="utf-8")
         chinese = (ROOT / "docs/edl-package.zh-CN.md").read_text(encoding="utf-8")
         for text in (english, chinese):
             self.assertIn("edl-package-", text)
-            self.assertIn("edl-install-package-", text)
-            self.assertIn("EDL_PACKAGE_PROFILE", text)
-        self.assertIn("install-only", english)
-        self.assertIn("仅首次安装", chinese)
+            self.assertNotIn("edl-install-package-", text)
+            self.assertNotIn("EDL_PACKAGE_PROFILE", text)
+            self.assertIn("TB710FU", text)
+            self.assertIn("offline-upgrade", text)
 
     def test_no_shell_interpolation_of_workflow_expressions(self):
         for name in ("promote.yml", "publish-update-channel.yml"):

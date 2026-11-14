@@ -34,15 +34,7 @@ $ just build-edl-package \
 
 四个参数必须描述同一次构建：检出的 `HEAD` 必须等于 `REVISION`，摘要必须解析到所请求的镜像，镜像的 `org.opencontainers.image.revision` 和 `org.opencontainers.image.version` 标签必须分别匹配 `REVISION` 与 `VERSION`。不一致时构建会停止。渠道名或标签不能当作版本使用，也不能用旧提交搭配新镜像。
 
-该配方接收这四个位置参数；默认不传递任何机型或配置选项，因此会像以前一样打包 `build_files/edl-devices.json` 中登记的全部机型配置。由于该集合包含 `TB710FU`，默认产物只具备首次安装能力。设置 `EDL_PACKAGE_PROFILE=release` 时，只选择经过校验的封闭机型对 `TB322FC` 与 `TB323FU`；只有该配置可以声明离线升级。其他取值会在构建开始前直接失败。部署包输出到 `output/edl/<version>/`，临时工作目录使用检出目录下新建的 `_build-edl.*`，该名称已被 Git 忽略。
-
-```console
-$ EDL_PACKAGE_PROFILE=release just build-edl-package \
-    docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing \
-    sha256:DIGEST \
-    FULL_SOURCE_COMMIT \
-    EXACT_OCI_VERSION
-```
+该配方接收这四个位置参数，不传递任何机型或配置选项，因此只生成一个部署包，其中包含 `build_files/edl-devices.json` 中登记的全部机型配置。该单一部署包可安装上述全部机型（含 `TB710FU`），其描述文件还会为所选且具备双启动槽后端的机型（Lenovo Legion Y700）声明 `offline-upgrade`。部署包输出到 `output/edl/<version>/`，临时工作目录使用检出目录下新建的 `_build-edl.*`，该名称已被 Git 忽略。
 
 如需只打包部分机型，或改用其他配置文件，请用同样的四个值直接调用封装脚本：
 
@@ -101,7 +93,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 | `bootPartitionBytes` | 写入机型清单的声明启动分区大小。 |
 | `diagnosticMode` | `rd-break` 或 `verbose`。 |
 
-适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。不在随附约定机型列表中的配置只能构建首次安装包；构建不会为它声明离线升级或恢复能力，且当它与默认机型一同选中时，整个包只声明首次安装。
+适配新硬件时，部署镜像中仍需有可用的 Linux 内核支持与匹配的设备树，runtime 快照中需有对应的 runtime 配置，Windows 安装器中需有对应的机型注册。仅添加一条配置项并不能让任意 Android 硬件获得支持。不在随附约定机型列表中的配置只能构建首次安装包；构建不会为它声明离线升级或恢复能力，且当它与任何其他机型一同选中时，整个包只声明首次安装。
 
 ## 内置插件来源
 
@@ -117,14 +109,11 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 ## 持续构建
 
-该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建两个 EDL 部署包变体，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。两个变体在各自独立的运行器上执行，检出目录、工作目录、输出目录和签名互不共享：
+该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建一个 EDL 部署包，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。产物名为 `edl-package-<运行编号>`，包含全部已登记机型（含 `TB710FU`）。其签名描述同时声明 `install` 与 `offline-upgrade`：全部所列机型均可安装，只有所选且具备双启动槽后端的机型接受离线升级请求。该产物就是正式产物，**Publish update channel** 照常接受它。描述在构建它的同一运行器上签名，因此只需签名一个部署包。
 
-- `edl-package-<运行编号>` 使用 `EDL_PACKAGE_PROFILE=release` 构建，只包含 `TB322FC` 与 `TB323FU`。其签名描述同时声明 `install` 与 `offline-upgrade`，是正式的多机型更新产物，也是 **Publish update channel** 唯一接受的产物。
-- `edl-install-package-<运行编号>` 使用默认的 universal 配置构建，包含全部已登记机型（含 `TB710FU`）。其签名描述只声明 `install`，用于配合 Windows 安装器完成首次安装，绝不会发布到更新渠道。
+产物会保留在工作流运行中，直到运维人员发布更新产物；不会自动创建 Release，也不会自动改动任何更新渠道。SD 镜像流程继续保留，其自动发布需按下文配置 R2 并启用。
 
-两个产物都会保留在工作流运行中，直到运维人员发布更新产物；不会自动创建 Release，也不会自动改动任何更新渠道。SD 镜像流程继续保留，其自动发布需按下文配置 R2 并启用。
-
-也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并运行同样的两个变体，把各自的分卷、`parts.json`、`SHA256SUMS` 和部署包 README 以独立名称上传。
+也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并运行同样的全机型构建，把分卷、`parts.json`、`SHA256SUMS` 和部署包 README 以 `edl-package-<运行编号>` 上传。
 
 ## 发布更新渠道
 
@@ -133,7 +122,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 流程是：构建 → 发布 testing → 晋升。
 
 1. 构建部署包：`main` 上的 `Build images`，或手动运行 `Build EDL package`。
-2. 用已完成的运行编号和 `testing` 运行 **Publish update channel**。它会确认该运行属于本仓库、已成功，并产出了 `edl-package-<运行编号>`。仅首次安装的 `edl-install-package-<运行编号>` 产物即使描述已签名也不会被接受，因为它没有声明 `offline-upgrade`。随后校验描述签名、分卷、分卷清单、`offline-upgrade` 能力，以及 OCI 摘要确实解析到由该源码修订构建的签名镜像。然后创建草稿 Release `<releaseId>`，上传分卷、分卷清单、描述文件和描述签名，等全部资产到位后才公开 Release，最后才签名并提交 `testing.json` 与 `testing.json.sig`。
+2. 用已完成的运行编号和 `testing` 运行 **Publish update channel**。它会确认该运行属于本仓库、已成功，并产出了 `edl-package-<运行编号>`。随后校验描述签名、分卷、分卷清单、`offline-upgrade` 能力，以及 OCI 摘要确实解析到由该源码修订构建的签名镜像。然后创建草稿 Release `<releaseId>`，上传分卷、分卷清单、描述文件和描述签名，等全部资产到位后才公开 Release，最后才签名并提交 `testing.json` 与 `testing.json.sig`。
 3. 运行 **Promote release**，`source: testing`，`target: beta` 或 `stable`。晋升先校验已发布的源渠道文档及其描述签名，再从该渠道取得不可变的 OCI 摘要，按该摘要检视镜像，并要求其修订标签与 Cosign 签名均匹配后才写入任何标签。晋升从不读取会移动的 `:testing` 标签，因此源标签被更新的、独立构建的版本重新指向时，不会阻止晋升渠道仍然指向的旧发布。随后把目标渠道指向同一批 Release 资产。全程不重新构建；源渠道没有有效的签名发布时，会在写入任何标签之前失败。
 
 不会就地替换：已公开的 Release 必须与校验过的部署包完全一致；草稿 Release 即使是空的也会就地补全——只上传缺失的资产，已存在的资产按签名计划做哈希校验而不是覆盖；内容不一致的 Release 会直接失败。渠道文档与签名以一次提交写入 `update-channels` 分支的对应文件，更新串行执行，绝不强制推送。
@@ -177,7 +166,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 正式镜像地址为 `ghcr.io/armadaos-freedom/armadaos-freedom`。`Build images` 从 `main` 发布签名后的 `testing` 镜像；`Promote release` 核验同一镜像摘要后，再设置 `beta` 或 `stable` 标签。将加密的 Cosign 私钥配置为 `SIGNING_SECRET`，密码配置为 `SIGNING_PASSWORD`；对应公钥位于 `system_files/etc/pki/containers/armadaos-freedom.pub`。私钥不得放入源码。
 
-GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `edl-package-<run-id>` 产物中，由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。仅首次安装的 `edl-install-package-<run-id>` 产物只用于首刷，不会成为渠道文档。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
+GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `edl-package-<run-id>` 产物中，由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
 
 Windows 安装器 0.7.32 起识别组织地址，并继续兼容迁移前 `mydanyi` 镜像地址的安装包。使用新组织地址的包之前，请先升级安装器；旧版会拒绝尚不认识的来源。新包和更新目标使用组织地址，不改写历史包的来源记录。
 
@@ -185,11 +174,11 @@ Windows 安装器 0.7.32 起识别组织地址，并继续兼容迁移前 `mydan
 
 构建封装脚本在归档及分卷生成后，输出 .zip.update.json 描述文件，绑定发布版本、源码提交、OCI 摘要、OSTree 提交、支持机型、有效载荷路径、压缩及展开大小和完整摘要；共用系统文件只记录一份。
 
-本地封装脚本输出的描述尚未签名。EDL Actions 工作流对其原始 UTF-8 字节使用发行密钥签名，以固定公钥核验后，把 .zip.update.json.sig 与分卷一起上传。矩阵中的每个变体都在各自的运行器上为自己的描述签名：更新变体必须核验为 install 与 offline-upgrade，仅安装变体必须核验为 install-only，之后才会上传产物。SHA256SUMS 和 parts.json 不能替代发行签名，也不能信任安装包自行提供的公钥。
+本地封装脚本输出的描述尚未签名。EDL Actions 工作流对其原始 UTF-8 字节使用发行密钥签名，以固定公钥核验后，把 .zip.update.json.sig 与分卷一起上传。工作流只签名它构建的这一个部署包，并在上传前确认描述的 `supportedModels` 与配置中的机型完全一致，且声明 `install` 与 `offline-upgrade`。SHA256SUMS 和 parts.json 不能替代发行签名，也不能信任安装包自行提供的公钥。
 
-生成器先确认部署镜像带有正常 Linux 更新器，随后声明 install 与 offline-upgrade；镜像缺少该更新器时构建直接失败，不会被改标为可升级。当所选机型包含随附约定之外的配置时，构建只生成首次安装包：封装脚本不会为它请求 offline-upgrade，而是把该已注册机型显式传给描述生成器，使构建产物通过校验，同时仍拒绝为它声明离线升级或恢复能力。离线升级保留用户数据，并用已校验的载荷写入两个启动槽；在线 OCI 更新只轮换非当前槽。签名本身不使包具备升级能力：描述必须声明 offline-upgrade，且已安装更新器版本不低于 `minimumUpdaterVersion`。
+生成器先确认部署镜像带有正常 Linux 更新器，随后为全机型部署包声明 install 与 offline-upgrade；镜像缺少该更新器时构建直接失败，不会被改标为可升级。操作列表是部署包级别的：全部所列机型均可安装，只有具备双启动槽后端的所选机型接受离线升级请求。当所选机型包含随附约定之外的配置时，构建只生成首次安装包：封装脚本不会为它请求 offline-upgrade，而是把该已注册机型显式传给描述生成器，使构建产物通过校验，同时仍拒绝为它声明离线升级或恢复能力。离线升级保留用户数据，并用已校验的载荷写入两个启动槽；在线 OCI 更新只轮换非当前槽。签名本身不使包具备升级能力：描述必须声明 offline-upgrade，所请求机型必须符合条件，且已安装更新器版本不低于 `minimumUpdaterVersion`。
 
-离线升级目前仅支持联想 Legion Y700 四代（TB322FC）与五代（TB323FU）。联想小新 Pad Pro GT（TB710FU）仍可能出现在通用首次安装包中，但其更新槽后端尚未实现，因此出现在部署包的机型列表中并不代表该机型支持离线升级。
+离线升级目前仅支持联想 Legion Y700 四代（TB322FC）与五代（TB323FU）。联想小新 Pad Pro GT（TB710FU）随同一个全机型部署包提供安装，但其更新槽后端尚未实现；出现在部署包的机型列表中并不代表该机型支持离线升级，指定它的升级请求会在任何槽操作之前被拒绝。
 
 恢复描述属于内存救援路径，不是本包的前提：本包不附带救援产物，该对象可以缺省或不完整；凡出现的条目仍按同一模式与文件记录逐项校验。渠道生成工具仍会拒绝只有首次安装能力的描述。
 

@@ -85,9 +85,9 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--minimum-updater-version", default="0.8.0")
     create.add_argument("--offline-upgrade", action="store_true", default=False,
                         help="declare offline-upgrade for normal-Linux installs; requires the "
-                             "bundle to record a verified normal updater and every packaged "
-                             "model to have the dual-slot update backend; recovery manifests "
-                             "optional")
+                             "bundle to record a verified normal updater and at least one "
+                             "eligible shipped model, with no custom install allowance; the "
+                             "consumer gates the selected model; recovery manifests optional")
     create.add_argument("--install-model", action="append", default=[],
                         metavar="ID",
                         help="registered non-default model packaged install-only; repeat once "

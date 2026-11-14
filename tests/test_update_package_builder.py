@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates.package_contract import (
-    AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, validate_package,
+    AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, require_operation,
+    validate_package,
 )
 
 CONFIG_PATH = ROOT / "build_files" / "edl-devices.json"
@@ -391,15 +392,16 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             self.assertEqual(desc["recoveryManifests"], {})
             self.assertEqual(validate_package(desc), desc)
             with self.assertRaisesRegex(
-                PackageError, "offline-upgrade is restricted"
+                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
             ):
                 build_descriptor(
                     archive, release_id="rel-gt", enable_offline_upgrade=True
                 )
 
-    def test_mixed_tb710fu_package_stays_install_only(self):
-        # A package-level operations list cannot exempt one model, so including
-        # TB710FU suppresses the upgrade claim for the whole archive.
+    def test_mixed_tb710fu_package_upgrades_only_the_dual_slot_models(self):
+        # A package-level operations list may declare upgrade even though
+        # TB710FU is bundled; the installer gate rejects the request for that
+        # model before any slot work, so TB710FU must not suppress the claim.
         def offline_capable(bundle, docs, members):
             bundle["offlineUpgrade"] = True
 
@@ -407,20 +409,39 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             archive = self._make_bundle(
                 Path(tmp), models=("TB322FC", "TB710FU"), mutate=offline_capable
             )
-            desc = build_descriptor(archive, release_id="rel-mixed")
+            desc = build_descriptor(
+                archive, release_id="rel-mixed", enable_offline_upgrade=True
+            )
             self.assertEqual(desc["supportedModels"], ["TB322FC", "TB710FU"])
-            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
             self.assertEqual(validate_package(desc), desc)
+            require_operation(desc, "TB322FC", "offline-upgrade",
+                              updater_version="0.10.0")
+            require_operation(desc, "TB710FU", "install",
+                              installer_version="0.10.0")
             with self.assertRaisesRegex(
-                PackageError, "offline-upgrade is restricted"
+                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
+            ):
+                require_operation(desc, "TB710FU", "offline-upgrade",
+                                  updater_version="0.10.0")
+
+    def test_mixed_upgrade_requires_the_verified_bundle_updater(self):
+        # A package may not claim upgrade unless the producer recorded that
+        # the image carries the normal updater, even in a mixed package.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=("TB322FC", "TB323FU", "TB710FU")
+            )
+            with self.assertRaisesRegex(
+                PackageError, "requires a bundle built from an image"
             ):
                 build_descriptor(
                     archive, release_id="rel-mixed", enable_offline_upgrade=True
                 )
 
     def test_configured_default_selection_is_install_only(self):
-        # The devices config also registers TB710FU, so the default multi-model
-        # build must keep every install model and advertise no upgrade.
+        # The devices config also registers TB710FU. Without an explicit
+        # upgrade request the universal package stays install-only.
         models = tuple(json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
         self.assertEqual(set(models), set(AUTHORIZED_MODELS))
 
@@ -436,12 +457,40 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             self.assertEqual(desc["operations"], ["install"])
             self.assertEqual(desc["recoveryManifests"], {})
             self.assertEqual(validate_package(desc), desc)
+
+    def test_full_configuration_descriptor_declares_install_and_upgrade(self):
+        # The universal package is the single release artifact: every
+        # registered model installs, both Y700 models upgrade, and TB710FU
+        # fails the operation gate before execution.
+        models = tuple(json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
+        self.assertEqual(set(models), set(AUTHORIZED_MODELS))
+
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=models, mutate=offline_capable
+            )
+            desc = build_descriptor(
+                archive, release_id="rel-default", enable_offline_upgrade=True
+            )
+            self.assertEqual(desc["supportedModels"], list(models))
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
+            self.assertEqual(desc["recoveryManifests"], {})
+            self.assertEqual(validate_package(desc), desc)
+
+            for model in models:
+                require_operation(desc, model, "install",
+                                  installer_version="0.10.0")
+            for model in sorted(OFFLINE_UPGRADE_MODELS):
+                require_operation(desc, model, "offline-upgrade",
+                                  updater_version="0.10.0")
             with self.assertRaisesRegex(
-                PackageError, "offline-upgrade is restricted"
+                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
             ):
-                build_descriptor(
-                    archive, release_id="rel-default", enable_offline_upgrade=True
-                )
+                require_operation(desc, "TB710FU", "offline-upgrade",
+                                  updater_version="0.10.0")
 
 
 if __name__ == "__main__":

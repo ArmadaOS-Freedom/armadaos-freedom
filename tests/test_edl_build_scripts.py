@@ -295,22 +295,19 @@ class WrapperPreflightTests(unittest.TestCase):
         self.assertEqual(upgrade, {"TB322FC", "TB323FU"})
         self.assertLessEqual(upgrade, authorized)
 
-    def test_wrapper_gates_both_upgrade_flags_on_the_upgrade_models(self):
-        # Neither the producer bundle flag nor the descriptor flag may depend on
-        # the wider install set: TB710FU is installed but never upgraded.
+    def test_wrapper_does_not_suppress_upgrade_for_tb710fu(self):
+        # TB710FU installs only, but its presence must not disable upgrade for
+        # the dual-slot models; the installer rejects a TB710FU upgrade request.
         text = REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("upgrade_blocked_models", text)
         for flag in ("producer_args", "descriptor_args"):
-            self.assertIn(
-                "if ((${#upgrade_blocked_models[@]} == 0)); then\n"
-                "    %s+=(--offline-upgrade)" % flag,
-                text,
-            )
+            self.assertIn("%s+=(--offline-upgrade)" % flag, text)
+        # Custom models stay explicit install-only identifiers.
+        self.assertIn('descriptor_args+=(--install-model "$model_id")', text)
 
-    def test_recipe_release_profile_matches_the_wrapper_upgrade_models(self):
-        # The release variant selects exactly the models the wrapper and the
-        # shipped contract allow to advertise offline-upgrade. The universal
-        # default carries no --model, so every configured profile stays in the
-        # install-only artifact.
+    def test_recipe_is_one_universal_package(self):
+        # One artifact contains every registered profile: no profile switch
+        # and no model selector may remain in the recipe.
         text = REAL_JUSTFILE.read_text(encoding="utf-8").replace("\r\n", "\n")
         match = re.search(
             r"^build-edl-package [^\n]*:\n(?P<body>(?:(?:[ \t]+.*)?\n)*)",
@@ -319,15 +316,9 @@ class WrapperPreflightTests(unittest.TestCase):
         )
         self.assertIsNotNone(match, "the Justfile must define build-edl-package")
         body = match.group("body")
-        models = set(
-            re.findall(r"--model ([A-Za-z0-9][A-Za-z0-9._-]*)", body)
-        )
-        self.assertEqual(models, self._wrapper_models("OFFLINE_UPGRADE_MODELS"))
-        self.assertEqual(
-            models, set(self._contract_models().OFFLINE_UPGRADE_MODELS)
-        )
-        self.assertIn("universal) model_args=()", body)
-        self.assertIn('${model_args[@]+"${model_args[@]}"}', body)
+        self.assertNotIn("EDL_PACKAGE_PROFILE", body)
+        self.assertNotIn("--model ", body)
+        self.assertNotIn("model_args", body)
 
     def _assert_stopped_at_docker_preflight(self, fixture, result):
         self.assertEqual(1, result.returncode, _diagnostics(result))

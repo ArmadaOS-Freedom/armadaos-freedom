@@ -76,6 +76,28 @@ def _base_package():
     }
 
 
+def _mixed_offline_package(models=("TB322FC", "TB323FU", "TB710FU")):
+    """A package whose declared operations cover every selected model."""
+    pkg = _base_package()
+    pkg["supportedModels"] = list(models)
+    pkg["modelManifests"] = {}
+    pkg["files"] = [
+        record for record in pkg["files"]
+        if record["role"] != "manifest" or record["path"] == "bundle.json"
+    ]
+    for index, model in enumerate(models, 1):
+        path = f"manifests/{model.lower()}.json"
+        pkg["files"].append(_file_record(path, "manifest", 512, 80 + index))
+        pkg["modelManifests"][model] = path
+    pkg["operations"] = ["install", "offline-upgrade"]
+    for record in pkg["files"]:
+        if record["role"] in ("linux-root", "linux-boot"):
+            expanded = 131072 if record["role"] == "linux-root" else 32768
+            record.update(compression="gzip", expandedBytes=expanded,
+                          expandedSha256=_h(60 + expanded))
+    return pkg
+
+
 class PackageContractTests(unittest.TestCase):
     def test_valid_single_and_deep_copy(self):
         pkg = _base_package()
@@ -244,29 +266,46 @@ class PackageContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PackageError, "indexed file"):
             validate_package(missing)
 
-    def test_tb710fu_is_authorized_for_install_only(self):
+    def test_mixed_package_gates_offline_upgrade_per_model(self):
         # TB710FU is a registered install target but has no dual-slot upgrade
-        # backend, so it is supported for install and nothing else.
+        # backend. Its presence must not suppress upgrade for the Y700 models,
+        # but it may never itself request offline-upgrade.
         self.assertIn("TB710FU", AUTHORIZED_MODELS)
         self.assertNotIn("TB710FU", OFFLINE_UPGRADE_MODELS)
 
-        pkg = _base_package()
-        pkg["supportedModels"].append("TB710FU")
-        pkg["modelManifests"]["TB710FU"] = "manifests/tb710fu.json"
-        pkg["files"].append(_file_record("manifests/tb710fu.json", "manifest", 512, 54))
-        self.assertEqual(validate_package(pkg)["operations"], ["install"])
-        require_operation(pkg, "TB710FU", "install", installer_version="0.10.0")
+        pkg = _mixed_offline_package()
+        validated = validate_package(pkg)
+        self.assertEqual(validated["supportedModels"],
+                         ["TB322FC", "TB323FU", "TB710FU"])
+        self.assertEqual(validated["operations"], ["install", "offline-upgrade"])
+        self.assertEqual(validated["recoveryManifests"], {})
 
-        upgrade = deepcopy(pkg)
-        upgrade["operations"].append("offline-upgrade")
-        with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
-            validate_package(upgrade)
+        for model in ("TB322FC", "TB323FU", "TB710FU"):
+            require_operation(pkg, model, "install", installer_version="0.10.0")
+        for model in ("TB322FC", "TB323FU"):
+            require_operation(pkg, model, "offline-upgrade",
+                              updater_version="0.10.0")
+        with self.assertRaisesRegex(
+                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"):
+            require_operation(pkg, "TB710FU", "offline-upgrade",
+                              updater_version="0.10.0")
 
         recovery = deepcopy(pkg)
         recovery["files"].append(_file_record("recovery/tb710fu.json", "manifest", 512, 55))
         recovery["recoveryManifests"] = {"TB710FU": "recovery/tb710fu.json"}
         with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
             validate_package(recovery)
+
+    def test_tb710fu_only_package_cannot_declare_offline_upgrade(self):
+        pkg = _mixed_offline_package(models=("TB710FU",))
+        with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
+            validate_package(pkg)
+
+        install_only = _mixed_offline_package(models=("TB710FU",))
+        install_only["operations"] = ["install"]
+        self.assertEqual(validate_package(install_only)["operations"], ["install"])
+        require_operation(install_only, "TB710FU", "install",
+                          installer_version="0.10.0")
 
     def test_install_only_allowance_is_explicit_and_narrow(self):
         def custom_package():
