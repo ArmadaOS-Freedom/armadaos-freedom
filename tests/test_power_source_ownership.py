@@ -169,6 +169,13 @@ def copy_instructions(text: str):
     must likewise come from this repository's own system_files, so a stage or
     alias source cannot install content the guard cannot trace; the canonical
     files keep their separate Control ownership check.
+
+    A ctx destination that normalizes onto a protected file must also be
+    spelled as that file.  Normalizing drops a trailing slash, so
+    /system_files/usr/lib/armada/x/ would compare equal to the protected file x
+    while Docker still treats it as a directory and lands the source inside it,
+    leaving the required file path unwritten.  The raw destination must name a
+    file leaf, so such a COPY is rejected before the path comparison.
     """
     stage = None
     for line in logical_lines(text):
@@ -241,6 +248,22 @@ def copy_instructions(text: str):
                     "cannot check.  Only this repository's system_files and the "
                     "provider's exported root may seed the whole tree; otherwise "
                     "COPY the protected files themselves from the owning tree"
+                )
+            # A protected file must be addressed as a file.  normalize() drops
+            # the trailing slash, so a directory spelling would otherwise match
+            # the leaf while Docker lands the source inside it: basename is ''
+            # for a trailing slash and '.'/'..' for a dot leaf.
+            is_protected_file = landing in {
+                normalize(f"{CTX_TREE}/{relative}")
+                for relative in CANONICAL + FIXTURES
+            }
+            if is_protected_file and posixpath.basename(dest) in ("", ".", ".."):
+                raise ValueError(
+                    "ownership guard requires a file-form COPY destination for "
+                    f"protected file {landing}: {dest} names a directory, so "
+                    "Docker would place the source inside it instead of at the "
+                    "protected file path; drop the trailing slash and name the "
+                    "file"
                 )
             for relative in FIXTURES:
                 if landing != normalize(f"{CTX_TREE}/{relative}"):
@@ -539,6 +562,12 @@ class ParserPolicyRegressionTests(unittest.TestCase):
             "FROM ubuntu AS ctx\n"
             "COPY --from=boot-tool-builder /replacement/ "
             "/system_files/usr/libexec/armada/\n",
+        ),
+        (
+            "canonical control daemon addressed as a directory",
+            "FROM ubuntu AS ctx\n"
+            "COPY decky/freedom-control/system_files/usr/libexec/armada/"
+            "armada-powerd /system_files/usr/libexec/armada/armada-powerd/\n",
         ),
         (
             "fixture installed in ctx from a foreign stage",
