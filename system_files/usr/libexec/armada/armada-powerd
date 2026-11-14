@@ -22,6 +22,7 @@ IFACE = "org.armada.Power1"
 IFACE_PROFILE = "com.steampowered.SteamOSManager1.PerformanceProfile1"
 IFACE_GPU = "com.steampowered.SteamOSManager1.GpuPerformanceLevel1"
 IFACE_CPU = "com.steampowered.SteamOSManager1.CpuScaling1"
+IFACE_LOW_POWER = "com.steampowered.SteamOSManager1.LowPowerMode1"
 LOGIN1_NAME = "org.freedesktop.login1"
 LOGIN1_PATH = "/org/freedesktop/login1"
 LOGIN1_IFACE = "org.freedesktop.login1.Manager"
@@ -30,6 +31,9 @@ STATE_FILE = Path("/var/lib/armada/powerd.state")
 FACTORY_CONFIG_FILE = Path("/usr/share/armada/power-profiles.conf")
 CONFIG_FILE = Path("/etc/armada/power-profiles.conf")
 FAN_SAFE_PWM = 128
+# Bounds live download-mode leases: each costs a pipe plus a main-loop watch,
+# and all bus calls are serialized, so one global cap suffices.
+MAX_DOWNLOAD_HANDLES = 64
 
 
 def normalize_profile(profile):
@@ -101,6 +105,15 @@ XML = f"""
   <interface name="{IFACE_CPU}">
     <property name="AvailableCpuScalingGovernors" type="as" access="read"/>
     <property name="CpuScalingGovernor" type="s" access="readwrite"/>
+  </interface>
+  <interface name="{IFACE_LOW_POWER}">
+    <method name="EnterDownloadMode">
+      <arg type="s" name="identifier" direction="in"/>
+      <arg type="h" name="handle" direction="out"/>
+    </method>
+    <method name="ListDownloadModeHandles">
+      <arg type="a{{su}}" name="identifiers" direction="out"/>
+    </method>
   </interface>
 </node>
 """
@@ -274,6 +287,7 @@ class ArmadaPower:
         self.suspended = False
         self.suspend_save = {}
         self.connection = None
+        self.download_handles = {}
         self.scx_child = None
         self.scx_spec = None
         self.scx_failed = None
@@ -1047,7 +1061,63 @@ class ArmadaPower:
             GLib.Variant("(sa{sv}as)", (iface, changed, [])),
         )
 
-    def handle_method_call(self, _conn, _sender, _path, iface, method, _params, invocation):
+    def enter_download_mode(self, identifier, invocation):
+        # Steam holds the write end; HUP on ours means every copy is closed.
+        if sum(self.download_handles.values()) >= MAX_DOWNLOAD_HANDLES:
+            # Reject before os.pipe(): nothing is allocated, no count changes.
+            print(f"armada-powerd: download mode handle limit reached "
+                  f"({MAX_DOWNLOAD_HANDLES})", file=sys.stderr)
+            invocation.return_dbus_error(
+                f"{BUS_NAME}.Error.DownloadModeLimitReached",
+                f"download mode handle limit {MAX_DOWNLOAD_HANDLES} reached",
+            )
+            return
+        rfd = wfd = -1
+        try:
+            rfd, wfd = os.pipe()
+            fds = Gio.UnixFDList.new()
+            fds.append(wfd)
+        except Exception as exc:
+            for fd in (rfd, wfd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            invocation.return_dbus_error(
+                f"{BUS_NAME}.Error.DownloadModeFailed", str(exc))
+            return
+        os.close(wfd)
+        self.download_handles[identifier] = self.download_handles.get(identifier, 0) + 1
+        GLib.unix_fd_add_full(
+            GLib.PRIORITY_DEFAULT,
+            rfd,
+            GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            self.download_handle_closed,
+            identifier,
+        )
+        print(f"armada-powerd: download mode handle for {identifier}", file=sys.stderr)
+        invocation.return_value_with_unix_fd_list(GLib.Variant("(h)", (0,)), fds)
+
+    def download_handle_closed(self, fd, _condition, identifier):
+        os.close(fd)
+        count = self.download_handles.get(identifier, 1) - 1
+        if count > 0:
+            self.download_handles[identifier] = count
+        else:
+            self.download_handles.pop(identifier, None)
+        print(f"armada-powerd: download mode handle for {identifier} closed", file=sys.stderr)
+        return False
+
+    def handle_method_call(self, _conn, _sender, _path, iface, method, params, invocation):
+        if iface == IFACE_LOW_POWER:
+            if method == "EnterDownloadMode":
+                self.enter_download_mode(params.unpack()[0], invocation)
+            elif method == "ListDownloadModeHandles":
+                invocation.return_value(GLib.Variant("(a{su})", (self.download_handles,)))
+            else:
+                invocation.return_dbus_error(f"{BUS_NAME}.Error.UnknownMethod", method)
+            return
         if iface != IFACE:
             invocation.return_dbus_error(f"{BUS_NAME}.Error.UnknownInterface", iface)
             return
