@@ -1,0 +1,51 @@
+---
+name: Unit tests
+
+# Runs the stdlib unittest suite over tests/test_*.py on a stock Ubuntu runner.
+# The privileged loop-mount case stays in the integration group; see
+# docs/testing.md. Shell and dashed-script tests keep their existing jobs.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: Automatic unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ libfdt-dev device-tree-compiler cpio dracut-core \
+            btrfs-progs e2fsprogs util-linux patch \
+            python3-websocket python3-gi gir1.2-glib-2.0 \
+            gir1.2-ostree-1.0 ostree dbus
+
+      - name: Run unit tests
+        env:
+          TEST_ARTIFACT_ROOT: ${{ runner.temp }}/unit-test-artifacts
+        run: |
+          mkdir -p "${TEST_ARTIFACT_ROOT}"
+          /usr/bin/python3 -B tests/run_unit_tests.py

@@ -1,0 +1,35 @@
+name: patch-catalogue
+
+on:
+  pull_request:
+    paths:
+      - packages/kernel/PATCHES.md
+      - "packages/kernel/patches/**"
+      - packages/gamescope-session/PATCHES.md
+      - "packages/gamescope-session/patches/**"
+      - tests/test_patch_catalogue.py
+      - .github/workflows/patch-catalogue.yml
+  push:
+    branches:
+      - main
+    paths:
+      - packages/kernel/PATCHES.md
+      - "packages/kernel/patches/**"
+      - packages/gamescope-session/PATCHES.md
+      - "packages/gamescope-session/patches/**"
+      - tests/test_patch_catalogue.py
+      - .github/workflows/patch-catalogue.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  catalogue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check patch catalogues
+        run: python3 -m unittest discover -s tests -p "test_patch_catalogue.py" -v

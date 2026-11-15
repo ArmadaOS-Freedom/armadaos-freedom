@@ -181,6 +181,14 @@ jobs:
           python3 -m unittest discover -s tests -p test_plugin_sources.py
           python3 build_files/resolve-plugin-sources.py
 
+      # The resolver checked out the shipped commit; test that, not the gitlink.
+      - name: Check resolved power daemon and device control
+        run: |
+          python3 -B tests/infinity-scheduler-test.py
+          bash tests/desktop-touchscreen-test.sh
+          bash tests/armada-control-settings-test.sh
+          python3 -B -m unittest discover -s tests -p test_power_source_ownership.py
+
       - name: Check tablet input integration
         run: bash tests/tb323fu-input-test.sh
 

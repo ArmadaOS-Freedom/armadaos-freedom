@@ -1,0 +1,15 @@
+--- a/usr/share/gamescope-session-plus/gamescope-session-plus
++++ b/usr/share/gamescope-session-plus/gamescope-session-plus
+@@ -139,6 +139,12 @@
+ done
+ set +a
+ 
++# Apply the Armada display orientation override after session and environment
++# configuration so an explicit user choice wins over the device profile.
++if [ "${CLIENT}" = "steam" ] && [ -r /usr/lib/armada/display-orientation.sh ]; then
++	. /usr/lib/armada/display-orientation.sh
++fi
++
+ # Setup socket for gamescope
+ # Create run directory file for startup and stats sockets
+ tmpdir="$([[ -n ${XDG_RUNTIME_DIR+x} ]] && mktemp -p "$XDG_RUNTIME_DIR" -d -t gamescope.XXXXXXX)"

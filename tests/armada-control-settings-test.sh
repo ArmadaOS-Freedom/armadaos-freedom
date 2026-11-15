@@ -6,6 +6,16 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# device-env reads defaults.conf and the selected profile from one directory.
+# Assemble the shipped profiles and overlay the canonical FreedomControl
+# profile, which the image takes from the plugin source rather than the base
+# device tree.
+DEVICES_DIR="$WORK/devices"
+mkdir -p "$DEVICES_DIR"
+cp "$ROOT"/system_files/usr/lib/armada/devices/*.conf "$DEVICES_DIR"/
+cp "$ROOT"/decky/freedom-control/system_files/usr/lib/armada/devices/lenovo-tb323fu.conf \
+    "$DEVICES_DIR"/
+
 python3 - "$ROOT" "$WORK" <<'PYEOF'
 import importlib.machinery
 import importlib.util
@@ -284,25 +294,25 @@ DEVICE_QUIRKS="$ROOT/system_files/usr/libexec/armada/device-quirks"
 DISPATCH="$ROOT/system_files/usr/libexec/armada/suspend-dispatch"
 
 device_env() {
-    env ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+    env ARMADA_DEVICE_DIR="$DEVICES_DIR" \
         ARMADA_MODEL="$1" ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
         ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
         "$DEVICE_ENV" | grep -x "ARMADA_SUSPEND_MODE=$2" >/dev/null
 }
 
-env ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+env ARMADA_DEVICE_DIR="$DEVICES_DIR" \
     ARMADA_MODEL="AYN Thor" ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
     ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
     "$ROOT/system_files/usr/libexec/armada/device-env" |
     grep -Fx 'ARMADA_SECONDARY_BACKLIGHT=ae94000.dsi.0' >/dev/null
-env ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+env ARMADA_DEVICE_DIR="$DEVICES_DIR" \
     ARMADA_MODEL="AYANEO Pocket DS" ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
     ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
     "$ROOT/system_files/usr/libexec/armada/device-env" |
     grep -Fx 'ARMADA_SECONDARY_BACKLIGHT=sy7758-backlight' >/dev/null
 
 # The real profile resolves the TB323FU model to the ID the dispatcher gates on.
-env ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+env ARMADA_DEVICE_DIR="$DEVICES_DIR" \
     ARMADA_MODEL="Lenovo Legion Tab Y700 (TB323FU)" \
     ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
     ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
@@ -343,7 +353,7 @@ printf '[s2idle] deep\n' >"$WORK/mem_sleep"
 printf 'future_sleep_setting=keep\nsuspend_mode=deep\n' >"$WORK/sleep.conf"
 touch "$WORK/ignore-sleep"
 env ARMADA_DEVICE_ENV="$DEVICE_ENV" \
-    ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+    ARMADA_DEVICE_DIR="$DEVICES_DIR" \
     ARMADA_MODEL="AYN Odin 2" ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
     ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
     ARMADA_NM_IGNORE_SLEEP="$WORK/ignore-sleep" \
@@ -356,7 +366,7 @@ suspend_mode=s2idle" ]]
 printf '[s2idle] deep\n' >"$WORK/mem_sleep"
 printf 'suspend_mode=fake\n' >"$WORK/sleep.conf"
 env ARMADA_DEVICE_ENV="$DEVICE_ENV" \
-    ARMADA_DEVICE_DIR="$ROOT/system_files/usr/lib/armada/devices" \
+    ARMADA_DEVICE_DIR="$DEVICES_DIR" \
     ARMADA_MODEL="AYN Odin 2" ARMADA_SLEEP_CONFIG="$WORK/sleep.conf" \
     ARMADA_MEM_SLEEP_PATH="$WORK/mem_sleep" \
     ARMADA_NM_IGNORE_SLEEP="$WORK/ignore-sleep" \
