@@ -17,8 +17,9 @@ import uuid
 from .boot_materials import BootMaterialsError, _validate_helper_path, _validate_output_dir
 from .boot_payload import require_runtime_marker
 from .deployment_store import DeploymentError, _parse_binding
+from .models import AUTHORIZED_MODELS
 
-_ALLOWED_MODELS = frozenset({"TB322FC", "TB323FU", "TB710FU"})
+_ALLOWED_MODELS = AUTHORIZED_MODELS
 _ALLOWED_SLOTS = frozenset({"a", "b"})
 _MODE_REPORTS = {
     "aosp-resign": "AospResign",

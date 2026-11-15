@@ -215,7 +215,7 @@ class UpdateBootPayloadTests(unittest.TestCase):
         (ctx / "armada-runtimes/SHA256SUMS").write_text("".join(sums), encoding="utf-8")
         upd = root / "usr/lib/armada/updates"
         upd.mkdir(parents=True, exist_ok=True)
-        for name in ("__init__.py", "boot_payload.py"):
+        for name in ("__init__.py", "boot_payload.py", "models.py"):
             shutil.copy2(REPO / "system_files/usr/lib/armada/updates" / name, upd / name)
         (root / "var/home/user/file").parent.mkdir(parents=True, exist_ok=True)
         (root / "var/home/user/file").write_text("keep", encoding="utf-8")
@@ -279,7 +279,7 @@ class UpdateBootPayloadTests(unittest.TestCase):
         (ub / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         upd = root / "usr/lib/armada/updates"
         upd.mkdir(parents=True, exist_ok=True)
-        for name in ("__init__.py", "boot_payload.py"):
+        for name in ("__init__.py", "boot_payload.py", "models.py"):
             (upd / name).write_text(
                 "raise RuntimeError('deployment python must never execute')\n",
                 encoding="utf-8",
@@ -534,6 +534,10 @@ class UpdateBootPayloadTests(unittest.TestCase):
         shutil.copy2(
             REPO / "system_files/usr/lib/armada/updates/boot_payload.py",
             upd / "boot_payload.py",
+        )
+        shutil.copy2(
+            REPO / "system_files/usr/lib/armada/updates/models.py",
+            upd / "models.py",
         )
         for name in ("edl_device_config.py", "edl_boot_requirements.py"):
             shutil.copy2(BUILD_FILES / name, bld / name)

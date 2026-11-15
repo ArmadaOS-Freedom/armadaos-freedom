@@ -5,6 +5,7 @@ import stat
 import struct
 import subprocess
 
+from .models import RECOVERY_PROFILES
 from .recovery_layout import SIZE, RecoveryLayoutError
 
 
@@ -16,12 +17,14 @@ def _require(condition, message):
 def locate_recovery_partition(*, require_edl=False):
     dt = Path('/proc/device-tree')
     compatible = (dt / 'compatible').read_bytes().split(b'\0')
-    profiles = [(b'lenovo,elden', (b'qcom,sm8750',), 1),
-                (b'lenovo,baldur', (b'qcom,sm8850', b'qcom,kaanapali'), 2)]
-    matches = [board for name, socs, board in profiles
-               if name in compatible and any(soc in compatible for soc in socs)]
+    # A device tree may report more than one compatible name for the same
+    # board (TB323FU answers to both lenovo,baldur and lenovo,tb323fu), so the
+    # board identity is collected as a set.  Two matches collapse to one board;
+    # genuinely different boards stay ambiguous and are refused.
+    matches = {board for alias, socs, board in RECOVERY_PROFILES
+               if alias in compatible and any(soc in compatible for soc in socs)}
     _require(len(matches) == 1, 'Unsupported board')
-    board = matches[0]
+    board = next(iter(matches))
     chosen = dt / 'chosen'
     if require_edl:
         _require((chosen / 'kshim,edl-request-version').read_bytes() == struct.pack('>I', 1),

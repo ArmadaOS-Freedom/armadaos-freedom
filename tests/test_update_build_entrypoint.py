@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import re
@@ -11,6 +12,10 @@ import test_update_package_builder as fixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
+
+from updates import system_manager  # noqa: E402
+
 DESCRIPTOR = ROOT / "build_files" / "make-universal-update-descriptor.py"
 JUSTFILE = ROOT / "Justfile"
 
@@ -88,6 +93,20 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), archive_before)
         return document
 
+    def test_builder_factory_baselines_cannot_drift(self):
+        # The builder factory's own defaults are the shipped baselines: the
+        # unified updater version for minimumUpdaterVersion, and the unchanged
+        # installer minimum. Reading the shared constant keeps the build
+        # factory and the running updater from silently disagreeing.
+        parameters = inspect.signature(fixture.build_descriptor).parameters
+        self.assertEqual(
+            parameters["minimum_updater_version"].default,
+            system_manager.UPDATER_VERSION,
+        )
+        self.assertEqual(
+            parameters["minimum_installer_version"].default, "0.8.0"
+        )
+
     def test_full_configuration_descriptor_declares_install_and_upgrade(self):
         # The single universal package covers every registered model. The
         # descriptor advertises upgrade for the Y700 models but the operation
@@ -98,18 +117,33 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         self.assertEqual(document["operations"], ["install", "offline-upgrade"])
         self.assertEqual(document["recoveryManifests"], {})
         self.assertEqual(document["supportedModels"], list(models))
+        # This unified package replaces the pre-unification 0.8.0 updater
+        # artifact: a 0.8.0 updater may not consume it, while the installer
+        # minimum stays unchanged.
+        self.assertEqual(document["minimumInstallerVersion"], "0.8.0")
+        self.assertEqual(document["minimumUpdaterVersion"], "0.8.1")
+        self.assertEqual(
+            document["minimumUpdaterVersion"], system_manager.UPDATER_VERSION
+        )
         self.assertEqual(fixture.validate_package(document), document)
 
         for model in models:
             fixture.require_operation(document, model, "install",
                                       installer_version="0.10.0")
         for model in sorted(fixture.OFFLINE_UPGRADE_MODELS):
+            # The installed unified runtime accepts the eligible Y700 upgrade.
             fixture.require_operation(document, model, "offline-upgrade",
-                                      updater_version="0.10.0")
+                                      updater_version=system_manager.UPDATER_VERSION)
+        for model in sorted(fixture.OFFLINE_UPGRADE_MODELS):
+            # The pre-unification 0.8.0 updater is too old for this package.
+            with self.assertRaisesRegex(
+                    fixture.PackageError, "older than minimumUpdaterVersion"):
+                fixture.require_operation(document, model, "offline-upgrade",
+                                          updater_version="0.8.0")
         with self.assertRaisesRegex(
                 fixture.PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"):
             fixture.require_operation(document, "TB710FU", "offline-upgrade",
-                                      updater_version="0.10.0")
+                                      updater_version=system_manager.UPDATER_VERSION)
 
     def test_explicit_install_only_full_selection_still_valid(self):
         models = ("TB322FC", "TB323FU", "TB710FU")

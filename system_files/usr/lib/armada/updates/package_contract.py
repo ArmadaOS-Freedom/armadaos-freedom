@@ -5,22 +5,21 @@ from pathlib import Path
 import re
 
 from .catalog import CatalogError, _identity, _updater_tuple
+from .models import AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS
 from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 
 
-# The shipped package contract. Consumers validate against this closed set by
+# The shipped package contract.  Consumers validate against this closed set by
 # default; only the build host may explicitly add install-only model names.
 # TB710FU installs but has no dual-slot upgrade backend yet, so it is listed
 # here for installation only and never for offline-upgrade or recovery.
-AUTHORIZED_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
-
+#
 # Models whose installed systems have the physical dual-slot backend the
-# offline upgrade drives. A package may advertise offline-upgrade when at least
-# one of its supported models is in this set and every supported model is a
-# shipped contract model; ``require_operation`` still rejects an upgrade
-# request for a selected model outside this set. Recovery manifests remain
+# offline upgrade drives.  A package may advertise offline-upgrade when at
+# least one of its supported models is in this set and every supported model is
+# a shipped contract model; ``require_operation`` still rejects an upgrade
+# request for a selected model outside this set.  Recovery manifests remain
 # restricted to packages whose supported models are all in this set.
-OFFLINE_UPGRADE_MODELS = frozenset(("TB322FC", "TB323FU"))
 _OPERATIONS = frozenset(("install", "offline-upgrade", "decky-repair"))
 _ROLES = frozenset((
     "manifest", "linux-root", "linux-boot", "kernel", "initramfs", "runtime",

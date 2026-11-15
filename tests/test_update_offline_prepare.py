@@ -21,7 +21,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import armada_os  # noqa: E402
 import test_update_channel_release as release_fixture  # noqa: E402
-from updates import boot_materials, offline_prepare, system_transaction  # noqa: E402
+from updates import (  # noqa: E402
+    UPDATER_VERSION, boot_materials, offline_prepare, system_transaction,
+)
 import updates.boot_writer  # noqa: E402
 import updates.offline_boot_writer  # noqa: E402
 import updates.slot_activation  # noqa: E402
@@ -361,7 +363,7 @@ class OfflinePrepareTest(unittest.TestCase):
                 "payload_directory": env.payload,
                 "expected_channel": "stable",
                 "model": "TB322FC",
-                "updater_version": "0.8.0",
+                "updater_version": UPDATER_VERSION,
                 "sysroot_path": env.sysroot,
                 "work_dir": env.work / "import",
                 "trusted_key": self.pub_key,

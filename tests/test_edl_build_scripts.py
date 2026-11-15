@@ -18,6 +18,13 @@ That lets a case prove exactly which docker calls were made: the valid
 preflight cases must reach ``docker info`` and stop at the daemon check, and
 every rejected case must fail before docker is ever looked up.
 
+The argument-recording cases opt into a second fake-docker mode that also
+creates the few files the wrapper checks for in the mounted work and output
+directories. Those cases run a copy of the wrapper whose only edit is the
+physical loop-device precondition, replaced with two fixed dummy loop paths;
+all model selection, upgrade decisions and producer/descriptor argument
+construction stay byte-identical to the checked-in wrapper.
+
 Standard library only; run with ``python3 -m unittest`` or directly.
 """
 
@@ -59,16 +66,76 @@ TIMEOUT_SECONDS = 120
 PREFLIGHT_REACHED = "Docker daemon is not reachable"
 
 FAKE_DOCKER_SOURCE = r'''#!/usr/bin/env python3
-"""Stand-in docker: record argv, then fail with a distinctive status."""
+"""Stand-in docker: record argv, then fail or emulate mounted effects."""
 
 import json
 import os
 import sys
+from pathlib import Path
 
+ARGS = sys.argv[1:]
 with open(os.environ["FAKE_DOCKER_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps(sys.argv[1:]) + "\n")
+    handle.write(json.dumps(ARGS) + "\n")
 
-sys.exit(%d if sys.argv[1:] == ["info"] else %d)
+ZIP_NAME = os.environ.get("FAKE_DOCKER_ZIP", "")
+PIPELINE = os.environ.get("FAKE_DOCKER_PIPELINE") == "1"
+
+
+def mounted(target):
+    """Return the host path bound to *target*, if the call binds it."""
+    for index, value in enumerate(ARGS[:-1]):
+        if value != "-v":
+            continue
+        spec = ARGS[index + 1]
+        for suffix in (":" + target + ":ro", ":" + target):
+            if spec.endswith(suffix):
+                return Path(spec[: -len(suffix)])
+    return None
+
+
+def invokes(name):
+    return any(Path(argument).name == name for argument in ARGS)
+
+
+if ARGS == ["info"]:
+    sys.exit(0 if PIPELINE else %d)
+if not PIPELINE:
+    sys.exit(%d)
+
+# Only the mounted effects the wrapper stat-checks are emulated; no image,
+# container, mount, loop or archive work happens.
+if ARGS[:1] == ["build"] or ARGS[:1] in (["rm"], ["image"]):
+    sys.exit(0)
+
+work = mounted("/work")
+output = mounted("/output")
+
+if invokes("skopeo"):
+    if work is not None:
+        (work / "oci").mkdir(parents=True, exist_ok=True)
+elif invokes("make-edl-raw-package.py"):
+    if work is not None:
+        archive = work / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / ZIP_NAME).write_bytes(b"fake producer archive")
+elif invokes("split-package-archive.py"):
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / (ZIP_NAME + ".parts.json")).write_text(
+            json.dumps({"parts": [{
+                "fileName": ZIP_NAME + ".001",
+                "bytes": 1,
+                "sha256": "0" * 64,
+            }]}),
+            encoding="utf-8",
+        )
+elif invokes("make-universal-update-descriptor.py"):
+    if output is not None:
+        (output / (ZIP_NAME + ".update.json")).write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+sys.exit(0)
 ''' % (DOCKER_INFO_SENTINEL, DOCKER_OTHER_SENTINEL)
 
 
@@ -109,8 +176,56 @@ def _third_profile(base_profile):
     return profile
 
 
+def _contract_models():
+    module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
+    sys.path.insert(0, module_root)
+    try:
+        from updates import package_contract
+    finally:
+        sys.path.remove(module_root)
+    return package_contract
+
+
+def _instrument_loop_precondition(text):
+    """Replace only the physical loop precondition of the wrapper copy.
+
+    The checked-in wrapper needs two real unused /dev/loopN block devices and
+    /dev/loop-control. A test fixture has none, so the complete loop-scan
+    section is replaced with two fixed dummy paths. Everything outside that
+    bounded section, including all upgrade decisions and both argument arrays,
+    is left byte-identical.
+    """
+    start = text.index("# --- loop devices")
+    end = text.index("# --- raw producer")
+    head, section, tail = text[:start], text[start:end], text[end:]
+    if "[[ -c /dev/loop-control ]]" not in section:
+        raise AssertionError("the wrapper loop section must hold the loop precondition")
+    replacement = (
+        'loop_a="/dev/loop0"\n'
+        'loop_b="/dev/loop1"\n'
+        'note "using $loop_a and $loop_b for the file-backed images"\n'
+        "\n"
+    )
+    instrumented = head + replacement + tail
+    # The edit inserts one span and deletes exactly the original loop section.
+    if instrumented[: len(head)] != head:
+        raise AssertionError("the loop instrumentation changed the wrapper head")
+    if instrumented[len(head) + len(replacement):] != tail:
+        raise AssertionError("the loop instrumentation changed the wrapper tail")
+    # Prove the edit is bounded to the loop section.
+    for needle in (
+        "producer_args+=(--offline-upgrade)",
+        "descriptor_args+=(--offline-upgrade)",
+        'descriptor_args+=(--install-model "$model_id")',
+        'producer_args+=(--model "$model_id")',
+    ):
+        if instrumented.count(needle) != text.count(needle):
+            raise AssertionError("the loop instrumentation changed %r" % needle)
+    return instrumented
+
+
 @contextmanager
-def build_fixture():
+def build_fixture(full_build=False):
     """Yield a minimal source tree, runtimes, fake docker and an env for it."""
     with tempfile.TemporaryDirectory(dir=_artifact_root()) as raw_root:
         root = Path(raw_root)
@@ -118,7 +233,13 @@ def build_fixture():
         build_files = source / "build_files"
         build_files.mkdir(parents=True)
 
-        shutil.copyfile(REAL_WRAPPER, build_files / REAL_WRAPPER.name)
+        wrapper_text = REAL_WRAPPER.read_text(encoding="utf-8")
+        if full_build:
+            wrapper_text = _instrument_loop_precondition(wrapper_text)
+        with open(
+            build_files / REAL_WRAPPER.name, "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(wrapper_text)
         shutil.copyfile(REAL_HELPER, build_files / REAL_HELPER.name)
 
         with open(REAL_DEVICES_CONFIG, encoding="utf-8") as handle:
@@ -148,6 +269,7 @@ def build_fixture():
             "package_contract",
             "package_media",
             "recovery_manifest",
+            "models",
             "boot_payload",
         ):
             module = source / ("system_files/usr/lib/armada/updates/" + name + ".py")
@@ -182,6 +304,9 @@ def build_fixture():
         env = os.environ.copy()
         env["PATH"] = os.pathsep.join((str(bin_dir), env.get("PATH", "/usr/bin:/bin")))
         env["FAKE_DOCKER_LOG"] = str(docker_log)
+        if full_build:
+            env["FAKE_DOCKER_PIPELINE"] = "1"
+            env["FAKE_DOCKER_ZIP"] = "ArmadaOS-Freedom-%s.zip" % PACKAGE_VERSION
 
         yield Fixture(
             source=source,
@@ -259,21 +384,11 @@ class WrapperPreflightTests(unittest.TestCase):
             raise AssertionError("the wrapper must define %s" % name)
         return set(match.group(1).split())
 
-    @staticmethod
-    def _contract_models():
-        module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
-        sys.path.insert(0, module_root)
-        try:
-            from updates import package_contract
-        finally:
-            sys.path.remove(module_root)
-        return package_contract
-
     def test_authorized_model_list_matches_the_package_contract(self):
         # The wrapper passes custom profiles to the descriptor as explicit
         # install models, so this list must stay the same closed set the
         # shipped descriptor contract accepts by default.
-        contract = self._contract_models()
+        contract = _contract_models()
         self.assertEqual(
             self._wrapper_models("AUTHORIZED_MODELS"),
             set(contract.AUTHORIZED_MODELS),
@@ -281,7 +396,7 @@ class WrapperPreflightTests(unittest.TestCase):
 
     def test_offline_upgrade_model_list_matches_the_package_contract(self):
         # The wrapper decides the package-level upgrade claim from this list.
-        contract = self._contract_models()
+        contract = _contract_models()
         self.assertEqual(
             self._wrapper_models("OFFLINE_UPGRADE_MODELS"),
             set(contract.OFFLINE_UPGRADE_MODELS),
@@ -478,6 +593,100 @@ class WrapperPreflightTests(unittest.TestCase):
                 ),
             )
             self._assert_rejected_before_docker(fixture, result, "duplicate runtime for")
+
+
+def _invoked(argv, script):
+    return any(Path(argument).name == script for argument in argv)
+
+
+def _values(argv, option):
+    return [
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == option
+    ]
+
+
+class WrapperArgumentTests(unittest.TestCase):
+    """Record the real producer and descriptor argv the wrapper builds."""
+
+    def _run_full_build(self, models):
+        contract = _contract_models()
+        authorized = set(contract.AUTHORIZED_MODELS)
+        upgrade_models = set(contract.OFFLINE_UPGRADE_MODELS)
+        install_only = [model for model in models if model not in authorized]
+        expected_upgrade = (
+            any(model in upgrade_models for model in models) and not install_only
+        )
+
+        with build_fixture(full_build=True) as fixture:
+            result = run_wrapper(fixture, base_arguments(fixture, models=models))
+            self.assertEqual(0, result.returncode, _diagnostics(result))
+
+            calls = read_docker_log(fixture)
+            producer = [
+                argv for argv in calls if _invoked(argv, "make-edl-raw-package.py")
+            ]
+            descriptor = [
+                argv
+                for argv in calls
+                if _invoked(argv, "make-universal-update-descriptor.py")
+            ]
+            self.assertEqual(1, len(producer), _diagnostics(result))
+            self.assertEqual(1, len(descriptor), _diagnostics(result))
+            producer, descriptor = producer[0], descriptor[0]
+
+            selected = _values(producer, "--model")
+            self.assertEqual(set(models), set(selected), _diagnostics(result))
+            self.assertEqual([], _values(descriptor, "--model"), _diagnostics(result))
+
+            # The producer records the package capability and the descriptor
+            # declares it. Both must agree with the selected-model eligibility
+            # the package contract defines, not with a fixed expectation.
+            self.assertEqual(
+                expected_upgrade, "--offline-upgrade" in producer,
+                _diagnostics(result),
+            )
+            self.assertEqual(
+                expected_upgrade, "--offline-upgrade" in descriptor,
+                _diagnostics(result),
+            )
+            self.assertEqual(
+                set(install_only),
+                set(_values(descriptor, "--install-model")),
+                _diagnostics(result),
+            )
+
+            # A package-level upgrade claim and an explicit install allowance
+            # are mutually exclusive in the descriptor.
+            if "--offline-upgrade" in descriptor:
+                self.assertEqual([], install_only)
+            return producer, descriptor
+
+    def test_y700_alone_builds_an_upgrade_package(self):
+        producer, descriptor = self._run_full_build(("TB322FC",))
+        self.assertIn("--offline-upgrade", producer)
+        self.assertIn("--offline-upgrade", descriptor)
+
+    def test_y700_with_tb710fu_builds_one_upgrade_package(self):
+        producer, descriptor = self._run_full_build(("TB322FC", "TB710FU"))
+        self.assertIn("--offline-upgrade", producer)
+        self.assertIn("--offline-upgrade", descriptor)
+        self.assertIn("TB710FU", _values(producer, "--model"))
+        self.assertEqual([], _values(descriptor, "--install-model"))
+
+    def test_tb710fu_alone_builds_an_install_only_package(self):
+        producer, descriptor = self._run_full_build(("TB710FU",))
+        self.assertNotIn("--offline-upgrade", producer)
+        self.assertNotIn("--offline-upgrade", descriptor)
+        self.assertEqual([], _values(descriptor, "--install-model"))
+
+    def test_custom_profile_is_an_explicit_install_model(self):
+        producer, descriptor = self._run_full_build(("TB322FC", THIRD_MODEL))
+        self.assertNotIn("--offline-upgrade", producer)
+        self.assertNotIn("--offline-upgrade", descriptor)
+        self.assertEqual([THIRD_MODEL], _values(descriptor, "--install-model"))
+        self.assertIn(THIRD_MODEL, _values(producer, "--model"))
 
 
 if __name__ == "__main__":

@@ -185,6 +185,7 @@ preflight_sources=(
     system_files/usr/lib/armada/updates/package_contract.py
     system_files/usr/lib/armada/updates/package_media.py
     system_files/usr/lib/armada/updates/recovery_manifest.py
+    system_files/usr/lib/armada/updates/models.py
     system_files/usr/lib/armada/updates/boot_payload.py
     system_files/usr/libexec/armada/armada-installer
 )

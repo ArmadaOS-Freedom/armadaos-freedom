@@ -403,6 +403,15 @@ make a package upgrade-capable: the descriptor must declare offline-upgrade,
 the requested model must be eligible, and the installed updater must meet
 `minimumUpdaterVersion`.
 
+The unified package ships updater 0.8.1, and its descriptor therefore declares
+`minimumUpdaterVersion` 0.8.1 while `minimumInstallerVersion` stays 0.8.0. A
+fresh installation from this package is the supported baseline: the installed
+system reports 0.8.1, and later unified packages can update the eligible Y700
+models in place while keeping user data. An installation made from an earlier
+0.8.0 package does not reach this baseline through an update: its installed
+validator rejects the mixed package, and this change ships no in-place
+migration path. That baseline is obtained by a fresh installation.
+
 Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
 (TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part
 of the same all-profile package for installation, but its update slot backend

@@ -17,6 +17,7 @@ import armada_os
 
 from . import system_manager
 from .finalization_receipt import _durable_ancestors
+from .models import OFFLINE_UPGRADE_MODELS
 from .system_transaction import (
     SystemTransactionError, run_online_transaction, run_rollback_transaction)
 
@@ -25,7 +26,7 @@ COMPATIBLE_PATH = Path("/sys/firmware/devicetree/base/compatible")
 SYSROOT_PATH = Path("/sysroot")
 STATE_DIR = Path("/var/lib/armada/updates/system")
 
-SUPPORTED_MODELS = {"TB322FC", "TB323FU"}
+SUPPORTED_MODELS = OFFLINE_UPGRADE_MODELS
 TERMINAL_STATES = {"awaiting_reboot", "up_to_date"}
 
 

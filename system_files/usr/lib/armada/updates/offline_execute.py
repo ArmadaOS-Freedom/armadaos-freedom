@@ -11,8 +11,10 @@ import stat
 import uuid
 
 from . import (
+    UPDATER_VERSION,
     boot_candidate,
     deployment_options,
+    models,
     offline_boot_writer,
     offline_prepare,
     package_contract,
@@ -206,7 +208,7 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
     package = package_contract.load_package(
         package_doc, signature_b64, trusted_key=trusted_key)
     initial = (physical_slots.inspect_physical_slots())
-    if initial['model'] not in ('TB322FC', 'TB323FU'):
+    if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
         raise ValueError('unsupported physical model')
     package_contract.require_operation(
         package, initial['model'], 'offline-upgrade', updater_version=updater_version)
@@ -352,7 +354,7 @@ def _build_record(ctx, plan_sha):
 
 
 def execute_offline_update(*, work_dir, recovery_ack,
-                           updater_version='0.8.0',
+                           updater_version=UPDATER_VERSION,
                            trusted_key=signature.DEFAULT_TRUSTED_KEY):
     return _execute_offline_update(
         work_dir=work_dir, recovery_ack=recovery_ack,
@@ -360,7 +362,7 @@ def execute_offline_update(*, work_dir, recovery_ack,
 
 
 def _execute_offline_update(*, work_dir=None, recovery_ack,
-                            updater_version='0.8.0',
+                            updater_version=UPDATER_VERSION,
                             trusted_key=signature.DEFAULT_TRUSTED_KEY):
     with trial_confirmation._locked():
         work = Path(work_dir) if work_dir is not None else None

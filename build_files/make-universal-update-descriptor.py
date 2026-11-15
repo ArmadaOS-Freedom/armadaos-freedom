@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from universal_package import build_descriptor
+from updates import UPDATER_VERSION
 from updates.package_contract import PackageError, load_package
 from updates.signature import MAX_DOCUMENT_BYTES, MAX_SIGNATURE_BYTES
 
@@ -82,7 +83,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--output", type=Path, required=True)
     create.add_argument("--parts-manifest", type=Path)
     create.add_argument("--minimum-installer-version", default="0.8.0")
-    create.add_argument("--minimum-updater-version", default="0.8.0")
+    create.add_argument("--minimum-updater-version", default=UPDATER_VERSION)
     create.add_argument("--offline-upgrade", action="store_true", default=False,
                         help="declare offline-upgrade for normal-Linux installs; requires the "
                              "bundle to record a verified normal updater and at least one "

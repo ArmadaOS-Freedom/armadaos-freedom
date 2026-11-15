@@ -17,7 +17,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'system_files/usr/lib/armada'))
 sys.path.insert(0, str(ROOT / 'tests'))
-from updates import offline_session, system_transaction, trial_confirmation
+from updates import (  # noqa: E402
+    UPDATER_VERSION, offline_session, system_transaction, trial_confirmation,
+)
 # Session builders and the execute-side recovery cases live in sibling mixin
 # modules so that each file stays reviewable.  Neither module is a test module
 # for discovery purposes: see the class defined below for the only concrete
@@ -370,7 +372,7 @@ class OfflineJobTests(OfflineJobRecoveryCases, OfflineJobFixtureMixin,
                              self.store.base / sid / 'incoming')
             self.assertEqual(kwargs['sysroot_path'], '/sysroot')
             self.assertEqual(kwargs['trusted_key'], self.public)
-            self.assertEqual(kwargs['updater_version'], '0.8.0')
+            self.assertEqual(kwargs['updater_version'], UPDATER_VERSION)
             with self.assertRaises(offline_session.OfflineSessionError):
                 self.manager().run_job('prepare', sid)
             prepare.assert_called_once()
