@@ -25,6 +25,7 @@ from .boot_candidate import _require_positive_int, _verify_claim
 from .boot_sources import _load_locator, _locate, _rehash_region
 from .boot_writer import _inventory
 from .deployment_store import _parse_binding
+from .models import OFFLINE_UPGRADE_MODELS
 
 SYS_CLASS_BSG = Path('/sys/class/bsg')
 SYS_DEV_CHAR = Path('/sys/dev/char')
@@ -157,7 +158,7 @@ def _activate_prepared_slots(write_report, offline):
         if write_report.get('phase') != expected_phase:
             raise ActivationError(f'write_report phase must be {expected_phase}')
         model = write_report.get('model')
-        if model not in ('TB322FC', 'TB323FU'):
+        if model not in OFFLINE_UPGRADE_MODELS:
             raise ActivationError(f'unsupported model: {model!r}')
         from_slot = write_report.get('fromSlot')
         if offline:
@@ -539,7 +540,7 @@ def mark_confirmed_slot(record):
         ):
             raise ActivationError('live physical report does not match confirmed target')
         model = initial.get('model')
-        if model not in ('TB322FC', 'TB323FU'):
+        if model not in OFFLINE_UPGRADE_MODELS:
             raise ActivationError(f'unsupported model: {model!r}')
         saved_boot_state = physical_slots._read_boot_state()
         recovery = physical_slots.locate_recovery_partition(require_edl=False)

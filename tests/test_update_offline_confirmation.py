@@ -291,9 +291,18 @@ class OfflineConfirmationTest(unittest.TestCase):
         new_dep = ("armada", confirmed.new_commit.hex(), confirmed.new_serial)
         old_dep = ("armada", confirmed.old_commit.hex(), confirmed.old_serial)
 
+        def patch_models(overrides):
+            # physical_slots._MODEL is the immutable BOARD_MODELS view derived
+            # from the capability registry, so the test substitutes a private
+            # copy carrying the board entry it means to observe.
+            patched = dict(system_transaction.physical_slots._MODEL)
+            patched.update(overrides)
+            return mock.patch.object(
+                system_transaction.physical_slots, "_MODEL", patched)
+
         def run(model):
             with mock.patch.object(system_transaction.recovery_device, "open_recovery", fake_open), \
-                 mock.patch.dict(system_transaction.physical_slots._MODEL, {1: model}):
+                 patch_models({1: model}):
                 system_transaction._check_recovery(dict(initial), new_dep)
 
         run("ModelX")
@@ -301,7 +310,7 @@ class OfflineConfirmationTest(unittest.TestCase):
         run("ModelX")
         initial["actualSlot"] = "a"
         with mock.patch.object(system_transaction.recovery_device, "open_recovery", fake_open), \
-             mock.patch.dict(system_transaction.physical_slots._MODEL, {1: "ModelX"}):
+             patch_models({1: "ModelX"}):
             with self.assertRaises(ValueError):
                 system_transaction._check_recovery(dict(initial), old_dep)
             pending = replace(confirmed, sequence=2, state=rec.TRIAL, remaining=1)
@@ -314,7 +323,7 @@ class OfflineConfirmationTest(unittest.TestCase):
         online = fx._trial_sample(sequence=3, state=rec.CONFIRMED, from_slot=0, target_slot=1)
         store.save(fx.fx.fd, store.load(fx.fx.fd, fx.fx.part, 1), online)
         with mock.patch.object(system_transaction.recovery_device, "open_recovery", fake_open), \
-             mock.patch.dict(system_transaction.physical_slots._MODEL, {1: "ModelX"}):
+             patch_models({1: "ModelX"}):
             system_transaction._check_recovery(
                 {**initial, "actualSlot": "b"}, new_dep)
             with self.assertRaises(ValueError):

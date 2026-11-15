@@ -9,13 +9,14 @@ from pathlib import Path
 import armada_os
 from . import boot_context
 from .boot_health import BootHealthError, _sysfs_block_node, _ufs_controller
+from .models import BOARD_MODELS
 from .recovery_device import locate_recovery_partition
 
 SYS_CLASS_BLOCK = Path('/sys/class/block')
 DEV_BLOCK = Path('/dev/block')
 LIBRARY_PATH = Path('/usr/libexec/armada/libarmada-update-ab.so')
 
-_MODEL = {1: 'TB322FC', 2: 'TB323FU'}
+_MODEL = BOARD_MODELS
 _LUN_IDS = frozenset(range(6))
 _INT64_MAX = (1 << 63) - 1
 _SYSFS_MAX = 64

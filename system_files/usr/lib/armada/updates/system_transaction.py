@@ -28,12 +28,14 @@ import uuid
 
 import armada_os
 from . import (
+    UPDATER_VERSION,
     boot_candidate,
     boot_materials,
     boot_trust,
     deployment_store,
     image_source,
     job_retirement,
+    models,
     offline_boot_writer,
     physical_slots,
     recovery_device,
@@ -271,7 +273,7 @@ def _commit_prepared_journal(*, initial, expected, record):
 
 def _run_transaction(*, mode, sysroot_path, work_dir,
                      channel_url=None, signature_url=None, expected_channel=None,
-                     expected_checksum=None, updater_version='0.8.0',
+                     expected_checksum=None, updater_version=UPDATER_VERSION,
                      boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
                      dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
                      trusted_key=signature.DEFAULT_TRUSTED_KEY):
@@ -302,7 +304,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 raise ValueError('sysroot is not a directory')
             boot_materials._validate_output_dir(work, [root / 'ostree', root / 'boot'])
             initial = physical_slots.inspect_physical_slots()
-            if initial['model'] not in ('TB322FC', 'TB323FU'):
+            if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
                 raise ValueError('unsupported physical model')
             snapshot = armada_os.snapshot()
             if (snapshot['repository'] not in armada_os.REPOSITORIES or
@@ -546,7 +548,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
 
 
 def run_online_transaction(*, channel_url, signature_url, expected_channel,
-                           sysroot_path, work_dir, updater_version='0.8.0',
+                           sysroot_path, work_dir, updater_version=UPDATER_VERSION,
                            boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
                            dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
                            trusted_key=signature.DEFAULT_TRUSTED_KEY):

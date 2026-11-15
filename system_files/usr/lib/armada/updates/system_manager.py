@@ -16,20 +16,15 @@ from .boot_context import BootContextError, read_boot_context
 from .trial_record import BOOT_POLICY
 from .trial_status import read_trial_status
 from .channel_source import fetch_update
-from . import channel_selection, offline_completion
+from .models import COMPATIBLE_MODELS
+from . import UPDATER_VERSION, channel_selection, offline_completion
 
-UPDATER_VERSION = "0.8.0"
 MAX_COMPATIBLE_BYTES = 4096
 MAX_CONFIG_BYTES = 64 * 1024
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 CHANNEL_MAP = {"stable": "stable", "beta": "beta",
                "preview": "testing", "testing": "testing"}
-MODELS = {
-    b"lenovo,elden": "TB322FC",
-    b"lenovo,baldur": "TB323FU",
-    b"lenovo,tb323fu": "TB323FU",
-    b"lenovo,tb710fu": "TB710FU",
-}
+MODELS = COMPATIBLE_MODELS
 
 SYSTEM_APPLY_STATE_ROOT = Path("/var/lib/armada/updates/system")
 SYSTEM_APPLY_ARGV = ["/usr/bin/python3", "-m", "updates.system_apply"]

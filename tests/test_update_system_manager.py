@@ -161,7 +161,7 @@ class SystemManagerTests(unittest.TestCase):
             "https://updates/stable.sig",
             expected_channel="stable",
             model="TB322FC",
-            updater_version="0.8.0")
+            updater_version=system_manager.UPDATER_VERSION)
 
     def test_preview_maps_to_testing_with_fetch_args(self):
         snap = snapshot(channel="preview")

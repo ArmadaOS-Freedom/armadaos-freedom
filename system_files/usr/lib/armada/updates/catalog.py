@@ -6,11 +6,12 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
+from .models import AUTHORIZED_MODELS
 from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 
 
 _CHANNELS = frozenset(("stable", "beta", "testing"))
-_MODELS = frozenset(("TB322FC", "TB323FU", "TB710FU"))
+_MODELS = AUTHORIZED_MODELS
 _TOP_KEYS = frozenset((
     "schemaVersion", "kind", "product", "channel", "releaseId", "version",
     "sourceRevision", "ociDigest", "ostreeCommit", "supportedModels",

@@ -7,6 +7,8 @@ import re
 import struct
 from typing import Any
 
+from .models import MIRROR_POLICY_MODELS
+
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "freedom-update-boot"
 RUNTIME_SIZE_BYTES = 4 * 1024 * 1024
@@ -21,7 +23,6 @@ KERNEL_RELEASE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 # the new-system mirrored policy models require it; TB710FU and read-only
 # inspection of older deployments stay outside this gate.
 MIRROR_RUNTIME_MARKER = b"ARMADA_LINUX_MIRROR_V1"
-MIRROR_POLICY_MODELS = frozenset({"TB322FC", "TB323FU"})
 
 
 def runtime_marker_required(model: str) -> bool:

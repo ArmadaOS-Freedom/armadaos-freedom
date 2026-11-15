@@ -11,11 +11,13 @@ import uuid
 
 import armada_os
 from . import (
+    UPDATER_VERSION,
     boot_candidate,
     boot_materials,
     boot_trust,
     deployment_store,
     image_source,
+    models,
     offline_payload,
     package_contract,
     physical_slots,
@@ -121,7 +123,7 @@ def _recovery_files(work, sources, journal):
 
 def prepare_offline_update(*, document, signature_b64, payload_directory,
                            expected_channel, sysroot_path, work_dir,
-                           updater_version='0.8.0',
+                           updater_version=UPDATER_VERSION,
                            boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
                            dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
                            trusted_key=signature.DEFAULT_TRUSTED_KEY):
@@ -135,7 +137,7 @@ def prepare_offline_update(*, document, signature_b64, payload_directory,
 
 def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                             expected_channel, sysroot_path=None, work_dir=None,
-                            updater_version='0.8.0',
+                            updater_version=UPDATER_VERSION,
                             boot_tool_path=boot_candidate._DEFAULT_BOOT_TOOL_PATH,
                             dtb_helper_path=Path('/usr/libexec/armada/kshim-build-boot.py'),
                             trusted_key=signature.DEFAULT_TRUSTED_KEY):
@@ -161,7 +163,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             inspect_slots = physical_slots.inspect_physical_slots
 
             initial = inspect_slots()
-            if initial['model'] not in ('TB322FC', 'TB323FU'):
+            if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
                 raise ValueError('unsupported physical model')
             snapshot = armada_os.snapshot()
             if (snapshot['repository'] not in armada_os.REPOSITORIES or

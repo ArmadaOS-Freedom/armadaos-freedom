@@ -24,6 +24,7 @@ from .boot_sources import (
     BootSourcesError,
     capture_boot_sources,
 )
+from .models import GBL_MODELS, OFFLINE_UPGRADE_MODELS
 from .physical_slots import (
     PhysicalSlotsError,
     inspect_physical_slots,
@@ -31,7 +32,7 @@ from .physical_slots import (
 )
 
 
-_NATIVE_MODELS = frozenset({"TB322FC", "TB323FU"})
+_NATIVE_MODELS = OFFLINE_UPGRADE_MODELS
 _SLOT_CLI_KEYS = ("boot", "vendorBoot", "initBoot", "abl", "xblConfig", "vbmeta")
 _SOURCE_KEY_MAP = {
     "boot": "current_boot",
@@ -292,7 +293,7 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
         extra_labels = (
             "recovery_a", "recovery_b", "vbmeta_system_a", "vbmeta_system_b"
         )
-        if initial["model"] == "TB323FU":
+        if initial["model"] in GBL_MODELS:
             extra_labels += ("efisp",)
         snapshot = capture_boot_sources(
             initial, out / "sources", extra_labels=extra_labels
@@ -307,7 +308,7 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
             "b": _slot_request(snapshot, "b"),
             "efisp": (
                 _to_cli_claim(snapshot["extraFiles"]["efisp"])
-                if initial["model"] == "TB323FU" else None
+                if initial["model"] in GBL_MODELS else None
             ),
         }
         return _finalize_trust(

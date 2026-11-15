@@ -10,7 +10,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'system_files/usr/lib/armada'))
 
-from updates import offline_session, physical_slots, trial_record  # noqa: E402
+from updates import (  # noqa: E402
+    UPDATER_VERSION, offline_session, physical_slots, trial_record,
+)
 
 CHECKSUM = 'b' * 64
 PART_UUID = '12345678-1234-5678-9abc-123456789abc'
@@ -72,7 +74,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
         strict.assert_not_called()
         self.assertEqual(info, {
             'schemaVersion': 1,
-            'updaterVersion': '0.8.0',
+            'updaterVersion': UPDATER_VERSION,
             'bootPolicy': 'dual-boot-no-slot-control',
             'model': 'TB322FC',
             'actualSlot': 'b',

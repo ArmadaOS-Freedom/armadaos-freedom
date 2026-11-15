@@ -17,7 +17,9 @@ from contextlib import contextmanager
 
 import armada_os
 from . import (
+    UPDATER_VERSION,
     boot_context,
+    models,
     offline_execute,
     offline_payload,
     package_contract,
@@ -29,13 +31,13 @@ from . import (
 )
 
 _DEFAULT_BASE = Path('/var/lib/armada-updates/offline')
-_UPDATER_VERSION = '0.8.0'
+_UPDATER_VERSION = UPDATER_VERSION
 _DOCUMENT_MAX = 2 * 1024 * 1024
 _SIGNATURE_MAX = 16 * 1024
 _JSON_MAX = 2 * 1024 * 1024
 _CHUNK_MAX = 1024 * 1024
 _SESSION_ID = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
-_MODELS = frozenset({'TB322FC', 'TB323FU'})
+_MODELS = models.OFFLINE_UPGRADE_MODELS
 _EXPORT_STATES = frozenset({
     'awaiting_recovery_export', 'executing', 'awaiting_reboot', 'failed',
     'recovery_required',

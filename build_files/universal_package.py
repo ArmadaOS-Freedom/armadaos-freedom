@@ -12,6 +12,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
+from updates import UPDATER_VERSION
 from updates.package_contract import (
     AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, _portable_path,
     validate_package,
@@ -176,7 +177,7 @@ def _artifact(item, model, shared, directory):
 
 def build_descriptor(archive_path: Path, *, release_id: str,
                      minimum_installer_version="0.8.0",
-                     minimum_updater_version="0.8.0",
+                     minimum_updater_version=UPDATER_VERSION,
                      parts_manifest: Path | None = None,
                      enable_offline_upgrade: bool = False,
                      install_models=()) -> dict:
@@ -288,10 +289,15 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                 raise PackageError(
                     "install_models must name exactly the non-default package models"
                 )
-            upgrade_models = tuple(
-                model for model in models if model not in OFFLINE_UPGRADE_MODELS
+            # The descriptor declares operations once per package. A mixed set
+            # of shipped models may advertise upgrade when at least one of
+            # them has the dual-slot backend; consumers reject the request for
+            # any other selected model. Custom install-only models and a
+            # selection with no eligible model keep the package install-only.
+            upgrade_eligible = tuple(
+                model for model in models if model in OFFLINE_UPGRADE_MODELS
             )
-            if enable_offline_upgrade and upgrade_models:
+            if enable_offline_upgrade and (custom_models or not upgrade_eligible):
                 raise PackageError(
                     "offline-upgrade is restricted to the models with the dual-slot "
                     "backend; build this package install-only"

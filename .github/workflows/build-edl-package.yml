@@ -49,33 +49,15 @@ on:
 
 jobs:
   build:
-    # Two independent variants on separate runners: the release profile is the
-    # closed TB322FC/TB323FU set that may declare offline-upgrade and be
-    # published, while the universal profile packages every registered profile
-    # (including TB710FU) for first installation only. Each runner has its own
-    # checkout, work directory and output directory, so one variant can never
-    # read, sign, or overwrite the other variant's package.
-    name: Build and upload (${{ matrix.variant }})
+    # One artifact, one runner: the package installs every profile registered
+    # in build_files/edl-devices.json and declares offline-upgrade for the
+    # selected models with the dual-slot backend. A single checkout, work
+    # directory, output directory and signature means there is no variant to
+    # keep apart.
+    name: Build and upload
     runs-on: ubuntu-24.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        # The artifact name below is composed as <artifact>-<run id>, keeping
-        # the existing edl-package-<run id> name for the publishable variant
-        # and adding edl-install-package-<run id> for the install-only one.
-        include:
-          - variant: release
-            profile: release
-            artifact: edl-package
-            offline_upgrade: "true"
-          - variant: install
-            profile: universal
-            artifact: edl-install-package
-            offline_upgrade: "false"
     concurrency:
-      # Keep the variants in separate queues as well, so a queued run of one
-      # variant can never delay or replace the other.
-      group: edl-package-${{ matrix.variant }}-${{ github.ref }}
+      group: edl-package-${{ github.ref }}
       cancel-in-progress: false
       queue: max
 
@@ -230,22 +212,19 @@ jobs:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
           REVISION: ${{ steps.revision.outputs.revision }}
           VERSION: ${{ inputs.version }}
-          EDL_PACKAGE_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
           # These step environment variables are passed as quoted Just
           # arguments; the recipe's exported parameters expose them to the
           # shell as quoted variables, and the wrapper validates digest/version
-          # agreement. EDL_PACKAGE_PROFILE=release selects the closed
-          # TB322FC/TB323FU set; universal (the recipe default) forwards no
-          # model, so every registered profile is packaged.
+          # agreement. The recipe selects no profile or model, so every
+          # profile registered in the devices config is packaged.
           just build-edl-package "${IMAGE}" "${IMAGE_DIGEST}" "${REVISION}" "${VERSION}"
 
       - name: Sign and verify universal update descriptor
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
           COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
-          EXPECT_OFFLINE_UPGRADE: ${{ matrix.offline_upgrade }}
         run: |
           set -euo pipefail
           mapfile -d '' -t descriptors < <(find output/edl -type f -name '*.zip.update.json' -print0)
@@ -263,35 +242,41 @@ jobs:
             --descriptor "${descriptor}" \
             --signature "${descriptor}.sig" \
             --trusted-key system_files/etc/pki/containers/armadaos-freedom.pub
-          # The signature above authenticates these exact bytes. The release
-          # variant must advertise both operations so the publisher accepts it;
-          # the install variant must stay install-only even though it carries
-          # the same valid signature. A mismatch fails before upload, so a
-          # mislabeled artifact can never be published.
-          python3 - "${descriptor}" "${EXPECT_OFFLINE_UPGRADE}" <<'PY'
+          # The signature above authenticates these exact bytes. Before upload,
+          # the descriptor must cover exactly the configured install set and
+          # declare both operations. The single package installs every model;
+          # the consumer rejects an offline-upgrade request for a selected
+          # model without the dual-slot backend. A mismatch fails before
+          # upload, so a mislabeled artifact can never be published.
+          python3 - "${descriptor}" <<'PY'
           import json
           import sys
 
+          with open("build_files/edl-devices.json", encoding="utf-8") as handle:
+              profiles = json.load(handle).get("profiles")
+          if not isinstance(profiles, dict) or not profiles:
+              raise SystemExit("the devices config has no profiles")
           with open(sys.argv[1], encoding="utf-8") as handle:
-              operations = json.load(handle).get("operations")
-          if not isinstance(operations, list) or "install" not in operations:
-              raise SystemExit("the signed descriptor does not declare install")
-          upgrade = "offline-upgrade" in operations
-          expected = sys.argv[2].strip() == "true"
-          if upgrade != expected:
-              expected_name = (
-                  "install and offline-upgrade" if expected else "install-only"
-              )
+              document = json.load(handle)
+          supported = document.get("supportedModels")
+          if not isinstance(supported, list) or set(supported) != set(profiles):
               raise SystemExit(
-                  "the signed descriptor is not the expected "
-                  f"{expected_name} package"
+                  "the signed descriptor supportedModels must exactly match "
+                  "the configured profiles"
+              )
+          operations = document.get("operations")
+          if not isinstance(operations, list) or not {
+              "install", "offline-upgrade"
+          } <= set(operations):
+              raise SystemExit(
+                  "the signed descriptor must declare install and offline-upgrade"
               )
           PY
 
       - name: Upload EDL package to GitHub artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.artifact }}-${{ github.run_id }}
+          name: edl-package-${{ github.run_id }}
           # Split volumes only: a monolithic *.zip is never published.
           path: |
             output/edl/**/*.zip.[0-9][0-9][0-9]*

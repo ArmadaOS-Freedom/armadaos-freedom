@@ -90,24 +90,65 @@ class UpdateDescriptorCliTests(unittest.TestCase):
         def capable(bundle, model_docs, members):
             bundle["offlineUpgrade"] = True
 
-        for models in (("TB710FU",), ("TB322FC", "TB710FU")):
-            with self.subTest(models=models), tempfile.TemporaryDirectory() as tmp:
-                directory = Path(tmp)
-                archive = fixtures.BASE._make_bundle(
-                    directory, models=models, mutate=capable
-                )
-                install_only = directory / "install-only.json"
-                result = self._make(archive, install_only)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                document = json.loads(install_only.read_text(encoding="utf-8"))
-                self.assertEqual(document["supportedModels"], list(models))
-                self.assertEqual(document["operations"], ["install"])
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            archive = fixtures.BASE._make_bundle(
+                directory, models=("TB710FU",), mutate=capable
+            )
+            install_only = directory / "install-only.json"
+            result = self._make(archive, install_only)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(install_only.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], ["TB710FU"])
+            self.assertEqual(document["operations"], ["install"])
 
-                rejected = directory / "rejected.json"
-                result = self._make(archive, rejected, offline=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(rejected.exists())
-                self.assertIn("offline-upgrade is restricted", result.stderr)
+            rejected = directory / "rejected.json"
+            result = self._make(archive, rejected, offline=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(rejected.exists())
+            self.assertIn("offline-upgrade is restricted", result.stderr)
+
+    def test_mixed_tb710fu_bundle_upgrades_only_the_dual_slot_models(self):
+        def capable(bundle, model_docs, members):
+            bundle["offlineUpgrade"] = True
+
+        models = ("TB322FC", "TB710FU")
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            archive = fixtures.BASE._make_bundle(
+                directory, models=models, mutate=capable
+            )
+
+            install_only = directory / "install-only.json"
+            result = self._make(archive, install_only)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(install_only.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], list(models))
+            self.assertEqual(document["operations"], ["install"])
+            for model in models:
+                fixtures.builder.require_operation(
+                    document, model, "install", installer_version="0.10.0"
+                )
+
+            upgrade = directory / "upgrade.json"
+            result = self._make(archive, upgrade, offline=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(upgrade.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], list(models))
+            self.assertEqual(document["operations"], ["install", "offline-upgrade"])
+            fixtures.builder.require_operation(
+                document, "TB322FC", "offline-upgrade", updater_version="0.10.0"
+            )
+            for model in models:
+                fixtures.builder.require_operation(
+                    document, model, "install", installer_version="0.10.0"
+                )
+            with self.assertRaisesRegex(
+                fixtures.PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
+            ):
+                fixtures.builder.require_operation(
+                    document, "TB710FU", "offline-upgrade", updater_version="0.10.0"
+                )
 
     def test_legacy_archive_rejects_explicit_upgrade(self):
         for models in MODEL_SETS:

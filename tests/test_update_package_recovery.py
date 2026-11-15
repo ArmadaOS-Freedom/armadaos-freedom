@@ -123,8 +123,10 @@ class BuilderRecoveryTests(unittest.TestCase):
                 self.assertEqual(by_path["common/boot/Image"]["role"], "kernel")
 
     def test_tb710fu_recovery_materials_are_rejected(self):
-        # TB710FU has no RAM rescue backend; recovery manifests are restricted
-        # to the models whose physical slots support the upgrade.
+        # TB710FU has no RAM rescue backend; recovery manifests stay restricted
+        # to packages whose supported models are all upgrade-capable. The
+        # mixed known-model upgrade itself is legitimate, but recovery is
+        # rejected on both the install-only and upgrade paths.
         with tempfile.TemporaryDirectory() as tmp:
             archive = BASE._make_bundle(
                 Path(tmp),
@@ -136,7 +138,7 @@ class BuilderRecoveryTests(unittest.TestCase):
             ):
                 builder.build_descriptor(archive, release_id="rel-gt")
             with self.assertRaisesRegex(
-                PackageError, "offline-upgrade is restricted"
+                PackageError, "recoveryManifests are restricted"
             ):
                 builder.build_descriptor(
                     archive, release_id="rel-gt", enable_offline_upgrade=True

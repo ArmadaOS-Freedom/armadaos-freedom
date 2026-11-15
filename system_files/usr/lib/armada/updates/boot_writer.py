@@ -11,6 +11,7 @@ from .boot_lock import read_boot_lock
 from .boot_sources import _load_locator, _locate, _rehash_region
 from .boot_trust import _normalize_snapshot
 from .deployment_store import _parse_binding
+from .models import GBL_MODELS, OFFLINE_UPGRADE_MODELS
 
 _MAX_BUFFER = 256 * 1024 * 1024
 _CHUNK = 1024 * 1024
@@ -143,14 +144,14 @@ def write_inactive_boot(trust_report, candidate_report):
             raise BootWriteError('invalid physical active/inactive slots')
         target = candidate_report['slot']
         mode = candidate_report['mode']
-        if target != inactive or initial['model'] not in ('TB322FC', 'TB323FU') \
+        if target != inactive or initial['model'] not in OFFLINE_UPGRADE_MODELS \
                 or candidate_report['model'] != initial['model'] \
                 or mode not in _MODES or mode != trust_report['mode']:
             raise BootWriteError('candidate target, model, or mode mismatch')
         if mode == 'aosp-resign' and candidate_report.get('payloadDigestMatchesSignedMetadata') is not True:
             raise BootWriteError('candidate payload digest does not match signed metadata')
         extras = ['recovery_a', 'recovery_b', 'vbmeta_system_a', 'vbmeta_system_b']
-        if initial['model'] == 'TB323FU':
+        if initial['model'] in GBL_MODELS:
             extras.append('efisp')
         snapshot = _normalize_snapshot(trust_report['sources'], initial, extras)
         trusted = trust_report['trust'][target]

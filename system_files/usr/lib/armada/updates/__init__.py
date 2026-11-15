@@ -25,3 +25,9 @@ Android slot the bootloader picked:
 Read-only observation of physical slots, per-slot materials and boot evidence
 remains required and is never a demand to reboot into the other slot.
 """
+
+# The updater carried by the initial all-model unified package.  Runtime
+# reporting, descriptor minimums and every entrypoint default read this one
+# value, so this baseline stays distinguishable from the pre-unification 0.8.0
+# updater that cannot consume a mixed package.
+UPDATER_VERSION = "0.8.1"
