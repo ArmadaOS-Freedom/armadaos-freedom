@@ -23,20 +23,23 @@ fi
 
 install -d -m 0755 /usr/lib /etc
 cat >"${os_release}" <<EOF
-NAME="Armada"
+NAME="ArmadaOS Freedom"
 VERSION="${armada_version}"
 ID=armada
 ID_LIKE="fedora"
 VERSION_ID="${base_version_id}"
+VERSION_CODENAME=freedom
 BUILD_ID="${armada_version}"
-PRETTY_NAME="Armada ${armada_version}"
+PRETTY_NAME="ArmadaOS Freedom ${armada_version}"
+VARIANT="Freedom"
+VARIANT_ID=freedom
 DEFAULT_HOSTNAME=armada
 IMAGE_ID=armada
 IMAGE_VERSION="${armada_version}"
-HOME_URL="https://armadaos.dev/"
-DOCUMENTATION_URL="https://armadaos.dev/"
-SUPPORT_URL="https://armadaos.dev/troubleshooting/frequently-asked-questions/"
-BUG_REPORT_URL="https://github.com/armada-os/armada/issues"
+HOME_URL="https://github.com/ArmadaOS-Freedom/armadaos-freedom"
+DOCUMENTATION_URL="https://github.com/ArmadaOS-Freedom/armadaos-freedom/blob/main/README.md"
+SUPPORT_URL="https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues"
+BUG_REPORT_URL="https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues"
 EOF
 chmod 0644 "${os_release}"
 

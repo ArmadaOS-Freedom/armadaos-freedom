@@ -1,0 +1,511 @@
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -394,56 +394,17 @@
+ 	wlserver_mousemotion(event->unaccel_dx, event->unaccel_dy, event->time_msec);
+ }
+ 
+-void wlserver_open_steam_menu( bool qam )
+-{
+-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( 0 );
+-	if (!server)
+-		return;
+-
+-	Display *dpy = server->get_xdisplay();
+-	if ( !dpy )
+-		return;
+-
+-	// XTest/libei re-routes synthetic input to the globally focused game, so
+-	// deliver Ctrl+1/2 straight to the X11 focus window with XSendEvent instead.
+-	Window focus = None;
+-	int revert = 0;
+-	XGetInputFocus( dpy, &focus, &revert );
+-	if ( focus == None || focus == PointerRoot )
+-		return;
+-
+-	KeyCode ctrl = XKeysymToKeycode( dpy, XK_Control_L );
+-	KeyCode digit = XKeysymToKeycode( dpy, qam ? XK_2 : XK_1 );
+-	if ( ctrl == 0 || digit == 0 )
+-		return;
+-
+-	auto sendKey = [&]( KeyCode keycode, bool press, unsigned int state )
+-	{
+-		XEvent event = {};
+-		event.xkey.type = press ? KeyPress : KeyRelease;
+-		event.xkey.display = dpy;
+-		event.xkey.window = focus;
+-		event.xkey.root = DefaultRootWindow( dpy );
+-		event.xkey.subwindow = None;
+-		event.xkey.time = CurrentTime;
+-		event.xkey.x = 0;
+-		event.xkey.y = 0;
+-		event.xkey.x_root = 0;
+-		event.xkey.y_root = 0;
+-		event.xkey.same_screen = True;
+-		event.xkey.keycode = keycode;
+-		event.xkey.state = state;
+-		XSendEvent( dpy, focus, False, press ? KeyPressMask : KeyReleaseMask, &event );
+-	};
+-
+-	sendKey( ctrl, true, 0 );
+-	sendKey( digit, true, ControlMask );
+-	sendKey( digit, false, ControlMask );
+-	sendKey( ctrl, false, ControlMask );
+-
+-	// Dispatch now: this must not wait on unrelated Steam X11 traffic while a game has focus.
+-	XFlush( dpy );
+-}
++void wlserver_open_steam_menu( bool qam )
++{
++	// Drive Steam's own virtual gamepad through the helper: synthetic X11 keys
++	// open the menu but switch it to keyboard navigation.
++	char szHelper[] = "/usr/libexec/armada/steam-menu";
++	char szHome[] = "home";
++	char szQam[] = "qam";
++	char *argv[] = { szHelper, qam ? szQam : szHome, nullptr };
++
++	gamescope::Process::SpawnProcess( argv, nullptr, true );
++}
+ 
+ void wlserver_open_steam_osk(bool osk)
+ {
+diff --git a/tests/test_steam_menu_dispatch.py b/tests/test_steam_menu_dispatch.py
+--- a/tests/test_steam_menu_dispatch.py
++++ b/tests/test_steam_menu_dispatch.py
+@@ -1,260 +1,176 @@
+-"""End-to-end X11 delivery test for wlserver_open_steam_menu.
+-
+-Existing tests stub wlserver_open_steam_menu, so they never see whether the
+-fake key events actually reach an X client. This test extracts the real
+-function body from src/wlserver.cpp, compiles it against libX11/libXtst, and
+-watches a separate receiver connection on a disposable Xvfb server.
+-
+-Because XTest input is routed through libei on the target tablet and lands in
+-the focused game instead of the shell, the receiver asserts direct addressing:
+-every event must arrive with window == the receiver window, send_event == true
+-(i.e. an explicit XSendEvent, not an injected device event), the expected keysym
+-sequence with states [0, ControlMask, ControlMask, ControlMask], and the server
+-focus (window plus revert mode) must be unchanged afterwards. An XTest-based
+-implementation can deliver the same four keys and still fail here.
+-
+-Run inside a container that provides Xvfb, g++ and the X11/XTest headers:
+-
+-    python3 -m unittest tests.test_steam_menu_dispatch -v
+-"""
+-
+-import os
+-import re
+-import subprocess
+-import tempfile
+-import time
+-import unittest
+-from pathlib import Path
+-
+-SRC = Path(__file__).resolve().parents[1] / "src" / "wlserver.cpp"
+-DISPLAY_NUM = 91
+-DISPLAY = f":{DISPLAY_NUM}"
+-
+-RUNNER_HEAD = r"""
+-#include <X11/Xlib.h>
+-#include <X11/keysym.h>
+-#include <X11/extensions/XTest.h>
+-#include <stdint.h>
+-#include <stdio.h>
+-#include <unistd.h>
+-#include <chrono>
+-#include <thread>
+-#include <vector>
+-
+-struct gamescope_xwayland_server_t {
+-	Display *dpy = nullptr;
+-	Display *get_xdisplay() { return dpy; }
+-};
+-
+-static gamescope_xwayland_server_t g_Server;
+-gamescope_xwayland_server_t *wlserver_get_xwayland_server( int index )
+-{
+-	return index == 0 ? &g_Server : nullptr;
+-}
+-
+-/* ---- extracted production code ---- */
+-"""
+-
+-RUNNER_MAIN = r"""
+-/* ---- end extracted production code ---- */
+-
+-int main( int argc, char **argv )
+-{
+-	if ( argc < 2 )
+-	{
+-		fprintf( stderr, "usage: %s <0|1>\n", argv[0] );
+-		return 2;
+-	}
+-	const bool bQAM = argv[1][0] == '1';
+-
+-	Display *pReceiver = XOpenDisplay( nullptr );
+-	Display *pSender = XOpenDisplay( nullptr );
+-	if ( !pReceiver || !pSender )
+-	{
+-		fprintf( stderr, "failed to open display\n" );
+-		return 3;
+-	}
+-	g_Server.dpy = pSender;
+-
+-	Window hWindow = XCreateSimpleWindow( pReceiver, DefaultRootWindow( pReceiver ), 0, 0, 32, 32, 0, 0, 0 );
+-	XSelectInput( pReceiver, hWindow, KeyPressMask | KeyReleaseMask );
+-	XMapWindow( pReceiver, hWindow );
+-	XSync( pReceiver, False );
+-	XSetInputFocus( pReceiver, hWindow, RevertToParent, CurrentTime );
+-	XSync( pReceiver, False );
+-
+-	const KeyCode uCtrl = XKeysymToKeycode( pReceiver, XK_Control_L );
+-	const KeyCode uDigit = XKeysymToKeycode( pReceiver, bQAM ? XK_2 : XK_1 );
+-
+-	XEvent ev;
+-	while ( XPending( pReceiver ) )
+-		XNextEvent( pReceiver, &ev );
+-
+-	/* Direct-address delivery must leave server focus alone, so record both the
+-	 * reported focus window and the revert mode before the production call. */
+-	Window hFocusBefore = None;
+-	int nRevertBefore = 0;
+-	XGetInputFocus( pReceiver, &hFocusBefore, &nRevertBefore );
+-	XSync( pReceiver, False );
+-
+-	/* Real production call. No flush/sync of the sender afterwards: delivery
+-	 * may only happen through whatever the production code itself sends. */
+-	wlserver_open_steam_menu( bQAM );
+-
+-	std::vector<XKeyEvent> vReceived;
+-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 300 );
+-	while ( std::chrono::steady_clock::now() < deadline )
+-	{
+-		while ( XPending( pReceiver ) )
+-		{
+-			XEvent evRecv;
+-			XNextEvent( pReceiver, &evRecv );
+-			if ( evRecv.type == KeyPress || evRecv.type == KeyRelease )
+-				vReceived.push_back( evRecv.xkey );
+-		}
+-		if ( vReceived.size() >= 4 )
+-			break;
+-		std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+-	}
+-
+-	Window hFocusAfter = None;
+-	int nRevertAfter = 0;
+-	XGetInputFocus( pReceiver, &hFocusAfter, &nRevertAfter );
+-
+-	const std::vector<std::pair<KeyCode, bool>> vExpected = {
+-		{ uCtrl, true },
+-		{ uDigit, true },
+-		{ uDigit, false },
+-		{ uCtrl, false },
+-	};
+-	const std::vector<int> vExpectedState = { 0, ControlMask, ControlMask, ControlMask };
+-
+-	printf( "mode=%s received=%zu expected=%zu\n", bQAM ? "qam" : "main", vReceived.size(), vExpected.size() );
+-	for ( size_t i = 0; i < vReceived.size(); i++ )
+-		printf( "  got[%zu] keycode=%u %s window=0x%lx send_event=%d state=0x%x\n", i,
+-			vReceived[i].keycode, vReceived[i].type == KeyPress ? "press" : "release",
+-			vReceived[i].window, vReceived[i].send_event ? 1 : 0, vReceived[i].state );
+-
+-	bool bOk = true;
+-	if ( vReceived.size() != vExpected.size() )
+-	{
+-		printf( "  mismatch: received %zu events, expected %zu\n", vReceived.size(), vExpected.size() );
+-		bOk = false;
+-	}
+-
+-	for ( size_t i = 0; i < vReceived.size() && i < vExpected.size(); i++ )
+-	{
+-		const bool bPress = vReceived[i].type == KeyPress;
+-		if ( vReceived[i].keycode != vExpected[i].first || bPress != vExpected[i].second )
+-		{
+-			printf( "  mismatch at %zu: keycode=%u %s, expected keycode=%u %s\n", i,
+-				vReceived[i].keycode, bPress ? "press" : "release",
+-				vExpected[i].first, vExpected[i].second ? "press" : "release" );
+-			bOk = false;
+-		}
+-		if ( vReceived[i].window != hWindow )
+-		{
+-			printf( "  mismatch at %zu: window=0x%lx, expected 0x%lx (event not addressed to receiver)\n",
+-				i, vReceived[i].window, hWindow );
+-			bOk = false;
+-		}
+-		if ( !vReceived[i].send_event )
+-		{
+-			printf( "  mismatch at %zu: send_event=false (not a synthetic XSendEvent delivery)\n", i );
+-			bOk = false;
+-		}
+-		if ( vReceived[i].state != vExpectedState[i] )
+-		{
+-			printf( "  mismatch at %zu: state=0x%x, expected 0x%x\n", i,
+-				vReceived[i].state, vExpectedState[i] );
+-			bOk = false;
+-		}
+-	}
+-
+-	if ( hFocusAfter != hFocusBefore || nRevertAfter != nRevertBefore )
+-	{
+-		printf( "  mismatch: focus changed from 0x%lx (revert %d) to 0x%lx (revert %d)\n",
+-			hFocusBefore, nRevertBefore, hFocusAfter, nRevertAfter );
+-		bOk = false;
+-	}
+-
+-	XCloseDisplay( pSender );
+-	XCloseDisplay( pReceiver );
+-	return bOk ? 0 : 1;
+-}
+-"""
+-
+-
+-def extract_function(text):
+-    match = re.search(r"void[ \t]+wlserver_open_steam_menu[ \t]*\([ \t]*bool[ \t]+\w+[ \t]*\)", text)
+-    if not match:
+-        raise AssertionError("wlserver_open_steam_menu not found in wlserver.cpp")
+-    start = text.index("{", match.end())
+-    depth = 0
+-    for pos in range(start, len(text)):
+-        if text[pos] == "{":
+-            depth += 1
+-        elif text[pos] == "}":
+-            depth -= 1
+-            if depth == 0:
+-                return text[match.start():pos + 1]
+-    raise AssertionError("unbalanced braces while extracting wlserver_open_steam_menu")
+-
+-
+-class SteamMenuDispatchTest(unittest.TestCase):
+-    @classmethod
+-    def setUpClass(cls):
+-        cls.tmpdir = tempfile.TemporaryDirectory()
+-        work = Path(cls.tmpdir.name)
+-
+-        source = SRC.read_text(encoding="utf-8")
+-        (work / "runner.cpp").write_text(RUNNER_HEAD + extract_function(source) + RUNNER_MAIN, encoding="utf-8")
+-        cls.binary = work / "runner"
+-
+-        build = subprocess.run(
+-            ["g++", "-std=c++17", "-O0", "-o", str(cls.binary), str(work / "runner.cpp"), "-lX11", "-lXtst"],
+-            capture_output=True, text=True)
+-        if build.returncode != 0:
+-            raise AssertionError(f"runner build failed:\n{build.stdout}\n{build.stderr}")
+-
+-        cls.xvfb = subprocess.Popen(
+-            ["Xvfb", DISPLAY, "-screen", "0", "640x480x24", "-nolisten", "tcp"],
+-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+-        socket = Path(f"/tmp/.X11-unix/X{DISPLAY_NUM}")
+-        deadline = time.monotonic() + 5.0
+-        while time.monotonic() < deadline:
+-            if socket.exists():
+-                break
+-            if cls.xvfb.poll() is not None:
+-                raise AssertionError("Xvfb exited during startup")
+-            time.sleep(0.05)
+-        else:
+-            raise AssertionError(f"Xvfb socket {socket} did not appear within 5s")
+-
+-        cls.env = dict(os.environ, DISPLAY=DISPLAY)
+-
+-    @classmethod
+-    def tearDownClass(cls):
+-        cls.xvfb.terminate()
+-        try:
+-            cls.xvfb.wait(timeout=5)
+-        except subprocess.TimeoutExpired:
+-            cls.xvfb.kill()
+-            cls.xvfb.wait()
+-        cls.tmpdir.cleanup()
+-
+-    def _run(self, qam):
+-        result = subprocess.run([str(self.binary), "1" if qam else "0"],
+-                                capture_output=True, text=True, env=self.env, timeout=30)
+-        self.assertEqual(result.returncode, 0,
+-                         f"dispatch failed for {'qam' if qam else 'main'}:\n{result.stdout}{result.stderr}")
+-
+-    def test_main_menu_sequence(self):
+-        self._run(False)
+-
+-    def test_qam_menu_sequence(self):
+-        self._run(True)
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
++"""Spawn-level test for wlserver_open_steam_menu.
++
++wlserver_open_steam_menu must ask the native menu helper to inject the Guide
++or Quick Access gamepad button, because synthetic X11 keys open the menu in
++keyboard mode. This test extracts the real function body from
++src/wlserver.cpp, compiles it against a tiny gamescope::Process::SpawnProcess
++stub, and checks what the compositor would launch.
++
++The harness provides no X11 headers or libraries, so a keyboard-based
++implementation cannot even build here.
++
++Run inside a container that provides g++:
++
++    python3 -m unittest tests.test_steam_menu_dispatch -v
++"""
++
++import re
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++SRC = Path(__file__).resolve().parents[1] / "src" / "wlserver.cpp"
++
++RUNNER_HEAD = r"""
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <utility>
++#include <vector>
++#include <sys/types.h>
++
++struct SpawnRecord
++{
++	std::vector<std::string> argv;
++	bool bTerminated = false;
++	bool bHasPreamble = false;
++	bool bDoubleFork = false;
++};
++
++static std::vector<SpawnRecord> g_Records;
++
++namespace gamescope::Process
++{
++	pid_t SpawnProcess( char **argv, std::function<void()> fnPreambleInChild, bool bDoubleFork )
++	{
++		SpawnRecord record;
++
++		int i = 0;
++		for ( ; i < 8 && argv[ i ]; i++ )
++			record.argv.emplace_back( argv[ i ] );
++		record.bTerminated = i < 8 && argv[ i ] == nullptr;
++		record.bHasPreamble = static_cast<bool>( fnPreambleInChild );
++		record.bDoubleFork = bDoubleFork;
++
++		g_Records.emplace_back( std::move( record ) );
++		return 1;
++	}
++}
++
++/* ---- extracted production code ---- */
++"""
++
++RUNNER_MAIN = r"""
++/* ---- end extracted production code ---- */
++
++int main( int argc, char **argv )
++{
++	if ( argc < 2 )
++	{
++		fprintf( stderr, "usage: %s <0|1>\n", argv[0] );
++		return 2;
++	}
++	const bool bQam = argv[1][0] == '1';
++
++	wlserver_open_steam_menu( bQam );
++
++	const std::vector<std::string> vExpected = {
++		"/usr/libexec/armada/steam-menu",
++		bQam ? "qam" : "home",
++	};
++
++	printf( "mode=%s spawns=%zu\n", bQam ? "qam" : "home", g_Records.size() );
++	for ( size_t nRecord = 0; nRecord < g_Records.size(); nRecord++ )
++	{
++		for ( size_t i = 0; i < g_Records[ nRecord ].argv.size(); i++ )
++			printf( "  spawn[%zu] argv[%zu]=%s\n", nRecord, i, g_Records[ nRecord ].argv[ i ].c_str() );
++	}
++
++	if ( g_Records.size() != 1 )
++	{
++		printf( "  mismatch: %zu helper launches, expected 1\n", g_Records.size() );
++		return 1;
++	}
++
++	const SpawnRecord &record = g_Records.front();
++	bool bOk = true;
++	if ( record.argv != vExpected )
++	{
++		printf( "  mismatch: unexpected helper argv\n" );
++		bOk = false;
++	}
++	if ( !record.bTerminated )
++	{
++		printf( "  mismatch: argv is not nullptr-terminated\n" );
++		bOk = false;
++	}
++	if ( record.bHasPreamble )
++	{
++		printf( "  mismatch: helper was given a child preamble\n" );
++		bOk = false;
++	}
++	if ( !record.bDoubleFork )
++	{
++		printf( "  mismatch: bDoubleFork=false, the compositor would reap the menu helper\n" );
++		bOk = false;
++	}
++
++	return bOk ? 0 : 1;
++}
++"""
++
++
++def extract_function(text):
++    match = re.search(r"void[ \t]+wlserver_open_steam_menu[ \t]*\([ \t]*bool[ \t]+\w+[ \t]*\)", text)
++    if not match:
++        raise AssertionError("wlserver_open_steam_menu not found in wlserver.cpp")
++    start = text.index("{", match.end())
++    depth = 0
++    for pos in range(start, len(text)):
++        if text[pos] == "{":
++            depth += 1
++        elif text[pos] == "}":
++            depth -= 1
++            if depth == 0:
++                return text[match.start():pos + 1]
++    raise AssertionError("unbalanced braces while extracting wlserver_open_steam_menu")
++
++
++class SteamMenuDispatchTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmpdir = tempfile.TemporaryDirectory()
++        work = Path(cls.tmpdir.name)
++
++        source = SRC.read_text(encoding="utf-8")
++        (work / "runner.cpp").write_text(RUNNER_HEAD + extract_function(source) + RUNNER_MAIN, encoding="utf-8")
++        cls.binary = work / "runner"
++
++        build = subprocess.run(
++            ["g++", "-std=c++17", "-O0", "-o", str(cls.binary), str(work / "runner.cpp")],
++            capture_output=True, text=True)
++        if build.returncode != 0:
++            raise AssertionError(f"runner build failed:\n{build.stdout}\n{build.stderr}")
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.tmpdir.cleanup()
++
++    def _run(self, qam):
++        result = subprocess.run([str(self.binary), "1" if qam else "0"],
++                                capture_output=True, text=True, timeout=30)
++        self.assertEqual(result.returncode, 0,
++                         f"dispatch failed for {'qam' if qam else 'home'}:\n{result.stdout}{result.stderr}")
++
++    def test_main_menu(self):
++        self._run(False)
++
++    def test_qam_menu(self):
++        self._run(True)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""One-shot Armada menu trigger for the tablet's on-screen gamepad.
+
+Sends a single fixed Runtime.evaluate request to the already trusted Steam CEF
+page, so the native gamepad navigation manager opens the requested overlay
+menu. Guard proof, target discovery and websocket peer verification all stay
+in the existing bridge module; this CLI drives one accepted request and never
+retries.
+"""
+
+import json
+import os
+import sys
+import time
+
+LIB_DIR = "/usr/lib/armada"
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
+from updates import steam_bridge  # noqa: E402 - installed below LIB_DIR
+
+USAGE = "usage: steam-menu home|qam"
+REQUEST_ID = 1
+# Seconds allowed for the single request, unrelated CDP traffic included.
+TOTAL_TIMEOUT = 5.0
+# Native Steam gamepad ids: STEAM_GUIDE = 27, STEAM_QUICK_MENU = 28, sent with
+# the GAMEPAD source so the menu opens and gamepad input mode is kept.
+BUTTON_IDS = {"home": 27, "qam": 28}
+EXPRESSION_TEMPLATE = (
+    "(function () {\n"
+    "  var nav = window.SteamUIStore &&\n"
+    "      window.SteamUIStore.m_GamepadNavigationManager;\n"
+    "  if (!nav || typeof nav.DispatchVirtualGamepad !== 'function') {\n"
+    "    throw new Error('Steam gamepad navigation API is unavailable');\n"
+    "  }\n"
+    "  try {\n"
+    "    nav.DispatchVirtualGamepad('vgp_onbuttondown',\n"
+    "        {button: %(button)d, source: 1, is_repeat: false});\n"
+    "  } finally {\n"
+    "    nav.DispatchVirtualGamepad('vgp_onbuttonup',\n"
+    "        {button: %(button)d, source: 1, is_repeat: false});\n"
+    "  }\n"
+    "  return true;\n"
+    "})()"
+)
+
+
+def _timeout_errors():
+    """Return the recv timeout classes, including the verified socket's own."""
+    try:
+        import websocket
+    except ImportError:
+        return (TimeoutError,)
+    return (TimeoutError, websocket.WebSocketTimeoutException)
+
+
+TIMEOUT_ERRORS = _timeout_errors()
+
+
+def expression_for(action):
+    """Return the exact fixed expression sent for one menu action."""
+    try:
+        button = BUTTON_IDS[action]
+    except (KeyError, TypeError):
+        raise steam_bridge.BridgeError("unknown menu action")
+    return EXPRESSION_TEMPLATE % {"button": button}
+
+
+def _exception_text(details):
+    """Return the most specific text from a JS exceptionDetails object."""
+    if not isinstance(details, dict):
+        return "unknown script error"
+    exception = details.get("exception")
+    if isinstance(exception, dict):
+        description = exception.get("description")
+        if isinstance(description, str):
+            return description
+    text = details.get("text")
+    return text if isinstance(text, str) else "unknown script error"
+
+
+def _await_reply(ws, deadline, clock):
+    """Return the reply to REQUEST_ID, skipping unrelated CDP traffic."""
+    while True:
+        if clock() >= deadline:
+            raise steam_bridge.BridgeError(
+                "timed out waiting for the Steam menu result")
+        try:
+            raw = ws.recv()
+        except TIMEOUT_ERRORS:
+            continue
+        if not raw:
+            raise steam_bridge.BridgeError(
+                "websocket closed before the Steam menu result")
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise steam_bridge.BridgeError("malformed CDP message")
+        if not isinstance(raw, str):
+            raise steam_bridge.BridgeError("malformed CDP message")
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            raise steam_bridge.BridgeError("malformed CDP message")
+        if not isinstance(message, dict):
+            raise steam_bridge.BridgeError("malformed CDP message")
+        reply_id = message.get("id")
+        if type(reply_id) is not int or reply_id != REQUEST_ID:
+            continue  # notification or an unrelated request
+        return message
+
+
+def _require_true(message):
+    """Return True only for an exception-free boolean true result."""
+    error = message.get("error")
+    if error is not None:
+        detail = error.get("message") if isinstance(error, dict) else error
+        raise steam_bridge.BridgeError("CDP command failed: %s" % detail)
+    result = message.get("result")
+    if not isinstance(result, dict):
+        raise steam_bridge.BridgeError("CDP reply has no result")
+    details = result.get("exceptionDetails")
+    if details is not None:
+        raise steam_bridge.BridgeError(
+            "menu script failed: %s" % _exception_text(details))
+    value = result.get("result")
+    if (not isinstance(value, dict) or value.get("type") != "boolean"
+            or value.get("value") is not True):
+        raise steam_bridge.BridgeError("menu script did not confirm success")
+    return True
+
+
+def dispatch_menu(ws_factory, action, timeout=TOTAL_TIMEOUT,
+                  clock=time.monotonic):
+    """Send one request over a verified socket and close it in finally."""
+    request = {"id": REQUEST_ID, "method": "Runtime.evaluate",
+               "params": {"expression": expression_for(action),
+                          "returnByValue": True}}
+    ws = ws_factory()
+    try:
+        ws.send(json.dumps(request))
+        return _require_true(_await_reply(ws, clock() + timeout, clock))
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 1 or args[0] not in BUTTON_IDS:
+        print(USAGE, file=sys.stderr)
+        return 2
+    action = args[0]
+    euid = os.geteuid()
+    if euid == 0:
+        print("steam-menu: refusing to run as root", file=sys.stderr)
+        return 1
+    try:
+        steam_bridge._verify_guard(euid)
+        ws_url = steam_bridge.discover_target()[1]
+        dispatch_menu(steam_bridge._default_ws_factory(ws_url), action)
+    except steam_bridge.BridgeError as exc:
+        print("steam-menu: %s" % exc, file=sys.stderr)
+        return 1
+    except Exception as exc:  # a socket failure must not print a traceback
+        print("steam-menu: failed: %s" % exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
