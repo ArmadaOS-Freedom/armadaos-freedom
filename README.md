@@ -9,64 +9,56 @@
 
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
-<p align="center"><strong>SteamOS-like Linux for ARM tablets</strong></p>
+<p align="center"><strong>Turn your Android tablet into a portable gaming device—with a Steam Deck-style gaming mode, a full Linux desktop, and optional multi-boot.</strong></p>
 
 <p align="center">
-  A tablet-focused fork of <a href="https://github.com/armada-os/armada">ArmadaOS</a>,
-  bringing Steam Gaming Mode, FEX, Proton, and KDE Plasma to ARM64 tablets,
-  with kShimC multi-boot.
+  A community-maintained operating system for ARM Android tablets,
+  built on <a href="https://github.com/armada-os/armada">ArmadaOS</a>.
 </p>
 
 <p align="center">
   <a href="https://github.com/armada-os/armada"><img alt="Based on ArmadaOS" src="https://img.shields.io/badge/based_on-ArmadaOS-18181a?style=flat"></a>
-  <a href="#device-support"><img alt="Y700 Gen 4 and Gen 5 tablet adaptation" src="https://img.shields.io/badge/devices-Y700_Gen_4_%26_5-285580?style=flat"></a>
+  <a href="#device-support"><img alt="Y700 Gen 4, Gen 5 and Xiaoxin Pad Pro GT adaptation" src="https://img.shields.io/badge/devices-Y700_Gen_4_%26_5_%2B_Pad_Pro_GT-285580?style=flat"></a>
   <a href="LICENSE"><img alt="GPL-2.0-or-later license" src="https://img.shields.io/badge/license-GPL--2.0--or--later-18181a?style=flat"></a>
 </p>
 
 <p align="center">
-  <a href="#device-support"><strong>Device support &amp; status</strong></a>
-  ·
-  <a href="#kshimc-multi-boot">Boot menu</a>
-  ·
-  <a href="#documentation">Documentation</a>
-  ·
-  <a href="https://armadaos.dev/">Upstream documentation</a>
+  <a href="#getting-started"><strong>Getting started</strong></a>
+  · <a href="#device-support">Supported devices</a>
+  · <a href="#companion-tools">Companion tools</a>
+  · <a href="#community-and-feedback">Community</a>
 </p>
 
 ## About ArmadaOS Freedom
 
-ArmadaOS Freedom is a community-maintained tablet branch based on
-[ArmadaOS](https://github.com/armada-os/armada). It retains the upstream gaming
-and desktop foundation while adapting boot, display, power, and peripherals to
-tablet hardware, and ships
-[Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) as its control
-plugin.
+[ArmadaOS Freedom](https://github.com/ArmadaOS-Freedom/armadaos-freedom) is a community-maintained operating system based on [ArmadaOS](https://github.com/armada-os/armada), focused on hardware support and gaming on ARM Android tablets.
 
-Highlights of the current adaptation:
+We build on ArmadaOS to create a tablet operating system with Steam Gaming Mode, FEX, Proton, KDE Plasma, and more. Our work also includes multi-boot support, hardware drivers, installation and maintenance tools, and gaming controls.
 
-- Steam Gaming Mode and KDE Plasma, with FEX and Proton from ArmadaOS.
-- A shared kernel build with device-specific device trees, drivers, and hardware
-  configuration.
-- kShimC multi-boot with separate internal-storage and TF-card Linux entries.
-- Device-specific display modes, touch, power, audio, and network configuration.
-- Dual-USB support, plus battery and temperature reporting.
-- Tablet touch input, plus G9 / G9 2026 controller mapping, RGB control, and
-  double-Home quick access.
-- Tablet-aware [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control),
-  including hiding fan controls on fanless devices.
+The system and its companion tools focus on:
 
-Feature availability varies by device; see the device pages below for details.
-This repository maintains adaptation sources and patches. Tablet installation
-images and OTA integration are still in development.
+- **Gaming and desktop modes**: Steam Gaming Mode and KDE Plasma, with FEX and Proton to run compatible PC games.
+- **Optional multi-boot**: Use the kShimC launcher to keep Android and Linux side by side and choose which system to start.
+- **Tablet hardware support**: A shared kernel with device-specific device trees, drivers, display modes, touch, audio, networking, power and USB configuration, plus battery and temperature reporting.
+- **Touch and controller input**: Tablet touch input, G9 / G9 2026 controller mapping, RGB control, and double-Home quick access.
+- **Installation and maintenance**: A companion installer for installation, backup, recovery and device maintenance, with support varying by model and platform.
+- **System tools**: [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) for global and per-game compatibility, performance settings and TF card game-library setup, alongside other [companion tools](#companion-tools).
+
+This repository maintains the Freedom system sources, kernel and drivers, boot support, and build configuration. Feature availability, tested behavior and update support vary by device; see the device documentation below.
+
+## Getting started
+
+1. **Check your device.** Open the matching [device guide](#device-support) and review its firmware, boot-chain, installation requirements and known issues.
+2. **Prepare the installer and system package.** Follow the [Freedom Installer documentation](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer) for environment checks, backups and the package required by your model.
+3. **Install to internal storage.** Follow the assistant's steps and the device guide, then use the system's gaming mode, desktop and companion tools as supported by your device.
+
+The current installer provides installation to internal storage; installation of the system to a TF card is not yet available through the assistant. Windows and Apple silicon macOS versions have different feature coverage; see the installer documentation. Installation and repartitioning erase the affected personal data, so back up your files first.
+
+To use a TF card as a game library, see [Companion tools](#companion-tools).
 
 ## Device support
 
-Current device work covers Lenovo Legion Y700 Gen 4 and Gen 5. Both share a Linux
-**7.2.6** kernel, with separate device trees and hardware configuration. The Lenovo
-Xiaoxin Pad Pro GT (TB710FU, SM8650) shares the same kernel with its own device
-tree, and the kShimC launcher; it installs to internal storage with the
-installer, next to the existing Android. See its documentation for the
-prerequisites and known limitations.
+Current work covers Lenovo Legion Y700 Gen 4, Y700 Gen 5, and Xiaoxin Pad Pro GT. They share the Linux **7.2.6** kernel, with separate device trees, boot payloads and hardware configuration for each model. Check the matching guide for installation requirements, available features, and known issues.
 
 | Device | Model / SoC | Documentation | Known issues |
 |---|---|---|---|
@@ -78,47 +70,37 @@ Boot images remain model-specific and must not be cross-flashed.
 
 ## kShimC multi-boot
 
-The tablet boot path uses **kShimC**, packaged with the boot payloads in the
-Android boot image. It keeps the factory boot chain and presents a menu for:
+The **kShimC** menu lets you choose Android or ArmadaOS Freedom. Available entries and boot support depend on your device:
 
 - Android.
-- ArmadaOS installed in internal storage.
-- ArmadaOS installed on a TF / microSD card.
-- Advanced boot: Linux diagnostics, Recovery, Fastboot, and 9008 / EDL.
-- Settings, device information, language selection, restart, and shutdown.
+- ArmadaOS Freedom installed in internal storage.
+- ArmadaOS Freedom on a TF / microSD card, where supported.
 
-The Linux kernel and device tree are boot payloads; Linux then mounts the root
-filesystem selected by the internal-storage or TF-card entry. These are two
-separate installation targets. See each device page for available boot entries.
+The menu also provides device settings, restart and shutdown, and advanced boot entries.
+
+A **TF card game library** stores games for the running system; it is separate from installing or booting Linux on the card. See [Companion tools](#companion-tools).
 
 <p align="center">
   <img src=".github/assets/kshimc-star-chart-en.png" alt="KShimC launcher — STAR_CHART theme, English menu" width="100%">
 </p>
 
-*STAR_CHART menu rendered from the current implementation; this is a software
-preview, not a photograph of the tablet.*
+*STAR_CHART menu rendered from the current implementation; this is a software preview, not a photograph of the tablet.*
 
-Both generations share the [kShimC launcher sources](devices/lenovo-tb323fu/boot/kshim-success-source/README.md),
-with separate device profiles and boot payloads. See the
-[Gen 4 boot guide](devices/lenovo-tb322fc/boot/README.md) and
-[Gen 5 boot guide](devices/lenovo-tb323fu/boot/star-chart-build/README.md)
-for their build paths.
+## Companion tools
 
-## Documentation
-
-| I want to… | Guide |
+| Project | Purpose |
 |---|---|
-| Build a boot image | [Gen 4 boot guide](devices/lenovo-tb322fc/boot/README.md) · [Gen 5 boot guide](devices/lenovo-tb323fu/boot/star-chart-build/README.md) |
-| Build a 9008 / EDL package | [EDL package build](docs/edl-package.md) |
-| Inspect the installed boot tools | [kShimC packaging tools](packages/kshim-tools/README.md) |
-| Check component origins and versions | [Gen 4 sources](devices/lenovo-tb322fc/README.md#源码与来源) · [Gen 5 sources](devices/lenovo-tb323fu/docs/SOURCES.md) |
-| Learn the upstream system | [Using ArmadaOS](https://armadaos.dev/using-armada/) |
-| Report a tablet-branch issue | [Freedom issues](https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues) |
+| [Freedom Installer](https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer) | Windows installation and maintenance, plus installation to internal storage on Apple silicon macOS. Features vary by model and platform. |
+| [Freedom Control](https://github.com/ArmadaOS-Freedom/freedom-control) | Global and per-game compatibility and performance settings, tablet controls, and TF card game-library setup. |
+| [Smart TF Card Allocator](https://github.com/ArmadaOS-Freedom/smart-tf-allocator) | An Android app for allocating microSD space between Android app storage and a Linux game library, and moving supported apps. Linux game-library setup is handled by Freedom Controller. |
+| [UU Accelerator Plugin](https://github.com/ArmadaOS-Freedom/decky-uu-accelerator) | A third-party Decky plugin for official core installation, phone pairing via QR code, and acceleration status monitoring. |
 
-Upstream installation instructions describe upstream-supported devices. Use the
-model-specific documentation here for tablet installation and boot.
+For a TF game library, first allocate the card's space on Android with Smart TF Card Allocator, then configure the reserved Linux partition through Freedom Controller's TF card game-library page. Initial allocation repartitions and erases the selected card; back it up first. App migration depends on Android, device firmware and app support. These tools configure storage and do not install Linux onto the card.
 
 ## Development
+
+<details>
+<summary>Build instructions and implementation details</summary>
 
 System images use ArmadaOS's bootc build foundation. The shared kernel lives in
 [`packages/kernel/`](packages/kernel/), hardware profiles in
@@ -170,6 +152,25 @@ layer — come from the same dependency; the rest of the host OS remains here.
 Follow the configuration and build guide for the target device. System updates
 use Freedom's own repository; see each device page for boot synchronization
 and OTA support status.
+
+### kShimC boot implementation
+
+The launcher, Linux kernel and device tree are packaged as boot payloads in the Android boot image. Linux mounts the root filesystem selected by the internal-storage or TF-card entry. These are separate system installation targets.
+
+The supported models share the [kShimC launcher sources](devices/lenovo-tb323fu/boot/kshim-success-source/README.md), with separate device profiles and boot payloads. Build paths are documented in the [Gen 4](devices/lenovo-tb322fc/boot/README.md), [Gen 5](devices/lenovo-tb323fu/boot/star-chart-build/README.md), and [Xiaoxin Pad Pro GT](devices/lenovo-tb710fu/boot/README.md) boot guides. For system package builds, see the [9008 / EDL package guide](docs/edl-package.md).
+
+</details>
+
+## Community and feedback
+
+Report bugs and feature requests through [Issues](https://github.com/ArmadaOS-Freedom/armadaos-freedom/issues), with your device model, system and kernel versions, steps to reproduce the problem, and relevant logs.
+
+- **Chinese-speaking community**: [Danyi's Bilibili channel](https://space.bilibili.com/258786) for updates, tutorials and demos.
+- **Main QQ fan group**: 487945399
+- **Second QQ fan group**: 332038419
+- **International contact**: [mydanyi@qq.com](mailto:mydanyi@qq.com)
+
+See the [ArmadaOS Freedom organization](https://github.com/ArmadaOS-Freedom) for all projects and updates.
 
 ## Credits
 
