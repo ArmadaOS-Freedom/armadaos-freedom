@@ -396,8 +396,9 @@ class SwipeGesturesTest(unittest.TestCase):
             desktop_mode=lambda: "desktop",
             desktop_modes=lambda: [],
             sleep_modes=lambda: [],
-            controller_type=lambda: "",
-            inputplumber_targets=lambda _env: [],
+            # build_config reads the USB network state unconditionally; unmocked
+            # it would reach for the live privileged socket.
+            usb_network_state=lambda: {"enabled": False, "supported": False},
         ), patch.object(
             plugin_config, "swipe_gestures_in_game_enabled",
             return_value=False, create=True,

@@ -1,0 +1,41 @@
+{
+  "privileged": [
+    "tests/update-deployment-store-test.py",
+    "tests/update-image-source-test.py",
+    "tests/update-offline-source-test.py",
+    "tests/update-offline-image-test.py",
+    "tests/update-offline-payload-test.py",
+    "tests/update-oci-pull-test.py",
+    "tests/update-deployment-options-test.py",
+    "tests/update-boot-materials-test.py",
+    "tests/update-installer-authorization-ssh-test.py",
+    "tests/installer-source-test.py",
+    "tests/kshim-write-loop-test.py",
+    "tests/waydroid-input-test.sh",
+    "tests/waydroid-input-test.py",
+    "tests/update-offline-privileges-test.py",
+    "tests/steam-pinyin-test.py"
+  ],
+  "manager_only": {
+    "tests/gamescope-touch-orientation-test.py": "needs GAMESCOPE_SOURCE_DIR with a patched gamescope tree",
+    "tests/kshim-ostree-lifecycle-test.py": "needs --work and --repo-root in a native ARM64 ostree container",
+    "tests/steam-oobe-path-test.sh": "needs systemd PID 1 plus the installed armada-steam-oobe units and fixups"
+  },
+  "arguments": {
+    "tests/update-offline-privileges-test.py": [
+      "build_files/50-create-user.sh",
+      "allow"
+    ],
+    "tests/kshim-write-loop-test.py": [
+      "--work",
+      "{work}/loop",
+      "--repo-root",
+      "."
+    ]
+  },
+  "environment": {
+    "tests/steam-pinyin-test.py": {
+      "ARMADA_PINYIN_TEST_CONTAINER": "1"
+    }
+  }
+}

@@ -102,7 +102,9 @@ def load_script(name):
 
 
 ENV = {"ARMADA_BIG_CORES": "3-7", "ARMADA_PRIME_CORES": "7", "ARMADA_LITTLE_CORES": "0-2"}
-ALL = ap.online_cpus()
+# Saved before the eight-core provider is bound below: the kernel-facing probe
+# and the real-affinity block must keep seeing this machine's CPUs.
+real_online_cpus = ap.online_cpus
 
 # --- armada_perf: cpulist grammar -------------------------------------------
 check("parse order preserved", ap.parse_cpulist("7,3-5") == [7, 3, 4, 5])
@@ -115,6 +117,20 @@ with _mock.patch("builtins.open", _mock.mock_open(read_data="0,3-7\n")):
 with _mock.patch("builtins.open", side_effect=OSError):
     check("online cpus fallback", ap.online_cpus() ==
           sorted(os.sched_getaffinity(0) | set(range(os.cpu_count() or 1))))
+
+# The policy, IRQ and manager units below assert the shipped eight-core
+# profile (3-7/6-7 presets), so bind a deterministic full set instead of the
+# runner's CPU count: a 4-CPU CI host has no cpu5-7. The reader itself was
+# exercised unpatched above; the affinity block rebinds real_online_cpus.
+ALL = list(range(8))
+
+
+def profile_online_cpus():
+    return list(ALL)
+
+
+ap.online_cpus = profile_online_cpus
+
 for bad in ("3,3", "a", "5-3", "1-x"):
     try:
         ap.parse_cpulist(bad)
@@ -428,41 +444,56 @@ finally:
     os.environ["HOME"] = saved_home
 
 # --- armada-game-launch: explicit affinity reset ----------------------------
+# This block is a real kernel round-trip (no mocked get/setaffinity): masks and
+# topology strings are derived from the CPUs this process may actually use, so
+# a 1/2/4-CPU cpuset passes without requiring eight host CPUs.
 saved = os.sched_getaffinity(0)
+eligible = sorted(set(saved) & set(real_online_cpus())) or sorted(saved)
+ap.online_cpus = lambda: list(eligible)
 topology_keys = ("WINE_CPU_TOPOLOGY", "PROTON_CPU_TOPOLOGY")
 saved_topology = {key: os.environ[key] for key in topology_keys if key in os.environ}
 try:
-    restricted = set(list(saved)[:2]) if len(saved) > 2 else saved
+    restricted = set(eligible[:2]) if len(eligible) > 2 else set(eligible)
+    # reversed order, strict subset when the cpuset allows it, so the derived
+    # topology order and the applied mask are both observable
+    selected = ([eligible[-1]] + eligible[:-2] if len(eligible) > 2
+                else [eligible[-1]] + eligible[:-1])
+    selected_list = ",".join(map(str, selected))
+    selected_topology = f"{len(selected)}:{','.join(map(str, selected))}"
+    pinned = eligible[-2:]
+    pinned_list = ap.format_cpulist(pinned)
     os.sched_setaffinity(0, restricted)
     for key in topology_keys:
         os.environ.pop(key, None)
     launch.apply_perf({}, None)  # session socket warning on stderr is fine
     check("wrapper resets inherited mask", os.sched_getaffinity(0) == set(ap.online_cpus()))
     check("no topology without cores", all(key not in os.environ for key in topology_keys))
-    launch.apply_perf({"cores": "7,3-6"}, None)
-    check("ordered topology derived", os.environ.get("WINE_CPU_TOPOLOGY") == "5:7,3,4,5,6")
+    launch.apply_perf({"cores": selected_list}, None)
+    check("ordered topology derived", os.environ.get("WINE_CPU_TOPOLOGY") == selected_topology)
     check("Proton override matches Wine topology",
-          os.environ.get("PROTON_CPU_TOPOLOGY") == "5:7,3,4,5,6")
-    check("cores mask applied", os.sched_getaffinity(0) == {3, 4, 5, 6, 7})
+          os.environ.get("PROTON_CPU_TOPOLOGY") == selected_topology)
+    check("cores mask applied", os.sched_getaffinity(0) == set(selected))
     for key in topology_keys:
         os.environ.pop(key, None)
-    launch.apply_perf({"cores": "big", "scheduler": "cosmos"}, None)
+    os.sched_setaffinity(0, restricted)
+    launch.apply_perf({"cores": selected_list, "scheduler": "cosmos"}, None)
     check("cosmos skips hard mask", os.sched_getaffinity(0) == set(ap.online_cpus()))
     # a malformed env name must not abort the rest of the launch path
     os.sched_setaffinity(0, restricted)
     os.environ.pop("GOODVAR", None)
-    launch.apply_perf({"env": {"BAD=NAME": "x", "GOODVAR": "1"}, "cores": "7,3-6"}, None)
+    launch.apply_perf({"env": {"BAD=NAME": "x", "GOODVAR": "1"}, "cores": selected_list}, None)
     check("bad env entry contained", os.environ.get("GOODVAR") == "1")
-    check("launch path survives bad env", os.sched_getaffinity(0) == {3, 4, 5, 6, 7})
+    check("launch path survives bad env", os.sched_getaffinity(0) == set(selected))
     os.environ.pop("GOODVAR", None)
+    first, second = selected[0], selected[-1]
     for explicit in (
-            {"WINE_CPU_TOPOLOGY": "2:6,7"},
-            {"PROTON_CPU_TOPOLOGY": "2:7,6"},
-            {"WINE_CPU_TOPOLOGY": "1:6", "PROTON_CPU_TOPOLOGY": "1:7"}):
+            {"WINE_CPU_TOPOLOGY": f"2:{second},{first}"},
+            {"PROTON_CPU_TOPOLOGY": f"2:{first},{second}"},
+            {"WINE_CPU_TOPOLOGY": f"1:{first}", "PROTON_CPU_TOPOLOGY": f"1:{second}"}):
         for source in ("inherited", "settings"):
             for key in topology_keys:
                 os.environ.pop(key, None)
-            settings = {"cores": "7,3-6"}
+            settings = {"cores": selected_list}
             if source == "inherited":
                 os.environ.update(explicit)
             else:
@@ -473,15 +504,17 @@ try:
                   all(os.environ.get(key) == explicit.get(key, expected) for key in topology_keys))
     for key in topology_keys:
         os.environ.pop(key, None)
-    launch.apply_perf({"cores": "6-7", "wineTopology": False}, None)
+    launch.apply_perf({"cores": pinned_list, "wineTopology": False}, None)
     check("disabled topology exports neither variable",
           all(key not in os.environ for key in topology_keys))
-    check("disabled topology still pins cores", os.sched_getaffinity(0) == {6, 7})
+    check("disabled topology still pins cores", os.sched_getaffinity(0) == set(pinned))
 finally:
     os.sched_setaffinity(0, saved)
     for key in topology_keys:
         os.environ.pop(key, None)
     os.environ.update(saved_topology)
+    # back to the eight-core profile for the IRQ/manager 3-7 assertions
+    ap.online_cpus = profile_online_cpus
 
 # --- device-env: topology emission + empty-override semantics ---------------
 device_env_script = os.path.join(ROOT, "system_files/usr/libexec/armada/device-env")

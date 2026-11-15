@@ -95,7 +95,11 @@ def seed_manifest_digest(fixture):
 class SourceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="installer-source-test.")
+        # Fedora's OSTree marks every deployment root immutable, which makes the
+        # owned temporary tree undeletable (EPERM). Clear that flag first; it is
+        # registered after the directory cleanup so it runs before it.
         self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.clear_immutable_deployments)
         self.work = Path(self.temp.name)
         self.path = self.work / "repo"
         run("ostree", "init", f"--repo={self.path}", "--mode=bare")
@@ -110,6 +114,29 @@ class SourceTests(unittest.TestCase):
         self.deployment.set_origin(self.origin)
         self.prepared = self.work / "prepared"
         self.prepared.mkdir()
+
+    def clear_immutable_deployments(self):
+        """Drop the immutable flag OSTree sets on deployment roots in this fixture.
+
+        Only directories below the owned temporary root are visited, symlinks are
+        never followed, and a directory counts as a deployment root only when it
+        holds the .ostree.cfs child OSTree writes there. Nothing else is touched.
+        """
+        root = os.path.realpath(self.temp.name)
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            names = set(os.listdir(current))
+            if ".ostree.cfs" in names:
+                run("chattr", "-i", current)
+            for name in names:
+                path = os.path.join(current, name)
+                if os.path.islink(path) or not os.path.isdir(path):
+                    continue
+                real = os.path.realpath(path)
+                if os.path.commonpath((root, real)) != root:
+                    continue
+                pending.append(real)
 
     def refs(self):
         return run("ostree", "refs", f"--repo={self.path}").splitlines()

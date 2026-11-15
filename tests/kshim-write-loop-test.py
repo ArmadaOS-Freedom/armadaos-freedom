@@ -7,10 +7,11 @@ and drives the real writer CLI against that partition. The images here are
 synthetic 96 MiB fixtures, not real boot images, and nothing is mounted,
 formatted, rebooted, or sent over the network.
 
-This script must run as root with loop devices available (remote Docker). It
-only detaches the loop device it allocated for this run's disk file. Raw
-fixtures, transaction directories, and private block nodes are kept under
---work for the manager to remove after logs are collected.
+This script must run as root with loop devices available (remote Docker). When
+/dev/loop-control is absent it prints a skip line and exits 77 before creating
+--work or any fixture. It only detaches the loop device it allocated for this
+run's disk file. Raw fixtures, transaction directories, and private block nodes
+are kept under --work for the manager to remove after logs are collected.
 """
 import argparse
 import hashlib
@@ -252,6 +253,17 @@ def main():
     error = None
     disk = work / "t023-loop-disk.img"
     try:
+        if os.geteuid() != 0:
+            raise RuntimeError("must run as root")
+
+        # Loop devices are only reachable through the control node, so its
+        # absence is a missing precondition, not a failure. Report it before
+        # creating the work directory, fixtures, or any writer state.
+        if not os.path.exists("/dev/loop-control"):
+            print("SKIP: loop devices unavailable: /dev/loop-control is absent",
+                  file=sys.stderr)
+            return 77
+
         if work.exists():
             if not work.is_dir() or os.listdir(work) != []:
                 raise RuntimeError("work dir must be absent or empty: %s" % work)
@@ -259,8 +271,6 @@ def main():
             work.mkdir(parents=True, mode=0o700)
         summary["work_was_absent"] = was_absent
 
-        if os.geteuid() != 0:
-            raise RuntimeError("must run as root")
         with open(disk, "wb") as handle:
             handle.truncate(DISK_BYTES)
         summary["disk"] = str(disk)

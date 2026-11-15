@@ -1,9 +1,16 @@
 ---
 name: Unit tests
 
-# Runs the stdlib unittest suite over tests/test_*.py on a stock Ubuntu runner.
-# The privileged loop-mount case stays in the integration group; see
-# docs/testing.md. Shell and dashed-script tests keep their existing jobs.
+# Automatic coverage is split by what a test actually needs:
+#   unittest              - tests/test_*.py on a stock Ubuntu runner
+#   script-tests          - unprivileged tests/*-test.sh and tests/*-test.py
+#                           inside a Fedora 44 container
+#   privileged-tests      - root-only unit modules and disposable-container
+#                           script tests, inside a throwaway Fedora 44 Docker
+#   kernel-source-checks  - the six host checks on the real patched kernel tree
+#   kshim-host-tests      - the kShimC CMake host suite
+#
+# See docs/testing.md for the exact groups and their prerequisites.
 
 on:
   pull_request:
@@ -49,3 +56,249 @@ jobs:
         run: |
           mkdir -p "${TEST_ARTIFACT_ROOT}"
           /usr/bin/python3 -B tests/run_unit_tests.py
+
+  script-tests:
+    name: Shell and dashed-script tests
+    runs-on: ubuntu-24.04
+    # The production image is built on quay.io/fedora/fedora-bootc:44, so the
+    # scripts run on the same Fedora 44 userspace. Ubuntu 24.04 ships
+    # libadwaita 1.5, which lacks the prefer-wide-layout property the GUI
+    # AdwAlertDialog tests set, and has no /usr/bin/bootc at all.
+    container:
+      image: quay.io/fedora/fedora:44
+      # Without --init the job container's shell is PID 1 and never reaps
+      # orphans, so a child killed by a process-lifecycle test stays a zombie
+      # that still answers kill -0. --init supplies a real reaper.
+      options: --init
+    env:
+      LC_ALL: C.UTF-8
+      LANGUAGE: ""
+      GSK_RENDERER: cairo
+    steps:
+      # Install before the checkout: actions/checkout needs git, and
+      # tests/steam-pinyin-test.py checks real Git tree modes from the
+      # checkout, so the tree must be a genuine Git working tree.
+      - name: Install test dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git gcc gcc-c++ dtc libfdt-devel libasan libubsan \
+            cpio dracut btrfs-progs e2fsprogs util-linux util-linux-user patch \
+            python3-websocket-client python3-gobject gobject-introspection \
+            ostree-libs ostree gtk3 gtk4 libadwaita \
+            xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 \
+            python3-vdf python3-pytest jq gdisk openssh-clients \
+            shadow-utils diffutils openssl procps-ng
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      # The ordinary group must stay unprivileged. A UID 1000 account whose
+      # home sits under RUNNER_TEMP owns only that home, the artifact root and
+      # the checkout; it gets no wheel membership and no sudo.
+      - name: Create isolated unprivileged user
+        run: |
+          useradd --uid 1000 --create-home --shell /bin/bash \
+            --home-dir "${RUNNER_TEMP}/ci-home" ci
+          mkdir -p "${RUNNER_TEMP}/script-test-artifacts"
+          chown -R 1000:1000 "${RUNNER_TEMP}/ci-home" \
+            "${RUNNER_TEMP}/script-test-artifacts" "${GITHUB_WORKSPACE}"
+
+      # The GTK-based tests need a headless display. server-num 70 keeps this
+      # runner clear of the private :99 that tests/installer-gui-test.py starts.
+      - name: Run unprivileged script tests
+        env:
+          TEST_SCRIPT_ARTIFACT_ROOT: ${{ runner.temp }}/script-test-artifacts
+        run: |
+          runuser --user ci -- env \
+            HOME="${RUNNER_TEMP}/ci-home" \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            TEST_SCRIPT_ARTIFACT_ROOT="${TEST_SCRIPT_ARTIFACT_ROOT}" \
+            LC_ALL=C.UTF-8 \
+            LANGUAGE= \
+            GSK_RENDERER=cairo \
+            xvfb-run -a --server-num=70 --server-args="-screen 0 1280x800x24" \
+              /usr/bin/python3 -B tests/run_script_tests.py --group unit
+
+  privileged-tests:
+    name: Root and disposable-container tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Prepare artifact directory
+        run: mkdir -p "${RUNNER_TEMP}/artifacts"
+
+      - name: Run root-only modules and privileged scripts in disposable Docker
+        run: |
+          docker run --rm --privileged \
+            --cpus 4 --memory 8g \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -v "${RUNNER_TEMP}/artifacts:/artifacts" \
+            -e TEST_ARTIFACT_ROOT=/artifacts \
+            -e TEST_SCRIPT_ARTIFACT_ROOT=/artifacts/scripts \
+            -e ARMADA_DISPOSABLE_PRIVILEGE_TEST=1 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            --workdir /src \
+            quay.io/fedora/fedora:44 \
+            bash -lc '
+              set -euo pipefail
+              # Same Fedora 44 userspace as the production image, plus the
+              # root-only tooling this group needs. dnf replaces apt here, and
+              # bootc supplies /usr/bin/bootc for the OCI import test.
+              dnf install -y --setopt=install_weak_deps=False \
+                bash ca-certificates git gcc gcc-c++ dtc libfdt-devel \
+                libasan libubsan \
+                cpio dracut btrfs-progs e2fsprogs util-linux util-linux-user \
+                patch python3-websocket-client python3-gobject \
+                gobject-introspection ostree-libs ostree gtk3 gtk4 libadwaita \
+                xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 \
+                python3-vdf python3-pytest jq gdisk openssh-clients \
+                shadow-utils diffutils openssl \
+                bootc sudo openssh-server procps-ng
+              for module in \
+                test_update_offline_jobs test_update_offline_session \
+                test_update_system_manager test_update_offline_retirement \
+                test_update_finalization_receipt test_update_channel_selection \
+                test_update_desktop test_update_recovery_channel; do
+                echo "== root ownership group: ${module}"
+                python3 -B -m unittest discover -s tests -p "${module}.py" -v
+              done
+              if [ -e /dev/loop-control ]; then
+                echo "== loop group: real ext4/btrfs filesystem pair"
+                cd tests
+                python3 -B -m unittest \
+                  test_edl_raw_package.ProducerContractTests.test_filesystem_pair_real_ext4_and_btrfs_images \
+                  -v
+                cd ..
+              else
+                echo "loop device unavailable in this container; real ext4/btrfs test not run"
+              fi
+              # steam-pinyin-test.py drives the shipped launcher against the real
+              # profile path; the profile is a documented precondition, so deploy
+              # the in-repo copy into the disposable container first.
+              install -D -m 0644 /src/system_files/usr/share/armada/ibus/profile \
+                /usr/share/armada/ibus/profile
+              python3 -B tests/run_script_tests.py --group privileged
+            '
+
+  kernel-source-checks:
+    name: Kernel host source checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install host check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 curl xz-utils patch ca-certificates
+
+      - name: Check the patched tree with the infinity overlay
+        env:
+          KERNEL_HOST_CHECKS_ONLY: "1"
+          KERNEL_OVERLAYS: infinity
+          WORK_DIR: ${{ runner.temp }}/kernel-host-checks
+        run: bash packages/kernel/scripts/build-kernel.sh
+
+  kshim-host-tests:
+    name: kShimC host tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      # configure_kconfig.py, which the CMake configure step runs, imports
+      # kconfiglib; Ubuntu 24.04 ships it as python3-kconfiglib.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake gcc g++ make python3 python3-kconfiglib \
+            device-tree-compiler libfdt-dev pkg-config git ca-certificates
+
+      # The kShimC snapshot ships without its third-party sources. Both are
+      # pinned to an exact commit and checked out detached; the CrDK tree keeps
+      # its real .git because prepare.py reads it with rev-parse and archive.
+      - name: Prepare LVGL and CrDK
+        working-directory: devices/lenovo-tb323fu/boot/kshim-success-source
+        run: |
+          set -euo pipefail
+          checkout() {
+            url="$1"
+            sha="$2"
+            dest="$3"
+            if [ -e "${dest}" ] && [ ! -d "${dest}/.git" ]; then
+              echo "error: ${dest} exists without a .git directory" >&2
+              exit 1
+            fi
+            if [ ! -d "${dest}/.git" ]; then
+              git init --quiet "${dest}"
+              git -C "${dest}" remote add origin "${url}"
+            fi
+            git -C "${dest}" fetch --quiet --depth 1 origin "${sha}"
+            git -C "${dest}" checkout --quiet --detach FETCH_HEAD
+            actual="$(git -C "${dest}" rev-parse HEAD)"
+            if [ "${actual}" != "${sha}" ]; then
+              echo "error: ${dest} is at ${actual}, expected ${sha}" >&2
+              exit 1
+            fi
+          }
+          checkout https://github.com/Project-Aloha/CrDK \
+            b6c3335136b7f6b28271917de11e8f11982975fc lib/CrDK
+          checkout https://github.com/lvgl/lvgl \
+            7f07a129e8d77f4984fff8e623fd5be18ff42e74 third_party/lvgl
+
+      # The suite also builds the vendored libfdt sources
+      # (lib/libfdt/fdt*.c) and puts lib/libfdt/include first, so the host
+      # libfdt-dev headers are not a substitute for the missing directory.
+      # Recover only lib/libfdt from the pinned public kShimC commit; the
+      # archive never replaces the rest of the snapshot.
+      - name: Prepare libfdt
+        working-directory: devices/lenovo-tb323fu/boot/kshim-success-source
+        run: |
+          set -euo pipefail
+          dep="${RUNNER_TEMP}/dependency-sources/kShimC"
+          git init --quiet "${dep}"
+          git -C "${dep}" remote add origin https://github.com/sunflower2333/kShimC
+          git -C "${dep}" fetch --quiet --depth 1 origin \
+            82ce6eaa10c36e64cfd3f16799172d854f9a955b
+          git -C "${dep}" checkout --quiet --detach FETCH_HEAD
+          git -C "${dep}" archive \
+            82ce6eaa10c36e64cfd3f16799172d854f9a955b lib/libfdt | tar -x -C .
+          # libfdt_env.h needs stdlib.h in the freestanding build. The export
+          # above rewrites the file first, so this inserts the line once.
+          sed -i '/^#include <stdint.h>$/a #include <stdlib.h>' \
+            lib/libfdt/include/libfdt_env.h
+          printf '%s  %s\n' \
+            132cb14b8f0b323e5701d4bfcb0ebba4b1f35726bfdfa6739f18ad638d20e582 \
+            lib/libfdt/include/libfdt_env.h | sha256sum -c -
+
+      - name: Configure
+        run: |
+          cmake -S devices/lenovo-tb323fu/boot/kshim-success-source/tests \
+            -B "${RUNNER_TEMP}/kshim-host" \
+            -DKSHIM_TEST_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build "${RUNNER_TEMP}/kshim-host" --parallel 2
+
+      - name: Run ctest
+        run: ctest --test-dir "${RUNNER_TEMP}/kshim-host" --output-on-failure
