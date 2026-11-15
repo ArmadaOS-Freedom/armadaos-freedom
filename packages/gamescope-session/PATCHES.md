@@ -42,6 +42,11 @@ this repository and `notes` name the header author and commit.
   source: https://github.com/ArmadaOS-Freedom/armadaos-freedom/blob/b75a6d48e006782b886627dc2dee2b8691aa64f6/packages/gamescope-session/patches/0009-fix-konkr-fit-refresh-rates.patch
   upstream: unknown
   notes: Header author FeralAI, header commit `3629c715113b875a1da8e8a4e0cc16953fb0209e`. Extends the KONKR Pocket FIT refresh-rate list to 60, 90, 120 and 144 Hz; upstream repository could not be established.
+- `patches/0010-armada-display-orientation-override.patch`
+  source: armada
+  notes: Applies the saved Steam Game Mode display orientation after session and
+  environment configuration. With the override disabled, the existing device and
+  user defaults remain in effect.
 
 ## Historical source records
 

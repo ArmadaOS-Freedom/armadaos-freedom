@@ -98,3 +98,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0043-drm-mirror-internal-screen-sleep-to-the-lease-companion.patch`
   source: armada
   notes: Steam sleeps the internal panel through `gamescope_control`, which only reaches the broker, so a lease companion's panel stayed lit during low-power downloads and suspend. The broker now forwards its internal screen sleep state over the lease socket, including to a companion that connects while it is already asleep. Locally fixed on top of upstream: reconnect replay uses a mutex-protected cached state; failed Sleep/Wake sends shut down the socket so the companion can reconnect; a separate atomic companion override sleeps both internal and external leased connectors without overwriting their independent screen settings. Original upstream 0029 renumbered to 0043 with these fixes.
+
+- `patches/0040-wlserver-follow-virtual-touch-orientation.patch`
+  source: armada
+  notes: A touch device tagged by the TB323FU udev rule carries a fixed desktop calibration, so its coordinates reach Gamescope already mapped for the unrotated desktop. Tagged touches on the virtual panel now undo that calibration once per event before the connector's output rotation is applied. Detection by real SPI/I2C/USB bus is unchanged, and the calibration matrix itself is still applied by libinput. Regression: `GAMESCOPE_SOURCE_DIR=/path/to/patched/gamescope python3 tests/gamescope-touch-orientation-test.py`.
