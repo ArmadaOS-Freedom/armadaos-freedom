@@ -9,10 +9,13 @@ from collections import OrderedDict
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import uuid
+import zlib
 
 ARMADA_LIB = Path(__file__).resolve().parents[1] / "system_files" / "usr" / "lib" / "armada"
 if str(ARMADA_LIB) not in sys.path:
@@ -40,22 +43,81 @@ class ClientStatusTest(unittest.TestCase):
 
 
 class RecoveryLayoutHeaderTest(unittest.TestCase):
+    """Every field below is accepted by parse_layout, so only the strict JSON
+    helper can reject the duplicate-key and non-finite cases."""
+
+    PARTITION = "11111111-2222-4333-8444-555555555555"
+    INSTALLATION = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    COMPRESSED = 64
+
+    @classmethod
+    def _meta_text(cls):
+        return json.dumps({
+            "kind": "armada-board-recovery-image",
+            "schemaVersion": 3,
+            "imageBytes": recovery_layout.SIZE,
+            "headerBytes": recovery_layout.REGION_BYTES,
+            "payloadOffset": recovery_layout.REGION_BYTES,
+            "configRegionOffset": recovery_layout.REGION_OFFSET,
+            "configRegionBytes": recovery_layout.REGION_BYTES,
+            "configBoardId": 1,
+            "configPartitionUuid": cls.PARTITION,
+            "compressedBytes": cls.COMPRESSED,
+            "installationId": cls.INSTALLATION,
+        }, separators=(",", ":"))
+
+    @classmethod
+    def _augmented(cls, fragment):
+        text = cls._meta_text()
+        return text[:-1] + "," + fragment + "}"
+
     @staticmethod
     def _header(text):
         raw = text.encode("utf-8")
         return raw + b" " * (recovery_layout.REGION_BYTES - len(raw))
 
-    def test_duplicate_and_nonfinite_metadata_are_layout_errors(self):
-        for text in ('{"installationId":"a","installationId":"b"}',
-                     '{"installationId":"a","imageBytes":NaN}'):
-            with self.subTest(text=text):
-                with self.assertRaises(recovery_layout.RecoveryLayoutError):
-                    recovery_layout.parse_layout(
-                        self._header(text),
-                        b"\x00" * recovery_layout.REGION_BYTES,
-                        "11111111-2222-4333-8444-555555555555",
-                        1,
-                    )
+    @classmethod
+    def _region(cls):
+        region = bytearray(recovery_layout.REGION_BYTES)
+        region[0:8] = b"KSCFGV3\0"
+        struct.pack_into("<I", region, 8, 1)
+        struct.pack_into("<I", region, 12, recovery_layout.SLOT_BYTES)
+        struct.pack_into("<Q", region, 16, recovery_layout.SIZE)
+        struct.pack_into(
+            "<Q", region, 24, recovery_layout.REGION_BYTES + cls.COMPRESSED)
+        struct.pack_into("<Q", region, 32, recovery_layout.REGION_OFFSET)
+        struct.pack_into("<I", region, 40, recovery_layout.REGION_BYTES)
+        struct.pack_into("<I", region, 44, recovery_layout.SLOT_BYTES)
+        region[48:64] = uuid.UUID(cls.PARTITION).bytes
+        region[64:80] = uuid.UUID(cls.INSTALLATION).bytes
+        struct.pack_into("<I", region, 80, recovery_layout.SLOT_BYTES)
+        struct.pack_into("<I", region, 84, 2 * recovery_layout.SLOT_BYTES)
+        struct.pack_into("<I", region, 88, 1)
+        struct.pack_into("<I", region, 4092, zlib.crc32(region[:4092]))
+        return bytes(region)
+
+    def _parse(self, text):
+        return recovery_layout.parse_layout(
+            self._header(text), self._region(), self.PARTITION, 1)
+
+    def test_valid_header_and_descriptor_return_recovery_layout(self):
+        self.assertEqual(
+            self._parse(self._meta_text()),
+            recovery_layout.RecoveryLayout(
+                descriptor_version=1,
+                partition_uuid=uuid.UUID(self.PARTITION).bytes,
+                installation_uuid=uuid.UUID(self.INSTALLATION).bytes,
+                board=1,
+            ),
+        )
+
+    def test_duplicate_installation_id_is_layout_error(self):
+        with self.assertRaises(recovery_layout.RecoveryLayoutError):
+            self._parse(self._augmented('"installationId":"%s"' % self.INSTALLATION))
+
+    def test_nonfinite_extra_metadata_is_layout_error(self):
+        with self.assertRaises(recovery_layout.RecoveryLayoutError):
+            self._parse(self._augmented('"metadataHint":NaN'))
 
 
 class OfflineExecuteDocumentTest(unittest.TestCase):
