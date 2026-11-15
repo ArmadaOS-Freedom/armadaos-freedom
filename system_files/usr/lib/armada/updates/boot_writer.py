@@ -1,11 +1,10 @@
 """Write a prepared candidate to the inactive native boot partition only."""
 
-import hashlib
 import os
 import stat
 import uuid
 
-from . import boot_sources, physical_slots
+from . import _io, boot_sources, physical_slots
 from .boot_candidate import _require_positive_int, _verify_claim
 from .boot_lock import read_boot_lock
 from .boot_sources import _load_locator, _locate, _rehash_region
@@ -90,7 +89,7 @@ def _read_private(claim):
             chunks.append(chunk)
             remaining -= len(chunk)
         data = b''.join(chunks)
-        if len(data) != claim['bytes'] or hashlib.sha256(data).hexdigest() != claim['sha256']:
+        if len(data) != claim['bytes'] or _io.sha256_hex(data) != claim['sha256']:
             raise BootWriteError('private boot buffer failed digest verification')
         return data
     finally:
@@ -254,7 +253,7 @@ def write_inactive_boot(trust_report, candidate_report):
             _pwrite_all(rw_fd, original, target_info['firstLba'] * target_info['blockSize'])
             os.fsync(rw_fd)
             restored = _rehash_region(rw_fd, target_info['firstLba'] * target_info['blockSize'], len(original))
-            if restored != hashlib.sha256(original).hexdigest():
+            if restored != _io.sha256_hex(original):
                 raise BootWriteError('restore readback digest mismatch')
         except Exception as restore_error:
             raise BootWriteError(

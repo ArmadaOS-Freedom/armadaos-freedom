@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 from pathlib import Path
 import stat
@@ -12,6 +10,7 @@ import uuid
 
 from . import (
     UPDATER_VERSION,
+    _io,
     boot_candidate,
     deployment_options,
     models,
@@ -34,7 +33,7 @@ _ACK_FILE_KEYS = frozenset({'path', 'bytes', 'sha256'})
 
 
 def _sha256(data):
-    return hashlib.sha256(data).hexdigest()
+    return _io.sha256_hex(data)
 
 
 def _is_sha(value):
@@ -85,7 +84,7 @@ def _read_bounded(path, limit, label):
 
 def _load_json(work, name, limit=_JSON_MAX):
     data = _read_bounded(work / name, limit, name)
-    value = json.loads(data.decode('ascii'))
+    value = _io.strict_loads(data.decode('ascii'))
     if not isinstance(value, dict):
         raise ValueError('%s root is not a JSON object' % name)
     return value, data

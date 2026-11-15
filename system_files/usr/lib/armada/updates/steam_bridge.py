@@ -27,6 +27,8 @@ import threading
 import urllib.parse
 import urllib.request
 
+from updates import _io
+
 log = logging.getLogger("armada.steam_bridge")
 
 DISCOVERY_URL = "http://127.0.0.1:8080/json"
@@ -128,7 +130,7 @@ def _http_get_discovery():
         data = resp.read(DISCOVERY_MAX_BYTES + 1)
     if len(data) > DISCOVERY_MAX_BYTES:
         raise BridgeError("discovery payload too large")
-    return json.loads(data.decode("utf-8"))
+    return _io.strict_loads(data.decode("utf-8"))
 
 
 def _valid_target_url(url):
@@ -325,16 +327,9 @@ class SteamConnection:
         if not isinstance(payload, str) or len(payload.encode("utf-8")) > MAX_BINDING_BYTES:
             log.debug("malformed binding payload ignored")
             return
-        def _reject_duplicates(pairs):
-            res = {}
-            for k, v in pairs:
-                if k in res:
-                    raise ValueError("duplicate key: %r" % (k,))
-                res[k] = v
-            return res
 
         try:
-            request = json.loads(payload, object_pairs_hook=_reject_duplicates)
+            request = _io.strict_loads(payload)
         except (ValueError, UnicodeDecodeError):
             log.debug("binding payload is not valid JSON or contains duplicate keys")
             return
@@ -424,7 +419,7 @@ class SteamConnection:
             log.debug("CDP message exceeds 2MiB limit, dropped")
             return
         try:
-            message = json.loads(raw)
+            message = _io.strict_loads(raw)
         except (ValueError, UnicodeDecodeError):
             return
         if not isinstance(message, dict):

@@ -5,12 +5,12 @@ sysroot without making it default, removing prior deployments, seeding /var/home
 or formatting storage. Caller holds /run/lock/armada-update.lock for the full
 transaction; this module also acquires and releases the OSTree Sysroot try_lock.
 """
-import json
 import re
 import sys
 import uuid
 from pathlib import Path
 
+from . import _io
 from .boot_context import _read_regular
 from .boot_payload import verify_manifest
 
@@ -289,8 +289,8 @@ def _load_manifest(dep_root, model):
     except Exception as exc:
         raise DeploymentError(f"invalid manifest file {p}: {exc}") from exc
     try:
-        doc = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        doc = _io.strict_loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise DeploymentError(f"manifest not UTF-8 JSON: {exc}") from exc
     try:
         verified = verify_manifest(dep_root, model, doc)
@@ -308,8 +308,8 @@ def _validate_commit_metadata(commit_variant, oci_digest, source_revision, versi
     img_cfg_raw = meta.get("ostree.container.image-config")
     if isinstance(img_cfg_raw, str):
         try:
-            img = json.loads(img_cfg_raw)
-        except json.JSONDecodeError as exc:
+            img = _io.strict_loads(img_cfg_raw)
+        except ValueError as exc:
             raise DeploymentError(f"invalid image-config JSON: {exc}") from exc
     elif isinstance(img_cfg_raw, dict):
         img = img_cfg_raw

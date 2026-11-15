@@ -1,8 +1,9 @@
 """Small, allow-listed D-Bus client for the update service."""
 
-import json
 import re
 import time
+
+from . import _io
 
 BUS_NAME = "org.armada.Updates"
 PATH = "/org/armada/Updates"
@@ -77,7 +78,7 @@ class UpdateClient:
 
     def snapshot(self):
         try:
-            data = json.loads(self.call("GetStatus"))
+            data = _io.strict_loads(self.call("GetStatus"))
             if (not isinstance(data, dict) or data.get("schemaVersion") != 1
                     or not isinstance(data.get("components"), dict)):
                 raise ValueError("invalid status schema")

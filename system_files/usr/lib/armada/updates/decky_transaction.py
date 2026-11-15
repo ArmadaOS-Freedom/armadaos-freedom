@@ -12,6 +12,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import _io
 from .decky_release import verify_payload
 from .decky_source import _validate_release
 
@@ -34,19 +35,12 @@ class DeckyTransaction:
 
     @staticmethod
     def _fsync_dir(path):
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _io.fsync_dir(path)
 
     @staticmethod
     def _sha256(path):
-        digest = hashlib.sha256()
         with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+            return _io.sha256_stream(stream)
 
     @staticmethod
     def _copy(source, destination, expected=None):
@@ -142,7 +136,7 @@ class DeckyTransaction:
         if self.pending.is_symlink():
             raise RuntimeError("Unsafe pending journal")
         with self.pending.open("rb") as stream:
-            value = json.load(stream)
+            value = _io.strict_loads(stream.read())
         required = {"schema", "txid", "phase", "previous_active"}
         if not isinstance(value, dict) or set(value) != required:
             raise ValueError("Invalid pending journal keys")
@@ -194,7 +188,7 @@ class DeckyTransaction:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise ValueError("Invalid backup manifest file")
         with manifest_path.open("rb") as stream:
-            manifest = json.load(stream)
+            manifest = _io.strict_loads(stream.read())
         if not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}:
             raise ValueError("Invalid backup manifest")
         if type(manifest["schema"]) is not int or manifest["schema"] != 1:

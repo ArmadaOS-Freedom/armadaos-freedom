@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 
+from . import _io
 from .package_contract import PackageError, _portable_path, validate_package
 
 MAX_RECOVERY_MANIFEST_BYTES = 64 * 1024
@@ -30,16 +31,17 @@ _REQUIRED_ROLES = {
 
 
 def _object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise PackageError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
+    try:
+        return _io.object_pairs(pairs)
+    except ValueError as exc:
+        raise PackageError(str(exc)) from exc
 
 
 def _reject_constant(value):
-    raise PackageError(f"invalid JSON constant: {value}")
+    try:
+        _io.reject_constant(value)
+    except ValueError as exc:
+        raise PackageError(f"invalid JSON constant: {value}") from exc
 
 
 def _reject_float(value):

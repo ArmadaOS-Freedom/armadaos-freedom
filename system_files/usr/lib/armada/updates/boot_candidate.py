@@ -14,6 +14,7 @@ import stat
 import subprocess
 import uuid
 
+from . import _io
 from .boot_materials import BootMaterialsError, _validate_helper_path, _validate_output_dir
 from .boot_payload import require_runtime_marker
 from .deployment_store import DeploymentError, _parse_binding
@@ -147,12 +148,10 @@ def _write_new(path, data):
     fd = os.open(path, flags, 0o600)
     try:
         try:
-            view = memoryview(data)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise BootCandidateError(f"short write to {path}")
-                view = view[written:]
+            try:
+                _io.write_all(fd, data)
+            except _io.ShortWriteError:
+                raise BootCandidateError(f"short write to {path}") from None
             os.fsync(fd)
         except BaseException:
             try:
@@ -296,9 +295,9 @@ def _run_stage(tool_path, subcommand, request_doc, out_dir, tmp_dir, expected_ph
     if len(result_bytes) != result_size:
         raise BootCandidateError(f"{subcommand} result.json changed during read")
     try:
-        stdout_doc = json.loads(stdout_bytes.decode("utf-8"))
-        result_doc = json.loads(result_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        stdout_doc = _io.strict_loads(stdout_bytes.decode("utf-8"))
+        result_doc = _io.strict_loads(result_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise BootCandidateError(f"{subcommand} produced invalid JSON report: {exc}") from exc
     if stdout_doc != result_doc or not isinstance(result_doc, dict):
         raise BootCandidateError(f"{subcommand} stdout JSON did not match result.json")
@@ -503,14 +502,7 @@ def prepare_boot_candidate(
         if "transactionUuid" in validated:
             report["transactionUuid"] = validated["transactionUuid"]
         _write_new(out / "candidate.json", json.dumps(report, indent=2, sort_keys=True).encode("utf-8"))
-        dir_fd = os.open(
-            out,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        _io.fsync_dir(out)
         return report
     except BootCandidateError:
         raise

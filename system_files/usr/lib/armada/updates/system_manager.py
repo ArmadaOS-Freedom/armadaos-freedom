@@ -1,7 +1,6 @@
 """Freedom OS update status, signed update checks, and apply operations."""
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -12,6 +11,7 @@ from pathlib import Path
 
 import armada_os
 
+from . import _io
 from .boot_context import BootContextError, read_boot_context
 from .trial_record import BOOT_POLICY
 from .trial_status import read_trial_status
@@ -78,8 +78,7 @@ def _apply_outcome(stdout, returncode, base, work_dir):
     try:
         if len(stdout.encode("utf-8", "replace")) > MAX_CONFIG_BYTES:
             raise ValueError("worker output exceeds the size limit")
-        report = json.loads(
-            stdout, object_pairs_hook=_no_duplicate_properties)
+        report = _io.strict_loads(stdout)
     except (TypeError, ValueError):
         return uncertain(
             "The system apply worker returned no usable result")
@@ -251,8 +250,7 @@ def _valid_trial_receipt(trial, model):
                 or root_info.st_mode & 0o022):
             return False
         raw_pointer = _read_regular(root / "current.json", MAX_CONFIG_BYTES)
-        pointer = json.loads(
-            raw_pointer, object_pairs_hook=_no_duplicate_properties)
+        pointer = _io.strict_loads(raw_pointer)
         if (not isinstance(pointer, dict)
                 or set(pointer) != {"schemaVersion", "jobId"}
                 or type(pointer["schemaVersion"]) is not int
@@ -271,8 +269,7 @@ def _valid_trial_receipt(trial, model):
             return False
         raw_receipt = _read_regular(
             work_dir / "status.json", MAX_CONFIG_BYTES)
-        receipt = json.loads(
-            raw_receipt, object_pairs_hook=_no_duplicate_properties)
+        receipt = _io.strict_loads(raw_receipt)
         if not isinstance(receipt, dict):
             return False
         if (type(receipt.get("schemaVersion")) is not int
@@ -305,7 +302,7 @@ def _private_directory(path):
 
 
 def _json_bytes(raw):
-    return json.loads(raw, object_pairs_hook=_no_duplicate_properties)
+    return _io.strict_loads(raw)
 
 
 def _json_document(path):
@@ -364,7 +361,7 @@ def _valid_offline_completion(trial, model):
         report = _json_document(transaction / "write-report.json")
         ack = _json_document(session / "ack.json")
         identity = offline_completion.execute_completion(
-            prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+            prepared, plan, _io.sha256_hex(plan_raw),
             status, report, ack, model)
         if identity is None:
             return False
@@ -389,7 +386,7 @@ def _configuration(path, channel):
             f"Update channel configuration is missing at {path}; "
             "the publisher must install an approved channels.json"
         ) from error
-    config = json.loads(raw, object_pairs_hook=_no_duplicate_properties)
+    config = _io.strict_loads(raw)
     if not isinstance(config, dict) or set(config) != {"schemaVersion", "channels"}:
         raise ValueError("Update configuration must contain schemaVersion and channels")
     if (type(config["schemaVersion"]) is not int
@@ -668,8 +665,7 @@ class SystemManager:
         try:
             raw = _read_regular(
                 work_dir / "status.json", MAX_CONFIG_BYTES)
-            report = json.loads(
-                raw, object_pairs_hook=_no_duplicate_properties)
+            report = _io.strict_loads(raw)
         except (OSError, ValueError, RuntimeError):
             return None
         if (not isinstance(report, dict)

@@ -265,6 +265,7 @@ def build_fixture(full_build=False):
 
         for name in (
             "__init__",
+            "_io",
             "signature",
             "package_contract",
             "package_media",

@@ -14,6 +14,7 @@ import stat
 import uuid
 from pathlib import Path
 
+from . import _io
 from . import physical_slots
 from .boot_candidate import BootCandidateError, _hash_regular_file, _write_new
 from .boot_materials import _validate_output_dir
@@ -356,22 +357,14 @@ def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,
         except Exception as error:
             raise BootSourcesError(
                 f'cannot write {manifest_path}: {error}') from error
-        dir_fd = -1
         try:
-            dir_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            os.fsync(dir_fd)
+            _io.fsync_dir(out, nofollow=True)
         except OSError as error:
             try:
                 os.unlink(manifest_path)
             except OSError:
                 pass
             raise BootSourcesError(f'cannot sync {out}: {error}') from error
-        finally:
-            if dir_fd >= 0:
-                try:
-                    os.close(dir_fd)
-                except OSError:
-                    pass
         return manifest
     except (PhysicalSlotsError, OSError) as error:
         raise BootSourcesError(f'{error}') from error

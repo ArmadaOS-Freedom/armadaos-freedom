@@ -17,6 +17,7 @@ import stat
 import uuid
 from pathlib import Path
 
+from . import _io
 from .boot_context import _read_regular
 from .boot_payload import (
     _resolve_regular_file,
@@ -40,7 +41,7 @@ class BootMaterialsError(RuntimeError):
 
 
 def _sha256_hex(data):
-    return hashlib.sha256(data).hexdigest()
+    return _io.sha256_hex(data)
 
 
 def _bootargs_bytes(value, label):
@@ -102,12 +103,10 @@ def _copy_verified(src_fd, out_path, expected_bytes):
             if not chunk:
                 raise BootMaterialsError("source truncated during copy")
             digest.update(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise BootMaterialsError("short write while staging boot artifact")
-                view = view[written:]
+            try:
+                _io.write_all(fd, chunk)
+            except _io.ShortWriteError:
+                raise BootMaterialsError("short write while staging boot artifact") from None
             total += len(chunk)
         extra = os.read(src_fd, 1)
         if extra:
@@ -265,7 +264,7 @@ def prepare_boot_materials(
         target_path = Path(options["path"])
         manifest_rel = "usr/share/armada/update-boot/manifest.json"
         manifest_bytes = _read_regular(target_path / manifest_rel, _MAX_MANIFEST_BYTES)
-        manifest_doc = json.loads(manifest_bytes.decode("utf-8"))
+        manifest_doc = _io.strict_loads(manifest_bytes.decode("utf-8"))
         verified = verify_manifest(
             Path(target_path), model, manifest_doc, require_runtime_marker=True
         )
@@ -345,7 +344,7 @@ def prepare_boot_materials(
         if recheck != options:
             raise BootMaterialsError("deployment options changed during preparation")
         current_manifest_bytes = _read_regular(target_path / manifest_rel, _MAX_MANIFEST_BYTES)
-        current_manifest_doc = json.loads(current_manifest_bytes.decode("utf-8"))
+        current_manifest_doc = _io.strict_loads(current_manifest_bytes.decode("utf-8"))
         if current_manifest_bytes != manifest_bytes or current_manifest_doc != manifest_doc:
             raise BootMaterialsError("boot manifest changed during preparation")
         reverified = verify_manifest(

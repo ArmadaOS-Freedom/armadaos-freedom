@@ -5,10 +5,11 @@ Uses /etc/pki/containers/armadaos-freedom.pub via system OpenSSL; payload never 
 import base64
 import binascii
 import json
-import math
 import subprocess
 import tempfile
 from pathlib import Path
+
+from . import _io
 
 DEFAULT_TRUSTED_KEY = Path('/etc/pki/containers/armadaos-freedom.pub')
 OPENSSL = '/usr/bin/openssl'
@@ -19,24 +20,6 @@ MAX_SIGNATURE_BYTES = 4096
 
 class SignatureError(ValueError):
     """Raised when signature verification fails or input is malformed."""
-
-
-def _reject_pairs(pairs):
-    hook = dict(pairs)
-    if len(hook) != len(pairs):
-        raise SignatureError('duplicate JSON object key')
-    return hook
-
-
-def _reject_constant(name):
-    raise SignatureError('non-finite JSON constant: %s' % name)
-
-
-def _parse_float(value):
-    num = float(value)
-    if not math.isfinite(num):
-        raise SignatureError('non-finite JSON float: %s' % value)
-    return num
 
 
 def verify_document(document, signature_b64, *, trusted_key=DEFAULT_TRUSTED_KEY):
@@ -118,16 +101,14 @@ def load_signed_json(document, signature_b64, *, trusted_key=DEFAULT_TRUSTED_KEY
     except UnicodeDecodeError as exc:
         raise SignatureError('document is not valid UTF-8') from exc
     try:
-        parsed = json.loads(
-            text,
-            object_pairs_hook=_reject_pairs,
-            parse_constant=_reject_constant,
-            parse_float=_parse_float,
-        )
-    except SignatureError:
-        raise
-    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        parsed = _io.strict_loads(text)
+    except json.JSONDecodeError as exc:
         raise SignatureError('document is not valid JSON') from exc
+    except RecursionError as exc:
+        raise SignatureError('document is not valid JSON') from exc
+    except ValueError as exc:
+        # Duplicate keys and non-finite numbers carry their own strict label.
+        raise SignatureError(str(exc)) from exc
     if not isinstance(parsed, dict):
         raise SignatureError('JSON root must be an object')
     return parsed

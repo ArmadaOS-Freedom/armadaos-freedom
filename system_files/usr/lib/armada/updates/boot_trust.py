@@ -1,10 +1,10 @@
 """Capture physical boot sources and authenticate them with the boot tool."""
 
 import json
-import os
 from copy import deepcopy
 from pathlib import Path
 
+from . import _io
 from .boot_candidate import (
     BootCandidateError,
     _DEFAULT_BOOT_TOOL_PATH,
@@ -213,12 +213,7 @@ def _validate_trust(result, initial, lock_state, snapshot):
 
 
 def _fsync_directory(path):
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _io.fsync_dir(path)
 
 
 def _slot_request(snapshot, slot):

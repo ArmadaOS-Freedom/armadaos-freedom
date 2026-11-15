@@ -1,10 +1,11 @@
 """Shared validation for Armada recovery headers and settings descriptors."""
 
 from dataclasses import dataclass
-import json
 import struct
 import uuid
 import zlib
+
+from . import _io
 
 SIZE = 2 * 1024**3
 REGION_BYTES = 65536
@@ -40,7 +41,7 @@ def u64(data, offset):
 def parse_layout(header: bytes, region: bytes, partition_uuid: str, board: int) -> RecoveryLayout:
     try:
         require(len(header) == REGION_BYTES and len(region) == REGION_BYTES, 'Short settings read')
-        meta = json.loads(header.decode('utf-8'))
+        meta = _io.strict_loads(header.decode('utf-8'))
         part = uuid.UUID(partition_uuid).bytes
         installation = uuid.UUID(meta['installationId']).bytes
         require(meta['kind'] == 'armada-board-recovery-image' and meta['schemaVersion'] == 3,
