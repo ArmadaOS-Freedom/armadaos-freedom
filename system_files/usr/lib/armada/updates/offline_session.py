@@ -6,7 +6,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import heapq
-import json
 import os
 from pathlib import Path
 import re
@@ -18,6 +17,7 @@ from contextlib import contextmanager
 import armada_os
 from . import (
     UPDATER_VERSION,
+    _io,
     boot_context,
     models,
     offline_execute,
@@ -62,23 +62,17 @@ class OfflineSessionError(RuntimeError):
 
 
 def _fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _io.fsync_dir(path, nofollow=True)
 
 
 def _write_new(path, data):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
-        view = memoryview(data)
-        while view:
-            count = os.write(fd, view)
-            if count <= 0:
-                raise OSError('short private-file write')
-            view = view[count:]
+        try:
+            _io.write_all(fd, data)
+        except _io.ShortWriteError:
+            raise OSError('short private-file write') from None
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -281,7 +275,7 @@ class OfflineSessionStore:
     def read_receipt(self, session):
         session = self.resolve_session(session) if isinstance(session, str) else Path(session)
         raw = offline_execute._read_bounded(session / 'receipt.json', _JSON_MAX, 'receipt')
-        receipt = json.loads(raw.decode('ascii'))
+        receipt = _io.strict_loads(raw.decode('ascii'))
         if (not isinstance(receipt, dict) or receipt.get('schemaVersion') != 1 or
                 receipt.get('sessionId') != session.name):
             raise OfflineSessionError('invalid session receipt')
@@ -417,7 +411,7 @@ class OfflineSessionStore:
         try:
             raw = offline_execute._read_bounded(
                 self.base / _RECLAIM_CURSOR, _RECLAIM_CURSOR_MAX, 'reclaim cursor')
-            cursor = json.loads(raw.decode('ascii'))
+            cursor = _io.strict_loads(raw.decode('ascii'))
         except (OSError, ValueError):
             return None
         if not isinstance(cursor, dict) or cursor.get('schemaVersion') != 1:
@@ -576,7 +570,7 @@ class OfflineSessionStore:
                 status_path = transaction / 'status.json'
                 if status_path.exists():
                     raw = offline_execute._read_bounded(status_path, _JSON_MAX, 'transaction status')
-                    receipt['transaction'] = json.loads(raw.decode('ascii'))
+                    receipt['transaction'] = _io.strict_loads(raw.decode('ascii'))
                 else:
                     receipt['transaction'] = {'state': 'queued', 'statusAvailable': False}
             return receipt
@@ -686,7 +680,7 @@ class OfflineSessionStore:
             return {'path': path, 'bytes': None}
         raw = offline_execute._read_bounded(
             transaction / 'recovery-manifest.json', _JSON_MAX, 'recovery manifest')
-        manifest = json.loads(raw.decode('ascii'))
+        manifest = _io.strict_loads(raw.decode('ascii'))
         files = manifest.get('files') if isinstance(manifest, dict) else None
         if not isinstance(files, list):
             raise OfflineSessionError('recovery manifest has no validated file list')
@@ -714,7 +708,7 @@ class OfflineSessionStore:
             _check_dir(transaction)
             raw = offline_execute._read_bounded(
                 transaction / 'status.json', _JSON_MAX, 'transaction status')
-            tx_status = json.loads(raw.decode('ascii'))
+            tx_status = _io.strict_loads(raw.decode('ascii'))
             if tx_status.get('state') not in _EXPORT_STATES:
                 raise OfflineSessionError('transaction is not ready for recovery export')
             entry = self._export_entry(transaction, path)

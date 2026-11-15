@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fcntl
 import hashlib
-import json
 import os
 from pathlib import Path
 import stat
@@ -15,7 +14,7 @@ import subprocess
 from typing import Any
 
 import armada_os
-from . import boot_context, boot_payload, recovery_device
+from . import _io, boot_context, boot_payload, recovery_device
 from .trial_record import (
     CONFIRMED,
     TRIAL,
@@ -120,8 +119,8 @@ def _verify_boot_payload(root: Path = ROOT_PATH) -> tuple[str, int]:
     )
     try:
         manifest_raw = boot_context._read_regular(manifest_path, MANIFEST_MAX_BYTES).decode("utf-8")
-        manifest = json.loads(manifest_raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest = _io.strict_loads(manifest_raw)
+    except (UnicodeDecodeError, ValueError) as exc:
         raise BootHealthError("Boot payload manifest is not valid UTF-8 JSON") from exc
     if not isinstance(manifest, dict):
         raise BootHealthError("Boot payload manifest must be a JSON object")

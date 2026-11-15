@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import http.client
-import json
 import math
 import os
 from pathlib import Path
@@ -10,6 +9,7 @@ import urllib.error
 from urllib.parse import urlsplit
 import urllib.request
 
+from . import _io
 from .decky_release import (
     ASSET_NAME,
     DeckyRelease,
@@ -111,8 +111,8 @@ def fetch_preview(*, timeout: int | float = 20) -> DeckyRelease:
         raise DeckyReleaseError("Releases metadata exceeds 16 MiB limit")
 
     try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = _io.strict_loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise DeckyReleaseError(f"Invalid releases JSON: {exc}") from exc
 
     return select_preview(payload)

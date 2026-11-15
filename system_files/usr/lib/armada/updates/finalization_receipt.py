@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
@@ -11,7 +10,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from . import boot_context
+from . import _io, boot_context
 from .trial_record import BOOT_POLICY, CONFIRMED, encode_record
 
 STATE_PATH = Path("/var/lib/armada/updates/system/finalized.json")
@@ -26,7 +25,7 @@ def _document(record) -> dict:
     deployment = f"{record.os_name}/{record.new_commit.hex()}.{record.new_serial}"
     return {
         "schemaVersion": 1,
-        "recordSha256": hashlib.sha256(encoded).hexdigest(),
+        "recordSha256": _io.sha256_hex(encoded),
         "transactionId": str(uuid.UUID(bytes=bytes(record.transaction_uuid))),
         "recordSequence": record.sequence,
         "deployment": deployment,
@@ -61,13 +60,7 @@ def _trusted_parent(path: Path, *, create: bool) -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    fd = os.open(
-        path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
-    )
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _io.fsync_dir(path)
 
 
 def _durable_ancestors(parent: Path) -> None:
@@ -101,12 +94,7 @@ def _durable_ancestors(parent: Path) -> None:
 
 
 def _no_duplicate_keys(pairs) -> dict:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
+    return _io.object_pairs(pairs)
 
 
 def _pending(error: object) -> dict:
@@ -207,9 +195,7 @@ def read(record) -> dict:
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             return _pending("finalization receipt is group or world writable")
         raw = boot_context._read_regular(target, _MAX_RECEIPT_BYTES)
-        loaded = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys
-        )
+        loaded = _io.strict_loads(raw.decode("utf-8"))
         if not isinstance(loaded, dict):
             return _pending("finalization receipt is not a JSON object")
         if (

@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import finalization_receipt, trial_confirmation
+from . import _io, finalization_receipt, trial_confirmation
 
 
 CHANNELS = ("stable", "beta", "testing")
@@ -63,12 +63,7 @@ def set_channel(channel, state_path=DEFAULT_STATE_PATH):
             finalization_receipt._durable_ancestors(parent)
             os.replace(str(temporary), str(destination))
             temporary = None
-            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            directory_fd = os.open(str(parent), directory_flags)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _io.fsync_dir(parent)
         finally:
             if fd is not None:
                 os.close(fd)

@@ -53,14 +53,12 @@ receipts and every recovery export stay in place.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import stat
 import uuid
 from pathlib import Path
 
-from . import boot_context
+from . import _io, boot_context
 from .trial_record import BOOT_POLICY, CONFIRMED, OFFLINE_DUAL
 
 APPLY_STATE_ROOT = Path('/var/lib/armada/updates/system')
@@ -124,18 +122,9 @@ def _owned_by_root(info):
     return info.st_uid == 0
 
 
-def _no_duplicate_keys(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError('duplicate JSON key: %s' % key)
-        result[key] = value
-    return result
-
-
 def _document(path):
     raw = boot_context._read_regular(path, _MAX_DOCUMENT_BYTES)
-    return json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
+    return _io.strict_loads(raw.decode('utf-8'))
 
 
 def _trusted_root(root):
@@ -431,7 +420,7 @@ def _offline_proof(session, receipt, bounds):
         return None
 
     identity = offline_completion.execute_completion(
-        prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+        prepared, plan, _io.sha256_hex(plan_raw),
         status, report, ack, model)
     if identity is None:
         return None
@@ -442,7 +431,7 @@ def _offline_proof(session, receipt, bounds):
 
     manifest_sha256 = prepared.get('recoveryManifestSha256')
     if (not _sha256(manifest_sha256) or
-            hashlib.sha256(manifest_raw).hexdigest() != manifest_sha256 or
+            _io.sha256_hex(manifest_raw) != manifest_sha256 or
             plan.get('recoveryManifestSha256') != manifest_sha256):
         return None
     if (manifest.get('transactionId') != bounds['transactionId'] or
@@ -603,8 +592,7 @@ def retire_confirmed_offline_session(record, *, base=None):
         offline_session._check_dir(pointer_path.parent)
         raw = offline_execute._read_bounded(
             pointer_path, _OFFLINE_POINTER_MAX, 'completion pointer')
-        pointer = json.loads(
-            raw.decode('ascii'), object_pairs_hook=_no_duplicate_keys)
+        pointer = _io.strict_loads(raw.decode('ascii'))
         session_id = offline_completion.pointer_session(
             pointer, bounds['transactionId'])
         if session_id is None:

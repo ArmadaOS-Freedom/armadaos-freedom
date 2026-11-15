@@ -181,6 +181,7 @@ preflight_sources=(
     build_files/Containerfile.edl-tools
     tests/update-oci-pull-test.py
     system_files/usr/lib/armada/updates/__init__.py
+    system_files/usr/lib/armada/updates/_io.py
     system_files/usr/lib/armada/updates/signature.py
     system_files/usr/lib/armada/updates/package_contract.py
     system_files/usr/lib/armada/updates/package_media.py

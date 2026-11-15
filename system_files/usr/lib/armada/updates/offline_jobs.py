@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 
 import armada_os
 from . import (
+    _io,
     boot_context,
     offline_completion,
     offline_execute,
@@ -215,7 +215,7 @@ class OfflineJobManager:
         except (OSError, ValueError, RuntimeError):
             return None
         identity = offline_completion.execute_completion(
-            prepared, plan, hashlib.sha256(plan_raw).hexdigest(),
+            prepared, plan, _io.sha256_hex(plan_raw),
             status, report, ack, receipt.get('model'))
         if identity is None:
             return None
@@ -297,7 +297,7 @@ class OfflineJobManager:
             return None
 
         identity = offline_completion.document_identity(
-            prepared, plan, hashlib.sha256(plan_raw).hexdigest())
+            prepared, plan, _io.sha256_hex(plan_raw))
         if identity is None:
             return None
         physical = receipt.get('physical')
@@ -319,7 +319,7 @@ class OfflineJobManager:
         manifest_sha = prepared.get('recoveryManifestSha256')
         package_sha = prepared.get('packageDescriptorSha256')
         if (not _is_sha256(manifest_sha) or
-                hashlib.sha256(manifest_raw).hexdigest() != manifest_sha or
+                _io.sha256_hex(manifest_raw) != manifest_sha or
                 plan.get('recoveryManifestSha256') != manifest_sha or
                 status.get('recoveryManifestSha256') != manifest_sha or
                 status.get('planSha256') != identity['planSha256'] or
@@ -327,7 +327,7 @@ class OfflineJobManager:
                 status['recoveryManifestBytes'] != len(manifest_raw)):
             return None
         if (not _is_sha256(package_sha) or
-                hashlib.sha256(session_document).hexdigest() != package_sha or
+                _io.sha256_hex(session_document) != package_sha or
                 plan.get('packageDescriptorSha256') != package_sha or
                 package_document != session_document or
                 package_signature != session_signature):
@@ -673,7 +673,7 @@ class OfflineJobManager:
         except (OSError, ValueError):
             return None
         return offline_completion.document_identity(
-            prepared, plan, hashlib.sha256(plan_raw).hexdigest())
+            prepared, plan, _io.sha256_hex(plan_raw))
 
     def _attach_completion(self, session_id, receipt):
         """Attach the read-only completion verdict for an executed session."""

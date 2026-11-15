@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import stat
@@ -12,6 +11,7 @@ import uuid
 import armada_os
 from . import (
     UPDATER_VERSION,
+    _io,
     boot_candidate,
     boot_materials,
     boot_trust,
@@ -32,7 +32,7 @@ _JOURNAL_BYTES = 64 * 1024
 
 
 def _sha256(data):
-    return hashlib.sha256(data).hexdigest()
+    return _io.sha256_hex(data)
 
 
 def _remove_owned_tree(path):

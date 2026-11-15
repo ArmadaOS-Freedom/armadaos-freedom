@@ -9,7 +9,7 @@ import json
 import os
 import sys
 
-from . import offline_jobs, offline_session
+from . import _io, offline_jobs, offline_session
 
 PROTOCOL = 1
 _FRAME_MAX = 4 * 1024 * 1024
@@ -48,19 +48,6 @@ class _Invalid(Exception):
 
 class _Denied(Exception):
     """A known method is not offered by this endpoint."""
-
-
-def _reject_constant(name):
-    raise _Invalid('JSON constant %s is not allowed' % name)
-
-
-def _object_pairs(pairs):
-    keys = set()
-    for key, _value in pairs:
-        if key in keys:
-            raise _Invalid('duplicate JSON object key')
-        keys.add(key)
-    return dict(pairs)
 
 
 def _b64(value, cap, label):
@@ -239,10 +226,8 @@ def serve(reader, writer, manager, *, allowed_methods=None):
                 return 1
             return 1
         try:
-            request = json.loads(
-                line[:-1].decode('utf-8'), parse_constant=_reject_constant,
-                object_pairs_hook=_object_pairs)
-        except (_Invalid, UnicodeDecodeError, ValueError):
+            request = _io.strict_loads(line[:-1].decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
             try:
                 _write(writer, _failure(
                     None, 'invalid_request', 'request is not valid JSON'))

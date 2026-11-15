@@ -20,7 +20,6 @@ device reports that the failed write was restored or never started.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,6 +28,7 @@ import uuid
 import armada_os
 from . import (
     UPDATER_VERSION,
+    _io,
     boot_candidate,
     boot_materials,
     boot_trust,
@@ -63,21 +63,15 @@ def _save_json(directory, name, value):
     fd = None
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError('short JSON write')
-            view = view[written:]
+        try:
+            _io.write_all(fd, data)
+        except _io.ShortWriteError:
+            raise OSError('short JSON write') from None
         os.fsync(fd)
         os.close(fd)
         fd = None
         os.replace(temporary, directory / name)
-        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
+        _io.fsync_dir(directory, nofollow=True)
         return data
     finally:
         if fd is not None:
@@ -433,7 +427,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 if target_version is not None:
                     plan['targetVersion'] = target_version
             plan_bytes = _save_json(work, 'plan.json', plan)
-            plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+            plan_sha256 = _io.sha256_hex(plan_bytes)
             status['planSha256'] = plan_sha256
 
             sequence = 1 if journal.record is None else journal.record.sequence + 1

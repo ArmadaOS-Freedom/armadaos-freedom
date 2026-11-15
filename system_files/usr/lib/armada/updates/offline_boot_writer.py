@@ -1,12 +1,11 @@
 """Write prepared boot candidates to both native slots for offline upgrades."""
 
 import copy
-import hashlib
 import os
 import stat
 import uuid
 
-from . import boot_sources, physical_slots
+from . import _io, boot_sources, physical_slots
 from .boot_candidate import _require_positive_int, _verify_claim
 from .boot_lock import read_boot_lock
 from .boot_sources import _load_locator, _locate, _rehash_region
@@ -427,7 +426,7 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
             t_info = target_extents[slot]
             offset = t_info['firstLba'] * t_info['blockSize']
             orig_data = plan[slot]['originalData']
-            orig_sha = hashlib.sha256(orig_data).hexdigest()
+            orig_sha = _io.sha256_hex(orig_data)
             rw_fd = rw_fds[t_info['lun']]
             try:
                 _pwrite_all(rw_fd, orig_data, offset)
