@@ -21,6 +21,7 @@ sed -i "s/^Version:.*/Version:        ${VERSION}/" ~/rpmbuild/SPECS/mangohud.spe
 sed -i "/^%build$/i %global build_cflags %{build_cflags} ${ARMADA_MARCH}" ~/rpmbuild/SPECS/mangohud.spec
 sed -i "/^%build$/i %global build_cxxflags %{build_cxxflags} ${ARMADA_MARCH}" ~/rpmbuild/SPECS/mangohud.spec
 cp /work/patches/*.patch ~/rpmbuild/SOURCES/
+cp /work/tests/battery_percent_test.cpp ~/rpmbuild/SOURCES/
 # fetch the upstream tarball
 spectool -g -R ~/rpmbuild/SPECS/mangohud.spec
 dnf -y builddep ~/rpmbuild/SPECS/mangohud.spec

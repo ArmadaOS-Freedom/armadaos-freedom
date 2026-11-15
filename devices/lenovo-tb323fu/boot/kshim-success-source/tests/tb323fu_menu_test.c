@@ -900,8 +900,10 @@ static void test_limits(void)
     QcomKeys Keys;
     FixtureInit(&Ui, &Fb, &Pix, Desc, &Keys);
 
-    /* Build KSHIM_MENU_MAX_ENTRIES+1 distinct, all-non-null strings */
-    static char Bufs[KSHIM_MENU_MAX_ENTRIES + 1][16];
+    /* Build KSHIM_MENU_MAX_ENTRIES+1 distinct, all-non-null strings.
+     * 32 bytes covers the worst case "Entry" + a full 32-bit int (11 chars)
+     * plus the terminator, so snprintf cannot truncate for any int value. */
+    static char Bufs[KSHIM_MENU_MAX_ENTRIES + 1][32];
     static const char *Entries[KSHIM_MENU_MAX_ENTRIES + 1];
     for (int I = 0; I < (int)KSHIM_MENU_MAX_ENTRIES + 1; I++) {
         snprintf(Bufs[I], sizeof(Bufs[I]), "Entry%d", I);

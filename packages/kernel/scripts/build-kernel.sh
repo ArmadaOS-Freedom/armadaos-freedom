@@ -33,7 +33,7 @@ JOBS=$(nproc)
 MAKE_ARGS=(-j"${JOBS}")
 if [[ "${HOST_ARCH}" == "aarch64" ]]; then
     echo "==> Native aarch64 build (${JOBS} jobs)"
-else
+elif [ -z "${KERNEL_HOST_CHECKS_ONLY:-}" ]; then
     if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
         echo "ERROR: aarch64-linux-gnu-gcc not found. Install the cross toolchain:" >&2
         echo "  sudo pacman -S aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils  # CachyOS/Arch" >&2
@@ -240,6 +240,46 @@ for ovdir in "${OVERLAY_DIRS[@]}"; do
         done < "${mk}"
     done
 done
+
+# ---------- 3b. Host source checks ----------
+# These run against the actual patched tree, not repository prose. They are
+# part of every real build so a source regression fails before the compile.
+# KERNEL_HOST_CHECKS_ONLY=1 stops here, which lets CI verify the tree without
+# building a whole kernel.
+KERNEL_CHECK_WORK="${WORK_DIR}/kernel-host-checks"
+if [ -z "${WORK_DIR}" ] || [ "${WORK_DIR}" = "/" ]; then
+    echo "ERROR: refusing to clear ${KERNEL_CHECK_WORK}: unsafe WORK_DIR" >&2
+    exit 1
+fi
+rm -rf "${KERNEL_CHECK_WORK}"
+mkdir -p "${KERNEL_CHECK_WORK}"
+echo "==> Running kernel host source checks"
+python3 "${REPO_ROOT}/tests/test_dpu_rotation.py" "${SRC_DIR}" \
+    --work "${KERNEL_CHECK_WORK}/dpu-rotation"
+python3 "${REPO_ROOT}/tests/test_dpu_sspp_format.py" "${SRC_DIR}" \
+    --work "${KERNEL_CHECK_WORK}/dpu-sspp-format"
+KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_msm_telemetry_pm.py"
+KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_sm8850_lutdma.py"
+python3 "${REPO_ROOT}/tests/test_infinity_package.py"
+
+# The review checks read Infinity functions, so they only apply when the
+# infinity overlay is part of this tree.
+infinity_source=0
+for ovdir in "${OVERLAY_DIRS[@]}"; do
+    if [ "$(basename "${ovdir}")" = "infinity" ]; then
+        infinity_source=1
+    fi
+done
+if [ "${infinity_source}" -eq 1 ]; then
+    KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_infinity_review.py"
+else
+    echo "  infinity review not applicable: infinity overlay not applied"
+fi
+
+if [ -n "${KERNEL_HOST_CHECKS_ONLY:-}" ]; then
+    echo "==> KERNEL_HOST_CHECKS_ONLY=1: source checks passed; stopping before config/compile"
+    exit 0
+fi
 
 # ---------- 4. Generate config ----------
 # defconfig + fragment via merge_config.sh. Explicit =y requests are checked

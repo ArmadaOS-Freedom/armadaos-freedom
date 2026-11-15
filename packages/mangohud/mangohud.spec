@@ -19,6 +19,7 @@ Summary:        Vulkan and OpenGL overlay for monitoring FPS, temperatures, CPU/
 License:        MIT
 URL:            %{forgeurl}
 Source0:        %{forgeurl}/archive/v%{tarball_version}/%{name}-%{tarball_version}.tar.gz
+Source1:        battery_percent_test.cpp
 
 Patch1:         0001-Qualcomm-GPU-support.patch
 Patch2:         0002-GPU-monitoring.patch
@@ -43,6 +44,7 @@ BuildRequires:  libstdc++-static
 BuildRequires:  meson >= 0.60
 BuildRequires:  python3-mako
 BuildRequires:  pkgconfig(dri)
+BuildRequires:  pkgconfig(fmt)
 BuildRequires:  pkgconfig(glfw3)
 BuildRequires:  pkgconfig(glslang)
 BuildRequires:  pkgconfig(nlohmann_json)
@@ -89,6 +91,21 @@ Local visualization "mangoplot" for %{name}.
     -Dwith_fex=true \
     %{nil}
 %meson_build
+
+
+%check
+# Local battery-percent regression against the already-patched source. The
+# upstream Meson suite may stay disabled; this check is unconditional.
+src=%{_builddir}/%{appname}-%{tarball_version}
+if [ ! -f "$src/include/filesystem.h" ]; then
+    echo "error: $src/include/filesystem.h is missing from the source tree" >&2
+    exit 1
+fi
+g++ -std=c++17 -O2 -o battery_percent_test \
+    %{SOURCE1} "$src/src/battery.cpp" \
+    -I"$src/src" -I"$src/include" \
+    -lspdlog -lfmt
+./battery_percent_test %{_builddir}
 
 
 %install

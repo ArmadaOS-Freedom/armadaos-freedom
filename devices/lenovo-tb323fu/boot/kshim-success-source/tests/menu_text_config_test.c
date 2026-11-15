@@ -31,18 +31,18 @@ int main(void)
     assert(strcmp(KSHIM_MENU_DESC_INTERNAL,
                   "启动安装在机身存储中的 ArmadaOS。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_TF,
-                  "启动安装在 TF 卡中的 ArmadaOS，请先插入对应 TF 卡。") == 0);
+                  "启动安装在 TF 卡中的 ArmadaOS。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_DIAGNOSTIC,
-                  "启动 Linux 诊断环境，用于检查启动和硬件问题。") == 0);
-    assert(strcmp(KSHIM_MENU_DESC_ADVANCED, "查看可用的高级启动模式。") == 0);
+                  "显示 Linux 的详细启动信息，用于排查系统启动问题。") == 0);
+    assert(strcmp(KSHIM_MENU_DESC_ADVANCED, "查看支持的高级启动模式") == 0);
     assert(strcmp(KSHIM_MENU_DESC_RESTART, "重新启动设备。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_OFF, "关闭设备电源。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_RECOVERY,
-                  "进入 Android 恢复模式，进行系统维护。") == 0);
+                  "进入设备原有的 Android 恢复模式，用于系统维护和恢复。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_FASTBOOT,
-                  "进入 Fastboot，通过 USB 连接电脑进行维护或刷写。") == 0);
+                  "进入 Fastboot 模式，通过 USB 连接电脑进行维护或刷写。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_EDL,
-                  "进入高通 9008 下载模式，供电脑端工具恢复或刷写。") == 0);
+                  "进入高通 9008 下载模式，配合电脑端工具进行备份、恢复或刷写。") == 0);
     assert(strcmp(KSHIM_MENU_DESC_BACK, "返回系统启动选项。") == 0);
 #else
     assert(strcmp(KSHIM_MENU_TEXT_TITLE("kShimC UEFI"), "kShimC UEFI") == 0);
