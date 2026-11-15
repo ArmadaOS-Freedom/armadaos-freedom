@@ -12,10 +12,12 @@ that requires an option or a container marker is still run by this runner
 instead of being demoted to a skip.
 
 ``TEST_SCRIPT_ARTIFACT_ROOT`` (or ``TEST_ARTIFACT_ROOT``) must name a writable
-directory; it holds one short ``t/<number>`` temporary directory per test. The
-short name matters: several tests create AF_UNIX sockets inside ``TMPDIR`` and
-the 108-byte sun_path limit is exceeded by an artifact path that repeats the
-full test filename.
+directory; every test execution gets a fresh short temporary directory created
+directly under it with ``tempfile.mkdtemp``. Earlier directories are left in
+place, so repeated runs against the same artifact root never share scratch
+space. The short name matters: several tests create AF_UNIX sockets inside
+``TMPDIR`` and the 108-byte sun_path limit is exceeded by an artifact path that
+repeats the full test filename.
 
 Exit status 77 means "skipped: precondition unavailable" and is reported as a
 skip. Any other non-zero status is a failure. Exceptions, import errors and
@@ -27,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -153,9 +156,11 @@ def main(argv=None):
             print(f"NOT RUN: {relative} - {manager_only[relative]}")
             continue
 
-        # A short numeric directory keeps AF_UNIX paths inside sun_path.
-        work = artifacts / "t" / str(index)
-        work.mkdir(parents=True, exist_ok=True)
+        # A fresh short directory directly under the artifact root keeps
+        # AF_UNIX paths inside sun_path and keeps consecutive runs from
+        # reusing a work directory that already holds the previous run's
+        # fixtures. Earlier directories are deliberately preserved.
+        work = Path(tempfile.mkdtemp(prefix=f"{index:02d}", dir=artifacts))
         extra = arguments.get(relative, ())
         env = dict(os.environ)
         env.update(environment.get(relative, {}))

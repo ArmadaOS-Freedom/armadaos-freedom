@@ -95,9 +95,12 @@ the GTK tests a display. `tests/installer-gui-test.py` starts and manages its
 own `:99` server, so the outer display deliberately avoids 99.
 
 `TEST_SCRIPT_ARTIFACT_ROOT` (or `TEST_ARTIFACT_ROOT`) must name a writable
-directory; there is no temporary-directory fallback. The runner creates one
-short `t/<number>` directory per test and points `TMPDIR` at it while it prints
-and logs the full test name. The short name matters, because
+directory; there is no temporary-directory fallback. For every test execution
+the runner creates a fresh short directory directly under the artifact root
+with `tempfile.mkdtemp` and points `TMPDIR` at it while it prints and logs the
+full test name. Earlier directories are left in place, so a second run against
+the same artifact root never inherits a work directory that already holds the
+previous run's files. The short name matters, because
 `tests/powerbutton-screen-test.sh` binds an AF_UNIX socket below `TMPDIR` and
 the 108-byte `sun_path` limit is exceeded when the artifact path repeats the
 whole test filename.
@@ -105,8 +108,8 @@ whole test filename.
 A test that needs an option or a container marker gets it from the
 `arguments`/`environment` maps in `tests/script-test-groups.json` rather than
 being demoted to a skip. Arguments are passed as literal `argv` entries with no
-shell; the only placeholder is `{work}`, which expands to this test's own
-`t/<number>` directory under the artifact root:
+shell; the only placeholder is `{work}`, which expands to this execution's own
+fresh short directory under the artifact root:
 
 - `update-offline-privileges-test.py` takes `build_files/50-create-user.sh` and
   the expectation `allow`; it checks the real sudo policy the image ships.

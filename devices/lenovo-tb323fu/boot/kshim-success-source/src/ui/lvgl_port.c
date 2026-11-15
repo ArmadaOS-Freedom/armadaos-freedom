@@ -260,7 +260,7 @@ static void KshimShowEntry(size_t Index)
   const char *EntryAction = mContext->ActionLabels[Index];
   bool Info = mMenuDesign.kind == KSHIM_DESIGN_STAR_CHART &&
       mContext->Roles[Index] == KSHIM_MENU_ROLE_DEVICE_INFO &&
-      EntryAction != NULL && strcmp(EntryAction, KSHIM_MENU_ACTION_BACK) == 0;
+      EntryAction != NULL && strcmp(EntryAction, kshim_menu_text(KSHIM_TEXT_BACK)) == 0;
   bool BootSlot = mMenuDesign.kind == KSHIM_DESIGN_STAR_CHART &&
       mContext->Roles[Index] == KSHIM_MENU_ROLE_BOOT_SLOT;
   kshim_menu_role_t Role = mContext->Roles[Index];
