@@ -475,7 +475,8 @@ static int boot_witness_bc_space(char c)
  * Examine one bootconfig statement (already split on newline and ';' outside
  * quotes, with any '#' comment removed). Only a statement whose key exactly
  * equals one of keys is examined; every other statement is ignored. The
- * accepted forms are "key=value", "key = value" and "key = \"value\"";
+ * accepted forms are "key=value", "key = value", "key = \"value\"" and
+ * "key = 'value'";
  * anything else for a matching key (another operator such as "+=" or ":=",
  * arrays, trailing text, an over-long value) is passed on as the bare key so
  * the accumulator records invalid evidence.
@@ -524,11 +525,11 @@ static void boot_witness_bc_statement(const char *text, size_t len,
             j++;
         }
 
-        if (j < len && text[j] == '"') {
+        if (j < len && (text[j] == '"' || text[j] == '\'')) {
             const char *close;
 
             val = text + j + 1;
-            close = memchr(val, '"', len - (j + 1));
+            close = memchr(val, text[j], len - (j + 1));
             if (!close) {
                 fn(ctx, key, key_len);
                 return;
@@ -538,7 +539,7 @@ static void boot_witness_bc_statement(const char *text, size_t len,
         } else {
             val = text + j;
             while (j < len && !boot_witness_bc_space(text[j]) &&
-                   text[j] != '"' && text[j] != ',') {
+                   text[j] != '"' && text[j] != '\'' && text[j] != ',') {
                 j++;
             }
             val_len = (size_t)(text + j - val);
@@ -560,13 +561,38 @@ static void boot_witness_bc_statement(const char *text, size_t len,
     }
 }
 
+/* An array continuation line that starts with a witness key is invalid
+ * evidence; any other continuation line is ignored. */
+static void boot_witness_bc_array_values(const char *text, size_t len,
+                                         const char *const *keys,
+                                         boot_witness_token_fn fn, void *ctx)
+{
+    size_t i = 0;
+    size_t k;
+
+    while (i < len && boot_witness_bc_space(text[i])) {
+        i++;
+    }
+    for (k = 0; keys[k] != NULL; k++) {
+        size_t key_len = strlen(keys[k]);
+
+        if (len - i >= key_len && memcmp(text + i, keys[k], key_len) == 0) {
+            fn(ctx, keys[k], key_len);
+            return;
+        }
+    }
+}
+
 /*
  * Feed bootconfig statements as normalized "key=value" tokens. Statements end
- * at a newline or at ';' outside double quotes; '#' outside quotes starts a
- * comment that runs to the end of the line. Android bootconfig is a flat list
- * of top-level keys, so any brace block (whose keys gain a prefix under the
- * bootconfig tree syntax) or an unterminated quote makes the whole bootconfig
+ * at a newline or at ';' outside quotes (either '"' or '\''); '#' outside
+ * quotes starts a comment that runs to the end of the line. Android
+ * bootconfig is a flat list of top-level keys, so a brace block (its keys
+ * gain a prefix) or an unterminated quote makes the whole bootconfig
  * unsupported: the first key is then passed on bare so no evidence is used.
+ * A statement ending in ',' outside quotes is an array whose values continue
+ * on the next line; such a continuation line is never an assignment, and if
+ * it starts with one of keys the evidence is recorded as invalid.
  */
 static void boot_witness_for_each_bootconfig(const char *text, size_t len,
                                              const char *const *keys,
@@ -575,22 +601,22 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
 {
     size_t start = 0;
     size_t i;
-    int quoted = 0;
+    char quote = 0;
 
-    /* Structural pass first: braces or an open quote reject the source. */
+    /* Structural pass first: unsupported constructs reject the source. */
     for (i = 0; i < len; i++) {
         char c = text[i];
 
-        if (quoted) {
-            if (c == '"') {
-                quoted = 0;
+        if (quote) {
+            if (c == quote) {
+                quote = 0;
             } else if (c == '\n') {
                 break;
             }
             continue;
         }
-        if (c == '"') {
-            quoted = 1;
+        if (c == '"' || c == '\'') {
+            quote = c;
         } else if (c == '#') {
             while (i < len && text[i] != '\n') {
                 i++;
@@ -599,37 +625,60 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
             break;
         }
     }
-    if (i < len || quoted) {
+    if (i < len || quote) {
         fn(ctx, keys[0], strlen(keys[0]));
         return;
     }
 
-    quoted = 0;
+    int continuation = 0;  /* this line continues an array value list */
+    char last = 0;         /* last non-space character outside quotes */
+
     for (i = 0; i <= len; i++) {
         char c = i < len ? text[i] : '\n';
+        int line_end = 0;
+        size_t stmt_end = i;
 
-        if (quoted) {
-            if (c == '"') {
-                quoted = 0;
+        if (quote) {
+            if (c == quote) {
+                quote = 0;
             }
+            last = c;
             continue;
         }
-        if (c == '"') {
-            quoted = 1;
+        if (c == '"' || c == '\'') {
+            quote = c;
+            last = c;
             continue;
         }
         if (c == '#') {
-            boot_witness_bc_statement(text + start, i - start, keys, fn, ctx);
             while (i < len && text[i] != '\n') {
                 i++;
             }
-            start = i + 1;
+            line_end = 1;
+        } else if (c == '\n') {
+            line_end = 1;
+        } else if (c != ';') {
+            if (!boot_witness_bc_space(c)) {
+                last = c;
+            }
             continue;
         }
-        if (c == '\n' || c == ';') {
-            boot_witness_bc_statement(text + start, i - start, keys, fn, ctx);
-            start = i + 1;
+
+        if (continuation) {
+            /* Array values, not an assignment. */
+            boot_witness_bc_array_values(text + start, stmt_end - start, keys,
+                                         fn, ctx);
+        } else {
+            boot_witness_bc_statement(text + start, stmt_end - start, keys,
+                                      fn, ctx);
         }
+        if (line_end) {
+            continuation = last == ',';
+        } else {
+            continuation = 0; /* ';' ends any array */
+        }
+        last = 0;
+        start = i + 1;
     }
 }
 

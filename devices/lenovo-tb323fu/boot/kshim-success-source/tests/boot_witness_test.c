@@ -599,6 +599,21 @@ static void test_bootconfig_slot_fallback(void)
                    &BC_OK, &source) == 1);
     assert(bc_slot("bootconfig", "# { ; }\nandroidboot.slot_suffix=_a\n",
                    &BC_OK, &source) == 0);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix = '_b'\n",
+                   &BC_OK, &source) == 1);
+    /* Unrelated arrays do not affect the witness keys. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=a, b\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == 1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=a,\n b\nandroidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == 0);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=a,\n b;androidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == 0);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=\"a,b\";androidboot.y='c,d'\n"
+                   "androidboot.slot_suffix=_a\n", &BC_OK, &source) == 0);
     /* Comments and lookalike keys are ignored. */
     assert(bc_slot("bootconfig",
                    "# androidboot.slot_suffix=_b\n"
@@ -673,6 +688,22 @@ static void test_bootconfig_slot_rejections(void)
      * still seen. */
     assert(bc_slot("bootconfig",
                    "androidboot.slot_suffix=_a; androidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    /* Single quotes are quotes too: nothing inside them is a statement. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.x='ignored;androidboot.slot_suffix=_b;tail'\n",
+                   &BC_OK, &source) == -1);
+    /* Arrays are unsupported: a value list may continue on the next line. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=first,\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.slot_suffix=_a, _b\n", &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=first, # note\n  androidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x='open\nandroidboot.slot_suffix=_a\n",
                    &BC_OK, &source) == -1);
     /* An unterminated quote anywhere rejects the source. */
     assert(bc_slot("bootconfig",
