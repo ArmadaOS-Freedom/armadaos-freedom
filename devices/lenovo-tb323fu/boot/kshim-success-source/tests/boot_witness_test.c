@@ -438,6 +438,329 @@ static void test_snapshot_freeze_flow(void)
     assert(fdt32_to_cpu(cells[3]) == 0u);
 }
 
+/* ---- firmware bootconfig fallback ---------------------------------------- */
+
+/* A synthetic firmware initrd: arbitrary ramdisk bytes followed by the AOSP
+ * bootconfig trailer. The firmware DT points linux,initrd-start/end at it and
+ * declares a memory node covering exactly that host buffer. */
+#define BC_RAMDISK 64u
+#define BC_MAX 4096u
+
+static uint8_t g_initrd[BC_RAMDISK + BC_MAX + 32u] __attribute__((aligned(8)));
+
+struct bc_opts {
+    uint32_t pad;          /* bytes after the magic (kernel accepts 0..3) */
+    int bad_checksum;
+    int bad_magic;
+    uint32_t size_delta;   /* added to the declared size */
+    uint32_t nul_pad;      /* NUL bytes appended inside the declared size */
+    int memory;            /* 0 none, 1 covering, 2 not covering */
+    int cells32;           /* 4-byte linux,initrd-* cells */
+};
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static size_t build_initrd(const char *params, const struct bc_opts *o)
+{
+    size_t len = strlen(params) + o->nul_pad;
+    uint8_t *p = g_initrd + BC_RAMDISK;
+    uint32_t sum = 0;
+    size_t i;
+
+    assert(len <= BC_MAX);
+    memset(g_initrd, 0xa5, sizeof(g_initrd));
+    memset(p, 0, len);
+    memcpy(p, params, strlen(params));
+    for (i = 0; i < len; i++) {
+        sum += p[i];
+    }
+    put_le32(p + len, (uint32_t)len + o->size_delta);
+    put_le32(p + len + 4, o->bad_checksum ? sum + 1u : sum);
+    memcpy(p + len + 8, o->bad_magic ? "#BOOTCONFIg\n" : "#BOOTCONFIG\n", 12);
+    memset(p + len + 20, 0, o->pad);
+    return BC_RAMDISK + len + 20 + o->pad;
+}
+
+static void set_cells(void *fdt, int node, const char *name, uint64_t v,
+                      int cells32)
+{
+    if (cells32) {
+        assert(fdt_setprop_u32(fdt, node, name, (uint32_t)v) == 0);
+    } else {
+        assert(fdt_setprop_u64(fdt, node, name, v) == 0);
+    }
+}
+
+static void make_bootconfig_fdt(void *buf, size_t size, const char *bootargs,
+                                const char *params, const struct bc_opts *o)
+{
+    uint64_t start = (uint64_t)(uintptr_t)g_initrd;
+    uint64_t end = start + build_initrd(params, o);
+    int chosen;
+
+    make_fdt_with_bootargs_str(buf, size, bootargs);
+    assert(fdt_setprop_u32(buf, 0, "#address-cells", 2) == 0);
+    assert(fdt_setprop_u32(buf, 0, "#size-cells", 2) == 0);
+    if (o->memory) {
+        int mem = fdt_add_subnode(buf, 0, "memory@0");
+        fdt64_t reg[2];
+
+        assert(mem >= 0);
+        assert(fdt_setprop_string(buf, mem, "device_type", "memory") == 0);
+        reg[0] = cpu_to_fdt64(o->memory == 1 ? start : end);
+        reg[1] = cpu_to_fdt64(sizeof(g_initrd));
+        assert(fdt_setprop(buf, mem, "reg", reg, sizeof(reg)) == 0);
+    }
+    chosen = fdt_path_offset(buf, "/chosen");
+    assert(chosen >= 0);
+    set_cells(buf, chosen, "linux,initrd-start", start, o->cells32);
+    set_cells(buf, chosen, "linux,initrd-end", end, o->cells32);
+}
+
+static const struct bc_opts BC_OK = { 0, 0, 0, 0, 0, 1, 0 };
+
+static int bc_slot(const char *bootargs, const char *params,
+                   const struct bc_opts *o, int *source)
+{
+    uint8_t buf[TEST_FDT_BUF_SIZE];
+    uint8_t initrd_before[sizeof(g_initrd)];
+    int slot;
+
+    make_bootconfig_fdt(buf, sizeof(buf), bootargs, params, o);
+    memcpy(initrd_before, g_initrd, sizeof(g_initrd));
+    slot = check_read_pure(buf, sizeof(buf));
+    assert(kshim_boot_slot_read_source(buf, source) == slot);
+    assert(memcmp(initrd_before, g_initrd, sizeof(g_initrd)) == 0);
+    return slot;
+}
+
+static int bc_lock(const char *bootargs, const char *params, int *source)
+{
+    uint8_t buf[TEST_FDT_BUF_SIZE];
+
+    make_bootconfig_fdt(buf, sizeof(buf), bootargs, params, &BC_OK);
+    return kshim_boot_lock_read_source(buf, source);
+}
+
+/* Shape measured on TB710FU (ZUXOS 495 ABL): bootargs only carry the
+ * "bootconfig" switch; slot and lock state exist only in bootconfig. */
+#define TB710FU_PARAMS \
+    "androidboot.hardware=qcom\nandroidboot.memcg=1\n" \
+    "androidboot.usbcontroller=a600000.dwc3\n" \
+    "androidboot.verifiedbootstate=green\n" \
+    "androidboot.vbmeta.device_state=locked\n" \
+    "androidboot.vbmeta.size=12288\n" \
+    "androidboot.slot_suffix=_a\n"
+
+static void test_bootconfig_slot_fallback(void)
+{
+    struct bc_opts o;
+    int source = -1;
+
+    assert(bc_slot("console=tty0 bootconfig", TB710FU_PARAMS, &BC_OK,
+                   &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_b\n", &BC_OK,
+                   &source) == 1);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* Spaced and quoted forms as written by bootconfig tools. */
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix = \"_b\"\n",
+                   &BC_OK, &source) == 1);
+    assert(bc_slot("bootconfig", "\tandroidboot.slot_suffix=_a  \r\n",
+                   &BC_OK, &source) == 0);
+    /* No terminating newline; trailing NUL padding inside the size. */
+    o = BC_OK;
+    o.nul_pad = 5;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_b", &o,
+                   &source) == 1);
+    /* Kernel-compatible alignment padding after the magic, 4-byte cells. */
+    for (o = BC_OK, o.pad = 1; o.pad <= 3; o.pad++) {
+        assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                       &source) == 0);
+    }
+    o = BC_OK;
+    o.cells32 = 1;
+    if ((uint64_t)(uintptr_t)g_initrd + sizeof(g_initrd) <= UINT32_MAX) {
+        assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                       &source) == 0);
+    }
+    /* Comments and lookalike keys are ignored. */
+    assert(bc_slot("bootconfig",
+                   "# androidboot.slot_suffix=_b\n"
+                   "androidboot.slot_suffix_extra=_b\n"
+                   "androidboot.slot_suffix=_a\n", &BC_OK, &source) == 0);
+}
+
+static void test_bootconfig_slot_rejections(void)
+{
+    struct bc_opts o;
+    int source = -1;
+
+    /* The kernel switch is required. */
+    assert(bc_slot("console=tty0", TB710FU_PARAMS, &BC_OK, &source) == -1);
+    assert(source == 0);
+    assert(bc_slot("bootconfig=1", TB710FU_PARAMS, &BC_OK, &source) == -1);
+    assert(bc_slot("xbootconfig", TB710FU_PARAMS, &BC_OK, &source) == -1);
+
+    /* Bootargs evidence wins and is never mixed with bootconfig. */
+    assert(bc_slot("androidboot.slot_suffix=_b bootconfig", TB710FU_PARAMS,
+                   &BC_OK, &source) == 1);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTARGS);
+    assert(bc_slot("androidboot.slot_suffix bootconfig", TB710FU_PARAMS,
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("androidboot.slot_suffix=_c bootconfig", TB710FU_PARAMS,
+                   &BC_OK, &source) == -1);
+
+    /* Duplicates, bad values and unsupported syntax. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.slot_suffix=_a\nandroidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix += _a\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix = \"_a\", \"_b\"\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix = \"_a\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a # x\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.hardware=qcom\n", &BC_OK,
+                   &source) == -1);
+    assert(source == 0);
+
+    /* Trailer integrity. */
+    o = BC_OK;
+    o.bad_checksum = 1;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+    o = BC_OK;
+    o.bad_magic = 1;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+    o = BC_OK;
+    o.pad = 4;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+    o = BC_OK;
+    o.size_delta = BC_RAMDISK + 1u; /* points before linux,initrd-start */
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+    o = BC_OK;
+    o.size_delta = 1u;              /* checksum no longer covers the data */
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+
+    /* The initrd must be inside a declared memory range. */
+    o = BC_OK;
+    o.memory = 0;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+    o = BC_OK;
+    o.memory = 2;
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
+                   &source) == -1);
+
+    /* Non-NUL bytes after the first NUL inside the declared size. */
+    {
+        static const char params[] = "androidboot.slot_suffix=_a\n";
+        uint8_t buf[TEST_FDT_BUF_SIZE];
+        uint8_t *data = g_initrd + BC_RAMDISK;
+        size_t len = strlen(params) + 2u;
+        uint32_t sum = 0;
+        size_t i;
+
+        o = BC_OK;
+        o.nul_pad = 2;
+        make_bootconfig_fdt(buf, sizeof(buf), "bootconfig", params, &o);
+        assert(kshim_boot_slot_read(buf) == 0);
+        data[len - 1] = 'x';
+        for (i = 0; i < len; i++) {
+            sum += data[i];
+        }
+        put_le32(data + len + 4, sum);
+        assert(kshim_boot_slot_read(buf) == -1);
+    }
+
+    /* Empty parameter data. */
+    assert(bc_slot("bootconfig", "", &BC_OK, &source) == -1);
+}
+
+static void test_bootconfig_lock(void)
+{
+    int source = -1;
+
+    assert(bc_lock("console=tty0 bootconfig", TB710FU_PARAMS, &source) == 1);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+    assert(bc_lock("bootconfig",
+                   "androidboot.verifiedbootstate = \"orange\"\n"
+                   "androidboot.vbmeta.device_state = \"unlocked\"\n",
+                   &source) == 2);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* verifiedbootstate is mandatory; corroboration must agree. */
+    assert(bc_lock("bootconfig", "androidboot.vbmeta.device_state=locked\n",
+                   &source) == 0);
+    assert(source == 0);
+    assert(bc_lock("bootconfig",
+                   "androidboot.verifiedbootstate=green\n"
+                   "androidboot.vbmeta.device_state=unlocked\n",
+                   &source) == 0);
+    assert(bc_lock("bootconfig",
+                   "androidboot.verifiedbootstate=green\n"
+                   "androidboot.verifiedbootstate=green\n",
+                   &source) == 0);
+
+    /* Any lock key in bootargs keeps the bootargs decision. */
+    assert(bc_lock("androidboot.verifiedbootstate=orange bootconfig",
+                   TB710FU_PARAMS, &source) == 2);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTARGS);
+    assert(bc_lock("androidboot.vbmeta.device_state=locked bootconfig",
+                   TB710FU_PARAMS, &source) == 0);
+    assert(bc_lock("console=tty0", TB710FU_PARAMS, &source) == 0);
+}
+
+static void test_export_source(void)
+{
+    uint8_t buf[TEST_FDT_BUF_SIZE];
+    const uint32_t *cells;
+    int node;
+    int len;
+
+    init_fdt_with_chosen(buf, sizeof(buf), 1);
+    node = fdt_path_offset(buf, "/chosen");
+    assert(kshim_boot_witness_export_source(buf, 1,
+                                            KSHIM_BOOT_EVIDENCE_BOOTCONFIG) == 0);
+    node = fdt_path_offset(buf, "/chosen");
+    cells = fdt_getprop(buf, node, "armada,boot-witness", &len);
+    assert(cells && len == 16);
+    assert(fdt32_to_cpu(cells[0]) == 1u && fdt32_to_cpu(cells[1]) == 2u &&
+           fdt32_to_cpu(cells[2]) == 1u && fdt32_to_cpu(cells[3]) == 0u);
+
+    assert(kshim_boot_lock_export_source(buf, 1,
+                                         KSHIM_BOOT_EVIDENCE_BOOTCONFIG) == 0);
+    node = fdt_path_offset(buf, "/chosen");
+    cells = fdt_getprop(buf, node, "armada,boot-lock", &len);
+    assert(cells && len == 16);
+    assert(fdt32_to_cpu(cells[1]) == 2u && fdt32_to_cpu(cells[2]) == 1u);
+
+    /* An unknown source clears stale evidence and publishes nothing. */
+    assert(kshim_boot_witness_export_source(buf, 0, 3) == 0);
+    assert(kshim_boot_lock_export_source(buf, 1, 0) == 0);
+    node = fdt_path_offset(buf, "/chosen");
+    assert(fdt_getprop(buf, node, "armada,boot-witness", &len) == NULL);
+    assert(fdt_getprop(buf, node, "armada,boot-lock", &len) == NULL);
+}
+
 int main(void)
 {
     test_read_valid_positions_and_whitespace();
@@ -447,6 +770,10 @@ int main(void)
     test_export_behavior_and_security();
     test_export_nospace_clears_forged_witness();
     test_snapshot_freeze_flow();
+    test_bootconfig_slot_fallback();
+    test_bootconfig_slot_rejections();
+    test_bootconfig_lock();
+    test_export_source();
     {
         uint8_t packed[TEST_FDT_BUF_SIZE];
         init_fdt_with_chosen(packed, sizeof(packed), 1);

@@ -71,6 +71,17 @@ never synthesized to escape that limit.
 The Android bootloader keeps owning slot selection and raw boot state.  Linux
 only reads the boot witness and the running deployment.
 
+kShim freezes the slot and lock evidence from the firmware device tree before
+it changes anything.  `/chosen/bootargs` is the primary source (witness
+`source = 1`).  Only when bootargs carries none of the relevant
+`androidboot.*` keys but does carry the kernel's `bootconfig` switch does kShim
+read the AOSP bootconfig trailer appended to the firmware initrd
+(`linux,initrd-start..end`, inside a declared memory range, with a matching
+size and checksum) and publish `source = 2`.  Bootloaders such as TB710FU's
+put the slot and lock state only there.  Evidence from the two sources is
+never combined; duplicates, bare keys and malformed values leave the witness
+unpublished in either case.
+
 ## Confirmation
 
 Confirmation accepts evidence from **either** physical slot when the running
