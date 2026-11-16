@@ -201,9 +201,9 @@ class BootSourcesTests(unittest.TestCase):
                 sources.capture_boot_sources(mismatched, out, extra_labels=('efisp',))
             self.assert_no_manifest(out)
             self.fixture.assert_closed_unchanged(env, before)
-        with self.fixture.environment(board=3) as env:
+        with self.fixture.environment(board=9) as env:
             before = self.fixture.digests(env)
-            with self.assertRaisesRegex(sources.BootSourcesError, 'unsupported board id 3'):
+            with self.assertRaisesRegex(sources.BootSourcesError, 'unsupported board id 9'):
                 sources.capture_boot_sources({}, self.output_for(env))
             self.assertEqual(env.opened, [])
             self.fixture.assert_closed_unchanged(env, before)

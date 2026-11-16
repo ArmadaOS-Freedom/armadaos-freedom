@@ -4,6 +4,7 @@ import re
 import subprocess
 
 from updates.client import UpdateClient, is_busy_error
+from updates.models import OFFLINE_UPGRADE_MODELS
 
 UPDATE = "/usr/libexec/armada/armada-update"
 SELECT = "/usr/libexec/armada/armada-select-branch"
@@ -163,7 +164,7 @@ def status():
         idle and not state["staged"] and not state["rollback_queued"]
         and state["repository"] in REPOSITORIES
         and result_state in ("installed", "up_to_date", "update_available")
-        and update.get("model") in ("TB322FC", "TB323FU")
+        and update.get("model") in OFFLINE_UPGRADE_MODELS
         and isinstance(trial, dict) and trial.get("recordState") == "confirmed"
         and trial.get("runningDeployment") == "new"
         and update.get("lastUpdateState") == "confirmed"

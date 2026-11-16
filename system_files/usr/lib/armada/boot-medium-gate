@@ -57,13 +57,17 @@ armada_boot_medium_gate() {
     ARMADA_BOOT_MEDIUM=legacy
 
     # The supported pairing mirrors the device profiles and recovery layout:
-    # Gen4 elden/SM8750, Gen5 baldur/SM8850 (kaanapali is the same SoC family).
+    # Gen4 elden/SM8750, Gen5 baldur/SM8850 (kaanapali is the same SoC family),
+    # TB710FU/SM8650.
     if _armada_boot_medium_has_token "${compatible}" 'lenovo,elden' &&
         _armada_boot_medium_has_token "${compatible}" 'qcom,sm8750'; then
         supported=1
     elif _armada_boot_medium_has_token "${compatible}" 'lenovo,baldur' &&
         { _armada_boot_medium_has_token "${compatible}" 'qcom,sm8850' ||
           _armada_boot_medium_has_token "${compatible}" 'qcom,kaanapali'; }; then
+        supported=1
+    elif _armada_boot_medium_has_token "${compatible}" 'lenovo,tb710fu' &&
+        _armada_boot_medium_has_token "${compatible}" 'qcom,sm8650'; then
         supported=1
     fi
     [ "${supported}" -eq 1 ] || return 0

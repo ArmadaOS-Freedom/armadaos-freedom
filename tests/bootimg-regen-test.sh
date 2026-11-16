@@ -73,7 +73,7 @@ assert_eq "supported-dtbs Gen4 entry count" "$elden_entries" "1"
 # missing installed medium; production keeps the fixed paths untouched.
 ESP="$WORK/esp"; BOOT="$WORK/boot"; SYS="$WORK/sysroot"
 mkdir -p "$ESP" "$WORK/device-tree"
-printf 'lenovo,tb710fu\0qcom,sm8650\0' > "$WORK/device-tree/compatible"
+printf 'ayn,odin2\0qcom,sm8550\0' > "$WORK/device-tree/compatible"
 sed "s|/sys/firmware/devicetree/base|$WORK/device-tree|" \
     "$ARMADA_LIB/boot-medium-gate" > "$WORK/boot-medium-gate"
 sed -e 's|findmnt -rn "${ESP}"|true "${ESP}"|' \

@@ -243,9 +243,9 @@ class PhysicalSlotsTests(unittest.TestCase):
                         self.assert_closed_unchanged(env, before)
 
     def test_unsupported_board_fails_before_lun_open(self):
-        with self.environment(board=3) as env:
+        with self.environment(board=9) as env:
             before = self.digests(env)
-            with self.assertRaisesRegex(slots.PhysicalSlotsError, 'unsupported board id 3'):
+            with self.assertRaisesRegex(slots.PhysicalSlotsError, 'unsupported board id 9'):
                 slots.inspect_physical_slots()
             self.assertEqual(env.opened, [])
             self.assertEqual(self.digests(env), before)

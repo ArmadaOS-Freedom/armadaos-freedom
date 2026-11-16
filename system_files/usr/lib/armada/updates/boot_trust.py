@@ -189,6 +189,11 @@ def _validate_trust(result, initial, lock_state, snapshot):
     mode = trust.get("mode")
     if not isinstance(mode, str) or mode not in _MODE_REPORTS.values():
         raise BootTrustError(f"unsupported inspect-trust mode: {mode!r}")
+    if initial["model"] not in GBL_MODELS and mode != "AospResign":
+        # Boards without a GBL envelope (TB710FU keeps its Android vbmeta,
+        # recovery and vbmeta_system) may only have their boot re-signed.
+        raise BootTrustError(
+            f"{initial['model']} accepts only AOSP boot resignation, not {mode}")
 
     for slot in ("a", "b"):
         _validate_slot_trust(slot, trust.get(slot), snapshot["slots"][slot])
@@ -276,7 +281,9 @@ def capture_boot_trust(*, output_dir, boot_tool_path=_DEFAULT_BOOT_TOOL_PATH):
 
         initial = inspect_physical_slots()
         if not isinstance(initial, dict) or initial.get("model") not in _NATIVE_MODELS:
-            raise BootTrustError("native A/B boot trust is supported only on TB322FC and TB323FU")
+            raise BootTrustError(
+                "native A/B boot trust is supported only on "
+                + "/".join(sorted(_NATIVE_MODELS)))
         initial_lock = read_boot_lock()
         if not isinstance(initial_lock, str) or initial_lock not in _LOCK_STATES:
             raise BootTrustError(f"unsupported boot-lock state: {initial_lock!r}")
