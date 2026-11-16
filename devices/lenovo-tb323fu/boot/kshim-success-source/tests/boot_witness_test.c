@@ -591,6 +591,14 @@ static void test_bootconfig_slot_fallback(void)
         assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
                        &source) == 0);
     }
+    /* Statements after ';', and ';' or braces inside quotes or comments. */
+    assert(bc_slot("bootconfig", "androidboot.x=1; androidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == 1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=\"a;b{c}\"\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == 1);
+    assert(bc_slot("bootconfig", "# { ; }\nandroidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == 0);
     /* Comments and lookalike keys are ignored. */
     assert(bc_slot("bootconfig",
                    "# androidboot.slot_suffix=_b\n"
@@ -632,11 +640,44 @@ static void test_bootconfig_slot_rejections(void)
                    &BC_OK, &source) == -1);
     assert(bc_slot("bootconfig", "androidboot.slot_suffix = \"_a\n", &BC_OK,
                    &source) == -1);
+    /* A trailing comment is valid bootconfig syntax. */
     assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a # x\n", &BC_OK,
-                   &source) == -1);
+                   &source) == 0);
     assert(bc_slot("bootconfig", "androidboot.hardware=qcom\n", &BC_OK,
                    &source) == -1);
     assert(source == 0);
+
+    /* Adjacent operators other than '=' invalidate the evidence. */
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix:=_b\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix+=_b\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.slot_suffix=_a\nandroidboot.slot_suffix:=_b\n",
+                   &BC_OK, &source) == -1);
+
+    /* Any brace block makes the bootconfig source unsupported: under the
+     * tree syntax its keys gain a prefix. */
+    assert(bc_slot("bootconfig",
+                   "metadata {\nandroidboot.slot_suffix=_b\n}\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.slot_suffix=_a\nmetadata { x = 1 }\n", &BC_OK,
+                   &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot { slot_suffix = _b }\n", &BC_OK,
+                   &source) == -1);
+    assert(source == 0);
+
+    /* ';' separates statements outside quotes, so a duplicate after it is
+     * still seen. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.slot_suffix=_a; androidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    /* An unterminated quote anywhere rejects the source. */
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=\"open\nandroidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == -1);
 
     /* Trailer integrity. */
     o = BC_OK;
@@ -727,6 +768,8 @@ static void test_bootconfig_lock(void)
     assert(bc_lock("androidboot.vbmeta.device_state=locked bootconfig",
                    TB710FU_PARAMS, &source) == 0);
     assert(bc_lock("console=tty0", TB710FU_PARAMS, &source) == 0);
+    assert(bc_lock("bootconfig",
+                   "androidboot { verifiedbootstate = green }\n", &source) == 0);
 }
 
 static void test_export_source(void)

@@ -472,102 +472,164 @@ static int boot_witness_bc_space(char c)
 }
 
 /*
- * Feed bootconfig lines as normalized "key=value" tokens. Only lines whose
- * key exactly equals one of keys are examined; every other line, including
- * comments and unrelated syntax, is ignored. For an examined line the
+ * Examine one bootconfig statement (already split on newline and ';' outside
+ * quotes, with any '#' comment removed). Only a statement whose key exactly
+ * equals one of keys is examined; every other statement is ignored. The
  * accepted forms are "key=value", "key = value" and "key = \"value\"";
- * anything else ("key += v", arrays, trailing text, an over-long value) is
- * passed on as a bare key so the accumulator records invalid evidence.
+ * anything else for a matching key (another operator such as "+=" or ":=",
+ * arrays, trailing text, an over-long value) is passed on as the bare key so
+ * the accumulator records invalid evidence.
+ */
+static void boot_witness_bc_statement(const char *text, size_t len,
+                                      const char *const *keys,
+                                      boot_witness_token_fn fn, void *ctx)
+{
+    size_t i = 0;
+    size_t k;
+
+    while (i < len && boot_witness_bc_space(text[i])) {
+        i++;
+    }
+    while (len > i && boot_witness_bc_space(text[len - 1])) {
+        len--;
+    }
+
+    for (k = 0; keys[k] != NULL; k++) {
+        const char *key = keys[k];
+        size_t key_len = strlen(key);
+        char token[BOOT_WITNESS_TOKEN_MAX];
+        const char *val;
+        size_t val_len;
+        size_t j;
+
+        if (len - i < key_len || memcmp(text + i, key, key_len) != 0) {
+            continue;
+        }
+        j = i + key_len;
+        if (j < len && text[j] != '=' && text[j] != '+' && text[j] != ':' &&
+            !boot_witness_bc_space(text[j])) {
+            /* A longer key such as key_extra or key.sub. */
+            continue;
+        }
+
+        while (j < len && boot_witness_bc_space(text[j])) {
+            j++;
+        }
+        if (j >= len || text[j] != '=') {
+            fn(ctx, key, key_len); /* bare key, "+=", ":=" or another operator */
+            return;
+        }
+        j++;
+        while (j < len && boot_witness_bc_space(text[j])) {
+            j++;
+        }
+
+        if (j < len && text[j] == '"') {
+            const char *close;
+
+            val = text + j + 1;
+            close = memchr(val, '"', len - (j + 1));
+            if (!close) {
+                fn(ctx, key, key_len);
+                return;
+            }
+            val_len = (size_t)(close - val);
+            j = (size_t)(close - text) + 1;
+        } else {
+            val = text + j;
+            while (j < len && !boot_witness_bc_space(text[j]) &&
+                   text[j] != '"' && text[j] != ',') {
+                j++;
+            }
+            val_len = (size_t)(text + j - val);
+        }
+
+        while (j < len && boot_witness_bc_space(text[j])) {
+            j++;
+        }
+        if (j != len || key_len + 1 + val_len > sizeof(token)) {
+            fn(ctx, key, key_len);
+            return;
+        }
+
+        memcpy(token, key, key_len);
+        token[key_len] = '=';
+        memcpy(token + key_len + 1, val, val_len);
+        fn(ctx, token, key_len + 1 + val_len);
+        return;
+    }
+}
+
+/*
+ * Feed bootconfig statements as normalized "key=value" tokens. Statements end
+ * at a newline or at ';' outside double quotes; '#' outside quotes starts a
+ * comment that runs to the end of the line. Android bootconfig is a flat list
+ * of top-level keys, so any brace block (whose keys gain a prefix under the
+ * bootconfig tree syntax) or an unterminated quote makes the whole bootconfig
+ * unsupported: the first key is then passed on bare so no evidence is used.
  */
 static void boot_witness_for_each_bootconfig(const char *text, size_t len,
                                              const char *const *keys,
                                              boot_witness_token_fn fn,
                                              void *ctx)
 {
-    size_t pos = 0;
+    size_t start = 0;
+    size_t i;
+    int quoted = 0;
 
-    while (pos < len) {
-        size_t line_end = pos;
-        size_t i;
-        size_t k;
+    /* Structural pass first: braces or an open quote reject the source. */
+    for (i = 0; i < len; i++) {
+        char c = text[i];
 
-        while (line_end < len && text[line_end] != '\n') {
-            line_end++;
-        }
-
-        i = pos;
-        while (i < line_end && boot_witness_bc_space(text[i])) {
-            i++;
-        }
-
-        for (k = 0; keys[k] != NULL; k++) {
-            const char *key = keys[k];
-            size_t key_len = strlen(key);
-            char token[BOOT_WITNESS_TOKEN_MAX];
-            const char *val;
-            size_t val_len;
-            size_t j;
-
-            if (line_end - i < key_len || memcmp(text + i, key, key_len) != 0) {
-                continue;
-            }
-            j = i + key_len;
-            if (j < line_end && text[j] != '=' &&
-                !boot_witness_bc_space(text[j])) {
-                /* A longer key such as key_extra. */
-                continue;
-            }
-
-            while (j < line_end && boot_witness_bc_space(text[j])) {
-                j++;
-            }
-            if (j >= line_end || text[j] != '=') {
-                fn(ctx, key, key_len); /* bare or unsupported operator */
+        if (quoted) {
+            if (c == '"') {
+                quoted = 0;
+            } else if (c == '\n') {
                 break;
             }
-            j++;
-            while (j < line_end && boot_witness_bc_space(text[j])) {
-                j++;
+            continue;
+        }
+        if (c == '"') {
+            quoted = 1;
+        } else if (c == '#') {
+            while (i < len && text[i] != '\n') {
+                i++;
             }
-
-            if (j < line_end && text[j] == '"') {
-                const char *close;
-
-                val = text + j + 1;
-                close = memchr(val, '"', line_end - (j + 1));
-                if (!close) {
-                    fn(ctx, key, key_len);
-                    break;
-                }
-                val_len = (size_t)(close - val);
-                j = (size_t)(close - text) + 1;
-            } else {
-                val = text + j;
-                while (j < line_end && !boot_witness_bc_space(text[j]) &&
-                       text[j] != '"' && text[j] != ',' && text[j] != ';' &&
-                       text[j] != '#' && text[j] != '{' && text[j] != '}') {
-                    j++;
-                }
-                val_len = (size_t)(text + j - val);
-            }
-
-            while (j < line_end && boot_witness_bc_space(text[j])) {
-                j++;
-            }
-            if (j != line_end || key_len + 1 + val_len > sizeof(token) ||
-                memchr(val, '\n', val_len) != NULL) {
-                fn(ctx, key, key_len);
-                break;
-            }
-
-            memcpy(token, key, key_len);
-            token[key_len] = '=';
-            memcpy(token + key_len + 1, val, val_len);
-            fn(ctx, token, key_len + 1 + val_len);
+        } else if (c == '{' || c == '}') {
             break;
         }
+    }
+    if (i < len || quoted) {
+        fn(ctx, keys[0], strlen(keys[0]));
+        return;
+    }
 
-        pos = line_end + 1;
+    quoted = 0;
+    for (i = 0; i <= len; i++) {
+        char c = i < len ? text[i] : '\n';
+
+        if (quoted) {
+            if (c == '"') {
+                quoted = 0;
+            }
+            continue;
+        }
+        if (c == '"') {
+            quoted = 1;
+            continue;
+        }
+        if (c == '#') {
+            boot_witness_bc_statement(text + start, i - start, keys, fn, ctx);
+            while (i < len && text[i] != '\n') {
+                i++;
+            }
+            start = i + 1;
+            continue;
+        }
+        if (c == '\n' || c == ';') {
+            boot_witness_bc_statement(text + start, i - start, keys, fn, ctx);
+            start = i + 1;
+        }
     }
 }
 
