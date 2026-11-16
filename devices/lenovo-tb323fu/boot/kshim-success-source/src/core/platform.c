@@ -854,11 +854,18 @@ static int menu_fill_device_info(struct menu_selection *menu)
 /* Session settings (only reached through the settings entry point)    */
 /* ------------------------------------------------------------------ */
 
+/* Boards a payload or the session can name; UNKNOWN is never one of them. */
+static int known_board(enum device_board board)
+{
+    return board == DEVICE_BOARD_TB322FC || board == DEVICE_BOARD_TB323FU ||
+           board == DEVICE_BOARD_TB710FU;
+}
 /* Localized marketing name for a board; UNKNOWN is never guessed. */
 static const char *settings_board_name(enum device_board board)
 {
     if (board == DEVICE_BOARD_TB322FC) return kshim_menu_text(KSHIM_TEXT_BOARD_TB322FC_NAME);
     if (board == DEVICE_BOARD_TB323FU) return kshim_menu_text(KSHIM_TEXT_BOARD_TB323FU_NAME);
+    if (board == DEVICE_BOARD_TB710FU) return kshim_menu_text(KSHIM_TEXT_BOARD_TB710FU_NAME);
     return kshim_menu_text(KSHIM_TEXT_DEVICE_UNKNOWN);
 }
 /* Localized platform code for a board. */
@@ -866,6 +873,7 @@ static const char *settings_board_code(enum device_board board)
 {
     if (board == DEVICE_BOARD_TB322FC) return kshim_menu_text(KSHIM_TEXT_DEVICE_TB322FC_NAME);
     if (board == DEVICE_BOARD_TB323FU) return kshim_menu_text(KSHIM_TEXT_DEVICE_TB323FU_NAME);
+    if (board == DEVICE_BOARD_TB710FU) return kshim_menu_text(KSHIM_TEXT_DEVICE_TB710FU_NAME);
     return kshim_menu_text(KSHIM_TEXT_UNKNOWN);
 }
 /* Row index of the selectable Default-page row that matches the resolved
@@ -913,7 +921,7 @@ static int settings_payload_available(const struct menu_selection *menu, size_t 
     enum device_board board;
     if (!menu->payload_boards || i >= menu->caller_count) return 0;
     board = menu->payload_boards[i];
-    if (board != DEVICE_BOARD_TB322FC && board != DEVICE_BOARD_TB323FU) return 0;
+    if (!known_board(board)) return 0;
     return board == menu->effective;
 }
 /* Resolve one Linux system role (INTERNAL / TF / DIAGNOSTIC) to its unique
@@ -1074,7 +1082,8 @@ static int settings_append_system(struct menu_selection *menu, kshim_menu_role_t
 static void settings_fill_device_name(const struct menu_selection *menu,
                                       char *buffer, size_t capacity)
 {
-    if (menu->boot.device_choice == BOOT_DEVICE_AUTO) {
+    if (menu->boot.device_choice == BOOT_DEVICE_AUTO ||
+        menu->effective == DEVICE_BOARD_TB710FU) {
         snprintf(buffer, capacity, kshim_menu_text(KSHIM_TEXT_SETTINGS_DEVICE_AUTO_FMT),
                  settings_board_name(menu->effective));
     } else {
@@ -1204,8 +1213,7 @@ static int menu_fill_settings(struct menu_selection *menu)
          * keep their explicit payload semantics; UNKNOWN is never a mismatch. */
         board = menu->payload_boards ? menu->payload_boards[i] : DEVICE_BOARD_UNKNOWN;
         board_known_other =
-            (board == DEVICE_BOARD_TB322FC || board == DEVICE_BOARD_TB323FU) &&
-            board != menu->effective;
+            known_board(board) && board != menu->effective;
         if (board_known_other) {
             if (menu_append(&menu->pages[page_index],
                             kshim_menu_role_name(role, menu->caller_names[i]),
@@ -1300,7 +1308,10 @@ static int menu_fill_settings(struct menu_selection *menu)
         menu->pages[MENU_PAGE_SETTINGS].descriptions[row] = menu->setting_descriptions[row];
     }
 
-    /* Device page: auto / TB322FC / TB323FU / back. */
+    /* Device page: auto / TB322FC / TB323FU / back. The manual rows only
+     * disambiguate the two Y700 generations; on a detected TB710FU they stay
+     * in place (row indices are the stored choice) but are unavailable. */
+    const int y700_manual = !(menu->info && menu->info->board == DEVICE_BOARD_TB710FU);
     snprintf(menu->device_auto_name, sizeof(menu->device_auto_name),
              kshim_menu_text(KSHIM_TEXT_DEVICE_AUTO_FMT),
              settings_board_name(menu->info ? menu->info->board : DEVICE_BOARD_UNKNOWN));
@@ -1308,10 +1319,14 @@ static int menu_fill_settings(struct menu_selection *menu)
                     kshim_menu_text(KSHIM_TEXT_DEVICE_AUTO_DESC), MENU_DEVICE_SET, BOOT_DEVICE_AUTO,
                     KSHIM_MENU_ROLE_DEVICE_AUTO) ||
         menu_append(&menu->pages[MENU_PAGE_DEVICE], KSHIM_MENU_LABEL_DEV_322,
-                    kshim_menu_text(KSHIM_TEXT_DEVICE_TB322FC_DESC), MENU_DEVICE_SET, BOOT_DEVICE_TB322FC,
+                    y700_manual ? kshim_menu_text(KSHIM_TEXT_DEVICE_TB322FC_DESC)
+                                : kshim_menu_text(KSHIM_TEXT_UNAVAILABLE),
+                    y700_manual ? MENU_DEVICE_SET : MENU_UNAVAILABLE, BOOT_DEVICE_TB322FC,
                     KSHIM_MENU_ROLE_DEVICE_TB322FC) ||
         menu_append(&menu->pages[MENU_PAGE_DEVICE], KSHIM_MENU_LABEL_DEV_323,
-                    kshim_menu_text(KSHIM_TEXT_DEVICE_TB323FU_DESC), MENU_DEVICE_SET, BOOT_DEVICE_TB323FU,
+                    y700_manual ? kshim_menu_text(KSHIM_TEXT_DEVICE_TB323FU_DESC)
+                                : kshim_menu_text(KSHIM_TEXT_UNAVAILABLE),
+                    y700_manual ? MENU_DEVICE_SET : MENU_UNAVAILABLE, BOOT_DEVICE_TB323FU,
                     KSHIM_MENU_ROLE_DEVICE_TB323FU) ||
         menu_append(&menu->pages[MENU_PAGE_DEVICE], kshim_menu_text(KSHIM_TEXT_BACK_SETTINGS),
                     kshim_menu_text(KSHIM_TEXT_BACK_SETTINGS_DESC),

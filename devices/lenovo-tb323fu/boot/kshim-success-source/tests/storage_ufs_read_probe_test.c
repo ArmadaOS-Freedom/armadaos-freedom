@@ -229,7 +229,7 @@ static void fixture_init(struct fixture *f)
     memset(arena, 0, sizeof(arena));
     f->log_len = 0; /* struct was just zeroed, log included */
     G = f;
-    f->ops = (struct kshim_ufs_ops){f, rd32, wr32, NULL, NULL, NULL, NULL, false};
+    f->ops = (struct kshim_ufs_ops){f, rd32, wr32, NULL, NULL, NULL, NULL, false, false};
     f->reg[REG_HCS / 4] = 0x0f;
     f->reg[REG_IS / 4] = 0x08;
     f->reg[REG_DOORBELL / 4] = 4; /* pre-release value, capture must see it */

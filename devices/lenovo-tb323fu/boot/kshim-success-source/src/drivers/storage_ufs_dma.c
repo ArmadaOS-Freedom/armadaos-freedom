@@ -51,7 +51,7 @@
 #define PAGE_4K UINT64_C(0x1000)
 #define PAGE_64K UINT64_C(0x10000)
 
-/* Both supported board profiles place the SMMU here; the collector and the
+/* Every supported board profile (SM8750, SM8850, SM8650) places the SMMU here; the collector and the
  * live DTS agree on this address. There is no register-pattern discovery. */
 #define SMMU_PROFILE_BASE UINT64_C(0x15000000)
 #define SMMU_WINDOW_BYTES UINT64_C(0x100000)
@@ -186,7 +186,8 @@ bool kshim_ufs_dma_is_identity(const struct storage_probe_snapshot *snapshot,
          STORAGE_PROBE_VALID_SMMU_LAYOUT))
         return false;
     if (snapshot->board != DEVICE_BOARD_TB323FU &&
-        snapshot->board != DEVICE_BOARD_TB322FC)
+        snapshot->board != DEVICE_BOARD_TB322FC &&
+        snapshot->board != DEVICE_BOARD_TB710FU)
         return false;
     if (snapshot->entry_count > STORAGE_PROBE_MAX_ENTRIES)
         return false;
