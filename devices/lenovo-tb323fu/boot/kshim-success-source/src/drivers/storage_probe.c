@@ -8,8 +8,9 @@
 /* Original read-only collector. Register semantics were checked against
  * UFSHCI and the MIT SMMUv2 interface in Project-Aloha/CrDK at
  * b6c3335136b7f6b28271917de11e8f11982975fc. No kernel driver code is imported.
- * These windows match the TB322FC/SM8750 and TB323FU/Kaanapali profiles, not a generic
- * Qualcomm fallback. No driver initialization or SmmuProbe call is made. */
+ * These windows match the TB322FC/SM8750, TB323FU/Kaanapali and TB710FU/SM8650
+ * profiles (SM8650 DT: ufshc@1d84000 reg 0x3000, apps SMMU @15000000, UFS SID
+ * 0x60), not a generic Qualcomm fallback. No driver initialization or SmmuProbe call is made. */
 #define UFS_BASE UINT64_C(0x01d84000)
 #define UFS_SIZE UINT64_C(0x3000)
 #define SMMU_BASE UINT64_C(0x15000000)
@@ -208,7 +209,8 @@ enum storage_probe_status storage_probe_collect(
     out->version = STORAGE_PROBE_VERSION;
     out->board = actual_board;
     out->status = STORAGE_PROBE_NOT_RUN;
-    if (actual_board != DEVICE_BOARD_TB323FU && actual_board != DEVICE_BOARD_TB322FC)
+    if (actual_board != DEVICE_BOARD_TB323FU && actual_board != DEVICE_BOARD_TB322FC &&
+        actual_board != DEVICE_BOARD_TB710FU)
         return finish(&reader, STORAGE_PROBE_BOARD_UNSUPPORTED, 0U, 0);
     if (read32 == NULL)
         return finish(&reader, STORAGE_PROBE_INVALID_ARGUMENT, 0U, 0);

@@ -804,10 +804,12 @@ static int menu_format_device_info(struct menu_selection *menu)
     snprintf(menu->info_values[0], sizeof(menu->info_values[0]), "%s",
              info->board == DEVICE_BOARD_TB322FC ? "TB322FC" :
              info->board == DEVICE_BOARD_TB323FU ? "TB323FU" :
+             info->board == DEVICE_BOARD_TB710FU ? "TB710FU" :
              kshim_menu_text(KSHIM_TEXT_UNKNOWN));
     snprintf(menu->info_values[1], sizeof(menu->info_values[1]), "%s",
              info->soc == DEVICE_SOC_SM8750 ? "SM8750" :
              info->soc == DEVICE_SOC_SM8850 ? "SM8850" :
+             info->soc == DEVICE_SOC_SM8650 ? "SM8650" :
              kshim_menu_text(KSHIM_TEXT_UNKNOWN));
     if (info->ram_known)
         snprintf(menu->info_values[2], sizeof(menu->info_values[2]), "%llu MiB",
