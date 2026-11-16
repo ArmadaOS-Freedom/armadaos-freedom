@@ -11,7 +11,7 @@
     "Vulkan": 1,
     "GL": 1,
     "drm": 1,
-    "WaylandClient": 1,
-    "asound": 1
+    "asound": 0,
+    "WaylandClient": 0
   }
 }
