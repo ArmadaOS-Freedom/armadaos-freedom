@@ -261,26 +261,6 @@ static int boot_witness_lock_result(const struct boot_witness_lock_acc *acc)
     return acc->verified;
 }
 
-struct boot_witness_switch {
-    int enabled;
-    int stopped; /* past "--": the remaining words are init arguments */
-};
-
-static void boot_witness_bootconfig_flag(void *ctx, const char *token,
-                                         size_t len)
-{
-    struct boot_witness_switch *sw = ctx;
-
-    if (sw->stopped) {
-        return;
-    }
-    if (len == 2 && memcmp(token, "--", 2) == 0) {
-        sw->stopped = 1; /* parse_args() stops here */
-    } else if (len == 10 && memcmp(token, "bootconfig", 10) == 0) {
-        sw->enabled = 1;
-    }
-}
-
 static int boot_witness_read_cells(const void *prop, int len, uint64_t *value)
 {
     const uint8_t *p = prop;
@@ -631,14 +611,43 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
     }
 }
 
-/* Firmware bootargs carry the exact "bootconfig" switch the kernel honours,
- * among the kernel parameters before any "--". */
+/*
+ * Firmware bootargs carry the exact "bootconfig" switch the kernel honours,
+ * among the kernel parameters before a standalone "--". Words are split like
+ * the kernel's next_arg(): whitespace inside double quotes does not end a
+ * word, so a quoted "a -- b" or "x bootconfig" is part of another argument.
+ * The slot/lock token rules above are deliberately left unchanged.
+ */
 static int boot_witness_bootconfig_enabled(const char *args, size_t len)
 {
-    struct boot_witness_switch sw = { 0, 0 };
+    size_t i = 0;
+    int enabled = 0;
 
-    boot_witness_for_each_token(args, len, boot_witness_bootconfig_flag, &sw);
-    return sw.enabled;
+    while (i < len) {
+        size_t start;
+        int quoted = 0;
+
+        while (i < len && boot_witness_is_space(args[i])) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
+        start = i;
+        while (i < len && (quoted || !boot_witness_is_space(args[i]))) {
+            if (args[i] == '"') {
+                quoted = !quoted;
+            }
+            i++;
+        }
+        if (i - start == 2 && memcmp(args + start, "--", 2) == 0) {
+            break; /* parse_args() stops here; the rest belongs to init */
+        }
+        if (i - start == 10 && memcmp(args + start, "bootconfig", 10) == 0) {
+            enabled = 1;
+        }
+    }
+    return enabled;
 }
 
 int kshim_boot_slot_read_source(const void *firmware_fdt, int *source)

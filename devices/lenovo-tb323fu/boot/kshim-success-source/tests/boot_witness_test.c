@@ -648,6 +648,13 @@ static void test_bootconfig_slot_rejections(void)
     assert(bc_slot("bootconfig -- init.x=1", TB710FU_PARAMS, &BC_OK,
                    &source) == 0);
     assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+    /* Quoted words keep their spaces, as in the kernel's next_arg(). */
+    assert(bc_slot("foo=\"a -- b\" bootconfig", TB710FU_PARAMS, &BC_OK,
+                   &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+    assert(bc_slot("foo=\"x bootconfig\"", TB710FU_PARAMS, &BC_OK,
+                   &source) == -1);
+    assert(source == 0);
     assert(bc_slot("xbootconfig", TB710FU_PARAMS, &BC_OK, &source) == -1);
 
     /* Bootargs evidence wins and is never mixed with bootconfig. */
