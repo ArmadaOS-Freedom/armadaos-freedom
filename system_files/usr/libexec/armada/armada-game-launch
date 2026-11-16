@@ -28,8 +28,8 @@ GUEST_TURNIP_MANIFESTS = (
     "/usr/share/vulkan/icd.d/freedreno_icd.i686.json",
 )
 VK_DRIVER_ENV = ("VK_DRIVER_FILES", "VK_ICD_FILENAMES")
-# Kept out of every generated FEX config regardless of what the base or user
-# settings say; see thunk_settings.
+# Never enabled by a generated FEX config regardless of what the base or user
+# settings say, and always written as an explicit 0; see thunk_settings.
 UNSUPPORTED_THUNKS = frozenset(("asound", "WaylandClient"))
 
 def is_appimage(command):
@@ -88,14 +88,19 @@ def load_fex_contract():
 def thunk_settings(settings, modules):
     # asound and WaylandClient are unsupported for now (upstream compatibility
     # faults), while older bundled defaults or legacy tweaks may still ask for
-    # them. Filter only those two so every other module the FEX config lists
+    # them. Skip only those two so every other module the FEX config lists
     # keeps its default-on/explicit-off semantics instead of being narrowed by
     # a whitelist.
-    modules = [name for name in modules if name not in UNSUPPORTED_THUNKS]
     thunks = settings.get("thunks")
     if not isinstance(thunks, dict):
         thunks = {}
-    return {name: 1 if thunks.get(name, True) else 0 for name in modules}
+    result = {name: 1 if thunks.get(name, True) else 0
+              for name in modules if name not in UNSUPPORTED_THUNKS}
+    # FEX applies Config.json in layers and a missing ThunksDB key inherits the
+    # previous layer's value; the shipped base enables both, so they are always
+    # written explicitly as off even when this layer never listed them.
+    result.update({name: 0 for name in UNSUPPORTED_THUNKS})
+    return result
 
 
 def cache_dir(name):

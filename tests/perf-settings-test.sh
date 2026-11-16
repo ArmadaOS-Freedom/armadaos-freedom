@@ -291,16 +291,17 @@ _, with_perf = fex_result({"fexProfile": "default", "cores": "big", "nice": -5,
                            "env": {"X": "1"}, "wineTopology": False})
 check("FEX config unaffected by perf keys", plain == with_perf)
 check("FEX config content sane", plain["Config"]["Multiblock"] == "0")
-check("generated config drops unsupported legacy thunks",
-      plain["ThunksDB"] == {"Vulkan": 1, "GL": 1, "drm": 1}
-      and not {"asound", "WaylandClient"} & set(plain["ThunksDB"]))
+check("generated config writes supported states plus unsupported zero keys",
+      plain["ThunksDB"] == {"Vulkan": 1, "GL": 1, "drm": 1,
+                            "asound": 0, "WaylandClient": 0})
 _, legacy_thunks = fex_result({"fexProfile": "default", "thunks": {"asound": True, "WaylandClient": True}})
 check("legacy thunk settings cannot re-enable unsupported thunks",
       legacy_thunks["ThunksDB"] == plain["ThunksDB"])
 check("missing profile uses safety fallback",
       launch.resolve_fex_config({}, profiles)["Multiblock"] == "0")
-check("thunks missing from the base FEX config stay off",
-      launch.thunk_settings({"thunks": {"asound": True}}, {"GL": 1}) == {"GL": 1})
+check("thunks missing from the base FEX config become explicit zero keys",
+      launch.thunk_settings({"thunks": {"asound": True}}, {"GL": 1}) ==
+      {"GL": 1, "asound": 0, "WaylandClient": 0})
 
 # --- armada-game-launch: Turnip driver selection -----------------------------
 turnip_root = pathlib.Path(WORK) / "turnip"

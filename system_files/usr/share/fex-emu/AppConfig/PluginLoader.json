@@ -10,6 +10,8 @@
   "ThunksDB": {
     "Vulkan": 1,
     "GL": 1,
-    "drm": 1
+    "drm": 1,
+    "asound": 0,
+    "WaylandClient": 0
   }
 }
