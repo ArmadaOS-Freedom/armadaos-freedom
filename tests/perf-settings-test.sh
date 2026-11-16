@@ -182,7 +182,7 @@ check("factory gamescope policy loaded",
       factory_global["gamescopeVulkanRealtime"] is True)
 check("factory scheduler loaded", factory_global["scheduler"] is None)
 check("factory thunk defaults loaded",
-      set(factory_global["thunks"]) == {"Vulkan", "GL", "drm", "WaylandClient", "asound"} and
+      set(factory_global["thunks"]) == {"Vulkan", "GL", "drm"} and
       all(factory_global["thunks"].values()))
 factory_perf = ap.sanitize_perf(factory_tweaks["global"], ENV)
 check("gamescope nice defaults to -20",
@@ -266,7 +266,10 @@ finally:
 
 base_fex = os.path.join(WORK, "base-fex.json")
 with open(base_fex, "w") as f:
-    json.dump({"Config": {"TSOEnabled": "1"}, "ThunksDB": {"Vulkan": 1, "GL": 1}}, f)
+    # an older bundled Config.json: the unsupported thunks are still advertised
+    json.dump({"Config": {"TSOEnabled": "1"},
+               "ThunksDB": {"Vulkan": 1, "GL": 1, "drm": 1,
+                            "asound": 1, "WaylandClient": 1}}, f)
 launch.BASE_FEX_CONFIG = __import__("pathlib").Path(base_fex)
 profiles = {
     "default": {"config": {"Multiblock": "0"}},
@@ -288,8 +291,16 @@ _, with_perf = fex_result({"fexProfile": "default", "cores": "big", "nice": -5,
                            "env": {"X": "1"}, "wineTopology": False})
 check("FEX config unaffected by perf keys", plain == with_perf)
 check("FEX config content sane", plain["Config"]["Multiblock"] == "0")
+check("generated config drops unsupported legacy thunks",
+      plain["ThunksDB"] == {"Vulkan": 1, "GL": 1, "drm": 1}
+      and not {"asound", "WaylandClient"} & set(plain["ThunksDB"]))
+_, legacy_thunks = fex_result({"fexProfile": "default", "thunks": {"asound": True, "WaylandClient": True}})
+check("legacy thunk settings cannot re-enable unsupported thunks",
+      legacy_thunks["ThunksDB"] == plain["ThunksDB"])
 check("missing profile uses safety fallback",
       launch.resolve_fex_config({}, profiles)["Multiblock"] == "0")
+check("thunks missing from the base FEX config stay off",
+      launch.thunk_settings({"thunks": {"asound": True}}, {"GL": 1}) == {"GL": 1})
 
 # --- armada-game-launch: Turnip driver selection -----------------------------
 turnip_root = pathlib.Path(WORK) / "turnip"
