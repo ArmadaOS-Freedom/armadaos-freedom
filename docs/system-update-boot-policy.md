@@ -80,7 +80,10 @@ read the AOSP bootconfig trailer appended to the firmware initrd
 size and checksum) and publish `source = 2`.  Bootloaders such as TB710FU's
 put the slot and lock state only there.  Evidence from the two sources is
 never combined; duplicates, bare keys and malformed values leave the witness
-unpublished in either case.
+unpublished in either case.  The bootconfig source is used only when every
+line is blank, a comment, or one `key = value` assignment (a bare value or a
+string quoted on the same line); arrays, `;`, brace blocks, other operators
+and empty values make the whole source unsupported.
 
 ## Confirmation
 

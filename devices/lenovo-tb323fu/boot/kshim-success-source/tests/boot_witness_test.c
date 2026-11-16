@@ -591,9 +591,7 @@ static void test_bootconfig_slot_fallback(void)
         assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &o,
                        &source) == 0);
     }
-    /* Statements after ';', and ';' or braces inside quotes or comments. */
-    assert(bc_slot("bootconfig", "androidboot.x=1; androidboot.slot_suffix=_b\n",
-                   &BC_OK, &source) == 1);
+    /* ';' or braces are fine inside quotes or comments. */
     assert(bc_slot("bootconfig",
                    "androidboot.x=\"a;b{c}\"\nandroidboot.slot_suffix=_b\n",
                    &BC_OK, &source) == 1);
@@ -601,18 +599,31 @@ static void test_bootconfig_slot_fallback(void)
                    &BC_OK, &source) == 0);
     assert(bc_slot("bootconfig", "androidboot.slot_suffix = '_b'\n",
                    &BC_OK, &source) == 1);
-    /* Unrelated arrays do not affect the witness keys. */
+    /* Outside the flat one-assignment-per-line grammar the whole source is
+     * unsupported, even when the witness lines themselves look valid. */
     assert(bc_slot("bootconfig",
                    "androidboot.x=a, b\nandroidboot.slot_suffix=_b\n",
-                   &BC_OK, &source) == 1);
+                   &BC_OK, &source) == -1);
     assert(bc_slot("bootconfig",
-                   "androidboot.x=a,\n b\nandroidboot.slot_suffix=_a\n",
-                   &BC_OK, &source) == 0);
+                   "androidboot.x=1; androidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
     assert(bc_slot("bootconfig",
-                   "androidboot.x=a,\n b;androidboot.slot_suffix=_a\n",
-                   &BC_OK, &source) == 0);
+                   "androidboot.slot_suffix=_a\n"
+                   "androidboot.x=left'part;androidboot.slot_suffix:=_b;"
+                   "androidboot.y=right'part\n", &BC_OK, &source) == -1);
     assert(bc_slot("bootconfig",
-                   "androidboot.x=\"a,b\";androidboot.y='c,d'\n"
+                   "androidboot.x=first,\n\n# note\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x = # empty\nandroidboot.slot_suffix=_b\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\nandroidboot\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "androidboot.x=\"a,b\"\nandroidboot.y='c;d' # n\n"
                    "androidboot.slot_suffix=_a\n", &BC_OK, &source) == 0);
     /* Comments and lookalike keys are ignored. */
     assert(bc_slot("bootconfig",

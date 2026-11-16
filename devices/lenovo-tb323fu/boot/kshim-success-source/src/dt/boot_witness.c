@@ -471,214 +471,151 @@ static int boot_witness_bc_space(char c)
     return c == ' ' || c == '\t' || c == '\r';
 }
 
+static int boot_witness_bc_key_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+}
+
 /*
- * Examine one bootconfig statement (already split on newline and ';' outside
- * quotes, with any '#' comment removed). Only a statement whose key exactly
- * equals one of keys is examined; every other statement is ignored. The
- * accepted forms are "key=value", "key = value", "key = \"value\"" and
- * "key = 'value'";
- * anything else for a matching key (another operator such as "+=" or ":=",
- * arrays, trailing text, an over-long value) is passed on as the bare key so
- * the accumulator records invalid evidence.
+ * Parse one bootconfig line under the strict flat grammar:
+ *   blank | '#' comment | KEY ws* '=' ws* VALUE ws* ['#' comment]
+ * KEY is [A-Za-z0-9._-]+. VALUE is a string quoted with '"' or '\'' and closed
+ * on the same line, or a non-empty bare value without any of ,;{}"'.
+ * Returns 0 for blank/comment lines, 1 with key/value for an assignment, and
+ * -1 for anything else.
  */
-static void boot_witness_bc_statement(const char *text, size_t len,
-                                      const char *const *keys,
-                                      boot_witness_token_fn fn, void *ctx)
+static int boot_witness_bc_line(const char *text, size_t len,
+                                const char **key, size_t *key_len,
+                                const char **val, size_t *val_len)
 {
     size_t i = 0;
-    size_t k;
+    size_t j;
 
     while (i < len && boot_witness_bc_space(text[i])) {
         i++;
     }
-    while (len > i && boot_witness_bc_space(text[len - 1])) {
-        len--;
+    if (i == len || text[i] == '#') {
+        return 0;
     }
 
-    for (k = 0; keys[k] != NULL; k++) {
-        const char *key = keys[k];
-        size_t key_len = strlen(key);
-        char token[BOOT_WITNESS_TOKEN_MAX];
-        const char *val;
-        size_t val_len;
-        size_t j;
+    j = i;
+    while (j < len && boot_witness_bc_key_char(text[j])) {
+        j++;
+    }
+    if (j == i) {
+        return -1;
+    }
+    *key = text + i;
+    *key_len = j - i;
 
-        if (len - i < key_len || memcmp(text + i, key, key_len) != 0) {
-            continue;
-        }
-        j = i + key_len;
-        if (j < len && text[j] != '=' && text[j] != '+' && text[j] != ':' &&
-            !boot_witness_bc_space(text[j])) {
-            /* A longer key such as key_extra or key.sub. */
-            continue;
-        }
+    while (j < len && boot_witness_bc_space(text[j])) {
+        j++;
+    }
+    if (j == len || text[j] != '=') {
+        return -1; /* bare key, "+=", ":=", braces or anything else */
+    }
+    j++;
+    while (j < len && boot_witness_bc_space(text[j])) {
+        j++;
+    }
+    if (j == len || text[j] == '#') {
+        return -1; /* an empty value continues on the next line */
+    }
 
+    if (text[j] == '"' || text[j] == '\'') {
+        const char *close = memchr(text + j + 1, text[j], len - (j + 1));
+
+        if (!close) {
+            return -1;
+        }
+        *val = text + j + 1;
+        *val_len = (size_t)(close - *val);
+        j = (size_t)(close - text) + 1;
         while (j < len && boot_witness_bc_space(text[j])) {
             j++;
         }
-        if (j >= len || text[j] != '=') {
-            fn(ctx, key, key_len); /* bare key, "+=", ":=" or another operator */
-            return;
+        if (j != len && text[j] != '#') {
+            return -1;
+        }
+        return 1;
+    }
+
+    *val = text + j;
+    while (j < len && text[j] != '#') {
+        char c = text[j];
+
+        if (c == ',' || c == ';' || c == '{' || c == '}' || c == '"' ||
+            c == '\'') {
+            return -1;
         }
         j++;
-        while (j < len && boot_witness_bc_space(text[j])) {
-            j++;
-        }
-
-        if (j < len && (text[j] == '"' || text[j] == '\'')) {
-            const char *close;
-
-            val = text + j + 1;
-            close = memchr(val, text[j], len - (j + 1));
-            if (!close) {
-                fn(ctx, key, key_len);
-                return;
-            }
-            val_len = (size_t)(close - val);
-            j = (size_t)(close - text) + 1;
-        } else {
-            val = text + j;
-            while (j < len && !boot_witness_bc_space(text[j]) &&
-                   text[j] != '"' && text[j] != '\'' && text[j] != ',') {
-                j++;
-            }
-            val_len = (size_t)(text + j - val);
-        }
-
-        while (j < len && boot_witness_bc_space(text[j])) {
-            j++;
-        }
-        if (j != len || key_len + 1 + val_len > sizeof(token)) {
-            fn(ctx, key, key_len);
-            return;
-        }
-
-        memcpy(token, key, key_len);
-        token[key_len] = '=';
-        memcpy(token + key_len + 1, val, val_len);
-        fn(ctx, token, key_len + 1 + val_len);
-        return;
     }
-}
-
-/* An array continuation line that starts with a witness key is invalid
- * evidence; any other continuation line is ignored. */
-static void boot_witness_bc_array_values(const char *text, size_t len,
-                                         const char *const *keys,
-                                         boot_witness_token_fn fn, void *ctx)
-{
-    size_t i = 0;
-    size_t k;
-
-    while (i < len && boot_witness_bc_space(text[i])) {
-        i++;
+    while (j > (size_t)(*val - text) && boot_witness_bc_space(text[j - 1])) {
+        j--;
     }
-    for (k = 0; keys[k] != NULL; k++) {
-        size_t key_len = strlen(keys[k]);
-
-        if (len - i >= key_len && memcmp(text + i, keys[k], key_len) == 0) {
-            fn(ctx, keys[k], key_len);
-            return;
-        }
-    }
+    *val_len = (size_t)(text + j - *val);
+    return *val_len ? 1 : -1;
 }
 
 /*
- * Feed bootconfig statements as normalized "key=value" tokens. Statements end
- * at a newline or at ';' outside quotes (either '"' or '\''); '#' outside
- * quotes starts a comment that runs to the end of the line. Android
- * bootconfig is a flat list of top-level keys, so a brace block (its keys
- * gain a prefix) or an unterminated quote makes the whole bootconfig
- * unsupported: the first key is then passed on bare so no evidence is used.
- * A statement ending in ',' outside quotes is an array whose values continue
- * on the next line; such a continuation line is never an assignment, and if
- * it starts with one of keys the evidence is recorded as invalid.
+ * Feed bootconfig assignments of keys as normalized "key=value" tokens.
+ * Android bootconfig is a flat list of single assignments, one per line. The
+ * whole bootconfig is first checked against the strict grammar above; any
+ * line outside it (arrays, ';', braces, other operators, empty values,
+ * embedded quotes, ...) could change which key a later line belongs to, so
+ * the source is then unsupported and the first key is passed on bare so no
+ * evidence is used.
  */
 static void boot_witness_for_each_bootconfig(const char *text, size_t len,
                                              const char *const *keys,
                                              boot_witness_token_fn fn,
                                              void *ctx)
 {
-    size_t start = 0;
-    size_t i;
-    char quote = 0;
+    const char *key;
+    const char *val;
+    size_t key_len;
+    size_t val_len;
+    size_t pos;
+    int pass;
 
-    /* Structural pass first: unsupported constructs reject the source. */
-    for (i = 0; i < len; i++) {
-        char c = text[i];
+    for (pass = 0; pass < 2; pass++) {
+        pos = 0;
+        while (pos < len) {
+            size_t line_end = pos;
+            int rc;
+            size_t k;
 
-        if (quote) {
-            if (c == quote) {
-                quote = 0;
-            } else if (c == '\n') {
-                break;
+            while (line_end < len && text[line_end] != '\n') {
+                line_end++;
             }
-            continue;
-        }
-        if (c == '"' || c == '\'') {
-            quote = c;
-        } else if (c == '#') {
-            while (i < len && text[i] != '\n') {
-                i++;
+            rc = boot_witness_bc_line(text + pos, line_end - pos, &key,
+                                      &key_len, &val, &val_len);
+            if (rc < 0) {
+                fn(ctx, keys[0], strlen(keys[0]));
+                return;
             }
-        } else if (c == '{' || c == '}') {
-            break;
-        }
-    }
-    if (i < len || quote) {
-        fn(ctx, keys[0], strlen(keys[0]));
-        return;
-    }
+            if (rc > 0 && pass == 1) {
+                for (k = 0; keys[k] != NULL; k++) {
+                    char token[BOOT_WITNESS_TOKEN_MAX];
 
-    int continuation = 0;  /* this line continues an array value list */
-    char last = 0;         /* last non-space character outside quotes */
-
-    for (i = 0; i <= len; i++) {
-        char c = i < len ? text[i] : '\n';
-        int line_end = 0;
-        size_t stmt_end = i;
-
-        if (quote) {
-            if (c == quote) {
-                quote = 0;
+                    if (strlen(keys[k]) != key_len ||
+                        memcmp(keys[k], key, key_len) != 0) {
+                        continue;
+                    }
+                    if (key_len + 1 + val_len > sizeof(token)) {
+                        fn(ctx, keys[k], key_len);
+                        break;
+                    }
+                    memcpy(token, key, key_len);
+                    token[key_len] = '=';
+                    memcpy(token + key_len + 1, val, val_len);
+                    fn(ctx, token, key_len + 1 + val_len);
+                    break;
+                }
             }
-            last = c;
-            continue;
+            pos = line_end + 1;
         }
-        if (c == '"' || c == '\'') {
-            quote = c;
-            last = c;
-            continue;
-        }
-        if (c == '#') {
-            while (i < len && text[i] != '\n') {
-                i++;
-            }
-            line_end = 1;
-        } else if (c == '\n') {
-            line_end = 1;
-        } else if (c != ';') {
-            if (!boot_witness_bc_space(c)) {
-                last = c;
-            }
-            continue;
-        }
-
-        if (continuation) {
-            /* Array values, not an assignment. */
-            boot_witness_bc_array_values(text + start, stmt_end - start, keys,
-                                         fn, ctx);
-        } else {
-            boot_witness_bc_statement(text + start, stmt_end - start, keys,
-                                      fn, ctx);
-        }
-        if (line_end) {
-            continuation = last == ',';
-        } else {
-            continuation = 0; /* ';' ends any array */
-        }
-        last = 0;
-        start = i + 1;
     }
 }
 
