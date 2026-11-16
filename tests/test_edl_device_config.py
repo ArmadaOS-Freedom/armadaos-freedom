@@ -61,6 +61,66 @@ TB322FC_PROFILE = {
             "qca/brhperifw20.tlv",
             "qca/brhperinv20.bin",
             "qca/tmel_peach_20.elf",
+            "qcom/sm8750/adsp_dtb.b00",
+            "qcom/sm8750/adsp_dtb.b01",
+            "qcom/sm8750/adsp_dtb.b02",
+            "qcom/sm8750/adsp_dtb.mdt",
+            "qcom/sm8750/adsp.b00",
+            "qcom/sm8750/adsp.b01",
+            "qcom/sm8750/adsp.b02",
+            "qcom/sm8750/adsp.b03",
+            "qcom/sm8750/adsp.b04",
+            "qcom/sm8750/adsp.b05",
+            "qcom/sm8750/adsp.b06",
+            "qcom/sm8750/adsp.b07",
+            "qcom/sm8750/adsp.b08",
+            "qcom/sm8750/adsp.b09",
+            "qcom/sm8750/adsp.b10",
+            "qcom/sm8750/adsp.b11",
+            "qcom/sm8750/adsp.b12",
+            "qcom/sm8750/adsp.b13",
+            "qcom/sm8750/adsp.b14",
+            "qcom/sm8750/adsp.b15",
+            "qcom/sm8750/adsp.b16",
+            "qcom/sm8750/adsp.b17",
+            "qcom/sm8750/adsp.b18",
+            "qcom/sm8750/adsp.b19",
+            "qcom/sm8750/adsp.b20",
+            "qcom/sm8750/adsp.b21",
+            "qcom/sm8750/adsp.b22",
+            "qcom/sm8750/adsp.b23",
+            "qcom/sm8750/adsp.b24",
+            "qcom/sm8750/adsp.b25",
+            "qcom/sm8750/adsp.b26",
+            "qcom/sm8750/adsp.b27",
+            "qcom/sm8750/adsp.b28",
+            "qcom/sm8750/adsp.b30",
+            "qcom/sm8750/adsp.b31",
+            "qcom/sm8750/adsp.b32",
+            "qcom/sm8750/adsp.b33",
+            "qcom/sm8750/adsp.b34",
+            "qcom/sm8750/adsp.b35",
+            "qcom/sm8750/adsp.b36",
+            "qcom/sm8750/adsp.b37",
+            "qcom/sm8750/adsp.b38",
+            "qcom/sm8750/adsp.b39",
+            "qcom/sm8750/adsp.b40",
+            "qcom/sm8750/adsp.b41",
+            "qcom/sm8750/adsp.b42",
+            "qcom/sm8750/adsp.b43",
+            "qcom/sm8750/adsp.b44",
+            "qcom/sm8750/adsp.b45",
+            "qcom/sm8750/adsp.b46",
+            "qcom/sm8750/adsp.b47",
+            "qcom/sm8750/adsp.b48",
+            "qcom/sm8750/adsp.b49",
+            "qcom/sm8750/adsp.b50",
+            "qcom/sm8750/adsp.b51",
+            "qcom/sm8750/adsp.b52",
+            "qcom/sm8750/adsp.b53",
+            "qcom/sm8750/adsp.b54",
+            "qcom/sm8750/adsp.b56",
+            "qcom/sm8750/adsp.mdt",
         ],
         "earlyDrivers": [
             "qcom_pil_info",
@@ -379,6 +439,23 @@ class RealConfigurationTests(TempConfigMixin, unittest.TestCase):
             TB323FU_PROFILE["runtimeCmakeArgs"],
         )
 
+    def test_tb322fc_declares_every_committed_adsp_firmware(self):
+        configuration = HELPER.load_configuration(CONFIG_PATH)
+        declared = set(configuration["profiles"]["TB322FC"]["bootRequirements"]["earlyFirmware"])
+        firmware_root = REPO_ROOT / "system_files" / "usr" / "lib" / "firmware"
+        adsp_dir = firmware_root / "qcom" / "sm8750"
+        committed_paths = [adsp_dir / "adsp.mdt", adsp_dir / "adsp_dtb.mdt"]
+        committed_paths.extend(adsp_dir.glob("adsp.b[0-9][0-9]"))
+        committed_paths.extend(adsp_dir.glob("adsp_dtb.b[0-9][0-9]"))
+        committed = {
+            path.relative_to(firmware_root).as_posix()
+            for path in committed_paths
+            if path.is_file()
+        }
+        self.assertTrue(committed, "expected committed ADSP firmware files")
+        self.assertIn("qcom/sm8750/adsp.mdt", committed)
+        self.assertIn("qcom/sm8750/adsp_dtb.mdt", committed)
+        self.assertEqual(sorted(committed - declared), [])
 
 class SelectionTests(unittest.TestCase):
     def setUp(self):
