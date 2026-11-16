@@ -19,7 +19,8 @@
  * absent, malformed, or conflicting (including duplicate keys).
  *
  * When bootargs carries no androidboot.slot_suffix token at all but does
- * carry the exact "bootconfig" switch, the AOSP bootconfig trailer at the end
+ * carry the exact "bootconfig" switch among the kernel parameters before any
+ * "--", the AOSP bootconfig trailer at the end
  * of the firmware initrd (/chosen linux,initrd-start..end, inside a declared
  * memory range, with a valid size and checksum) is read instead with the same
  * duplicate, bare-key and value rules. Bootargs evidence, valid or not, is

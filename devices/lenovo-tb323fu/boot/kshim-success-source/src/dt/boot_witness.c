@@ -261,11 +261,23 @@ static int boot_witness_lock_result(const struct boot_witness_lock_acc *acc)
     return acc->verified;
 }
 
+struct boot_witness_switch {
+    int enabled;
+    int stopped; /* past "--": the remaining words are init arguments */
+};
+
 static void boot_witness_bootconfig_flag(void *ctx, const char *token,
                                          size_t len)
 {
-    if (len == 10 && memcmp(token, "bootconfig", 10) == 0) {
-        *(int *)ctx = 1;
+    struct boot_witness_switch *sw = ctx;
+
+    if (sw->stopped) {
+        return;
+    }
+    if (len == 2 && memcmp(token, "--", 2) == 0) {
+        sw->stopped = 1; /* parse_args() stops here */
+    } else if (len == 10 && memcmp(token, "bootconfig", 10) == 0) {
+        sw->enabled = 1;
     }
 }
 
@@ -619,14 +631,14 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
     }
 }
 
-/* Firmware bootargs carry the exact "bootconfig" switch the kernel honours. */
+/* Firmware bootargs carry the exact "bootconfig" switch the kernel honours,
+ * among the kernel parameters before any "--". */
 static int boot_witness_bootconfig_enabled(const char *args, size_t len)
 {
-    int enabled = 0;
+    struct boot_witness_switch sw = { 0, 0 };
 
-    boot_witness_for_each_token(args, len, boot_witness_bootconfig_flag,
-                                &enabled);
-    return enabled;
+    boot_witness_for_each_token(args, len, boot_witness_bootconfig_flag, &sw);
+    return sw.enabled;
 }
 
 int kshim_boot_slot_read_source(const void *firmware_fdt, int *source)
