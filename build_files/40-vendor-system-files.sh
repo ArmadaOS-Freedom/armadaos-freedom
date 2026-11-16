@@ -96,6 +96,22 @@ install -Dpm 0644 "${fw_bundle}/qcom/kaanapali/lenovo/baldur/adsp_dtb.mbn" \
 install -Dpm 0644 "${fw_bundle}/aw882xx_acf.bin" "${fw_audio}/aw882xx_acf.bin"
 install -Dpm 0644 "${fw_bundle}/SHA256SUMS" "${fw_audio}/SHA256SUMS"
 
+# TB323FU CDSP: the signed vendor compute firmware, shipped in this repository
+# beside its SHA256SUMS. It is installed at a board-only path and copied into
+# the kernel firmware search path at run time by tb323fu-cdsp-prepare.service;
+# nothing is extracted from or read off a partition.
+cdsp_bundle=/ctx/tb323fu-cdsp/firmware
+cdsp_fw=/usr/share/tb323fu/firmware/compute
+(
+    cd "${cdsp_bundle}"
+    sha256sum -c --strict SHA256SUMS
+)
+install -Dpm 0644 "${cdsp_bundle}/qcom/kaanapali/lenovo/baldur/cdsp.mbn" \
+    "${cdsp_fw}/qcom/kaanapali/lenovo/baldur/cdsp.mbn"
+install -Dpm 0644 "${cdsp_bundle}/qcom/kaanapali/lenovo/baldur/cdsp_dtb.mbn" \
+    "${cdsp_fw}/qcom/kaanapali/lenovo/baldur/cdsp_dtb.mbn"
+install -Dpm 0644 "${cdsp_bundle}/SHA256SUMS" "${cdsp_fw}/SHA256SUMS"
+
 # TB710FU firmware: every file sits at a path only this board's device tree
 # names (qcom/sm8650/xiaoxin/gt/, novatek/novatek_nt36532_*), so it goes
 # straight into the firmware search root and nothing is staged at run time.
@@ -112,6 +128,7 @@ chmod 0755 /usr/libexec/armada/*
 chmod 0755 /usr/libexec/os-session-select
 chmod 0755 /usr/libexec/tb323fu/tb323fu-usb-port
 chmod 0755 /usr/libexec/tb323fu/tb323fu-audio-prepare
+chmod 0755 /usr/libexec/tb323fu/tb323fu-cdsp-prepare
 
 sed -i '/const allPanels/,$d' /usr/share/plasma/layout-templates/org.kde.plasma.desktop.defaultPanel/contents/layout.js
 sed -i '$r /usr/share/plasma/shells/org.kde.plasma.desktop/contents/updates/armada-pins.js' /usr/share/plasma/layout-templates/org.kde.plasma.desktop.defaultPanel/contents/layout.js
@@ -129,6 +146,7 @@ systemctl enable tb323fu-btaddr.service
 systemctl enable tb323fu-usb-port.service
 systemctl enable tb323fu-audio.service
 systemctl enable tb323fu-audio-prepare.service
+systemctl enable tb323fu-cdsp-prepare.service
 systemctl enable tb323fu-bluetooth-firmware.service
 # The user unit is enabled on every device; the helper itself exits 0 unless
 # the exact lenovo,baldur token and the exact LENOVOTB323FU card are present.
