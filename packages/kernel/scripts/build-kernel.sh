@@ -256,6 +256,11 @@ mkdir -p "${KERNEL_CHECK_WORK}"
 echo "==> Running kernel host source checks"
 python3 "${REPO_ROOT}/tests/test_dpu_rotation.py" "${SRC_DIR}" \
     --work "${KERNEL_CHECK_WORK}/dpu-rotation"
+python3 "${REPO_ROOT}/tests/test_dpu_core_perf.py" \
+    --core-source "${SRC_DIR}/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c" \
+    --plane-source "${SRC_DIR}/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c" \
+    --msm-atomic-source "${SRC_DIR}/drivers/gpu/drm/msm/msm_atomic.c" \
+    --work "${KERNEL_CHECK_WORK}/dpu-core-perf"
 python3 "${REPO_ROOT}/tests/test_dpu_sspp_format.py" "${SRC_DIR}" \
     --work "${KERNEL_CHECK_WORK}/dpu-sspp-format"
 KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_msm_telemetry_pm.py"

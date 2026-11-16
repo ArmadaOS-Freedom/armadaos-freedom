@@ -1,0 +1,190 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] drm/msm/dpu: check Elden bandwidth after preparing all CRTCs
+
+A per-CRTC check can mix the current pending vote with a different CRTC's
+old duplicated new_perf. A valid transfer of bandwidth between CRTCs then
+depends on callback order. Do not read another CRTC's pipe configuration
+before its helper callback has assigned resources.
+
+Add an optional backend check after drm_atomic_helper_check succeeds.
+Elden's individual CRTC check still calculates its pending performance;
+the backend check validates the complete prepared transaction. Lock the
+untouched CRTCs through the transaction acquire context before reading
+committed votes and propagate -EDEADLK for the normal retry protocol.
+Other machines and post-commit bus voting retain the existing path.
+
+This patch depends on 0230. It does not change the bandwidth formula,
+hardware limit, display timing, DTB, or userspace rotation policy.
+---
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -69,6 +69,14 @@
+ 	int (*check_mode_changed)(struct msm_kms *kms, struct drm_atomic_commit *state);
+ 
+ 	/**
++	 * @atomic_check:
++	 *
++	 * Validate backend-wide limits after the helper has prepared every
++	 * plane and CRTC. Must propagate modeset-lock errors to the caller.
++	 */
++	int (*atomic_check)(struct msm_kms *kms, struct drm_atomic_commit *state);
++
++	/**
+ 	 * Prepare for atomic commit.  This is called after any previous
+ 	 * (async or otherwise) commit has completed.
+ 	 */
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -207,7 +207,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return drm_atomic_helper_check(dev, state);
++	ret = drm_atomic_helper_check(dev, state);
++	if (ret)
++		return ret;
++
++	if (kms && kms->funcs && kms->funcs->atomic_check)
++		return kms->funcs->atomic_check(kms, state);
++
++	return 0;
+ }
+ 
+ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -462,6 +462,12 @@
+ 	return 0;
+ }
+ 
++static int dpu_kms_atomic_check(struct msm_kms *kms,
++		struct drm_atomic_commit *state)
++{
++	return dpu_core_perf_atomic_check(to_dpu_kms(kms), state);
++}
++
+ static void dpu_kms_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
+ {
+ 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
+@@ -1075,6 +1081,7 @@
+ 	.enable_commit   = dpu_kms_enable_commit,
+ 	.disable_commit  = dpu_kms_disable_commit,
+ 	.check_mode_changed = dpu_kms_check_mode_changed,
++	.atomic_check    = dpu_kms_atomic_check,
+ 	.flush_commit    = dpu_kms_flush_commit,
+ 	.wait_flush      = dpu_kms_wait_flush,
+ 	.complete_commit = dpu_kms_complete_commit,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.h
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.h
+@@ -70,6 +70,10 @@
+ 		unsigned long max_core_clk_rate);
+ 
+ struct dpu_kms;
++struct drm_atomic_commit;
++
++int dpu_core_perf_atomic_check(struct dpu_kms *kms,
++		struct drm_atomic_commit *state);
+ 
+ int dpu_core_perf_debugfs_init(struct dpu_kms *dpu_kms, struct dentry *parent);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -12,6 +12,8 @@
+ #include <linux/clk.h>
+ #include <linux/bitmap.h>
+ #include <linux/of.h>
++
++#include <drm/drm_modeset_lock.h>
+ 
+ #include "dpu_kms.h"
+ #include "dpu_trace.h"
+@@ -273,11 +275,12 @@
+ 	/* obtain new values */
+ 	_dpu_core_perf_calc_crtc(&kms->perf, crtc, state, &dpu_cstate->new_perf);
+ 
++	/* Other pending CRTCs may not have assigned their pipes yet. */
+ 	if (of_machine_is_compatible("lenovo,elden"))
+-		dpu_core_perf_aggregate_atomic(crtc, state, &perf);
+-	else
+-		dpu_core_perf_aggregate(crtc->dev,
+-					dpu_crtc_get_client_type(crtc), &perf);
++		return 0;
++
++	dpu_core_perf_aggregate(crtc->dev,
++				dpu_crtc_get_client_type(crtc), &perf);
+ 
+ 	/* convert bandwidth to kb */
+ 	bw = DIV_ROUND_UP_ULL(perf.bw_ctl, 1000);
+@@ -293,6 +296,67 @@
+ 	} else if (bw > threshold) {
+ 		DPU_ERROR("exceeds bandwidth: %ukb > %ukb\n", bw,
+ 				threshold);
++		return -E2BIG;
++	}
++
++	return 0;
++}
++
++/**
++ * dpu_core_perf_atomic_check - validate Elden's prepared atomic transaction
++ * @kms: DPU backend
++ * @state: transaction after drm_atomic_helper_check() has succeeded
++ *
++ * Each touched CRTC has now assigned resources and calculated new_perf. Lock
++ * the untouched CRTCs before reading their committed votes, without adding
++ * unprepared CRTC states to the already-checked transaction. The acquire
++ * context owns these locks; -EDEADLK is handled by the atomic caller's retry.
++ */
++int dpu_core_perf_atomic_check(struct dpu_kms *kms,
++		struct drm_atomic_commit *state)
++{
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	struct dpu_core_perf_params perf = { 0 };
++	u64 bw;
++	u32 threshold;
++	bool has_rt = false;
++	int i, ret;
++
++	if (!of_machine_is_compatible("lenovo,elden"))
++		return 0;
++	if (!kms || !state || !state->acquire_ctx || !kms->perf.perf_cfg)
++		return -EINVAL;
++
++	/* Transactions without an RT CRTC do not change its bandwidth. */
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		if (dpu_crtc_get_client_type(crtc) != NRT_CLIENT) {
++			has_rt = true;
++			break;
++		}
++	}
++	if (!has_rt)
++		return 0;
++
++	drm_for_each_crtc(crtc, kms->dev) {
++		ret = drm_modeset_lock(&crtc->mutex, state->acquire_ctx);
++		if (ret)
++			return ret;
++	}
++
++	/* The helper has finished every pending CRTC, independent of order. */
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		if (dpu_crtc_get_client_type(crtc) == NRT_CLIENT)
++			continue;
++		dpu_core_perf_aggregate_atomic(crtc, crtc_state, &perf);
++		break;
++	}
++
++	bw = DIV_ROUND_UP_ULL(perf.bw_ctl, 1000);
++	threshold = kms->perf.perf_cfg->max_bw_high;
++	if (!threshold || bw > threshold) {
++		DPU_ERROR("atomic bandwidth %llukB/s exceeds limit %ukB/s\n",
++			  bw, threshold);
+ 		return -E2BIG;
+ 	}
+ 

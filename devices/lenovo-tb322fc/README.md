@@ -18,11 +18,20 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 | Android 启动 | 可从菜单进入原厂 Android |
 | 机身 Linux | 可进入 ArmadaOS 和 Steam 游戏模式 |
 | 触屏 | 坐标已修正，点击和滑动已确认正常 |
-| Steam 会话重开 | 显示初始化修正后，正常退出并重开 Steam 的画面与触屏已确认正常 |
+| Game Mode 显示方向 | 启动时固定 `right`（270°），使用 DPU 硬件旋转；原生 60 Hz 静态图和 30 秒动态齿轮已实屏确认 |
+| Steam 会话重开 | 硬件旋转试验恢复 Steam 时观察到半屏闪烁，交接与恢复仍待修复 |
 | G9 手柄 | 基础按键、单按／双击 Home 及 RGB 控制已确认正常 |
 | Armada Control | 使用四代独立配置，隐藏风扇相关入口 |
 
 这些状态对应已完成的实机操作验证；长期稳定性及其它显示切换场景仍在验证中。
+
+## Game Mode 固定横屏
+
+四代沿用五代的会话初始化方式：设备配置提供 `ARMADA_PANEL_ORIENTATION=right`，Steam 启动脚本将它作为 `ORIENTATION` 默认值；`ARMADA_GAMESCOPE_USE_ROTATION_SHADER=0` 使 Gamescope 请求 DPU 旋转，不强制合成器旋转着色器。正常启动即选择 270°，无需在启动后重开 Steam 切换方向。加速度计硬件暂不可用，当前不提供重力自动切向。
+
+显式的会话 `ORIENTATION`、`/etc/armada/display-orientation.conf` 保存的用户选择和 `FORCE_COMPOSITION_ROTATION=1` 软件回退仍有效。排查时创建的用户会话 `99-rescue-normal.conf` 会继续覆盖设备默认值；验证正常启动前需移除此临时覆盖，并保留副本便于恢复。
+
+本次实屏验证覆盖 1904×3040 面板、60 Hz、两个活动 UBWC plane 的 270°静态标记图和 30 秒齿轮。它们不替代固定硬件横屏启动、触控、高刷、休眠恢复或长期稳定性验收。恢复 Steam 时的半屏闪烁和 DPU 提交超时仍单独追踪，不能由齿轮画面正常推定已修复。
 
 ## G9 手柄
 
@@ -50,7 +59,7 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 
 四代使用 `lenovo,elden` / SM8750，五代使用 `lenovo,baldur` / SM8850。两代仍需各自的设备树和启动载荷，**boot 镜像不能互刷**。统一内核并不意味着两代已经共用安装包或完成 OTA 验证。
 
-四代 Steam 会话重开的显示修正由 `0153`、`0154`、`0155` 内核补丁提供，按 `lenovo,elden` 匹配；五代显示支持使用独立的 Baldur 匹配。
+四代的 `0153`、`0154`、`0155` 内核补丁提供按 `lenovo,elden` 匹配的显示关停与启动处理；五代显示支持使用独立的 Baldur 匹配。固定方向配置不等于所有会话恢复问题已经解决。
 
 引导构建见[四代引导说明](boot/README.md)，其中分别介绍原厂 Android 基座打包和机身 Linux／诊断环境打包。四代使用 `tb322fc_android_defconfig` 启动器配置，不能直接套用五代的 DTB 和离线打包布局。
 

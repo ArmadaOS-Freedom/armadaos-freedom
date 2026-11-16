@@ -827,7 +827,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0141-drm-panel-add-nt36536-and-dsc-packet-support.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
   upstream: unknown
-  notes: Literal NT36536 panel plus an opt-in DSC packet flag and its host handling.
+  notes: NT36536 panel plus an opt-in DSC packet flag and its host handling. The local panel-orientation addition reads the DT rotation and exposes it through drm_panel get_orientation. A missing rotation retains the DRM helper's unknown-orientation result; Elden explicitly supplies 270 degrees.
 - `patches/0142-drm-msm-elden-dsc12-10bpc.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/6f97250ead155fc3b980856323e99a4623dae73d
   upstream: unknown
@@ -857,7 +857,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Extracts only the `cci0`, `cci1`, and `camss` nodes under `&soc` with one indentation normalization; it closes the labels the board DTS references and does not imply camera support.
 - `dts/sm8750-lenovo-elden.dts.patch`
   source: armada
-  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`.
+  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`. The panel node also reports rotation 270 for the fixed landscape-right startup profile.
 - `patches/0147-power-sequencing-qcom-wcn-add-wcn7861-pmu.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/blob/6f97250ead155fc3b980856323e99a4623dae73d/drivers/power/sequencing/pwrseq-qcom-wcn.c
   upstream: unknown
@@ -1170,7 +1170,20 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0228-drm-msm-dpu-qseed-v11-rotation-boundaries.patch`
   source: armada
   upstream: local
-  notes: Local Kaanapali and Elden QSEED3 V11 axis handling for inline 90/270-degree rotation. Computes phase step, initial phase, preload and fetch extension in post-rotation coordinates, records the physical extended source rectangle, and uses it for bandwidth and pixel-extension programming. Older scaler revisions keep the existing path; not submitted upstream.
+  notes: Local Kaanapali and Elden QSEED3 V11 axis handling for inline 90/270-degree rotation. Computes phase step, initial phase, preload and fetch extension in post-rotation coordinates, records the physical extended source rectangle, and uses it for bandwidth and pixel-extension programming. The source extent includes the pixel-extension fetch total. The entry guard accepts either quarter-turn representation; the normal hardware path already simplifies 270 degrees to 90 degrees plus reflection. Older scaler revisions retain the existing path.
+  validation: TB322FC fixed-right/270-degree 60 Hz scanout was checked with physical static-grid and dynamic-gears observations. The separate Steam restart half-panel flicker remains unresolved; this stack does not claim lifecycle or sensor-rotation acceptance.
+- `patches/0229-drm-msm-dpu-program-source-split-order.patch`
+  source: armada
+  upstream: local
+  notes: Programs and clears the DPU 12 source-split order bit from the final destination adjacency. Covers both pipes of a split plane and adjacent virtual planes; solid fill and disable clear stale state. Other DPU revisions retain their existing path.
+- `patches/0230-drm-msm-dpu-elden-candidate-performance.patch`
+  source: armada
+  upstream: local
+  notes: Computes Elden bandwidth from pending plane geometry and mode, with post-rotation scan width and fractional downscale arithmetic. Candidate CRTC votes are checked without reusing stale committed fetch fields. The bandwidth limit and interconnect voting policy are unchanged; paired with 0232 below.
+- `patches/0232-drm-msm-dpu-elden-final-atomic-bandwidth.patch`
+  source: armada
+  upstream: local
+  notes: Moves Elden's aggregate bandwidth check after every CRTC/plane helper has prepared its candidate resources. Locks untouched CRTC states through the transaction acquire context and propagates -EDEADLK for normal retries. Real C host checks cover multi-CRTC callback order, stale-state rejection, pending disables, the exact bandwidth boundary and lock retry.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local

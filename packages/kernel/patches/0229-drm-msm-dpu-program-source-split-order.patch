@@ -1,0 +1,181 @@
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
+index 7dc5e98..8fd1bb4 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
+@@ -84,6 +84,7 @@
+ #define MDSS_MDP_OP_IGC_ROM_1              BIT(18)
+ #define MDSS_MDP_OP_IGC_ROM_0              BIT(17)
+ #define MDSS_MDP_OP_IGC_EN                 BIT(16)
++#define MDSS_MDP_OP_SPLIT_ORDER            BIT(4)
+ #define MDSS_MDP_OP_FLIP_UD                BIT(14)
+ #define MDSS_MDP_OP_FLIP_LR                BIT(13)
+ #define MDSS_MDP_OP_ROT_90                 BIT(15)
+@@ -157,6 +158,29 @@ static void dpu_hw_sspp_setup_multirect(struct dpu_sw_pipe *pipe)
+ 	dpu_hw_setup_multirect_impl(pipe, ctx, SSPP_MULTIRECT_OPMODE);
+ }
+ 
++static void dpu_hw_sspp_setup_src_split_order(struct dpu_sw_pipe *pipe,
++					      bool enable)
++{
++	struct dpu_hw_sspp *ctx = pipe->sspp;
++	u32 opmode, op_mode_off;
++
++	if (!ctx)
++		return;
++
++	if (pipe->multirect_index == DPU_SSPP_RECT_SOLO ||
++	    pipe->multirect_index == DPU_SSPP_RECT_0)
++		op_mode_off = SSPP_SRC_OP_MODE;
++	else
++		op_mode_off = SSPP_SRC_OP_MODE_REC1;
++
++	opmode = DPU_REG_READ(&ctx->hw, op_mode_off);
++	if (enable)
++		opmode |= MDSS_MDP_OP_SPLIT_ORDER;
++	else
++		opmode &= ~MDSS_MDP_OP_SPLIT_ORDER;
++	DPU_REG_WRITE(&ctx->hw, op_mode_off, opmode);
++}
++
+ void dpu_hw_setup_multirect_impl(struct dpu_sw_pipe *pipe,
+ 				 struct dpu_hw_sspp *ctx, u32 op_mode_off)
+ {
+@@ -659,6 +683,9 @@ static void _setup_layer_ops(struct dpu_hw_sspp *c,
+ 		test_bit(DPU_SSPP_SMART_DMA_V2, &c->cap->features))
+ 		c->ops.setup_multirect = dpu_hw_sspp_setup_multirect;
+ 
++	if (mdss_rev->core_major_ver == 12)
++		c->ops.setup_src_split_order = dpu_hw_sspp_setup_src_split_order;
++
+ 	if (test_bit(DPU_SSPP_SCALER_QSEED3_COMPATIBLE, &features))
+ 		c->ops.setup_scaler = dpu_hw_sspp_setup_scaler3;
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+index 4e092e4..4b3f403 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+@@ -150,6 +150,8 @@ struct dpu_hw_pixel_ext {
+  *             such as decimation, flip etc to program this field
+  * @dst_rect: destination ROI.
+  * @rotation: simplified drm rotation hint
++ * @is_right_pipe: true when this configuration is the right half of a
++ *                 source split and must advertise split order to the SSPP
+  * @mixer_x: global horizontal destination origin of the mixer this pipe
+  *           drives. Used to translate the per-pipe dst_rect back to global
+  *           destination coordinates when computing QSEED3 V11 axes.
+@@ -166,6 +168,7 @@ struct dpu_sw_pipe_cfg {
+ 	struct drm_rect src_rect;
+ 	struct drm_rect dst_rect;
+ 	unsigned int rotation;
++	bool is_right_pipe;
+ 	int mixer_x;
+ 	bool qseed3_v11_valid;
+ 	struct dpu_qseed3_axis qseed3_v11[2];
+@@ -255,6 +258,13 @@ struct dpu_hw_sspp_ops {
+ 
+ 	void (*setup_multirect)(struct dpu_sw_pipe *pipe);
+ 
++	/**
++	 * @setup_src_split_order: configure left/right source split order
++	 * @pipe: Pointer to software pipe context
++	 * @enable: true for the right pipe in a source split pair
++	 */
++	void (*setup_src_split_order)(struct dpu_sw_pipe *pipe, bool enable);
++
+ 	/**
+ 	 * @setup_sharpening: setup sharpening
+ 	 * @ctx: Pointer to pipe context
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index f681512..4f665f2 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -644,6 +644,9 @@ static void _dpu_plane_color_fill_pipe(struct dpu_plane_state *pstate,
+ {
+ 	struct dpu_sw_pipe_cfg pipe_cfg = {};
+ 
++	if (pipe->sspp->ops.setup_src_split_order)
++		pipe->sspp->ops.setup_src_split_order(pipe, false);
++
+ 	/* update sspp */
+ 	if (!pipe->sspp->ops.setup_solidfill)
+ 		return;
+@@ -1054,6 +1057,23 @@ static u32 dpu_plane_get_max_linewidth(const struct dpu_plane *pdpu,
+ 	return catalog->caps->max_linewidth;
+ }
+ 
++static void dpu_plane_set_src_split_order(struct dpu_sw_pipe_cfg *pipe_cfg,
++					  struct dpu_sw_pipe_cfg *peer_cfg)
++{
++	pipe_cfg->is_right_pipe = false;
++	peer_cfg->is_right_pipe = false;
++
++	if (pipe_cfg->dst_rect.y1 != peer_cfg->dst_rect.y1 ||
++	    drm_rect_height(&pipe_cfg->dst_rect) !=
++	    drm_rect_height(&peer_cfg->dst_rect))
++		return;
++
++	if (pipe_cfg->dst_rect.x2 == peer_cfg->dst_rect.x1)
++		peer_cfg->is_right_pipe = true;
++	else if (peer_cfg->dst_rect.x2 == pipe_cfg->dst_rect.x1)
++		pipe_cfg->is_right_pipe = true;
++}
++
+ static int dpu_plane_split(struct drm_plane *plane,
+ 			   struct drm_plane_state *new_plane_state,
+ 			   const struct drm_crtc_state *crtc_state)
+@@ -1104,6 +1124,7 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 		r_pipe_cfg = &pstate->pipe_cfg[cfg_idx + 1];
+ 		/* The split calculation below uses already-rotated rectangles. */
+ 		pipe_cfg->rotation = DRM_MODE_ROTATE_0;
++		pipe_cfg->is_right_pipe = false;
+ 		pipe_cfg->mixer_x = mixer_rect.x1;
+ 		pipe_cfg->qseed3_v11_valid = false;
+ 
+@@ -1153,6 +1174,7 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 			pipe_cfg->dst_rect.x2 = (pipe_cfg->dst_rect.x1 + pipe_cfg->dst_rect.x2) >> 1;
+ 			r_pipe_cfg->src_rect.x1 = pipe_cfg->src_rect.x2;
+ 			r_pipe_cfg->dst_rect.x1 = pipe_cfg->dst_rect.x2;
++			dpu_plane_set_src_split_order(pipe_cfg, r_pipe_cfg);
+ 			DPU_DEBUG_PLANE(pdpu, "Split wide plane into:"
+ 					DRM_RECT_FMT " and " DRM_RECT_FMT "\n",
+ 					DRM_RECT_ARG(&pipe_cfg->src_rect),
+@@ -1510,6 +1532,18 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
+ 	reqs.luts = dpu_plane_get_luts(state, plane_state, &igc, &lut3d);
+ 
+ 	for (i = 0; i < STAGES_PER_PLANE; i++) {
++		if (prev_adjacent_pstate[i] &&
++		    dpu_plane_get_single_pipe_in_stage(pstate, &pipe, &pipe_cfg, i)) {
++			struct dpu_sw_pipe *prev_pipe;
++			struct dpu_sw_pipe_cfg *prev_pipe_cfg;
++
++			if (dpu_plane_get_single_pipe_in_stage(prev_adjacent_pstate[i],
++							       &prev_pipe,
++							       &prev_pipe_cfg, i))
++				dpu_plane_set_src_split_order(pipe_cfg,
++							      prev_pipe_cfg);
++		}
++
+ 		if (prev_adjacent_pstate[i] && !reqs.luts &&
+ 		    dpu_plane_try_multirect_shared(pstate, prev_adjacent_pstate[i], fmt,
+ 						   dpu_kms->catalog->caps->max_linewidth,
+@@ -1716,6 +1750,10 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
+ 				pipe_cfg);
+ 	}
+ 
++	if (pipe->sspp->ops.setup_src_split_order)
++		pipe->sspp->ops.setup_src_split_order(pipe,
++				pipe_cfg->is_right_pipe);
++
+ 	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg);
+ 
+ 	if (pipe->sspp->ops.setup_multirect)
+@@ -1841,6 +1879,9 @@ static void _dpu_plane_atomic_disable(struct drm_plane *plane)
+ 		trace_dpu_plane_disable(DRMID(plane), false,
+ 					pstate->pipe[i].multirect_mode);
+ 
++		if (pipe->sspp->ops.setup_src_split_order)
++			pipe->sspp->ops.setup_src_split_order(pipe, false);
++
+ 		if (i % PIPES_PER_STAGE == 0)
+ 			continue;
+ 

@@ -6,13 +6,18 @@ clipping are taken from the kernel under test, not reimplemented here.
 Generated fixture files are written below --work.
 """
 import argparse
+import hashlib
+import json
+import os
 import pathlib
+import shlex
 import subprocess
 import sys
 
 def function(text, name):
     import re
-    match = re.search(r"^(?:static\s+)?(?:inline\s+)?(?:bool|u32|u64|int|void|uint32_t)\s+" +
+    match = re.search(r"^(?:static\s+)?(?:inline\s+)?"
+                      r"(?:bool|s32|s64|u32|u64|int|void|uint32_t)\s+" +
                       re.escape(name) + r"\s*\(", text, re.M)
     if not match:
         raise ValueError("missing function: " + name)
@@ -27,6 +32,13 @@ def function(text, name):
         i += 1
     return text[match.start():i]
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 PREFIX = r"""
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,6 +49,8 @@ PREFIX = r"""
 #include <errno.h>
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int32_t s32;
+typedef int64_t s64;
 #define BIT(n) (1UL << (n))
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -44,6 +58,9 @@ typedef uint64_t u64;
 #define DIV_ROUND_UP_ULL(a,b) (((a)+(b)-1)/(b))
 #define DIV_ROUND_DOWN_ULL(a,b) ((a)/(b))
 #define mul_u32_u32(a,b) ((u64)(u32)(a)*(u32)(b))
+#define swap(a,b) do { typeof(a) __tmp=(a); (a)=(b); (b)=__tmp; } while (0)
+static u64 __attribute__((unused)) div_u64(u64 dividend, u32 divisor)
+{ return dividend / divisor; }
 #define DRM_MODE_ROTATE_0 BIT(0)
 #define DRM_MODE_ROTATE_90 BIT(1)
 #define DRM_MODE_ROTATE_180 BIT(2)
@@ -70,36 +87,69 @@ static bool drm_rotation_90_or_270(unsigned int r)
 { return r & (DRM_MODE_ROTATE_90 | DRM_MODE_ROTATE_270); }
 static void drm_rect_fp_to_int(struct drm_rect *d, const struct drm_rect *s)
 { *d=(struct drm_rect){s->x1>>16,s->y1>>16,s->x2>>16,s->y2>>16}; }
-struct drm_framebuffer { int width, height; };
+struct msm_format;
+struct drm_framebuffer { int width, height; const struct msm_format *fmt; };
 struct drm_plane { int unused; };
 struct drm_plane_state {
  struct drm_rect src, dst;
  struct drm_framebuffer *fb;
+ struct drm_plane *plane;
  unsigned int rotation;
+ bool visible;
 };
-struct drm_display_mode { int hdisplay, vdisplay, vtotal, fps; };
+struct drm_display_mode {
+ int hdisplay, vdisplay, vtotal, vsync_start, vsync_end, fps;
+};
 static int drm_mode_vrefresh(const struct drm_display_mode *m) { return m->fps; }
 #define do_div(n,d) ((n)/=(d))
+static u64 mult_frac(u64 x, u32 numerator, u32 denominator)
+{ return x * numerator / denominator; }
 struct drm_crtc_state { struct drm_display_mode adjusted_mode; unsigned int num_lm; };
-struct dpu_sw_pipe_cfg { struct drm_rect src_rect, dst_rect; unsigned int rotation; int mixer_x; bool qseed3_v11_valid; };
+struct dpu_qseed3_axis {
+ u32 phase_step, init_phase, preload, src_size;
+ s32 fetch_before, fetch_after;
+};
+struct dpu_sw_pipe_cfg {
+ struct drm_rect src_rect, src_ext_rect, dst_rect;
+ unsigned int rotation;
+ bool is_right_pipe;
+ int mixer_x;
+ bool qseed3_v11_valid;
+ struct dpu_qseed3_axis qseed3_v11[2];
+};
 struct dpu_plane_state {
  struct drm_plane_state base;
  struct dpu_sw_pipe_cfg pipe_cfg[PIPES_PER_PLANE];
+ u64 plane_fetch_bw, plane_clk;
 };
 struct dpu_rotation_cfg {
  u32 rot_maxheight, rot_max_downscale_numerator, rot_max_downscale_denominator;
  size_t rot_num_formats;
  const u32 *rot_format_list;
 };
-struct dpu_sspp_sub_blks { const struct dpu_rotation_cfg *rotation_cfg; };
+struct dpu_sspp_sub_blks {
+ const struct dpu_rotation_cfg *rotation_cfg;
+ struct { u32 version; } scaler_blk;
+};
 struct dpu_sspp_cfg { int id; unsigned long features; const struct dpu_sspp_sub_blks *sblk; };
 struct dpu_caps { uint32_t max_linewidth; };
-struct dpu_mdss_cfg { const struct dpu_caps *caps; int sspp_count; const struct dpu_sspp_cfg *sspp; };
+struct dpu_perf_cfg { u32 min_prefill_lines; };
+struct dpu_mdss_cfg {
+ const struct dpu_caps *caps;
+ int sspp_count;
+ const struct dpu_sspp_cfg *sspp;
+ const struct dpu_perf_cfg *perf;
+};
 struct dpu_plane { struct drm_plane base; int pipe; const struct dpu_mdss_cfg *catalog; };
 struct dpu_kms { struct { u64 max_core_clk_rate; } perf; };
 struct dpu_hw_sspp { const struct dpu_sspp_cfg *cap; };
 struct dpu_sw_pipe { struct dpu_hw_sspp *sspp; };
-struct msm_format { bool is_yuv, ubwc; u32 pixel_format; };
+struct msm_format { bool is_yuv, ubwc; u32 pixel_format, bpp; };
+static bool fixture_elden = true;
+static bool of_machine_is_compatible(const char *name)
+{ return fixture_elden && !strcmp(name, "lenovo,elden"); }
+static const struct msm_format *msm_framebuffer_format(struct drm_framebuffer *fb)
+{ return fb->fmt; }
 static bool dpu_find_format(u32 fmt, const u32 *formats, size_t count)
 { for(size_t i=0;i<count;i++) if(formats[i]==fmt) return true; return false; }
 static struct dpu_kms kms = {{1000000000}};
@@ -121,15 +171,15 @@ static void split_case(unsigned int rotation, int height, bool virt,
                        bool support, int wanted_pipes, int wanted_error)
 {
  const struct dpu_rotation_cfg rot={.rot_maxheight=1088};
- const struct dpu_sspp_sub_blks sblk={&rot};
+ const struct dpu_sspp_sub_blks sblk={.rotation_cfg=&rot};
  const struct dpu_caps caps={8192};
  struct dpu_sspp_cfg cfg[]={
   {1, support ? BIT(DPU_SSPP_INLINE_ROTATION) : 0, &sblk},
   {2, 0, &sblk},
  };
- struct dpu_mdss_cfg cat={&caps,2,cfg};
+ struct dpu_mdss_cfg cat={.caps=&caps,.sspp_count=2,.sspp=cfg};
  struct dpu_plane plane={{0},1,&cat};
- struct drm_framebuffer fb={3040,height};
+ struct drm_framebuffer fb={.width=3040,.height=height};
  struct dpu_plane_state state={0};
  struct drm_crtc_state crtc={{.hdisplay=height,.vdisplay=3040},2};
  int rotated=drm_rotation_90_or_270(rotation);
@@ -140,9 +190,13 @@ static void split_case(unsigned int rotation, int height, bool virt,
  state.base.rotation=rotation;
  state.base.src=(struct drm_rect){0,0,3040<<16,height<<16};
  state.base.dst=(struct drm_rect){0,0,crtc.adjusted_mode.hdisplay,crtc.adjusted_mode.vdisplay};
+#ifdef HAS_SRC_SPLIT_ORDER
  /* An old rotated state must not poison a later unrotated allocation. */
  state.pipe_cfg[0].rotation=DRM_MODE_ROTATE_90;
  state.pipe_cfg[1].rotation=DRM_MODE_ROTATE_90;
+ state.pipe_cfg[0].is_right_pipe=true;
+ state.pipe_cfg[1].is_right_pipe=true;
+#endif
  dpu_use_virtual_planes=virt;
  rc=dpu_plane_split(&plane.base,&state.base,&crtc);
  if (rc!=wanted_error) {
@@ -154,6 +208,9 @@ static void split_case(unsigned int rotation, int height, bool virt,
  n=!!drm_rect_width(&state.pipe_cfg[0].src_rect)+
    !!drm_rect_width(&state.pipe_cfg[1].src_rect);
  CHECK(n==wanted_pipes);
+#ifdef HAS_SRC_SPLIT_ORDER
+ if(n) CHECK(!state.pipe_cfg[0].is_right_pipe);
+#endif
  for(int i=0;i<n;i++) {
   struct dpu_sw_pipe_cfg *p=&state.pipe_cfg[i];
   struct drm_rect transformed=p->src_rect;
@@ -167,6 +224,9 @@ static void split_case(unsigned int rotation, int height, bool virt,
  }
  CHECK(total_area==3040*height);
  if(n==2) {
+#ifdef HAS_SRC_SPLIT_ORDER
+  CHECK(state.pipe_cfg[1].is_right_pipe);
+#endif
   CHECK(state.pipe_cfg[0].dst_rect.x2==state.pipe_cfg[1].dst_rect.x1);
   CHECK(state.pipe_cfg[0].dst_rect.x1==0);
   CHECK(state.pipe_cfg[1].dst_rect.x2==crtc.adjusted_mode.hdisplay);
@@ -175,25 +235,43 @@ static void split_case(unsigned int rotation, int height, bool virt,
 
 static void multirect_case(unsigned int rotation, bool expected)
 {
- struct dpu_sw_pipe_cfg cfg={{0,0,512,512},{0,0,512,512},rotation,0,false};
+ struct dpu_sw_pipe_cfg cfg={
+  .src_rect={0,0,512,512},
+  .dst_rect={0,0,512,512},
+  .rotation=rotation,
+ };
  struct msm_format fmt={.is_yuv=false};
  cases++;
  CHECK(!!dpu_plane_is_multirect_capable(NULL,&cfg,&fmt)==expected);
 }
+
+#ifdef HAS_SRC_SPLIT_ORDER
+static void src_split_case(struct drm_rect first, struct drm_rect second,
+                           bool first_right, bool second_right)
+{
+ struct dpu_sw_pipe_cfg first_cfg={.dst_rect=first,.is_right_pipe=!first_right};
+ struct dpu_sw_pipe_cfg second_cfg={.dst_rect=second,.is_right_pipe=!second_right};
+
+ cases++;
+ dpu_plane_set_src_split_order(&first_cfg,&second_cfg);
+ CHECK(first_cfg.is_right_pipe==first_right);
+ CHECK(second_cfg.is_right_pipe==second_right);
+}
+#endif
 
 static void inline_case(int width, int height, int dest_height, bool limited,
                         bool ubwc, u32 format, int expected)
 {
  const u32 formats[]={1,2};
  const struct dpu_rotation_cfg rot={1088,limited?11:0,limited?5:0,2,formats};
- const struct dpu_sspp_sub_blks sblk={&rot};
+ const struct dpu_sspp_sub_blks sblk={.rotation_cfg=&rot};
  const struct dpu_sspp_cfg caps={1,BIT(DPU_SSPP_INLINE_ROTATION),&sblk};
  struct dpu_hw_sspp sspp={&caps};
  struct dpu_sw_pipe pipe={&sspp};
  struct dpu_plane plane={0};
  struct drm_rect src={0,0,width,height};
  struct drm_rect dst={0,0,height,dest_height};
- struct msm_format fmt={false,ubwc,format};
+ struct msm_format fmt={.is_yuv=false,.ubwc=ubwc,.pixel_format=format};
  cases++;
 #ifdef HAS_ROTATION_DOWNSCALE_LIMIT
  CHECK(dpu_plane_check_inline_rotation(&plane,&pipe,src,dst,&fmt)==expected);
@@ -203,13 +281,226 @@ static void inline_case(int width, int height, int dest_height, bool limited,
 #endif
 }
 
+#ifdef HAS_QSEED_V11
+static void qseed_src_size_case(u32 full_src, u32 full_dst, u32 src_start,
+                                u32 src_len, u32 dst_start, u32 dst_len,
+                                u32 support, u32 preload,
+                                s32 expected_before, s32 expected_after,
+                                u32 expected_src_size)
+{
+ struct dpu_qseed3_axis axis={0};
+ cases++;
+ CHECK(dpu_qseed3_v11_axis(full_src,full_dst,src_start,src_len,
+                           dst_start,dst_len,support,preload,&axis)==0);
+ CHECK(axis.fetch_before==expected_before);
+ CHECK(axis.fetch_after==expected_after);
+ CHECK(axis.src_size==expected_src_size);
+}
+#endif
+
+#ifdef HAS_QSEED_V11
+/* Exercise the actual catalog/rotation entry guard, not only the axis helper. */
+static void qseed_guard_case(unsigned int rotation, u32 scaler_version,
+                              bool elden, bool yuv, bool expected)
+{
+ const struct dpu_rotation_cfg rot={.rot_maxheight=1088};
+ const struct dpu_sspp_sub_blks sblk={
+  .rotation_cfg=&rot,.scaler_blk={.version=scaler_version},
+ };
+ const struct dpu_sspp_cfg caps={.sblk=&sblk};
+ struct dpu_hw_sspp sspp={.cap=&caps};
+ struct dpu_sw_pipe pipe={.sspp=&sspp};
+ struct drm_framebuffer fb={.width=3040,.height=952};
+ struct drm_plane_state state={
+  .src={0,0,3040<<16,952<<16},.dst={0,0,952,3040},
+  .fb=&fb,.rotation=rotation,
+ };
+ struct dpu_sw_pipe_cfg cfg={
+  .src_rect={0,0,3040,952},.dst_rect={0,0,952,3040},
+  .rotation=rotation,.qseed3_v11_valid=true,
+ };
+ const struct msm_format fmt={.is_yuv=yuv,.bpp=4};
+ int rc;
+ cases++;
+ fixture_elden=elden;
+ rc=dpu_plane_check_qseed3_v11(&pipe,&cfg,&state,&fmt);
+ CHECK(rc==0);
+ CHECK(cfg.qseed3_v11_valid==expected);
+ if (expected) {
+  CHECK(drm_rect_width(&cfg.src_ext_rect)==3040);
+  CHECK(drm_rect_height(&cfg.src_ext_rect)==952);
+  CHECK(cfg.qseed3_v11[0].src_size==952);
+  CHECK(cfg.qseed3_v11[1].src_size==3040);
+ }
+ fixture_elden=true;
+}
+#endif
+
 static void clock_case(unsigned int rotation, int src_w, int src_h,
                        int dst_w, int dst_h, u64 expected)
 {
  struct drm_display_mode mode={.vtotal=3120,.fps=165};
- struct dpu_sw_pipe_cfg cfg={{0,0,src_w,src_h},{0,0,dst_w,dst_h},rotation,0,false};
+ struct dpu_sw_pipe_cfg cfg={
+  .src_rect={0,0,src_w,src_h},
+  .dst_rect={0,0,dst_w,dst_h},
+  .rotation=rotation,
+ };
  cases++;
  CHECK(_dpu_plane_calc_clk(&mode,&cfg)==expected);
+}
+
+static void bandwidth_case(bool elden, unsigned int rotation,
+                           int src_w, int src_h, int dst_w, int dst_h,
+                           int fps, bool ubwc, u64 expected)
+{
+ const struct dpu_perf_cfg perf={.min_prefill_lines=35};
+ const struct dpu_mdss_cfg cat={.perf=&perf};
+ const struct drm_display_mode mode={
+  .vdisplay=dst_h,
+  .vtotal=3120,
+  .vsync_start=dst_h+26,
+  .vsync_end=dst_h+30,
+  .fps=fps,
+ };
+ const struct dpu_sw_pipe_cfg cfg={
+  .src_rect={0,0,src_w,src_h},
+  .dst_rect={0,0,dst_w,dst_h},
+  .rotation=rotation,
+ };
+ const struct msm_format fmt={.ubwc=ubwc,.bpp=4};
+ u64 actual;
+
+ cases++;
+ fixture_elden=elden;
+ actual=_dpu_plane_calc_bw(&cat,&fmt,&mode,&cfg);
+ if (actual!=expected)
+  fprintf(stderr,"bandwidth elden=%d rotation=%u ubwc=%d fps=%d: %llu != %llu\n",
+          elden,rotation,ubwc,fps,(unsigned long long)actual,
+          (unsigned long long)expected);
+ CHECK(actual==expected);
+ fixture_elden=true;
+}
+
+static void candidate_case(void)
+{
+ const struct dpu_perf_cfg perf={.min_prefill_lines=35};
+ const struct dpu_mdss_cfg cat={.perf=&perf};
+ struct dpu_plane plane={{0},1,&cat};
+ const struct msm_format fmt={.bpp=4};
+ struct drm_framebuffer fb={.fmt=&fmt};
+ const struct drm_display_mode mode={
+  .vdisplay=3040,
+  .vtotal=3120,
+  .vsync_start=3066,
+  .vsync_end=3070,
+  .fps=165,
+ };
+ struct dpu_plane_state state={0};
+ u64 bw,clk;
+ const struct dpu_sw_pipe_cfg left={
+  .src_rect={0,0,3040,952},
+  .dst_rect={0,0,952,3040},
+  .rotation=DRM_MODE_ROTATE_90,
+ };
+ const struct dpu_sw_pipe_cfg right={
+  .src_rect={0,952,3040,1904},
+  .dst_rect={952,0,1904,3040},
+  .rotation=DRM_MODE_ROTATE_90,
+  .is_right_pipe=true,
+ };
+
+ state.base.fb=&fb;
+ state.base.plane=&plane.base;
+ state.base.visible=true;
+ state.base.rotation=DRM_MODE_ROTATE_90;
+ state.pipe_cfg[0]=left;
+ state.pipe_cfg[1]=right;
+ state.plane_fetch_bw=1;
+ state.plane_clk=2;
+ cases++;
+ dpu_plane_calc_perf(&state.base,&mode,&bw,&clk);
+ CHECK(bw==3920716800ULL);
+ CHECK(clk==490089600);
+ /* Candidate calculation must not write the committed cache fields. */
+ CHECK(state.plane_fetch_bw==1);
+ CHECK(state.plane_clk==2);
+
+ state.base.visible=false;
+ dpu_plane_calc_perf(&state.base,&mode,&bw,&clk);
+ CHECK(bw==0);
+ CHECK(clk==0);
+}
+
+static void plane_matrix_case(int fps, int layers, bool ubwc,
+                              unsigned int rotation, u64 expected_per_layer,
+                              u64 expected_clk)
+{
+ const struct dpu_perf_cfg perf={.min_prefill_lines=35};
+ const struct dpu_mdss_cfg cat={.perf=&perf};
+ struct dpu_plane planes[2]={0};
+ const struct msm_format fmt={.ubwc=ubwc,.bpp=4};
+ struct drm_framebuffer fb={.fmt=&fmt};
+ const struct drm_display_mode mode={
+  .hdisplay=1904,
+  .vdisplay=3040,
+  .vtotal=3120,
+  .vsync_start=3066,
+  .vsync_end=3070,
+  .fps=fps,
+ };
+ const struct dpu_sw_pipe_cfg left={
+  .src_rect={0,0,3040,952},
+  .dst_rect={0,0,952,3040},
+  .rotation=rotation,
+ };
+ const struct dpu_sw_pipe_cfg right={
+  .src_rect={0,952,3040,1904},
+  .dst_rect={952,0,1904,3040},
+  .rotation=rotation,
+  .is_right_pipe=true,
+ };
+ struct dpu_plane_state states[2]={0};
+ u64 total=0;
+
+ for(int layer=0;layer<layers;layer++) {
+  u64 bw,clk;
+  planes[layer].catalog=&cat;
+  states[layer].base.fb=&fb;
+  states[layer].base.plane=&planes[layer].base;
+  states[layer].base.visible=true;
+  states[layer].base.rotation=rotation;
+  states[layer].pipe_cfg[0]=left;
+  states[layer].pipe_cfg[1]=right;
+  cases++;
+  dpu_plane_calc_perf(&states[layer].base,&mode,&bw,&clk);
+  CHECK(bw==expected_per_layer);
+  CHECK(clk==expected_clk);
+  total+=bw;
+ }
+ CHECK(total==expected_per_layer*(u64)layers);
+}
+
+static void no_fb_case(void)
+{
+ const struct dpu_perf_cfg perf={.min_prefill_lines=35};
+ const struct dpu_mdss_cfg cat={.perf=&perf};
+ struct dpu_plane plane={{0},1,&cat};
+ const struct dpu_sw_pipe_cfg pipe={
+  .src_rect={0,0,3040,952},
+  .dst_rect={0,0,952,3040},
+  .rotation=DRM_MODE_ROTATE_90,
+ };
+ struct dpu_plane_state state={0};
+ const struct drm_display_mode mode={.vdisplay=3040,.vtotal=3120,.fps=165};
+ u64 bw=1,clk=1;
+
+ state.base.plane=&plane.base;
+ state.base.visible=true;
+ state.pipe_cfg[0]=pipe;
+ cases++;
+ dpu_plane_calc_perf(&state.base,&mode,&bw,&clk);
+ CHECK(bw==0);
+ CHECK(clk==0);
 }
 
 int main(void)
@@ -217,6 +508,9 @@ int main(void)
  unsigned int turns[]={DRM_MODE_ROTATE_90,DRM_MODE_ROTATE_270,
                        DRM_MODE_ROTATE_90|DRM_MODE_REFLECT_X,
                        DRM_MODE_ROTATE_270|DRM_MODE_REFLECT_Y};
+ int matrix_fps[]={60,90,120,165};
+ u64 matrix_bw[]={1425715200ULL,2138572800ULL,2851430400ULL,3920716800ULL};
+ u64 matrix_clk[]={178214400ULL,267321600ULL,356428800ULL,490089600ULL};
  for(unsigned int i=0;i<ARRAY_SIZE(turns);i++) {
   split_case(turns[i],1904,true,true,2,0);
   split_case(turns[i],1088,true,true,1,0);
@@ -235,6 +529,18 @@ int main(void)
  multirect_case(DRM_MODE_ROTATE_90,false);
  multirect_case(DRM_MODE_ROTATE_270,false);
  multirect_case(DRM_MODE_ROTATE_270|DRM_MODE_REFLECT_X,false);
+#ifdef HAS_SRC_SPLIT_ORDER
+ src_split_case((struct drm_rect){0,0,100,100},
+                (struct drm_rect){100,0,200,100},false,true);
+ src_split_case((struct drm_rect){100,0,200,100},
+                (struct drm_rect){0,0,100,100},true,false);
+ src_split_case((struct drm_rect){0,0,100,100},
+                (struct drm_rect){110,0,210,100},false,false);
+ src_split_case((struct drm_rect){0,0,100,100},
+                (struct drm_rect){0,100,100,200},false,false);
+ src_split_case((struct drm_rect){0,0,100,100},
+                (struct drm_rect){100,0,200,90},false,false);
+#endif
  inline_case(2200,952,1000,true,true,1,0);
  inline_case(2201,952,1000,true,true,1,-ERANGE);
  inline_case(4000,952,1000,true,true,1,-ERANGE);
@@ -244,11 +550,52 @@ int main(void)
  inline_case(3040,1089,3040,true,true,1,-EINVAL);
  inline_case(3040,952,3040,true,false,1,-EINVAL);
  inline_case(3040,952,3040,true,true,3,-EINVAL);
+#ifdef HAS_QSEED_V11
+ qseed_guard_case(DRM_MODE_ROTATE_270,0x30004,true,false,true);
+ qseed_guard_case(DRM_MODE_ROTATE_90,0x30004,true,false,true);
+ qseed_guard_case(DRM_MODE_ROTATE_0,0x30004,true,false,false);
+ qseed_guard_case(DRM_MODE_ROTATE_270,0x30004,false,false,false);
+ qseed_guard_case(DRM_MODE_ROTATE_270,0x30005,false,false,true);
+ qseed_guard_case(DRM_MODE_ROTATE_270,0x30004,true,true,false);
+ /* QSEED source size includes the fetch extension seen by PE request. */
+ qseed_src_size_case(1904,1904,0,952,0,952,5,12,0,6,958);
+ qseed_src_size_case(1904,1904,952,952,952,952,5,12,5,0,957);
+ qseed_src_size_case(1080,1904,0,540,0,952,5,12,0,6,546);
+ qseed_src_size_case(1080,1904,540,540,952,952,5,12,6,0,546);
+ qseed_src_size_case(3040,3040,0,3040,0,3040,1,4,0,0,3040);
+#endif
  clock_case(DRM_MODE_ROTATE_90,3040,952,952,3040,490089600);
  clock_case(DRM_MODE_ROTATE_270,3040,952,952,1520,980179200);
  clock_case(DRM_MODE_ROTATE_0,952,3040,952,1520,980179200);
  clock_case(DRM_MODE_ROTATE_180,952,3040,952,3040,490089600);
  clock_case(DRM_MODE_ROTATE_90,1520,952,952,3040,490089600);
+ /* Elden charges rotated planes by post-rotation scan width. */
+ bandwidth_case(true,DRM_MODE_ROTATE_90,3040,952,952,3040,165,false,
+                1960358400ULL);
+ bandwidth_case(true,DRM_MODE_ROTATE_270,3040,952,952,3040,165,true,
+                1960358400ULL);
+ bandwidth_case(true,DRM_MODE_ROTATE_0,3040,952,3040,952,165,false,
+                6259968000ULL);
+ bandwidth_case(true,DRM_MODE_ROTATE_180,3040,952,3040,952,165,true,
+                6259968000ULL);
+ bandwidth_case(true,DRM_MODE_ROTATE_90,3040,952,760,1000,165,false,
+                5959489536ULL);
+ /* Other machines keep the established pre-rotation formula. */
+ bandwidth_case(false,DRM_MODE_ROTATE_90,3040,952,952,3040,165,false,
+                6259968000ULL);
+ for(unsigned int fps_index=0;fps_index<ARRAY_SIZE(matrix_fps);fps_index++) {
+  for(int layers=1;layers<=2;layers++) {
+  for(unsigned int rotation_index=0;rotation_index<2;rotation_index++) {
+   unsigned int rotation=rotation_index ?
+    DRM_MODE_ROTATE_270 : DRM_MODE_ROTATE_90;
+   for(int ubwc=0;ubwc<=1;ubwc++)
+    plane_matrix_case(matrix_fps[fps_index],layers,!!ubwc,rotation,
+                      matrix_bw[fps_index],matrix_clk[fps_index]);
+  }
+  }
+ }
+ candidate_case();
+ no_fb_case();
  printf("%d cases, %d failed assertions\n",cases,failures);
  return failures ? 1 : 0;
 }
@@ -258,12 +605,22 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("source", type=pathlib.Path)
     p.add_argument("--work", required=True, type=pathlib.Path)
+    p.add_argument("--cc", default=os.environ.get("CC", "gcc"),
+                   help="compiler command, for example: zig.exe cc")
     a = p.parse_args()
     a.work.mkdir(parents=True, exist_ok=True)
-    plane = (a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c").read_text()
-    rect = (a.source/"drivers/gpu/drm/drm_rect.c").read_text()
+    plane = (a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c").read_text(encoding="utf-8")
+    qseed_path = a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_hw_qseed3_v11.h"
+    rect = (a.source/"drivers/gpu/drm/drm_rect.c").read_text(encoding="utf-8")
     parts = [PREFIX]
+    if qseed_path.exists():
+        qseed = qseed_path.read_text(encoding="utf-8")
+        parts.append("#define HAS_QSEED_V11 1")
+        parts.append(function(qseed,"dpu_qseed3_min64"))
+        parts.append(function(qseed,"dpu_qseed3_v11_axis"))
+    parts.append(function(plane,"_dpu_plane_calc_bw"))
     parts.append(function(plane,"_dpu_plane_calc_clk"))
+    parts.append(function(plane,"dpu_plane_calc_perf"))
     if "rot_max_downscale_numerator" in plane:
         parts.append("#define HAS_ROTATION_DOWNSCALE_LIMIT 1")
     parts.append(function(plane,"dpu_plane_check_inline_rotation"))
@@ -272,15 +629,60 @@ def main():
         parts.append(function(rect,n))
     if "static u32 dpu_plane_get_max_linewidth(" in plane:
         parts.append(function(plane,"dpu_plane_get_max_linewidth"))
+    if qseed_path.exists():
+        parts.append(function(plane,"dpu_plane_check_qseed3_v11"))
+    if "dpu_plane_set_src_split_order(" in plane:
+        parts.append("#define HAS_SRC_SPLIT_ORDER 1")
+        parts.append(function(plane,"dpu_plane_set_src_split_order"))
     for n in ("dpu_plane_split", "dpu_plane_is_multirect_capable"):
         parts.append(function(plane,n))
     parts.append(TESTS)
     src=a.work/"rotation_fixture.c"
-    exe=a.work/"rotation_fixture"
+    exe=a.work/("rotation_fixture.exe" if os.name=="nt" else "rotation_fixture")
     src.write_text("\n\n".join(parts))
-    subprocess.run(["gcc","-std=gnu11","-Wall","-Wextra","-Werror","-Wno-sign-compare",
-                    "-O1","-g","-fsanitize=undefined,address",
-                    str(src),"-o",str(exe)],check=True)
+    compiler_flags = shlex.split(a.cc, posix=os.name != "nt") + [
+        "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+        "-Wno-sign-compare", "-O1", "-g",
+    ]
+    sanitize = os.environ.get("DPU_TEST_SANITIZE", "1") != "0"
+    if sanitize:
+        compiler_flags.append(
+            "-fsanitize=undefined" if os.name == "nt"
+            else "-fsanitize=undefined,address"
+        )
+    manifest = {
+        "compiler_argv": compiler_flags + [str(src), "-o", str(exe)],
+        "generated_source": str(src),
+        "generated_source_sha256": sha256(src),
+        "inputs": {
+            "plane": {
+                "path": str(a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c"),
+                "sha256": sha256(a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c"),
+            },
+            "drm_rect": {
+                "path": str(a.source/"drivers/gpu/drm/drm_rect.c"),
+                "sha256": sha256(a.source/"drivers/gpu/drm/drm_rect.c"),
+            },
+        },
+        "sanitizer": (
+            "undefined" if sanitize and os.name == "nt"
+            else "undefined,address" if sanitize
+            else "off"
+        ),
+        "test_runner": {
+            "path": str(pathlib.Path(__file__).resolve()),
+            "sha256": sha256(pathlib.Path(__file__).resolve()),
+        },
+    }
+    if qseed_path.exists():
+        manifest["inputs"]["qseed"] = {
+            "path": str(qseed_path),
+            "sha256": sha256(qseed_path),
+        }
+    (a.work/"run-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    subprocess.run(compiler_flags + [str(src), "-o", str(exe)], check=True)
     return subprocess.run([str(exe)]).returncode
 
 if __name__=="__main__":

@@ -2,14 +2,18 @@
 
 # Script copied from https://github.com/OpenGamingCollective/gamescope-session-steam/commit/55e541aa3adb80ee751220c886b9d133504f6e20
 
-# Baldur's panel profile is landscape-right. The launcher consumes ORIENTATION,
+# The Y700 panel profiles are landscape-right. The launcher consumes ORIENTATION,
 # not ARMADA_PANEL_ORIENTATION. Keep explicit overrides; later /etc and per-user
 # session files can still override this default. Gamescope associates and rotates
 # real SPI child inputs itself; the vendor virtual NVT input is handled by
 # 99-armada-tb323fu-virtual-touch.rules, so do not add the old libinput rotation
 # matrix here.
-if [[ "${ARMADA_DEVICE_ID:-}" == lenovo-tb323fu && -z "${ORIENTATION:-}" ]]; then
-    ORIENTATION="${ARMADA_PANEL_ORIENTATION:-right}"
+if [[ -z "${ORIENTATION:-}" ]]; then
+    case "${ARMADA_DEVICE_ID:-}" in
+        lenovo-tb322fc|lenovo-tb323fu)
+            ORIENTATION="${ARMADA_PANEL_ORIENTATION:-right}"
+            ;;
+    esac
 fi
 
 source /usr/lib/armada/storage-lib
