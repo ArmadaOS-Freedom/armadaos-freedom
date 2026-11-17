@@ -1,0 +1,131 @@
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index b2a01a4..4a152a0 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -3392,9 +3392,12 @@ paint_all( global_focus_t *pFocus, bool async )
+ 	// cannot push out the Steam overlay or the cursor. The mura plane is not reserved and yields
+ 	// when the frame is full.
+ 	const bool bHasExternalOverlay = externalOverlay && externalOverlay->opacity && cv_paint_external_overlay_plane;
+-	// An existing external overlay makes the transparent Steam placeholder redundant.
++	// A visible Armada overlay is a plane of its own, painted below the cursor.
++	const bool bHasArmadaOverlay = armadaOverlay && armadaOverlay->opacity;
++	// A visible external or Armada overlay already gives the compositor a plane of its own,
++	// so the transparent Steam placeholder is only needed when neither of them is up.
+ 	const bool bNeedsSteamOverlayPlaceholder = !GetBackend()->UsesVulkanSwapchain() &&
+-		GetBackend()->IsSessionBased() && !bHasExternalOverlay;
++		GetBackend()->IsSessionBased() && !bHasExternalOverlay && !bHasArmadaOverlay;
+ 	int nReservedLayers = 1; // cursor
+ 	if ( bHasExternalOverlay )
+ 		nReservedLayers++;
+@@ -3403,7 +3406,7 @@ paint_all( global_focus_t *pFocus, bool async )
+ 		nReservedLayers++;
+ 	if ( notification && notification->opacity )
+ 		nReservedLayers++;
+-	if ( armadaOverlay && armadaOverlay->opacity )
++	if ( bHasArmadaOverlay )
+ 		nReservedLayers++;
+ 
+ 	if ( w && !w->isSteamStreamingClient && cv_paint_override_redirect_plane )
+@@ -3501,7 +3504,7 @@ paint_all( global_focus_t *pFocus, bool async )
+ 	// Armada's virtual trackpads need a stable, non-interactive plane of their
+ 	// own.  Steam notification windows are transient and must not be allowed to
+ 	// replace this overlay while a game or the Steam UI is visible.
+-	if (armadaOverlay && armadaOverlay->opacity)
++	if (bHasArmadaOverlay)
+ 	{
+ 		paint_window(pFocus, armadaOverlay, armadaOverlay, &frameInfo, pFocus->cursor,
+ 			PaintWindowFlag::NoScale | PaintWindowFlag::NoFilter |
+diff --git a/tests/test_steam_overlay_placeholder.py b/tests/test_steam_overlay_placeholder.py
+index 45b28b4..4158741 100644
+--- a/tests/test_steam_overlay_placeholder.py
++++ b/tests/test_steam_overlay_placeholder.py
+@@ -3,6 +3,11 @@
+ Compile the extracted production blocks against drawing stubs, following the
+ existing refresh-handler test. This checks layer decisions, not DRM hardware.
+ TMPDIR selects the location of temporary C++ artifacts.
++
++Only the Steam overlay draw block is compiled, so ``painted`` counts real Steam
++menu paints and nothing else. The external HUD and Armada overlay are reserved
++by the first block but painted outside both extracted blocks, so these tests
++assert their reservation, not their drawing.
+ """
+ 
+ import os
+@@ -74,11 +79,13 @@ int painted = 0, touched = 0;
+ void paint_window(Focus *, Window *, Window *, FrameInfo_t *, void *, int) { ++painted; }
+ void update_touch_scaling(FrameInfo_t *) { ++touched; }
+ int main(int argc, char **argv) {
+-    assert(argc == 10);
++    assert(argc == 11);
+     int ext = std::atoi(argv[1]), steam = std::atoi(argv[2]);
+-    Window externalWindow{ext}, steamWindow{steam};
++    int armada = std::atoi(argv[10]);
++    Window externalWindow{ext}, steamWindow{steam}, armadaWindow{armada};
+     Window *externalOverlay = ext < 0 ? nullptr : &externalWindow;
+     Window *overlay = steam < 0 ? nullptr : &steamWindow;
++    Window *armadaOverlay = armada < 0 ? nullptr : &armadaWindow;
+     Window *notification = nullptr;
+     bool cv_paint_external_overlay_plane = std::atoi(argv[3]);
+     bool cv_paint_steam_overlay_plane = std::atoi(argv[4]);
+@@ -114,9 +121,9 @@ class OverlayPlaceholderTest(unittest.TestCase):
+ 
+     def check_scene(self, expected, ext=-1, steam=-1, external_enabled=1,
+                     steam_enabled=1, swapchain=0, session=1, texture=1,
+-                    layers=1, input_focused=0):
++                    layers=1, input_focused=0, armada=-1):
+         args = (ext, steam, external_enabled, steam_enabled, swapchain,
+-                session, texture, layers, input_focused)
++                session, texture, layers, input_focused, armada)
+         result = subprocess.run([str(self.binary), *map(str, args)],
+                                 check=True, capture_output=True, text=True)
+         self.assertEqual(tuple(map(int, result.stdout.split())), expected)
+@@ -157,6 +164,49 @@ class OverlayPlaceholderTest(unittest.TestCase):
+     def test_full_layer_array_does_not_overflow(self):
+         self.check_scene((2, 0, 0, 0), layers=8)
+ 
++    def test_visible_armada_overlay_replaces_the_placeholder(self):
++        self.check_scene((2, 0, 0, 0), armada=1)
++
++    def test_hidden_armada_overlay_preserves_placeholder(self):
++        self.check_scene((2, 1, 0, 0), armada=0)
++
++    # Three reserves (cursor, HUD, Armada overlay), no placeholder layer, and no
++    # paint from the extracted Steam block because no Steam menu is visible.
++    def test_visible_armada_overlay_with_hud_needs_no_steam_placeholder(self):
++        self.check_scene((3, 0, 0, 0), ext=1, armada=1)
++
++    # A hidden Steam window is still no visible Steam menu: no placeholder and
++    # nothing for the extracted Steam block to paint.
++    def test_visible_armada_overlay_with_hidden_steam_window_needs_no_steam_placeholder(self):
++        self.check_scene((3, 0, 0, 0), ext=1, steam=0, armada=1)
++
++    def test_visible_armada_overlay_with_hidden_hud(self):
++        self.check_scene((2, 0, 0, 0), ext=0, armada=1)
++
++    def test_visible_armada_overlay_with_disabled_hud_plane(self):
++        self.check_scene((2, 0, 0, 0), ext=1, external_enabled=0, armada=1)
++
++    def test_visible_armada_overlay_with_real_menu_draws_menu(self):
++        self.check_scene((3, 0, 1, 0), steam=1, armada=1)
++
++    def test_visible_armada_overlay_with_focused_real_menu_updates_touch(self):
++        self.check_scene((3, 0, 1, 1), steam=1, armada=1, input_focused=1)
++
++    def test_hidden_armada_overlay_with_real_menu_draws_menu(self):
++        self.check_scene((2, 0, 1, 0), steam=1, armada=0)
++
++    def test_visible_armada_overlay_with_disabled_steam_plane(self):
++        self.check_scene((2, 0, 0, 0), steam=1, steam_enabled=0, armada=1)
++
++    def test_visible_armada_overlay_on_swapchain_backend(self):
++        self.check_scene((2, 0, 0, 0), armada=1, swapchain=1)
++
++    def test_visible_armada_overlay_on_non_session_backend(self):
++        self.check_scene((2, 0, 0, 0), armada=1, session=0)
++
++    def test_visible_armada_overlay_with_full_layer_array(self):
++        self.check_scene((2, 0, 0, 0), armada=1, layers=8)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

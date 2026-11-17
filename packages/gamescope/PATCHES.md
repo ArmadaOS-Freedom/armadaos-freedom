@@ -102,3 +102,11 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0040-wlserver-follow-virtual-touch-orientation.patch`
   source: armada
   notes: A touch device tagged by the TB323FU udev rule carries a fixed desktop calibration, so its coordinates reach Gamescope already mapped for the unrotated desktop. Tagged touches on the virtual panel now undo that calibration once per event before the connector's output rotation is applied. Detection by real SPI/I2C/USB bus is unchanged, and the calibration matrix itself is still applied by libinput. Regression: `GAMESCOPE_SOURCE_DIR=/path/to/patched/gamescope python3 tests/gamescope-touch-orientation-test.py`.
+
+- `patches/0044-steamcompmgr-freedom-touch-overlay.patch`
+  source: armadaos-freedom
+  notes: Gives the window carrying `ARMADA_VIRTUAL_TRACKPADS_OVERLAY` its own compositor plane: `isArmadaOverlay` is tracked like an overlay window (own atom, focus slot, opacity and zpos handling, reserved layer, no appID, no decoration) and painted from `paint_all` before the input focus window. Steam notification/external overlay handling, physical touch and other patches are unaffected.
+
+- `patches/0045-steamcompmgr-freedom-touch-placeholder.patch`
+  source: armadaos-freedom
+  notes: Extends the transparent Steam placeholder suppression to a visible Freedom Touch overlay; real Steam menus, the no-overlay fallback and normal layer reservations are kept.
