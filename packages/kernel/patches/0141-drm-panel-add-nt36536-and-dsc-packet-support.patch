@@ -23,9 +23,9 @@ from the number of DSC slices packed into each packet.
  drivers/gpu/drm/msm/dsi/dsi_host.c | 28 +-
  drivers/gpu/drm/panel/Kconfig | 16 +
  drivers/gpu/drm/panel/Makefile | 1 +
- drivers/gpu/drm/panel/panel-novatek-nt36536.c | 533 +
+ drivers/gpu/drm/panel/panel-novatek-nt36536.c | 550 +
  include/drm/drm_mipi_dsi.h | 2 +
- 5 files changed, 565 insertions(+), 15 deletions(-)
+ 5 files changed, 582 insertions(+), 15 deletions(-)
 ---
 
 diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000000..c8dcc4305c5a
 --- /dev/null
 +++ b/drivers/gpu/drm/panel/panel-novatek-nt36536.c
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,550 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Novatek NT36536 DriverIC panels driver
@@ -172,6 +172,7 @@ index 000000000000..c8dcc4305c5a
 +	struct gpio_desc *reset_gpio;
 +	struct regulator_bulk_data *supplies;
 +	struct backlight_device *backlight;
++	enum drm_panel_orientation orientation;
 +};
 +
 +struct panel_desc {
@@ -333,11 +334,20 @@ index 000000000000..c8dcc4305c5a
 +	return desc->num_modes;
 +}
 +
++static enum drm_panel_orientation
++novatek_get_orientation(struct drm_panel *panel)
++{
++	struct novatek *ctx = to_novatek(panel);
++
++	return ctx->orientation;
++}
++
 +static const struct drm_panel_funcs novatek_panel_funcs = {
 +	.prepare = novatek_prepare,
 +	.enable = novatek_enable,
 +	.unprepare = novatek_unprepare,
 +	.get_modes = novatek_get_modes,
++	.get_orientation = novatek_get_orientation,
 +};
 +
 +static int novatek_bl_update_status(struct backlight_device *bl)
@@ -571,6 +581,13 @@ index 000000000000..c8dcc4305c5a
 +		return -ENODEV;
 +	ctx->desc = desc;
 +	ctx->dsc = *desc->dsc_cfg;
++
++	ret = of_drm_get_panel_orientation(dev->of_node, &ctx->orientation);
++	if (ret == -ENOENT)
++		ctx->orientation = DRM_MODE_PANEL_ORIENTATION_NORMAL;
++	else if (ret < 0)
++		return dev_err_probe(dev, ret,
++				     "Failed to get panel orientation\n");
 +
 +	if (desc->is_dual_dsi) {
 +		num_dsi = 2;

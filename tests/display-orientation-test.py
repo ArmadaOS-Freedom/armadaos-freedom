@@ -110,14 +110,14 @@ class DisplayOrientationTest(unittest.TestCase):
                     control.action_get_display_orientation({})["defaultOrientation"], "normal"
                 )
 
-    def test_gen4_and_gen5_defaults_stay_distinct(self):
+    def test_y700_defaults_report_landscape_right(self):
         # Mocked device_env only: this exercises the profile values, it does not
         # verify the physical defaults of either model.
-        gen4 = {"ARMADA_DEVICE_ID": "lenovo-tb322fc"}
+        gen4 = {"ARMADA_DEVICE_ID": "lenovo-tb322fc", "ARMADA_PANEL_ORIENTATION": "right"}
         gen5 = {"ARMADA_DEVICE_ID": "lenovo-tb323fu", "ARMADA_PANEL_ORIENTATION": "right"}
         with patch.object(control, "device_env", return_value=gen4):
             self.assertEqual(
-                control.action_get_display_orientation({})["defaultOrientation"], "normal"
+                control.action_get_display_orientation({})["defaultOrientation"], "right"
             )
         with patch.object(control, "device_env", return_value=gen5):
             self.assertEqual(

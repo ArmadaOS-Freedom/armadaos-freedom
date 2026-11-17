@@ -297,7 +297,7 @@ index 437c993..f681512 100644
 +	}
 +	if (MSM_FORMAT_IS_YUV(fmt))
 +		return 0;
-+	if (!(cfg->rotation & DRM_MODE_ROTATE_90))
++	if (!drm_rotation_90_or_270(cfg->rotation))
 +		return 0;
 +
 +	drm_rect_fp_to_int(&full_src, &state->src);
