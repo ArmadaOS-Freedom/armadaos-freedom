@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+# Virtual gamepad owned by the Freedom Touch plugin. This profile is global
+# (no machine/model match) because the source is created at runtime on any
+# device; the exact name and ID pair keep it from matching physical pads.
+version: 1
+kind: CompositeDevice
+name: Freedom Touch Controller
+matches: []
+single_source: false
+source_devices:
+  - group: gamepad
+    evdev:
+      name: Freedom Touch Controller Source
+      vendor_id: "0000"
+      product_id: "4654"
+      handler: event*
+options:
+  auto_manage: true
+  persist: false
+  preserve_digital_edges: true
+target_devices:
+  - deck-uhid

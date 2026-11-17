@@ -1,0 +1,4 @@
+# The Freedom Touch plugin creates this private controller source. Keep it
+# root-only and drop the uaccess tag so Steam/udev does not enumerate it as a
+# second gamepad; the plugin and InputPlumber both run as root.
+SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{name}=="Freedom Touch Controller Source", TAG-="uaccess", OWNER="root", GROUP="root", MODE="0600"
