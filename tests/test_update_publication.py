@@ -808,6 +808,60 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(verified["artifact"], "edl-package-7")
         self.assertEqual(verified["workflow"], ".github/workflows/build.yml")
 
+        preview_name = "ArmadaOS-Freedom-20261117.1f28617-preview"
+        preview = publication.verify_package_run(
+            run,
+            {"artifacts": [
+                {"name": preview_name, "expired": False, "size_in_bytes": 4096}]},
+            run_id=7, repository=REPOSITORY)
+        self.assertEqual(preview["artifact"], preview_name)
+        # New format plus legacy in one run is ambiguous and must be rejected.
+        with self.assertRaises(publication.PublicationError):
+            publication.verify_package_run(
+                run,
+                {"artifacts": [
+                    {"name": preview_name, "expired": False, "size_in_bytes": 4096},
+                    {"name": "edl-package-7", "expired": False,
+                     "size_in_bytes": 4096}]},
+                run_id=7, repository=REPOSITORY)
+        with self.assertRaises(publication.PublicationError):
+            publication.verify_package_run(
+                run,
+                {"artifacts": [
+                    {"name": preview_name, "expired": False, "size_in_bytes": 4096},
+                    {"name": "ArmadaOS-Freedom-20261118.2-preview",
+                     "expired": False, "size_in_bytes": 4096}]},
+                run_id=7, repository=REPOSITORY)
+        for bad_name in (
+            "ArmadaOS-Freedom--preview",
+            "ArmadaOS-Freedom-20261117.1f28617-preview-arm64",
+            "ArmadaOS-Freedom-20261117.1f28617-Preview",
+            "ArmadaOS-Freedom-20261117.1f28617",
+            "edl-install-package-7",
+            f"edl-package-{preview_name}",
+        ):
+            with self.assertRaises(publication.PublicationError, msg=bad_name):
+                publication.verify_package_run(
+                    run,
+                    {"artifacts": [
+                        {"name": bad_name, "expired": False,
+                         "size_in_bytes": 4096}]},
+                    run_id=7, repository=REPOSITORY)
+        with self.assertRaises(publication.PublicationError):
+            publication.verify_package_run(
+                run,
+                {"artifacts": [
+                    {"name": preview_name, "expired": True,
+                     "size_in_bytes": 4096}]},
+                run_id=7, repository=REPOSITORY)
+        with self.assertRaises(publication.PublicationError):
+            publication.verify_package_run(
+                run,
+                {"artifacts": [
+                    {"name": preview_name, "expired": False,
+                     "size_in_bytes": 0}]},
+                run_id=7, repository=REPOSITORY)
+
         # The install-only artifact never substitutes for the release package.
         with self.assertRaises(publication.PublicationError):
             publication.verify_package_run(
@@ -855,6 +909,21 @@ class PublicationTest(unittest.TestCase):
             publication.require_run_identity(verified, {"sourceRevision": "b" * 40})
         dispatch = dict(verified, workflow=".github/workflows/build-edl-package.yml")
         publication.require_run_identity(dispatch, {"sourceRevision": "b" * 40})
+
+        # The preview artifact name binds its version to the signed package.
+        publication.require_run_identity(
+            preview,
+            {"sourceRevision": "a" * 40, "version": "20261117.1f28617"})
+        with self.assertRaises(publication.PublicationError):
+            publication.require_run_identity(
+                preview,
+                {"sourceRevision": "a" * 40, "version": "20261118.2"})
+        dispatch_preview = dict(
+            preview, workflow=".github/workflows/build-edl-package.yml")
+        with self.assertRaises(publication.PublicationError):
+            publication.require_run_identity(
+                dispatch_preview,
+                {"sourceRevision": "a" * 40, "version": "20261118.2"})
 
     def test_commit_channel_files_creates_one_commit_for_both_files(self):
         github = FakeGitHub()
@@ -1259,7 +1328,9 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertNotIn("matrix:", text)
         self.assertNotIn("fail-fast", text)
         self.assertNotIn("edl-install-package", text)
-        self.assertIn("name: edl-package-${{ github.run_id }}", text)
+        self.assertIn(
+            "name: ArmadaOS-Freedom-${{ inputs.version }}-preview", text)
+        self.assertNotIn("name: edl-package-$", text)
         self.assertIn("group: edl-package", text)
         self.assertNotIn("matrix.variant", text)
         # The one signed descriptor must cover every model and upgrade.
@@ -1270,7 +1341,9 @@ class WorkflowConsistencyTest(unittest.TestCase):
     def test_publication_workflow_uses_the_package_artifact(self):
         text = (ROOT / ".github/workflows/publish-update-channel.yml").read_text(
             encoding="utf-8")
-        self.assertIn("edl-package-", text)
+        self.assertNotIn("edl-package-${RUN_ID}", text)
+        self.assertIn("jq -er '.artifact'", text)
+        self.assertIn('--name "${artifact}"', text)
         self.assertIn("gh run download", text)
         self.assertIn(".github/scripts/update-publication.py", text)
         self.assertIn(".github/scripts/publish-signed-channel.sh", text)
@@ -1522,7 +1595,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
         english = (ROOT / "docs/edl-package.md").read_text(encoding="utf-8")
         chinese = (ROOT / "docs/edl-package.zh-CN.md").read_text(encoding="utf-8")
         for text in (english, chinese):
-            self.assertIn("edl-package-", text)
+            self.assertIn("ArmadaOS-Freedom-<version>-preview", text)
             self.assertNotIn("edl-install-package-", text)
             self.assertNotIn("EDL_PACKAGE_PROFILE", text)
             self.assertIn("TB710FU", text)

@@ -125,9 +125,10 @@ jobs:
           SCRATCH: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          artifact="$(jq -er '.artifact' "${SCRATCH}/run.json")"
           gh run download "${RUN_ID}" \
             --repo "${REPOSITORY}" \
-            --name "edl-package-${RUN_ID}" \
+            --name "${artifact}" \
             --dir "${SCRATCH}/package"
 
       - name: Verify signed package and parts

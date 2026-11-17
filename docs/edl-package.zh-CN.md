@@ -109,11 +109,11 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 ## 持续构建
 
-该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建一个 EDL 部署包，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。产物名为 `edl-package-<运行编号>`，包含全部已登记机型（含 `TB710FU`）。其签名描述同时声明 `install` 与 `offline-upgrade`：全部所列机型均可安装，只有所选且具备双启动槽后端的机型接受离线升级请求。该产物就是正式产物，**Publish update channel** 照常接受它。描述在构建它的同一运行器上签名，因此只需签名一个部署包。
+该构建也会自动运行。在 `main` 分支上，[`Build images`](../.github/workflows/build.yml) 中的 `build_edl_package` 任务在容器镜像任务之后执行，用刚推送的镜像构建一个 EDL 部署包，渠道为 `testing`，并使用该镜像的摘要、实际源码修订和 `org.opencontainers.image.version` 标签。产物名为 `ArmadaOS-Freedom-<version>-preview`，例如 `ArmadaOS-Freedom-20261117.1f28617-preview`。下载时 GitHub Actions 提供的 `.zip` 约定为 `ArmadaOS-Freedom-<version>-<channel>.zip`；当前 CI 构建为 `preview`，对应内部 `testing` 渠道。beta 与 stable 晋升复用不可变的已签名载荷，不重命名已签名的内部内容。此前已完成构建的 `edl-package-<运行编号>` 产物仍可使用。包内含全部已登记机型（含 `TB710FU`）。其签名描述同时声明 `install` 与 `offline-upgrade`：全部所列机型均可安装，只有所选且具备双启动槽后端的机型接受离线升级请求。该产物就是正式产物，**Publish update channel** 照常接受它。描述在构建它的同一运行器上签名，因此只需签名一个部署包。
 
 产物会保留在工作流运行中，直到运维人员发布更新产物；不会自动创建 Release，也不会自动改动任何更新渠道。SD 镜像流程继续保留，其自动发布需按下文配置 R2 并启用。
 
-也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并运行同样的全机型构建，把分卷、`parts.json`、`SHA256SUMS` 和部署包 README 以 `edl-package-<运行编号>` 上传。
+也可以手动启动 [`Build EDL package`](../.github/workflows/build-edl-package.yml)：它接收与配方相同的四个值，按指定修订递归检出子模块，并运行同样的全机型构建，把分卷、`parts.json`、`SHA256SUMS` 和部署包 README 以 `ArmadaOS-Freedom-<version>-preview`（旧版已完成构建则为 `edl-package-<运行编号>`）上传。
 
 ## 发布更新渠道
 
@@ -122,7 +122,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 流程是：构建 → 发布 testing → 晋升。
 
 1. 构建部署包：`main` 上的 `Build images`，或手动运行 `Build EDL package`。
-2. 用已完成的运行编号和 `testing` 运行 **Publish update channel**。它会确认该运行属于本仓库、已成功，并产出了 `edl-package-<运行编号>`。随后校验描述签名、分卷、分卷清单、`offline-upgrade` 能力，以及 OCI 摘要确实解析到由该源码修订构建的签名镜像。然后创建草稿 Release `<releaseId>`，上传分卷、分卷清单、描述文件和描述签名，等全部资产到位后才公开 Release，最后才签名并提交 `testing.json` 与 `testing.json.sig`。
+2. 用已完成的运行编号和 `testing` 运行 **Publish update channel**。它会确认该运行属于本仓库、已成功，并产出了恰好一个部署包产物：`ArmadaOS-Freedom-<version>-preview`（其版本须与已签名部署包一致）或旧版 `edl-package-<运行编号>`。随后校验描述签名、分卷、分卷清单、`offline-upgrade` 能力，以及 OCI 摘要确实解析到由该源码修订构建的签名镜像。然后创建草稿 Release `<releaseId>`，上传分卷、分卷清单、描述文件和描述签名，等全部资产到位后才公开 Release，最后才签名并提交 `testing.json` 与 `testing.json.sig`。
 3. 运行 **Promote release**，`source: testing`，`target: beta` 或 `stable`。晋升先校验已发布的源渠道文档及其描述签名，再从该渠道取得不可变的 OCI 摘要，按该摘要检视镜像，并要求其修订标签与 Cosign 签名均匹配后才写入任何标签。晋升从不读取会移动的 `:testing` 标签，因此源标签被更新的、独立构建的版本重新指向时，不会阻止晋升渠道仍然指向的旧发布。随后把目标渠道指向同一批 Release 资产。全程不重新构建；源渠道没有有效的签名发布时，会在写入任何标签之前失败。
 
 不会就地替换：已公开的 Release 必须与校验过的部署包完全一致；草稿 Release 即使是空的也会就地补全——只上传缺失的资产，已存在的资产按签名计划做哈希校验而不是覆盖；内容不一致的 Release 会直接失败。渠道文档与签名以一次提交写入 `update-channels` 分支的对应文件，更新串行执行，绝不强制推送。
@@ -166,7 +166,7 @@ $ just build-edl-package-local ORIGIN [IMAGE] [TAG]
 
 正式镜像地址为 `ghcr.io/armadaos-freedom/armadaos-freedom`。`Build images` 从 `main` 发布签名后的 `testing` 镜像；`Promote release` 核验同一镜像摘要后，再设置 `beta` 或 `stable` 标签。将加密的 Cosign 私钥配置为 `SIGNING_SECRET`，密码配置为 `SIGNING_PASSWORD`；对应公钥位于 `system_files/etc/pki/containers/armadaos-freedom.pub`。私钥不得放入源码。
 
-GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `edl-package-<run-id>` 产物中，由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
+GHCR 包需设为公开，并允许本仓库的 Actions 访问；工作流在发布渠道标签前检查匿名读取。构建好的部署包先保存在 `ArmadaOS-Freedom-<version>-preview` 产物中（旧版已完成构建则为 `edl-package-<run-id>` 产物），由 **Publish update channel** 转成 Release 与签名的 `testing` 渠道；beta 与 stable 只能由 **Promote release** 跟进。镜像自带的 `system_files/etc/armada/updates/channels.json` 列出全部三个渠道，只有对应文档出现在 `update-channels` 分支后该渠道才可用。原有磁盘镜像的 R2 发布按需启用：先配置 R2 地址、桶和凭据，再设置仓库变量 `ARMADA_PUBLISH_DISK=true`。
 
 Windows 安装器 0.7.32 起识别组织地址，并继续兼容迁移前 `mydanyi` 镜像地址的安装包。使用新组织地址的包之前，请先升级安装器；旧版会拒绝尚不认识的来源。新包和更新目标使用组织地址，不改写历史包的来源记录。
 
