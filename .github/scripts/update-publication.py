@@ -55,6 +55,10 @@ _GITHUB_HOSTS = frozenset((
     "objects.githubusercontent.com",
 ))
 _SAFE_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
+_PREVIEW_ARTIFACT = re.compile(
+    r"ArmadaOS-Freedom-([A-Za-z0-9][A-Za-z0-9._+-]{0,127})-preview\Z",
+    re.ASCII,
+)
 _HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _RESERVED_TAGS = frozenset(("latest",) + CHANNELS)
 _DESCRIPTOR_SUFFIX = ".zip.update.json"
@@ -355,26 +359,38 @@ def verify_package_run(run, artifacts, *, run_id, repository) -> dict:
         )
     if not isinstance(artifacts, dict) or not isinstance(artifacts.get("artifacts"), list):
         raise PublicationError("artifact metadata must list artifacts")
-    expected = f"edl-package-{run_id}"
-    matches = [
-        item for item in artifacts["artifacts"]
-        if isinstance(item, dict) and item.get("name") == expected
-    ]
+    legacy = f"edl-package-{run_id}"
+    matches = []
+    for item in artifacts["artifacts"]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        if name == legacy:
+            matches.append(item)
+            continue
+        if _PREVIEW_ARTIFACT.fullmatch(name) is not None:
+            matches.append(item)
     if len(matches) != 1:
-        raise PublicationError(f"expected exactly one {expected} artifact in the run")
+        raise PublicationError(
+            "expected exactly one package artifact (legacy edl-package-"
+            f"{run_id} or ArmadaOS-Freedom-<version>-preview) in the run"
+        )
     artifact = matches[0]
+    selected = artifact.get("name")
     if artifact.get("expired") is True:
-        raise PublicationError(f"the {expected} artifact has expired")
+        raise PublicationError(f"the {selected} artifact has expired")
     size = artifact.get("size_in_bytes")
     if type(size) is not int or size <= 0:
-        raise PublicationError(f"the {expected} artifact is empty")
+        raise PublicationError(f"the {selected} artifact is empty")
     return {
         "runId": run_id,
         "workflow": path,
         "event": run.get("event"),
         "headSha": run.get("head_sha"),
         "headBranch": run.get("head_branch"),
-        "artifact": expected,
+        "artifact": selected,
         "artifactBytes": size,
     }
 
@@ -383,6 +399,14 @@ def require_run_identity(run_info: dict, plan: dict) -> None:
     """Reject a package whose revision is not the revision that run built."""
     if not isinstance(run_info, dict) or not isinstance(plan, dict):
         raise PublicationError("run and package metadata are required")
+    name = run_info.get("artifact")
+    if isinstance(name, str):
+        preview = _PREVIEW_ARTIFACT.fullmatch(name)
+        if preview is not None:
+            if preview.group(1) != plan.get("version"):
+                raise PublicationError(
+                    "the package artifact version is not the signed package version"
+                )
     if run_info.get("workflow") == BUILD_IMAGES_WORKFLOW:
         if run_info.get("headSha") != plan.get("sourceRevision"):
             raise PublicationError(
