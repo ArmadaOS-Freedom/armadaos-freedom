@@ -190,6 +190,10 @@ COPY devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8/tb323fu-linux-11a25bf8
 COPY devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8/tb323fu-linux-11a25bf89b65fff48112a91a0b25bc247e7736d8/userspace/platform/systemd/system/tb323fu-audio.service /tb323fu-audio/tb323fu-audio.service
 COPY devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8/tb323fu-linux-11a25bf89b65fff48112a91a0b25bc247e7736d8/userspace/platform/etc/tb323fu/audio.conf /tb323fu-audio/audio.conf
 COPY devices/lenovo-tb323fu/firmware/audio/ /tb323fu-audio/firmware/
+# TB323FU CDSP: the signed vendor compute firmware, verified at build time
+# against devices/lenovo-tb323fu/firmware/compute/SHA256SUMS. It ships as a
+# bundle and is staged only on the exact lenovo,baldur board.
+COPY devices/lenovo-tb323fu/firmware/compute/ /tb323fu-cdsp/firmware/
 COPY devices/lenovo-tb323fu/rootfs/usr/libexec/tb323fu/tb323fu-speaker-gain /tb323fu-audio/tb323fu-speaker-gain
 COPY devices/lenovo-tb323fu/rootfs/usr/lib/systemd/user/tb323fu-speaker-gain.service /tb323fu-audio/tb323fu-speaker-gain.service
 COPY devices/lenovo-tb323fu/rootfs/usr/share/tb323fu/pipewire/tb323fu-speakers-protection.json /tb323fu-audio/tb323fu-speakers-protection.json

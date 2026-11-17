@@ -1,0 +1,130 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stages the signed CDSP firmware from the installed bundle for the exact
+# lenovo,baldur board; every other device exits 0 without a write.
+set -euo pipefail
+
+DT_COMPATIBLE=${TB323FU_DT_COMPATIBLE:-/sys/firmware/devicetree/base/compatible}
+FIRMWARE_DIR=${TB323FU_CDSP_FIRMWARE_DIR:-/usr/share/tb323fu/firmware/compute}
+REMOTEPROC_DIR=${TB323FU_REMOTEPROC_DIR:-/sys/class/remoteproc}
+FIRMWARE_CLASS_PATH=${TB323FU_FIRMWARE_CLASS_PATH:-/sys/module/firmware_class/parameters/path}
+RUN_FIRMWARE=${TB323FU_RUN_FIRMWARE:-/run/armada-firmware}
+
+MODEL=lenovo,baldur
+FW_REL=qcom/kaanapali/lenovo/baldur
+CDSP_FIRMWARE=$FW_REL/cdsp.mbn
+
+log() { echo "tb323fu-cdsp-prepare: $*" >&2; }
+fail() { log "error: $*"; exit 1; }
+
+read_value() {
+  local value=
+  if [ -r "$1" ]; then
+    IFS= read -r value <"$1" || true
+  fi
+  printf '%s' "$value"
+}
+
+model_matches() {
+  local entry
+  [ -r "$DT_COMPATIBLE" ] || return 1
+  while IFS= read -r -d '' entry || [ -n "$entry" ]; do
+    if [ "$entry" = "$MODEL" ]; then
+      return 0
+    fi
+  done <"$DT_COMPATIBLE"
+  return 1
+}
+
+if ! model_matches; then
+  log 'skip: unsupported device tree model'
+  exit 0
+fi
+
+src_mbn=$FIRMWARE_DIR/$FW_REL/cdsp.mbn
+src_dtb=$FIRMWARE_DIR/$FW_REL/cdsp_dtb.mbn
+for src in "$src_mbn" "$src_dtb"; do
+  if [ ! -f "$src" ] || [ ! -s "$src" ]; then
+    fail "missing firmware file: $src"
+  fi
+done
+
+WAIT_SECONDS=${TB323FU_CDSP_WAIT_SECONDS:-20}
+case $WAIT_SECONDS in
+  ''|*[!0-9]*) fail "invalid TB323FU_CDSP_WAIT_SECONDS: $WAIT_SECONDS" ;;
+esac
+
+cdsp_count=0
+cdsp_path=
+waited=0
+waited_logged=0
+deadline=$((SECONDS + WAIT_SECONDS))
+while :; do
+  cdsp_count=0
+  cdsp_path=
+  for rp in "$REMOTEPROC_DIR"/*; do
+    [ -d "$rp" ] || continue
+    if [ "$(read_value "$rp/name")" != cdsp ]; then
+      continue
+    fi
+    cdsp_count=$((cdsp_count + 1))
+    cdsp_path=$rp
+  done
+  if [ "$cdsp_count" -gt 0 ]; then
+    break
+  fi
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    break
+  fi
+  if [ "$waited_logged" -eq 0 ]; then
+    log "waiting up to ${WAIT_SECONDS}s for cdsp processor registration"
+    waited_logged=1
+  fi
+  sleep 0.2
+  waited=1
+done
+if [ "$cdsp_count" -eq 0 ]; then
+  fail "timed out after ${WAIT_SECONDS}s waiting for cdsp processor"
+fi
+if [ "$cdsp_count" -ne 1 ]; then
+  fail "expected exactly one cdsp processor, found $cdsp_count"
+fi
+if [ "$waited" -eq 1 ]; then
+  log "cdsp processor registered after wait"
+fi
+cdsp_firmware=$(read_value "$cdsp_path/firmware")
+if [ "$cdsp_firmware" != "$CDSP_FIRMWARE" ]; then
+  fail "unexpected cdsp firmware: $cdsp_firmware"
+fi
+state=$(read_value "$cdsp_path/state")
+case $state in
+  offline|running) ;;
+  *) fail "unsupported cdsp state: $state" ;;
+esac
+
+dest_root=$(read_value "$FIRMWARE_CLASS_PATH")
+set_path=0
+if [ -z "$dest_root" ]; then
+  dest_root=$RUN_FIRMWARE
+  set_path=1
+fi
+case $dest_root in
+  /*) ;;
+  *) fail "firmware path is not absolute: $dest_root" ;;
+esac
+
+dest_dir=$dest_root/$FW_REL
+install -d -m 0755 "$dest_dir" || fail "cannot create $dest_dir"
+install -m 0644 "$src_mbn" "$dest_dir/cdsp.mbn" || fail "cannot install cdsp.mbn"
+install -m 0644 "$src_dtb" "$dest_dir/cdsp_dtb.mbn" || fail "cannot install cdsp_dtb.mbn"
+
+if [ "$set_path" -eq 1 ]; then
+  printf '%s' "$dest_root" > "$FIRMWARE_CLASS_PATH" || fail "cannot set $FIRMWARE_CLASS_PATH"
+fi
+
+if [ "$state" = offline ]; then
+  echo start > "$cdsp_path/state" || fail "cannot start cdsp"
+  log "cdsp firmware installed at $dest_dir; started cdsp"
+else
+  log "cdsp firmware installed at $dest_dir; cdsp already running"
+fi
