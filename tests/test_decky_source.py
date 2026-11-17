@@ -66,6 +66,58 @@ class TestDeckySource(unittest.TestCase):
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 7.0)
         self.assertEqual((release.release_id, release.asset_id, release.url), (1, 10, URL))
 
+    def test_fetch_preview_sees_stable_promotion(self):
+        # Mirrors the reproduced bug: loader.json branch=1 (official preview),
+        # installed v3.3.1-pre1. Native Decky sees stable v3.3.1 as an update, so
+        # runtime fetch_preview must also select the stable promotion.
+        stable_url = (
+            "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/"
+            "v3.3.1/PluginLoader-arm64"
+        )
+        pre_url = (
+            "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/"
+            "v3.3.1-pre1/PluginLoader-arm64"
+        )
+        raw = json.dumps([
+            {
+                "id": 100,
+                "tag_name": "v3.3.1-pre1",
+                "published_at": "2024-05-01T00:00:00Z",
+                "draft": False,
+                "prerelease": True,
+                "assets": [{
+                    "name": "PluginLoader-arm64",
+                    "id": 900,
+                    "size": 200,
+                    "browser_download_url": pre_url,
+                    "digest": "sha256:" + "b" * 64,
+                }],
+            },
+            {
+                "id": 200,
+                "tag_name": "v3.3.1",
+                "published_at": "2024-06-01T00:00:00Z",
+                "draft": False,
+                "prerelease": False,
+                "assets": [{
+                    "name": "PluginLoader-arm64",
+                    "id": 1000,
+                    "size": 300,
+                    "browser_download_url": stable_url,
+                    "digest": "sha256:" + "c" * 64,
+                }],
+            },
+        ]).encode()
+        opener = mock_opener(FakeResponse(raw))
+        with patch.object(decky_source.urllib.request, "build_opener", return_value=opener):
+            release = decky_source.fetch_preview()
+        self.assertEqual(release.tag, "v3.3.1")
+        self.assertEqual(release.release_id, 200)
+        self.assertEqual(release.asset_id, 1000)
+        self.assertEqual(release.url, stable_url)
+        self.assertEqual(release.size, 300)
+        self.assertEqual(release.sha256, "c" * 64)
+
     def test_metadata_failures_and_nonfinite_timeouts(self):
         cases = [
             ("json", FakeResponse(b"{"), None, None),
