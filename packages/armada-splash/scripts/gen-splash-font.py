@@ -155,6 +155,9 @@ def extract_catalog_string_literals(path):
     # \\uXXXX and \\UXXXXXXXX Unicode universal escapes are decoded directly
     # as UTF-8 text. Unknown or malformed escapes and raw control bytes are
     # rejected; they are never silently reinterpreted as ASCII backslashes.
+    # Adjacent literals (only whitespace/newlines between them) are parts of
+    # one C string: their decoded bytes are concatenated before UTF-8
+    # decoding, so adjacent-literal concatenation is honored.
     literal_re = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)
 
     simple_escape = {'"': 0x22, '\\': 0x5c, "'": 0x27, '?': 0x3f,
@@ -163,8 +166,7 @@ def extract_catalog_string_literals(path):
     hex_digits = '0123456789abcdefABCDEF'
     oct_digits = '01234567'
 
-    for match in literal_re.finditer(cleaned):
-        raw = match.group(1)
+    def decode_token(raw):
         decoded = bytearray()
         j = 0
         while j < len(raw):
@@ -236,11 +238,28 @@ def extract_catalog_string_literals(path):
                 continue
             die("unknown escape \\%s in catalog %s literal %r"
                 % (nxt, path, raw))
-        # Decode the resulting byte stream as UTF-8 (the catalogs are UTF-8).
+        return bytes(decoded)
+
+    def flush_group(group):
+        joined = b''.join(decode_token(raw) for raw in group)
         try:
-            yield decoded.decode('utf-8')
+            return joined.decode('utf-8')
         except UnicodeDecodeError as exc:
-            die("invalid UTF-8 in catalog %s literal %r: %s" % (path, raw, exc))
+            die("invalid UTF-8 in catalog %s literal(s) %r: %s"
+                % (path, group, exc))
+
+    group = []
+    last_end = None
+    for match in literal_re.finditer(cleaned):
+        if last_end is not None and group and match.start() > last_end:
+            between = cleaned[last_end:match.start()]
+            if between.strip():
+                yield flush_group(group)
+                group = []
+        group.append(match.group(1))
+        last_end = match.end()
+    if group:
+        yield flush_group(group)
 
 
 def collect_catalog_codepoints(paths):

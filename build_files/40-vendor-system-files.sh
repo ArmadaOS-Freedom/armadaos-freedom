@@ -31,6 +31,16 @@ if [ -L "${splash_font}" ] || [ ! -f "${splash_font}" ] || [ ! -s "${splash_font
     exit 1
 fi
 
+# Steam's startup splash reuses the system Noto CJK TTC (installed by
+# 10-base-packages.sh) as its desktop font source; the armada-splash binary
+# only needs a stable path, so link the first matching Regular face here.
+splash_ttc=$(rpm -ql google-noto-sans-cjk-fonts | awk '/NotoSansCJK-Regular\.ttc$/ { print; exit }')
+if [ ! -s "${splash_ttc}" ]; then
+    echo "ERROR: google-noto-sans-cjk-fonts NotoSansCJK-Regular.ttc not found" >&2
+    exit 1
+fi
+ln -sfn "${splash_ttc}" /usr/share/armada/splash/font-desktop.ttc
+
 # mkbootimg must be present for on-device /KERNEL rebuilds after OTA.
 install -Dpm 0755 /ctx/build_files/vendor/mkbootimg/mkbootimg.py /usr/libexec/armada/mkbootimg.py
 install -Dpm 0755 /ctx/build_files/vendor/mkbootimg/gki/generate_gki_certificate.py /usr/libexec/armada/gki/generate_gki_certificate.py

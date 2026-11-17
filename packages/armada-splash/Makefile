@@ -27,7 +27,10 @@ SPLASH_FONT_SOURCE ?= $(firstword $(wildcard \
 SPLASH_FONT_GEN    := scripts/gen-splash-font.py
 SPLASH_FONT_CATALOGS := src/locales/en.h src/locales/zh-CN.h
 
-build/font.ttf: $(SPLASH_FONT_GEN) $(SPLASH_FONT_CATALOGS)
+empty :=
+space := $(empty) $(empty)
+
+build/font.ttf: $(SPLASH_FONT_GEN) $(SPLASH_FONT_CATALOGS) $(subst $(space),\ ,$(SPLASH_FONT_SOURCE))
 	@mkdir -p build
 	@test -n "$(SPLASH_FONT_SOURCE)" || { \
 	    echo "ERROR: set SPLASH_FONT_SOURCE to a NotoSansCJK-Regular.ttc" >&2; exit 1; }

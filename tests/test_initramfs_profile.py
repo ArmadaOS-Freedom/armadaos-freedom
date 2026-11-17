@@ -103,9 +103,6 @@ class InitramfsProfileTest(unittest.TestCase):
         )
         _write_exe(bindir / "lsinitrd", lsinitrd_stub)
 
-        # awk stub: script feeds required paths into awk; our lsinitrd already lists them.
-        _write_exe(bindir / "awk", "#!/bin/sh\ncat >/dev/null\nexit 0\n")
-
         env = os.environ.copy()
         env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
         env["TMPDIR"] = str(tmp)
@@ -230,10 +227,9 @@ class InitramfsProfileTest(unittest.TestCase):
                 bindir / "dracut",
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DRACUT_LOG\"\nexit 0\n",
             )
-            # lsinitrd reports nothing.
+            # lsinitrd reports nothing; real awk (from PATH) must surface
+            # every required path as missing so the production check aborts.
             _write_exe(bindir / "lsinitrd", "#!/bin/sh\nexit 0\n")
-            # awk passthrough that surfaces missing=1 without matching anything.
-            _write_exe(bindir / "awk", "#!/bin/sh\nexit 1\n")
             # grep used in failure path.
             _write_exe(bindir / "grep", "#!/bin/sh\nexit 1\n")
 
@@ -255,6 +251,11 @@ class InitramfsProfileTest(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0, proc.stderr)
             self.assertFalse(verify_marker.exists(), "verify must not run when required files are missing")
+            self.assertIn(
+                "usr/libexec/armada/armada-splash missing from initramfs",
+                proc.stderr,
+                proc.stderr,
+            )
 
     def test_requirement_resolver_failure_aborts_before_dracut(self):
         with tempfile.TemporaryDirectory() as td:

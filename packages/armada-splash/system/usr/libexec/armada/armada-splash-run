@@ -16,7 +16,13 @@ SLOW_AFTER="${ARMADA_SPLASH_SLOW_AFTER:-25}"   # secs -> "still starting" messag
 ERROR_HOLD="${ARMADA_SPLASH_ERROR_HOLD:-45}"   # secs to show a launch failure
 SPLASH_BIN="${ARMADA_SPLASH_BIN:-/usr/libexec/armada/armada-splash}"
 ASSET="${ARMADA_SPLASH_ASSET:-${DIR}/splash.asp}"
-FONT="${ARMADA_SPLASH_FONT:-${DIR}/font.ttf}"
+if [[ -n "${ARMADA_SPLASH_FONT:-}" ]]; then
+    FONT="${ARMADA_SPLASH_FONT}"
+elif [[ -r "${DIR}/font-desktop.ttc" ]]; then
+    FONT="${DIR}/font-desktop.ttc"
+else
+    FONT="${DIR}/font.ttf"
+fi
 
 # One status file across all boot phases; writes go through armada-splash-progress.
 STATUS="${ARMADA_SPLASH_STATUS:-/run/armada/splash/status}"

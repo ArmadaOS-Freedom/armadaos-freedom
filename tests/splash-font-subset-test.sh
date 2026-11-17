@@ -168,4 +168,19 @@ if 0x5B57 in covered:
 PY
 printf 'PASS: added catalog Chinese character propagates into the subset\n'
 
+# 6. Adjacent-literal concatenation: the same probe U+5B57 split across two
+#    C string tokens must generate a byte-identical font to the single-token
+#    case above (the shared key "test.add" and identical glyph bytes mean the
+#    codepoint set is the same, so output is deterministic and equal).
+cat >"$OUT/add-split-catalog.h" <<'HDR'
+static const SplashMsg SPLASH_TEST_ADD_SPLIT[] = {
+    { "test.add", "\xE5\xAD" "\x97" },
+};
+HDR
+run_gen "$OUT/font-add-split.ttf" "$cjk_font" "$OUT/add-split-catalog.h" \
+    || fail "generator failed for split adjacent-literal catalog"
+cmp -s "$OUT/font-add.ttf" "$OUT/font-add-split.ttf" \
+    || fail "adjacent-literal split produced a different font than the single-token case"
+printf 'PASS: adjacent catalog string literals concatenate into one glyph set\n'
+
 printf 'splash subset font test passed\n'
