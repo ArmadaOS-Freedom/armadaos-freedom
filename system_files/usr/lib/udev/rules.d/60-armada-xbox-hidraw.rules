@@ -1,0 +1,25 @@
+# Xbox Bluetooth controllers, including compatible devices using Xbox IDs.
+# Allow the active local session to use SDL/Steam's Xbox HIDAPI parser instead
+# of depending on the controller's evdev mapping. Keep this before
+# 73-seat-late.rules so its uaccess builtin can grant the session ACL.
+ACTION=="remove", GOTO="armada_xbox_hidraw_end"
+SUBSYSTEM!="hidraw", GOTO="armada_xbox_hidraw_end"
+
+# xpadneo deliberately uses evdev and disables hidraw to avoid double mapping.
+DRIVERS=="xpadneo", GOTO="armada_xbox_hidraw_end"
+
+# Xbox One S, original and revised Bluetooth firmware.
+KERNELS=="0005:045E:02E0.*", MODE="0660", TAG+="uaccess"
+KERNELS=="0005:045E:02FD.*", MODE="0660", TAG+="uaccess"
+# Xbox One S with Bluetooth LE firmware.
+KERNELS=="0005:045E:0B20.*", MODE="0660", TAG+="uaccess"
+# Xbox Elite Series 2, Bluetooth and Bluetooth LE firmware.
+KERNELS=="0005:045E:0B05.*", MODE="0660", TAG+="uaccess"
+KERNELS=="0005:045E:0B22.*", MODE="0660", TAG+="uaccess"
+# Xbox Series X|S over Bluetooth LE.
+KERNELS=="0005:045E:0B13.*", MODE="0660", TAG+="uaccess"
+# Xbox Adaptive Controller, Bluetooth and Bluetooth LE firmware.
+KERNELS=="0005:045E:0B0C.*", MODE="0660", TAG+="uaccess"
+KERNELS=="0005:045E:0B21.*", MODE="0660", TAG+="uaccess"
+
+LABEL="armada_xbox_hidraw_end"
