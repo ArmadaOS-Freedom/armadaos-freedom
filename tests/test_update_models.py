@@ -61,7 +61,7 @@ EXPECTED_CAPABILITIES = {
     "TB710FU": (
         (b"lenovo,tb710fu",),
         (b"qcom,sm8650",),
-        None,
+        3,
         False,
         False,
         False,
@@ -71,6 +71,7 @@ EXPECTED_PROFILES = {
     (b"lenovo,elden", (b"qcom,sm8750",), 1),
     (b"lenovo,baldur", (b"qcom,sm8850", b"qcom,kaanapali"), 2),
     (b"lenovo,tb323fu", (b"qcom,sm8850", b"qcom,kaanapali"), 2),
+    (b"lenovo,tb710fu", (b"qcom,sm8650",), 3),
 }
 
 
@@ -200,17 +201,18 @@ class ModelCapabilityTableTests(unittest.TestCase):
                 self.assertEqual((socs, board_id),
                                  (capability.soc_compatible, capability.board_id))
 
-    def test_tb710fu_remains_install_only_without_recovery_or_gbl(self):
+    def test_tb710fu_has_recovery_layout_but_no_upgrade_backend_yet(self):
         capability = models.MODELS["TB710FU"]
-        self.assertIsNone(capability.board_id)
+        self.assertEqual(capability.board_id, 3)
         self.assertFalse(capability.offline_upgrade)
         self.assertFalse(capability.mirrored_boot)
         self.assertFalse(capability.gbl_envelope)
         self.assertNotIn("TB710FU", models.OFFLINE_UPGRADE_MODELS)
         self.assertNotIn("TB710FU", models.MIRROR_POLICY_MODELS)
         self.assertNotIn("TB710FU", models.GBL_MODELS)
-        aliases = {entry[0] for entry in models.RECOVERY_PROFILES}
-        self.assertFalse(aliases & set(capability.compatible))
+        self.assertEqual(models.BOARD_MODELS[3], "TB710FU")
+        self.assertIn((b"lenovo,tb710fu", (b"qcom,sm8650",), 3),
+                      models.RECOVERY_PROFILES)
 
 
 class UpdaterPolicyImportTests(unittest.TestCase):

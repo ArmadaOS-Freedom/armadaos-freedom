@@ -334,16 +334,27 @@ class HookTest(unittest.TestCase):
                 self.assertNotIn("rolling back", out)
 
     def test_unrelated_platform_keeps_the_legacy_writer(self):
-        self.set_dt(("lenovo,tb710fu", "qcom,sm8650"), b"internal\0",
+        self.set_dt(("ayn,odin2", "qcom,sm8550"), b"internal\0",
                     b"\0" * 16)
         self.method.write_text("kshimc\n", encoding="utf-8")
         code, out = self.run_script(self.update, self.legacy)
         self.assertEqual(code, 0, out)
         self.assertEqual(self.calls(), [str(self.state), "sync"])
 
+    def test_tb710fu_internal_install_skips_the_legacy_writer(self):
+        # TB710FU is a new-system board too: an installed internal medium
+        # never falls back to the old ESP or kShimC writer.
+        self.set_dt(("lenovo,tb710fu", "qcom,sm8650"), b"internal\0",
+                    b"\0" * 16)
+        self.method.write_text("kshimc\n", encoding="utf-8")
+        code, out = self.run_script(self.update, self.legacy)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls(), [])
+
     def test_board_tokens_must_match_exactly_and_as_a_pair(self):
         cases = ((("lenovo,elden-x", "qcom,sm8750"), b"internal\0"),
-                 (("lenovo,elden", "qcom,sm8850"), b"internal\0"))
+                 (("lenovo,elden", "qcom,sm8850"), b"internal\0"),
+                 (("lenovo,tb710fu", "qcom,sm8550"), b"internal\0"))
         for compatible, medium in cases:
             with self.subTest(compatible=compatible):
                 self.set_dt(compatible, medium, b"\0" * 16)
@@ -369,7 +380,7 @@ class HookTest(unittest.TestCase):
         override = self.root / "device-tree-override"
         self.set_dt(("lenovo,elden", "qcom,sm8750"), b"internal\0",
                     b"\0" * 16, root=override)
-        self.set_dt(("lenovo,tb710fu", "qcom,sm8650"), b"internal\0",
+        self.set_dt(("ayn,odin2", "qcom,sm8550"), b"internal\0",
                     b"\0" * 16)
         self.method.write_text("kshimc\n", encoding="utf-8")
 

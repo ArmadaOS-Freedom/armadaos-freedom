@@ -5,8 +5,9 @@ shipped boards, so a capability change is made once and cannot drift between
 the catalog, package, boot, recovery, and execution gates.
 
 The flags describe implemented backends, not hardware: TB710FU installs and
-builds boot payloads, but no dual-slot upgrade, mirrored trusted boot, or GBL
-envelope backend exists for it yet.  Nothing here is registered at runtime and
+builds boot payloads and has the installer-provisioned recovery layout (board
+3), but its dual-slot upgrade and mirrored trusted boot stay disabled until
+the native backend is accepted on hardware; it never uses a GBL envelope.  Nothing here is registered at runtime and
 no dependency outside the standard library is used.
 """
 
@@ -52,7 +53,7 @@ MODELS = MappingProxyType({
     "TB710FU": ModelCapabilities(
         compatible=(b"lenovo,tb710fu",),
         soc_compatible=(b"qcom,sm8650",),
-        board_id=None,
+        board_id=3,
         offline_upgrade=False,
         mirrored_boot=False,
         gbl_envelope=False,

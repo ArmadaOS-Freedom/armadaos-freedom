@@ -152,7 +152,7 @@ def read_device_identity():
     # The board-id table belongs to the slot precheck; do not duplicate it.
     model = physical_slots._MODEL.get(board) if type(board) is int else None
     if model not in _MODELS:
-        raise OfflineSessionError('physical offline upgrades support only TB322FC/TB323FU')
+        raise OfflineSessionError('physical offline upgrades support only ' + '/'.join(sorted(_MODELS)))
     if not isinstance(part_uuid, str) or not part_uuid:
         raise OfflineSessionError('recovery partition has no verified PARTUUID')
     return {
@@ -182,12 +182,12 @@ class OfflineSessionStore:
     def _physical_info(self):
         physical = self._inspect()
         if not isinstance(physical, dict) or physical.get('model') not in _MODELS:
-            raise OfflineSessionError('physical offline upgrades support only TB322FC/TB323FU')
+            raise OfflineSessionError('physical offline upgrades support only ' + '/'.join(sorted(_MODELS)))
         return physical
 
     def _require_identity(self, physical):
         if not isinstance(physical, dict) or physical.get('model') not in _MODELS:
-            raise OfflineSessionError('physical offline upgrades support only TB322FC/TB323FU')
+            raise OfflineSessionError('physical offline upgrades support only ' + '/'.join(sorted(_MODELS)))
         for field in ('model', 'actualSlot', 'inactiveSlot', 'deployment',
                       'recoveryPartUuid'):
             value = physical.get(field)
