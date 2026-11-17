@@ -146,11 +146,13 @@ def apply_type(value):
         return False
     ok = False
     for path in paths:
-        # The Freedom Touch plugin owns this virtual composite and feeds its
-        # deck-uhid target; retargeting it here would replace that target and
-        # break touch input. Skip only that exact composite and leave physical
-        # controllers, including the G9, on the existing apply path.
-        if composite_name(path) == "Freedom Touch Controller":
+        # Read the composite name exactly once. Skip when the name cannot be
+        # resolved (empty/falsy) so an unidentified plugin composite is never
+        # retargeted, and skip the exact Freedom Touch plugin name because it
+        # owns this virtual composite and feeds its deck-uhid target; leaving
+        # physical controllers, including the G9, on the existing apply path.
+        name = composite_name(path)
+        if not name or name == "Freedom Touch Controller":
             continue
         targets = [value] + extra_targets(path)
         try:

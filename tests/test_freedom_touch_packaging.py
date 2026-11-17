@@ -2,6 +2,7 @@
 """Guard the Freedom Touch packaging chain in the image build."""
 import re
 import runpy
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +35,44 @@ class PatchFilesExist(unittest.TestCase):
         for name in TOUCH_PATCHES:
             with self.subTest(patch=name):
                 self.assertTrue((PATCH_DIR / name).is_file(), name)
+
+
+class TouchEventUsesOrderedWriteEvent(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read(PATCH_DIR / "0004-add-dbus-touch-events.patch")
+
+    def test_send_touch_event_uses_write_event_not_write_send_event(self):
+        # Extract the SendTouchEvent method body from the patch:
+        # every line of the added method is PLUS-prefixed.
+        lines = self.text.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if line.startswith("+") and "async fn send_touch_event" in line:
+                start = i
+                break
+        self.assertIsNotNone(start, "send_touch_event not found in patch0004")
+        body = []
+        for line in lines[start + 1:]:
+            if line.startswith("+"):
+                body.append(line[1:])
+            elif line.startswith(" "):
+                # context line - stop once we pass the method (next doc comment/method)
+                if "Directly write to the composite device" in line:
+                    break
+            else:
+                break
+        joined = "\n".join(body)
+        self.assertIn(
+            "write_event(NativeEvent::new(cap, value))",
+            joined,
+            "SendTouchEvent must reuse CompositeDeviceClient::write_event for FIFO ordering",
+        )
+        self.assertNotIn(
+            "write_send_event(NativeEvent::new(cap, value))",
+            joined,
+            "SendTouchEvent must not go through the button-delay write_send_event path",
+        )
 
 
 class SpecWiring(unittest.TestCase):
@@ -207,6 +246,71 @@ class ControllerTypeSkip(unittest.TestCase):
         self.assertIn("/org/shadowblip/InputPlumber/CompositeDevice0", targets)
         self.assertIn("/org/shadowblip/InputPlumber/CompositeDevice2", targets)
         self.assertNotIn("/org/shadowblip/InputPlumber/CompositeDevice1", targets)
+
+    def test_unknown_names_skip_all_returns_false_no_calls(self):
+        names = {
+            "/org/shadowblip/InputPlumber/CompositeDevice0": "",
+            "/org/shadowblip/InputPlumber/CompositeDevice1": None,
+        }
+        ok, calls = self._run(list(names), names, {})
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+
+    def test_mixed_unknown_plugin_physical_only_physical_targeted(self):
+        names = {
+            "/org/shadowblip/InputPlumber/CompositeDevice0": "",
+            "/org/shadowblip/InputPlumber/CompositeDevice1": PROFILE_NAME,
+            "/org/shadowblip/InputPlumber/CompositeDevice2": "G9",
+        }
+        ok, calls = self._run(list(names), names, {})
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0]
+        self.assertEqual(cmd[4], "/org/shadowblip/InputPlumber/CompositeDevice2")
+        self.assertEqual(cmd[6], "SetTargetDevices")
+        self.assertEqual(cmd[9], "ds5")
+
+    def test_composite_name_timeout_does_not_retarget(self):
+        paths = ["/org/shadowblip/InputPlumber/CompositeDevice0"]
+        run_calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if "get-property" in cmd and cmd[-1] == "Name":
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 2))
+            run_calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            self.fn.__globals__,
+            {
+                "composite_paths": lambda: list(paths),
+                "extra_targets": lambda _: [],
+            },
+        ), mock.patch.object(self.ns["subprocess"], "run", side_effect=fake_run):
+            ok = self.fn("ds5")
+        self.assertFalse(ok)
+        self.assertFalse(any("SetTargetDevices" in c for c in run_calls))
+
+    def test_composite_name_failure_does_not_retarget(self):
+        paths = ["/org/shadowblip/InputPlumber/CompositeDevice0"]
+        run_calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if "get-property" in cmd and cmd[-1] == "Name":
+                raise subprocess.CalledProcessError(1, cmd, output="", stderr="")
+            run_calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            self.fn.__globals__,
+            {
+                "composite_paths": lambda: list(paths),
+                "extra_targets": lambda _: [],
+            },
+        ), mock.patch.object(self.ns["subprocess"], "run", side_effect=fake_run):
+            ok = self.fn("ds5")
+        self.assertFalse(ok)
+        self.assertFalse(any("SetTargetDevices" in c for c in run_calls))
 
     def test_existing_adapter_slot_codes_preserved(self):
         text = read(CTRL)

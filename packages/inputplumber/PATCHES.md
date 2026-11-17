@@ -15,8 +15,9 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0004-add-dbus-touch-events.patch`
   source: armadaos-freedom
   notes: Adds a `SendTouchEvent` method to the CompositeDevice D-Bus interface;
-  it clamps a normalized touchpad contact and writes it via
-  `write_send_event`. `SendEvent` awaits the same call instead of
+  it clamps a normalized touchpad contact and queues it via `write_event` so
+  contact updates retain FIFO order without the button-delay mechanism.
+  `SendEvent` awaits `write_send_event` instead of
   `blocking_write_send_event`. Authorizes through the existing
   `org.shadowblip.Input.CompositeDevice.SendEvent` polkit action; no new
   action or policy change.

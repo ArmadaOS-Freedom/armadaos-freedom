@@ -71,7 +71,7 @@ index e3db7ac..b0734e9 100644
 +            y: Some(y.clamp(0.0, 1.0)),
 +        };
 +        self.composite_device
-+            .write_send_event(NativeEvent::new(cap, value))
++            .write_event(NativeEvent::new(cap, value))
 +            .await
 +            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
 +        Ok(())
@@ -80,3 +80,96 @@ index e3db7ac..b0734e9 100644
      /// Directly write to the composite device's target devices with the given button event list
      async fn send_button_chord(
          &self,
+diff --git a/src/input/composite_device/client.rs b/src/input/composite_device/client.rs
+index ee8e4fe..367e165 100644
+--- a/src/input/composite_device/client.rs
++++ b/src/input/composite_device/client.rs
+@@ -587,3 +587,88 @@ impl CompositeDeviceClient {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::input::capability::{Touch, Touchpad};
++    use crate::input::event::value::InputValue;
++    use tokio::time::sleep;
++
++    fn touch_event(index: u8, is_touching: bool, x: f64, y: f64) -> NativeEvent {
++        let cap = Capability::Touchpad(Touchpad::RightPad(Touch::Motion));
++        let value = InputValue::Touch {
++            index,
++            is_touching,
++            pressure: Some(if is_touching { 1.0 } else { 0.0 }),
++            x: Some(x),
++            y: Some(y),
++        };
++        NativeEvent::new(cap, value)
++    }
++
++    async fn drain_touches(rx: &mut Receiver<CompositeCommand>) -> Vec<NativeEvent> {
++        let mut out = Vec::new();
++        while let Ok(cmd) = rx.try_recv() {
++            match cmd {
++                CompositeCommand::WriteEvent(ev) => out.push(ev),
++                CompositeCommand::WriteSendEvent(ev) => {
++                    panic!("SendTouchEvent must use WriteEvent, got WriteSendEvent: {ev:?}")
++                }
++                other => panic!("unexpected composite command: {other:?}"),
++            }
++        }
++        out
++    }
++
++    #[tokio::test]
++    async fn send_touch_event_preserves_fifo_order() {
++        let (tx, mut rx) = channel::<CompositeCommand>(16);
++        let client = CompositeDeviceClient::new(tx);
++
++        client
++            .write_event(touch_event(0, true, 0.25, 0.25))
++            .await
++            .expect("down");
++        sleep(Duration::from_millis(3)).await;
++        client
++            .write_event(touch_event(0, true, 0.5, 0.5))
++            .await
++            .expect("motion");
++        sleep(Duration::from_millis(2)).await;
++        client
++            .write_event(touch_event(0, false, 0.5, 0.5))
++            .await
++            .expect("release");
++
++        let events = drain_touches(&mut rx).await;
++        assert_eq!(events.len(), 3, "expected down/motion/release, got {events:?}");
++
++        let taken: Vec<(u8, bool, Option<f64>)> = events
++            .iter()
++            .map(|ev| {
++                assert!(
++                    matches!(ev.as_capability(), Capability::Touchpad(Touchpad::RightPad(_))),
++                    "capability not right touchpad: {:?}",
++                    ev.as_capability()
++                );
++                match ev.get_value() {
++                    InputValue::Touch { index, is_touching, x, .. } => {
++                        (index, is_touching, x)
++                    }
++                    other => panic!("expected touch value, got {other:?}"),
++                }
++            })
++            .collect();
++
++        assert_eq!(taken.len(), 3);
++        assert_eq!(taken[0].0, 0);
++        assert_eq!(taken[1].0, 0);
++        assert_eq!(taken[2].0, 0);
++        assert_eq!((taken[0].1, taken[1].1, taken[2].1), (true, true, false));
++        let xs: Vec<f64> = taken.iter().filter_map(|(_, _, x)| *x).collect();
++        assert_eq!(xs.len(), 3);
++        assert!(xs[0] < xs[1], "motion x must follow down: {xs:?}");
++        assert!(taken[2].1 == false, "release must be last");
++    }
++}
