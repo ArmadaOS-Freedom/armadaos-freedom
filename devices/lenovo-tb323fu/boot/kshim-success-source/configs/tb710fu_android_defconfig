@@ -21,8 +21,9 @@ CONFIG_DEBUG_LEVEL_NONE=y
 CONFIG_ASSERT_HALT=y
 CONFIG_KSHIM_MENU_STYLE_STAR_CHART=y
 CONFIG_KSHIM_MENU_LANGUAGE_SWITCH=y
-# Session settings off: legacy default handling (initial row always auto-boots).
-# CONFIG_KSHIM_MENU_SESSION_SETTINGS is not set
+# Persistent session settings in the installer-provisioned ARMADA_BACKUP
+# region (board 3); default boot, language and remember-last.
+CONFIG_KSHIM_MENU_SESSION_SETTINGS=y
 CONFIG_KSHIM_MENU_CHINESE=y
 CONFIG_KSHIM_MENU_ENTRY_DETAILS=y
 CONFIG_KSHIM_MENU_BASE_ANDROID=y
@@ -30,3 +31,11 @@ CONFIG_KSHIM_MENU_POWER_ACTIONS=y
 CONFIG_KSHIM_MENU_ADVANCED_ACTIONS=y
 CONFIG_KSHIM_QCOM_REBOOT=y
 # CONFIG_KSHIM_BOOT_TIMING is not set
+
+# Native UFS settings and update-trial accounting. The SM8650 ABL hands over
+# a live UFS link with the UFS SID 0x60 context bank untranslated (measured on
+# hardware), the same precondition the Y700 profiles rely on.
+CONFIG_KSHIM_UFS_NATIVE_IO=y
+CONFIG_KSHIM_UFS_LINK_WAKE=y
+CONFIG_KSHIM_UFS_DEVICE_WAKE=y
+CONFIG_KSHIM_UFS_SETTINGS=y

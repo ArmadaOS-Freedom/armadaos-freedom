@@ -17,16 +17,22 @@ static uint32_t TestPerformed;
 static int TestStatus;
 static uint64_t now_ms(void *ctx) { (void)ctx;return get_current_time(); }
 static void delay_us(void *ctx,uint32_t us) { (void)ctx;(void)delay(us); }
-static const struct kshim_ufs_ops Ops={
+static struct kshim_ufs_ops Ops={
     .read32=storage_ufs_native_read32,.write32=storage_ufs_native_write32,
     .sync_device=storage_ufs_native_sync_device,.sync_cpu=storage_ufs_native_sync_cpu,
     .now_ms=now_ms,.delay_us=delay_us,.manage_link=true
 };
+/* Boards with a measured native UFS/SMMU profile and an installer-provisioned
+ * ARMADA_BACKUP descriptor carrying their board id. */
+static bool native_board(uint32_t board)
+{
+    return board==DEVICE_BOARD_TB322FC || board==DEVICE_BOARD_TB323FU ||
+           board==DEVICE_BOARD_TB710FU;
+}
 static int preflight(void *ctx,uint64_t *physical)
 {
     const struct kshim_ufs_settings *b=ctx;
-    if ((b->board!=DEVICE_BOARD_TB322FC && b->board!=DEVICE_BOARD_TB323FU) ||
-        arm64_read_cntfrq()==0) return KSHIM_UFS_UNSUPPORTED;
+    if (!native_board(b->board) || arm64_read_cntfrq()==0) return KSHIM_UFS_UNSUPPORTED;
     int rc=storage_ufs_native_dma_address(Arena,sizeof(Arena),physical);
     if (rc) return rc;
     storage_probe_native_capture((enum device_board)b->board,&Fresh);
@@ -38,12 +44,15 @@ int storage_settings_native_open(enum device_board actual_board,
 {
     if (!kshim_ufs_settings_handoff_safe(&Backend)) return KSHIM_UFS_QUARANTINED;
     TestPerformed=0;TestStatus=0;
-    if (actual_board!=DEVICE_BOARD_TB322FC && actual_board!=DEVICE_BOARD_TB323FU) {
+    if (!native_board((uint32_t)actual_board)) {
         Backend.board=(uint32_t)actual_board;
         Backend.load_status=KSHIM_UFS_UNSUPPORTED;
         Backend.settings.source=KSHIM_SETTINGS_NONE;
         return KSHIM_UFS_UNSUPPORTED;
     }
+    /* SM8650 reports CAP.LSDBS although its firmware runs the legacy
+     * doorbell (measured: UTRL running, MCQ config off). */
+    Ops.broken_lsdbs_cap=actual_board==DEVICE_BOARD_TB710FU;
     int rc=kshim_ufs_settings_open(&Backend,&Ops,Arena,(uint32_t)actual_board,
                                      preflight,&Backend,defaults);
 #if defined(CONFIG_KSHIM_SETTINGS_SAVE_TEST) && CONFIG_KSHIM_SETTINGS_SAVE_TEST
@@ -98,7 +107,7 @@ int storage_settings_native_export(void *fdt)
 }
 bool storage_settings_native_ab_supported(void)
 {
-    return Backend.preflight && (Backend.board==DEVICE_BOARD_TB322FC || Backend.board==DEVICE_BOARD_TB323FU)
+    return Backend.preflight && native_board(Backend.board)
         && kshim_ufs_settings_handoff_safe(&Backend);
 }
 static int ab_transaction(struct kshim_ab_status *status,bool change,

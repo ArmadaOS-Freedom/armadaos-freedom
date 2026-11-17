@@ -95,7 +95,7 @@ static void cpu(void *p,void *a,size_t n){assert(a==arena&&n==8192);++((struct f
 static uint64_t now(void *p){return ((struct fixture*)p)->ticks;}
 static void delay(void *p,uint32_t u){((struct fixture*)p)->ticks+=(u+999)/1000;}
 static struct kshim_ufs_ops ops(struct fixture *f)
-{ return (struct kshim_ufs_ops){f,rd,wr,dev,cpu,now,delay,false}; }
+{ return (struct kshim_ufs_ops){f,rd,wr,dev,cpu,now,delay,false,false}; }
 static void init(struct fixture *f) {
     memset(f,0,sizeof(*f));memset(arena,0,sizeof(arena));
     f->reg[0]=1u<<24;f->reg[0x34/4]=1;f->reg[0x30/4]=15;
@@ -201,6 +201,15 @@ int main(void) {
         if(i==4)f.reg[0x30/4]|=0x10;
         assert(kshim_ufs_claim(&h,&o,arena,sizeof(arena),0x10000000)!=0&&f.writes==0);
     }
+    /* CAP.LSDBS is ignored only with the explicit quirk, and never when MCQ
+     * mode is enabled. */
+    init(&f);{struct kshim_ufs_ops o=ops(&f);o.broken_lsdbs_cap=true;memset(&h,0,sizeof(h));
+    f.reg[0]|=1u<<29;
+    assert(kshim_ufs_claim(&h,&o,arena,sizeof(arena),0x10000000)==0);
+    assert(kshim_ufs_release(&h)==0);}
+    init(&f);{struct kshim_ufs_ops o=ops(&f);o.broken_lsdbs_cap=true;memset(&h,0,sizeof(h));
+    f.reg[0]|=(1u<<29)|(1u<<30);f.reg[0x300/4]=1;
+    assert(kshim_ufs_claim(&h,&o,arena,sizeof(arena),0x10000000)==KSHIM_UFS_UNSUPPORTED&&f.writes==0);}
     init(&f);claim(&f,&h);f.bad_tag=1;
     assert(kshim_ufs_nop(&h)!=0);assert(kshim_ufs_release(&h)==0);
     init(&f);claim(&f,&h);f.bad_ocs=1;

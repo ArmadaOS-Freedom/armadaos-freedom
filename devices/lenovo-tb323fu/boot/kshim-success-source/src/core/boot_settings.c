@@ -52,6 +52,7 @@ static bool detected_valid(enum device_board board)
     case DEVICE_BOARD_UNKNOWN:
     case DEVICE_BOARD_TB322FC:
     case DEVICE_BOARD_TB323FU:
+    case DEVICE_BOARD_TB710FU:
         return true;
     default:
         return false;
@@ -92,6 +93,13 @@ int boot_settings_effective_board(const struct boot_settings *settings,
     if (out == NULL || !detected_valid(detected) ||
         boot_settings_validate(settings) != BOOT_SETTINGS_OK) {
         return BOOT_SETTINGS_INVALID;
+    }
+
+    /* The manual choices only disambiguate the two Y700 generations that
+     * share one boot image; they never retarget a detected TB710FU. */
+    if (detected == DEVICE_BOARD_TB710FU) {
+        *out = detected;
+        return BOOT_SETTINGS_OK;
     }
 
     switch (settings->device_choice) {

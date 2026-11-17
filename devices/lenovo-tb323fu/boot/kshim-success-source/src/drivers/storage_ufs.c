@@ -172,7 +172,8 @@ int kshim_ufs_claim(struct kshim_ufs_host *h,const struct kshim_ufs_ops *o,
     if(cap&(1u<<30)){READ(MEM_CFG,mode);}
     if(!(hce&1)||(hcs&15)!=15||(hcs&0x30)||db||tdb||(status&ERRORS))
         return KSHIM_UFS_BUSY;
-    if((cap&(1u<<29))||(mode&1)||(!(cap&(1u<<24))&&dma+8191>UINT32_MAX))
+    if(((cap&(1u<<29))&&!o->broken_lsdbs_cap)||(mode&1)||
+       (!(cap&(1u<<24))&&dma+8191>UINT32_MAX))
         return KSHIM_UFS_UNSUPPORTED;
     READ(BASE_LO,h->saved_base[0]);READ(BASE_HI,h->saved_base[1]);
     READ(RUN,h->saved_run);READ(IE,h->saved_ie);READ(AHIT,h->saved_ahit);

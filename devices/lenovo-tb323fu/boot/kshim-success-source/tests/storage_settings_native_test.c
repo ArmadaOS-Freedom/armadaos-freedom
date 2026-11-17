@@ -21,7 +21,8 @@ int storage_ufs_native_dma_address(void *arena,size_t size,uint64_t *dma){
     assert(((uintptr_t)arena&4095)==0&&size==8192);++maps;*dma=0x10000000;return mapping_rc;
 }
 void storage_probe_native_capture(enum device_board board,struct storage_probe_snapshot *out){
-    assert(board==DEVICE_BOARD_TB322FC||board==DEVICE_BOARD_TB323FU);
+    assert(board==DEVICE_BOARD_TB322FC||board==DEVICE_BOARD_TB323FU||
+           board==DEVICE_BOARD_TB710FU);
     ++captures;memset(out,0,sizeof(*out));out->board=board;
 }
 bool kshim_ufs_dma_is_identity(const struct storage_probe_snapshot *s,uint64_t dma,size_t size){
@@ -238,6 +239,8 @@ int main(void){
     assert(captures==1&&proofs==1&&saves==0);
     identity=1;assert(storage_settings_native_open(DEVICE_BOARD_TB323FU,&defaults)==KSHIM_STORAGE_EMPTY);
     assert(saves==0); /* the explicit seed test never writes on Gen5 */
+    assert(storage_settings_native_open(DEVICE_BOARD_TB710FU,&defaults)==KSHIM_STORAGE_EMPTY);
+    assert(saves==0); /* nor on TB710FU */
     load_result=0;assert(storage_settings_native_open(DEVICE_BOARD_TB322FC,&defaults)==0&&saves==0);
     load_result=KSHIM_STORAGE_NOT_FOUND;
     assert(storage_settings_native_open(DEVICE_BOARD_TB322FC,&defaults)==KSHIM_STORAGE_NOT_FOUND&&saves==0);

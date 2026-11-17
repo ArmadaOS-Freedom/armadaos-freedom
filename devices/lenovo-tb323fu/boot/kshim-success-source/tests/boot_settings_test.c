@@ -100,6 +100,21 @@ static void test_effective_board(void)
     assert(boot_settings_effective_board(&settings, DEVICE_BOARD_TB322FC,
                                          &out) == BOOT_SETTINGS_OK);
     assert(out == DEVICE_BOARD_TB322FC);
+
+    /* A detected TB710FU is its own effective board; the Y700 manual choices
+     * never retarget it, and the stored choice is left untouched. */
+    assert(boot_settings_effective_board(&settings, DEVICE_BOARD_TB710FU,
+                                         &out) == BOOT_SETTINGS_OK);
+    assert(out == DEVICE_BOARD_TB710FU);
+    settings.device_choice = BOOT_DEVICE_TB322FC;
+    assert(boot_settings_effective_board(&settings, DEVICE_BOARD_TB710FU,
+                                         &out) == BOOT_SETTINGS_OK);
+    assert(out == DEVICE_BOARD_TB710FU);
+    settings.device_choice = BOOT_DEVICE_TB323FU;
+    assert(boot_settings_effective_board(&settings, DEVICE_BOARD_TB710FU,
+                                         &out) == BOOT_SETTINGS_OK);
+    assert(out == DEVICE_BOARD_TB710FU);
+    assert(settings.device_choice == BOOT_DEVICE_TB323FU);
 }
 
 /* Negative and upper out-of-range enum values are rejected for both fields;
@@ -285,7 +300,7 @@ static void test_resolve_boundaries(void)
     assert(boot_settings_effective_board(&settings, (enum device_board)-1,
                                          &board) == BOOT_SETTINGS_INVALID);
     assert(board == DEVICE_BOARD_TB323FU);
-    assert(boot_settings_effective_board(&settings, (enum device_board)3,
+    assert(boot_settings_effective_board(&settings, (enum device_board)99,
                                          &board) == BOOT_SETTINGS_INVALID);
     assert(board == DEVICE_BOARD_TB323FU);
     assert(boot_settings_effective_board(NULL, DEVICE_BOARD_UNKNOWN, &board) ==
