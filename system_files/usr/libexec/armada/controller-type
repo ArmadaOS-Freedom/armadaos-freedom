@@ -83,14 +83,27 @@ def save_type(value):
     tmp.replace(CONFIG)
 
 
-def composite_paths():
+def _capped(timeout, deadline):
+    """Return effective timeout (cap to remaining), or None if no time left."""
+    if deadline is None:
+        return timeout
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        return None
+    return min(timeout, rem)
+
+
+def composite_paths(deadline=None):
+    eff = _capped(2, deadline)
+    if eff is None:
+        return []
     try:
         result = subprocess.run(
             ["busctl", "--system", "tree", SERVICE],
             check=True,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=eff,
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -102,14 +115,17 @@ def composite_paths():
     return sorted(set(paths))
 
 
-def composite_name(path):
+def composite_name(path, deadline=None):
+    eff = _capped(2, deadline)
+    if eff is None:
+        return ""
     try:
         result = subprocess.run(
             ["busctl", "--system", "get-property", SERVICE, path, IFACE, "Name"],
             check=True,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=eff,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -117,31 +133,34 @@ def composite_name(path):
     return parts[1] if len(parts) >= 2 else ""
 
 
-def current_target_paths(path):
+def current_target_paths(path, deadline=None):
+    eff = _capped(2, deadline)
+    if eff is None:
+        return []
     try:
         result = subprocess.run(
             ["busctl", "--system", "get-property", SERVICE, path, IFACE, "TargetDevices"],
             check=True,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=eff,
         )
     except (OSError, subprocess.SubprocessError):
         return []
     return re.findall(r'"([^"]*)"', result.stdout)
 
 
-def extra_targets(path):
+def extra_targets(path, deadline=None):
     extras = []
-    for target_path in current_target_paths(path):
+    for target_path in current_target_paths(path, deadline=deadline):
         segment = target_path.rsplit("/", 1)[-1].rstrip("0123456789")
         if segment in ("keyboard", "mouse") and segment not in extras:
             extras.append(segment)
     return extras
 
 
-def apply_type(value):
-    paths = composite_paths()
+def apply_type(value, deadline=None):
+    paths = composite_paths(deadline=deadline)
     if not paths:
         return False
     ok = False
@@ -152,20 +171,24 @@ def apply_type(value):
         # retargeted, and skip the exact Freedom Touch plugin name because it
         # owns this virtual composite and feeds its deck-uhid target; leaving
         # physical controllers, including the G9, on the existing apply path.
-        name = composite_name(path)
+        name = composite_name(path, deadline=deadline)
         if not name:
             unresolved = True
             continue
         if name == "Freedom Touch Controller":
             continue
-        targets = [value] + extra_targets(path)
+        targets = [value] + extra_targets(path, deadline=deadline)
+        eff = _capped(8, deadline)
+        if eff is None:
+            unresolved = True
+            continue
         try:
             subprocess.run(
                 ["busctl", "--system", "call", SERVICE, path, IFACE, "SetTargetDevices", "as", str(len(targets)), *targets],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                timeout=eff,
             )
             ok = True
         except (OSError, subprocess.SubprocessError):
@@ -173,11 +196,31 @@ def apply_type(value):
     return ok and not unresolved
 
 
-def apply_with_retry(value):
+# Total wall-clock budget for a full apply_with_retry pass. Kept at 14s so the
+# whole retry envelope fits comfortably inside the caller's 20s armada-control
+# timeout even after the first available_types()/device_env() probe (5s).
+APPLY_RETRY_BUDGET = 14.0
+
+
+def apply_with_retry(value, deadline=None):
+    """Retry apply_type until it succeeds or the shared deadline expires.
+
+    When ``deadline`` is None a fresh monotonic deadline is derived from
+    ``APPLY_RETRY_BUDGET``. Every subprocess call inside apply_type is capped
+    to the remaining time and no call is started once the deadline has
+    passed. Sleep is 0.5s capped to the remaining budget.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + APPLY_RETRY_BUDGET
     for _ in range(30):
-        if apply_type(value):
+        if time.monotonic() >= deadline:
+            return False
+        if apply_type(value, deadline=deadline):
             return True
-        time.sleep(0.5)
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return False
+        time.sleep(min(0.5, rem))
     return False
 
 

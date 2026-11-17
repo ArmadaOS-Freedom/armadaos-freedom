@@ -194,12 +194,18 @@ class ControllerTypeSkip(unittest.TestCase):
             calls.append(cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+        def name_for(path, deadline=None):
+            return names.get(path)
+
+        def extra_for(path, deadline=None):
+            return []
+
         with mock.patch.dict(
             self.fn.__globals__,
             {
-                "composite_paths": lambda: list(paths),
-                "composite_name": names.get,
-                "extra_targets": lambda _: [],
+                "composite_paths": lambda deadline=None: list(paths),
+                "composite_name": name_for,
+                "extra_targets": extra_for,
             },
         ), mock.patch.object(self.ns["subprocess"], "run", side_effect=fake_run):
             ok = self.fn("ds5")
@@ -280,7 +286,7 @@ class ControllerTypeSkip(unittest.TestCase):
         calls = []
         sleeps = []
 
-        def name_for(path):
+        def name_for(path, deadline=None):
             reads[path] += 1
             if path == paths[0]:
                 return "Xbox Series" if reads[path] > 1 else ""
@@ -295,9 +301,9 @@ class ControllerTypeSkip(unittest.TestCase):
         with mock.patch.dict(
             self.fn.__globals__,
             {
-                "composite_paths": lambda: list(paths),
+                "composite_paths": lambda deadline=None: list(paths),
                 "composite_name": name_for,
-                "extra_targets": lambda _: [],
+                "extra_targets": lambda _p, deadline=None: [],
             },
         ), mock.patch.object(
             self.ns["subprocess"], "run", side_effect=fake_run
@@ -330,8 +336,8 @@ class ControllerTypeSkip(unittest.TestCase):
         with mock.patch.dict(
             self.fn.__globals__,
             {
-                "composite_paths": lambda: list(paths),
-                "extra_targets": lambda _: [],
+                "composite_paths": lambda deadline=None: list(paths),
+                "extra_targets": lambda _p, deadline=None: [],
             },
         ), mock.patch.object(self.ns["subprocess"], "run", side_effect=fake_run):
             ok = self.fn("ds5")
@@ -351,13 +357,66 @@ class ControllerTypeSkip(unittest.TestCase):
         with mock.patch.dict(
             self.fn.__globals__,
             {
-                "composite_paths": lambda: list(paths),
-                "extra_targets": lambda _: [],
+                "composite_paths": lambda deadline=None: list(paths),
+                "extra_targets": lambda _p, deadline=None: [],
             },
         ), mock.patch.object(self.ns["subprocess"], "run", side_effect=fake_run):
             ok = self.fn("ds5")
         self.assertFalse(ok)
         self.assertFalse(any("SetTargetDevices" in c for c in run_calls))
+
+    def test_apply_with_retry_shared_deadline_ds5(self):
+        import subprocess, time, types
+        from unittest import mock
+        clock=[0.0]
+        def fake_monotonic():
+            return clock[0]
+        def fake_sleep(s):
+            clock[0]+=s
+        calls=[]
+        def fake_run(cmd,*args,**kwargs):
+            start=clock[0]
+            timeout=kwargs.get("timeout")
+            self.assertIsNotNone(timeout)
+            self.assertGreater(timeout,0)
+            self.assertLessEqual(timeout,14-start+1e-9)
+            self.assertLess(start,14)
+            calls.append((start,timeout,list(cmd)))
+            if cmd[2]=="tree":
+                out="\n".join(["/org/shadowblip/InputPlumber/CompositeDevice0","/org/shadowblip/InputPlumber/CompositeDevice1","/org/shadowblip/InputPlumber/CompositeDevice2"])
+                return types.SimpleNamespace(returncode=0,stdout=out,stderr="")
+            if cmd[-1]=="Name":
+                path=cmd[4]
+                if "CompositeDevice0" in path:
+                    clock[0]+=timeout
+                    raise subprocess.TimeoutExpired(cmd,timeout)
+                if "CompositeDevice1" in path:
+                    return types.SimpleNamespace(returncode=0,stdout='s "G9"',stderr="")
+                return types.SimpleNamespace(returncode=0,stdout='s "Freedom Touch Controller"',stderr="")
+            if cmd[-1]=="TargetDevices":
+                return types.SimpleNamespace(returncode=0,stdout="ao 0",stderr="")
+            if cmd[6]=="SetTargetDevices":
+                return types.SimpleNamespace(returncode=0,stdout="",stderr="")
+            normal0 = 0.01
+            if normal0 > timeout:
+                clock[0]+=timeout
+                raise subprocess.TimeoutExpired(cmd,timeout)
+            clock[0]+=normal0
+            return types.SimpleNamespace(returncode=0,stdout="",stderr="")
+        with mock.patch.object(subprocess,"run",side_effect=fake_run), \
+             mock.patch.object(time,"monotonic",side_effect=fake_monotonic), \
+             mock.patch.object(time,"sleep",side_effect=fake_sleep):
+            result=self.ns["apply_with_retry"]("ds5")
+        self.assertFalse(result)
+        self.assertLessEqual(abs(clock[0]-14.0),1e-6)
+        name0=[c for c in calls if c[2][-1]=="Name" and "CompositeDevice0" in c[2][4]]
+        self.assertGreaterEqual(len(name0),2)
+        set_calls=[c for c in calls if len(c)>2 and len(c[2])>6 and c[2][6]=="SetTargetDevices"]
+        self.assertTrue(any("CompositeDevice1" in c[2][4] for c in set_calls))
+        self.assertFalse(any("CompositeDevice0" in c[2][4] for c in set_calls))
+        self.assertFalse(any("CompositeDevice2" in c[2][4] for c in set_calls))
+        for c in calls:
+            self.assertLess(c[0],14)
 
     def test_existing_adapter_slot_codes_preserved(self):
         text = read(CTRL)

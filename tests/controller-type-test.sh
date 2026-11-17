@@ -122,7 +122,7 @@ class ControllerTypeApplyTest(unittest.TestCase):
         polled, slept = [], []
         patches = [
             mock.patch.object(
-                self.module, "composite_paths", side_effect=lambda: polled.append(1) or []
+                self.module, "composite_paths", side_effect=lambda deadline=None: polled.append(1) or []
             ),
             mock.patch.object(
                 self.module.time, "sleep", side_effect=lambda _s: slept.append(1)
@@ -199,7 +199,7 @@ class ControllerTypeApplyTest(unittest.TestCase):
         self.module.CONFIG = config
         applied = []
         with mock.patch.object(
-            self.module, "apply_type", side_effect=lambda v: applied.append(v) or True
+            self.module, "apply_type", side_effect=lambda v, deadline=None: applied.append(v) or True
         ):
             self.assertEqual(self.module.main(["controller-type", "set", "xbox-series"]), 0)
         self.assertEqual(applied, ["xbox-series"])
