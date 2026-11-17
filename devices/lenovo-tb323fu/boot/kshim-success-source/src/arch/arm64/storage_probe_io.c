@@ -62,7 +62,8 @@ void storage_probe_native_capture(enum device_board actual_board,
                                    struct storage_probe_snapshot *out)
 {
     if (!out) return;
-    if (actual_board != DEVICE_BOARD_TB323FU && actual_board != DEVICE_BOARD_TB322FC) {
+    if (actual_board != DEVICE_BOARD_TB323FU && actual_board != DEVICE_BOARD_TB322FC &&
+        actual_board != DEVICE_BOARD_TB710FU) {
         (void)storage_probe_collect(actual_board, storage_probe_native_read32, NULL, out);
         return;
     }

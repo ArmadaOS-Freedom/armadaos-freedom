@@ -155,7 +155,7 @@ void device_info_read(const void *validated_fdt, struct device_info *info)
     const char *model, *compatible;
     int compat_len, off, rc;
     size_t cap, used;
-    bool truncated, tb322, tb323, soc8750, soc8850;
+    bool truncated, tb322, tb323, tb710, soc8750, soc8850, soc8650;
     uint64_t ram = 0;
 
     if (!info)
@@ -207,6 +207,9 @@ void device_info_read(const void *validated_fdt, struct device_info *info)
                   list_contains(compatible, compat_len, "qcom,canoep") ||
                   list_contains(compatible, compat_len, "qcom,kaanapali") ||
                   list_contains(compatible, compat_len, "qcom,sm8850");
+        soc8650 = list_contains(compatible, compat_len, "qcom,pineapple") ||
+                  list_contains(compatible, compat_len, "qcom,pineapplep") ||
+                  list_contains(compatible, compat_len, "qcom,sm8650");
 
         /* The trusted Linux reference pairing (elden + sm8750) is unchanged.
          * A stock TB322FC is additionally accepted from the measured .096
@@ -232,11 +235,24 @@ void device_info_read(const void *validated_fdt, struct device_info *info)
                      validated_fdt,
                      "qcom,mdss_dsi_baldur_nt36523_csot_3k_dsc_vid",
                      "nt36523 3k fhd plus 165Hz DPHY video panel"));
-        if (tb322 != tb323)
-            info->board = tb322 ? DEVICE_BOARD_TB322FC : DEVICE_BOARD_TB323FU;
+        /* Lenovo's stock SM8650 overlays carry only generic Pineapple
+         * compatibles; a stock TB710FU is identified only by its exact root
+         * family and the measured NT36532 dual-DSI panel fingerprint. */
+        tb710 = list_contains(compatible, compat_len, "lenovo,tb710fu") ||
+                ((list_contains(compatible, compat_len, "qcom,pineapple") ||
+                  list_contains(compatible, compat_len, "qcom,pineapplep")) &&
+                 !soc8750 && !soc8850 &&
+                 stock_active_panel(
+                     validated_fdt,
+                     "qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid",
+                     "nt36532_wqhd_dual_dsi_dsc_vid"));
+        if ((int)tb322 + (int)tb323 + (int)tb710 == 1)
+            info->board = tb322 ? DEVICE_BOARD_TB322FC :
+                          tb323 ? DEVICE_BOARD_TB323FU : DEVICE_BOARD_TB710FU;
 
-        if (soc8750 != soc8850)
-            info->soc = soc8750 ? DEVICE_SOC_SM8750 : DEVICE_SOC_SM8850;
+        if ((int)soc8750 + (int)soc8850 + (int)soc8650 == 1)
+            info->soc = soc8750 ? DEVICE_SOC_SM8750 :
+                        soc8850 ? DEVICE_SOC_SM8850 : DEVICE_SOC_SM8650;
     }
 
     rc = memory_total(validated_fdt, &ram);

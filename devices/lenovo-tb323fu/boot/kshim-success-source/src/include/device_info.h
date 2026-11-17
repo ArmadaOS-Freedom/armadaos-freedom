@@ -25,6 +25,8 @@
  *     "qcom,sm8750" (the trusted Linux TB322FC reference), or the alternate
  *     strict stock fingerprint described below.
  *   - DEVICE_BOARD_TB323FU: exact "lenovo,tb323fu" or exact "lenovo,baldur".
+ *   - DEVICE_BOARD_TB710FU: exact "lenovo,tb710fu" (the Linux reference), or
+ *     the strict stock fingerprint described below.
  *   - "qcom,canoep" alone is a SoC marker, not a board identity.
  * Conflicting board evidence leave the board UNKNOWN; unrelated
  * devices that share a SoC keep the board UNKNOWN.
@@ -38,11 +40,19 @@
  * runtime FDT stays unverified, any unmatched generic-SoC tree stays UNKNOWN,
  * and a mere standby panel never counts.
  *
+ * The strict TB710FU stock fingerprint uses the same active-reference shape:
+ * an exact root "qcom,pineapple" or "qcom,pineapplep" with no SM8750- or
+ * SM8850-family marker, whose primary display resolves to the enabled
+ * "qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid" node with the exact panel name
+ * "nt36532_wqhd_dual_dsi_dsc_vid". Lenovo's stock SM8650 overlays carry no
+ * Lenovo compatible, so the generic Pineapple root alone never names a board.
+ *
  * The SoC is classified independently from exact entries:
  *   - DEVICE_SOC_SM8750: "qcom,sun", "qcom,sunp" or "qcom,sm8750".
  *   - DEVICE_SOC_SM8850: "qcom,canoe", "qcom,canoep", "qcom,kaanapali" or
  *     "qcom,sm8850".
- * Entries from both groups leave the SoC UNKNOWN.
+ *   - DEVICE_SOC_SM8650: "qcom,pineapple", "qcom,pineapplep" or "qcom,sm8650".
+ * Entries from more than one group leave the SoC UNKNOWN.
  *
  * The compatible field preserves the original root compatible list verbatim
  * as a NUL-separated list: whole entries are copied while they fit and
@@ -68,12 +78,14 @@ enum device_board {
     DEVICE_BOARD_UNKNOWN = 0,
     DEVICE_BOARD_TB322FC,
     DEVICE_BOARD_TB323FU,
+    DEVICE_BOARD_TB710FU,
 };
 
 enum device_soc {
     DEVICE_SOC_UNKNOWN = 0,
     DEVICE_SOC_SM8750,
     DEVICE_SOC_SM8850,
+    DEVICE_SOC_SM8650,
 };
 
 struct device_info {
