@@ -312,9 +312,9 @@ class BuildWiringTest(unittest.TestCase):
     def test_official_sources_use_upstream_fixed_base(self):
         kwin = self._read('packages/kwin/BASE.env')
         powerdevil = self._read('packages/powerdevil/BASE.env')
-        self.assertIn('SRPM=kwin-6.8.2-2.fc44', kwin)
+        self.assertIn('SRPM=kwin-6.8.3-1.fc44', kwin)
         self.assertNotIn('6.7.5', kwin)
-        self.assertIn('SRPM=powerdevil-6.8.2-1.fc44', powerdevil)
+        self.assertIn('SRPM=powerdevil-6.8.3-1.fc44', powerdevil)
         self.assertNotIn('6.7.5', powerdevil)
 
     def test_runtime_verification_is_last_build_step(self):
