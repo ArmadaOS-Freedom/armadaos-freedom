@@ -49,10 +49,10 @@ The recipe takes these four positional arguments and forwards no model or
 configuration options, so it packages one artifact containing every profile
 registered in `build_files/edl-devices.json`. That single package installs all
 of them, including `TB710FU`, and its descriptor also declares
-`offline-upgrade` for the selected models with the dual-slot backend (the
-Lenovo Legion Y700 models). It writes the package to `output/edl/<version>/`
-and uses a fresh `_build-edl.*` work directory under the checkout, which is
-ignored by Git.
+`offline-upgrade` for the selected models with the dual-slot backend (every
+shipped model: TB322FC, TB323FU and TB710FU). It writes the package to
+`output/edl/<version>/` and uses a fresh `_build-edl.*` work directory under
+the checkout, which is ignored by Git.
 
 To package a subset, or to use another configuration file, call the wrapper
 directly with the same four values:
@@ -406,18 +406,22 @@ the requested model must be eligible, and the installed updater must meet
 The unified package ships updater 0.8.1, and its descriptor therefore declares
 `minimumUpdaterVersion` 0.8.1 while `minimumInstallerVersion` stays 0.8.0. A
 fresh installation from this package is the supported baseline: the installed
-system reports 0.8.1, and later unified packages can update the eligible Y700
+system reports 0.8.1, and later unified packages can update the eligible
 models in place while keeping user data. An installation made from an earlier
 0.8.0 package does not reach this baseline through an update: its installed
 validator rejects the mixed package, and this change ships no in-place
 migration path. That baseline is obtained by a fresh installation.
 
-Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
-(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part
-of the same all-profile package for installation, but its update slot backend
-is not implemented yet; being listed in the package is not offline-upgrade
-support for that model, and an upgrade request naming it is rejected before
-any slot work.
+Offline upgrade is supported on every shipped model: the Lenovo Legion Y700
+Gen 4 (TB322FC) and Gen 5 (TB323FU) and the Lenovo Xiaoxin Pad Pro GT
+(TB710FU). TB710FU follows the same mirrored dual-slot policy without a GBL
+envelope: an update rebuilds `boot_a` and `boot_b` from each slot's own
+verified boot material, re-signs only the boot image with the AOSP test key
+the device already trusts (AospPreserved), and both slots boot the same Linux
+deployment. Android keeps its slot selection and its own vbmeta, recovery and
+vbmeta_system partitions. A TB710FU system installed from a package without
+this backend cannot upgrade in place; it needs a fresh installation from a
+package that includes it.
 
 Recovery manifests describe the RAM rescue path and are not a prerequisite here:
 this package ships no rescue artifacts, and the object may be absent or partial.

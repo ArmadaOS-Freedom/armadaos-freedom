@@ -47,6 +47,7 @@ REAL_WRAPPER = BUILD_FILES / "build-edl-package.sh"
 REAL_HELPER = BUILD_FILES / "edl_device_config.py"
 REAL_DEVICES_CONFIG = BUILD_FILES / "edl-devices.json"
 REAL_JUSTFILE = REPO_ROOT / "Justfile"
+REAL_RUNTIME_BUILDER = BUILD_FILES / "build-edl-runtime.sh"
 
 # An arbitrary ID the copied config is extended with, never shipped by it.
 THIRD_MODEL = "THIRD-DEVICE"
@@ -403,17 +404,42 @@ class WrapperPreflightTests(unittest.TestCase):
             set(contract.OFFLINE_UPGRADE_MODELS),
         )
 
-    def test_tb710fu_is_authorized_for_install_only(self):
+    def test_runtime_marker_models_match_the_mirror_policy(self):
+        # build-edl-runtime.sh refuses a runtime without the mirrored-policy
+        # marker for exactly the models the updater gates on it.
+        text = REAL_RUNTIME_BUILDER.read_text(encoding="utf-8")
+        match = re.search(
+            r'^\s*if \[\[ (?P<cond>[^\n]*) \]\]; then\n'
+            r'\s*grep -aqF \'ARMADA_LINUX_MIRROR_V1\'',
+            text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "the runtime builder must gate the marker")
+        marker_models = set(re.findall(r'"\$model" == ([A-Za-z0-9_-]+)',
+                                       match.group("cond")))
+        module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
+        sys.path.insert(0, module_root)
+        try:
+            from updates import models
+        finally:
+            sys.path.remove(module_root)
+        self.assertEqual(marker_models, set(models.MIRROR_POLICY_MODELS))
+
+    def test_tb710fu_is_authorized_for_install_and_upgrade(self):
         authorized = self._wrapper_models("AUTHORIZED_MODELS")
         upgrade = self._wrapper_models("OFFLINE_UPGRADE_MODELS")
         self.assertIn("TB710FU", authorized)
-        self.assertNotIn("TB710FU", upgrade)
-        self.assertEqual(upgrade, {"TB322FC", "TB323FU"})
+        self.assertIn("TB710FU", upgrade)
+        self.assertEqual(upgrade, {"TB322FC", "TB323FU", "TB710FU"})
         self.assertLessEqual(upgrade, authorized)
+        # The synthetic profile stays outside both shipped lists.
+        self.assertNotIn(THIRD_MODEL, authorized)
+        self.assertNotIn(THIRD_MODEL, upgrade)
 
-    def test_wrapper_does_not_suppress_upgrade_for_tb710fu(self):
-        # TB710FU installs only, but its presence must not disable upgrade for
-        # the dual-slot models; the installer rejects a TB710FU upgrade request.
+    def test_wrapper_does_not_suppress_upgrade_for_mixed_shipped_models(self):
+        # A shipped model outside the upgrade list must not disable upgrade for
+        # the dual-slot models; the installer rejects that model's own upgrade
+        # request.
         text = REAL_WRAPPER.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertNotIn("upgrade_blocked_models", text)
         for flag in ("producer_args", "descriptor_args"):
@@ -676,11 +702,17 @@ class WrapperArgumentTests(unittest.TestCase):
         self.assertIn("TB710FU", _values(producer, "--model"))
         self.assertEqual([], _values(descriptor, "--install-model"))
 
-    def test_tb710fu_alone_builds_an_install_only_package(self):
+    def test_tb710fu_alone_builds_an_upgrade_package(self):
         producer, descriptor = self._run_full_build(("TB710FU",))
+        self.assertIn("--offline-upgrade", producer)
+        self.assertIn("--offline-upgrade", descriptor)
+        self.assertEqual([], _values(descriptor, "--install-model"))
+
+    def test_custom_profile_alone_builds_an_install_only_package(self):
+        producer, descriptor = self._run_full_build((THIRD_MODEL,))
         self.assertNotIn("--offline-upgrade", producer)
         self.assertNotIn("--offline-upgrade", descriptor)
-        self.assertEqual([], _values(descriptor, "--install-model"))
+        self.assertEqual([THIRD_MODEL], _values(descriptor, "--install-model"))
 
     def test_custom_profile_is_an_explicit_install_model(self):
         producer, descriptor = self._run_full_build(("TB322FC", THIRD_MODEL))

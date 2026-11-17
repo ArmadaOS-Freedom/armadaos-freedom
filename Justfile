@@ -409,7 +409,7 @@ build-armada-image $target_image=("localhost/" + image_name) $tag=default_tag: (
 # layout directory. Output: ./output/edl/<version>/
 # The single package installs every profile registered in the devices config;
 # its descriptor also declares offline upgrade for the selected models with
-# the dual-slot backend (the Lenovo Legion Y700 models).
+# the dual-slot backend (every shipped model: TB322FC, TB323FU and TB710FU).
 [group('Armada')]
 build-edl-package $image $digest $revision $version $origin="":
     #!/usr/bin/env bash
