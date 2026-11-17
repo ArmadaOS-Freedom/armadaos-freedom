@@ -13,9 +13,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 root = Path(sys.argv[1])
@@ -120,18 +122,31 @@ class ControllerTypeApplyTest(unittest.TestCase):
 
     def _patch_polling(self):
         polled, slept = [], []
+        real_time = self.module.time
+        isolated_time = SimpleNamespace(
+            monotonic=real_time.monotonic,
+            sleep=lambda _s: slept.append(1),
+        )
         patches = [
             mock.patch.object(
                 self.module, "composite_paths", side_effect=lambda deadline=None: polled.append(1) or []
             ),
             mock.patch.object(
-                self.module.time, "sleep", side_effect=lambda _s: slept.append(1)
+                self.module, "time", isolated_time
             ),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
         return polled, slept
+
+    def test_patch_polling_does_not_mutate_shared_time_module(self):
+        original_sleep = time.sleep
+        polled, slept = self._patch_polling()
+        self.assertIs(time.sleep, original_sleep)
+        self.module.time.sleep(1)
+        self.assertEqual(slept, [1])
+        self.assertIs(time.sleep, original_sleep)
 
     def test_apply_capability_zero_is_noop_without_polling(self):
         self.module.DEVICE_ENV = make_fake_device_env(
