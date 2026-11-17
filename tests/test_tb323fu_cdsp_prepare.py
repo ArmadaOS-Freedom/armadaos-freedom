@@ -7,6 +7,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -78,6 +79,19 @@ class CdspPrepareTest(unittest.TestCase):
         (path / 'state').write_bytes(state.encode() + NL)
         return path
 
+    def _env(self, **overrides):
+        env = {
+            'PATH': os.environ.get('PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'),
+            'TB323FU_DT_COMPATIBLE': str(self.compatible),
+            'TB323FU_CDSP_FIRMWARE_DIR': str(self.bundle),
+            'TB323FU_REMOTEPROC_DIR': str(self.remoteproc),
+            'TB323FU_FIRMWARE_CLASS_PATH': str(self.param),
+            'TB323FU_RUN_FIRMWARE': str(self.run_fw),
+            'TB323FU_CDSP_WAIT_SECONDS': '0',
+        }
+        env.update(overrides)
+        return env
+
     def _snapshot(self, directory):
         return {
             path.relative_to(directory).as_posix(): path.read_bytes()
@@ -86,16 +100,7 @@ class CdspPrepareTest(unittest.TestCase):
         }
 
     def _run(self, **overrides):
-        env = {
-            'PATH': os.environ.get('PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'),
-            'TB323FU_DT_COMPATIBLE': str(self.compatible),
-            'TB323FU_CDSP_FIRMWARE_DIR': str(self.bundle),
-            'TB323FU_REMOTEPROC_DIR': str(self.remoteproc),
-            'TB323FU_FIRMWARE_CLASS_PATH': str(self.param),
-            'TB323FU_RUN_FIRMWARE': str(self.run_fw),
-        }
-        env.update(overrides)
-        return subprocess.run(['bash', str(HELPER)], env=env, capture_output=True, text=True)
+        return subprocess.run(['bash', str(HELPER)], env=self._env(**overrides), capture_output=True, text=True)
 
     def _assert_no_mutation(self):
         self.assertFalse(self.run_fw.exists())
@@ -196,6 +201,84 @@ class CdspPrepareTest(unittest.TestCase):
         self.assertEqual(dest.stat().st_mode & 0o777, 0o755)
         for name in FIRMWARE_NAMES:
             self.assertEqual((dest / name).stat().st_mode & 0o777, 0o644)
+
+    def test_late_cdsp_registration_starts_after_wait(self):
+        # Remove async cdsp; adsp remains. Helper must wait, then start once
+        # the async cdsp directory appears with complete contents.
+        shutil.rmtree(self.cdsp)
+        adsp_before = self._snapshot(self.adsp)
+        staging = self.remoteproc / '.cdsp0.staging'
+        staging.mkdir()
+        (staging / 'name').write_bytes(b'cdsp' + NL)
+        (staging / 'firmware').write_bytes(CDSP_FIRMWARE.encode() + NL)
+        (staging / 'state').write_bytes(b'offline' + NL)
+        err_path = self.root / 'helper-stderr'
+        published = {'done': False}
+        with open(err_path, 'wb') as err_file:
+            proc = subprocess.Popen(
+                ['bash', str(HELPER)],
+                env=self._env(TB323FU_CDSP_WAIT_SECONDS='5'),
+                stdout=subprocess.PIPE,
+                stderr=err_file,
+            )
+            try:
+                deadline = time.monotonic() + 3.0
+                observed = False
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        text = err_path.read_text(errors='replace')
+                    except OSError:
+                        text = ''
+                    if 'waiting up to ' in text:
+                        observed = True
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(observed,
+                                'helper did not emit waiting message; stderr=' +
+                                err_path.read_text(errors='replace'))
+                # Atomically publish fully-prepared cdsp directory.
+                os.rename(str(staging), str(self.remoteproc / 'cdsp0'))
+                published['done'] = True
+                try:
+                    out, _ = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    out, _ = proc.communicate()
+                    self.fail('helper did not exit after late cdsp appeared')
+            finally:
+                if not published['done'] and staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdout is not None:
+                    proc.stdout.close()
+        self.assertEqual(proc.returncode, 0, err_path.read_text(errors='replace'))
+        dest = self.run_fw / FW_REL
+        self.assertEqual((dest / 'cdsp.mbn').read_bytes(), MBN)
+        self.assertEqual((dest / 'cdsp_dtb.mbn').read_bytes(), DTB)
+        self.assertEqual(self.param.read_bytes(), str(self.run_fw).encode())
+        self.assertEqual((self.remoteproc / 'cdsp0' / 'state').read_bytes(), b'start' + NL)
+        self.assertEqual(self._snapshot(self.adsp), adsp_before)
+
+
+    def test_duplicate_cdsp_fails_immediately_with_positive_wait(self):
+        self._proc('cdsp1', 'cdsp', CDSP_FIRMWARE, 'offline')
+        try:
+            result = subprocess.run(
+                ['bash', str(HELPER)],
+                env=self._env(TB323FU_CDSP_WAIT_SECONDS='10'),
+                capture_output=True, text=True, timeout=3,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail('helper waited on duplicate cdsp instead of failing fast')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.run_fw.exists())
+        self.assertEqual(self.param.read_bytes(), b'')
+        self.assertEqual((self.cdsp / 'state').read_bytes(), b'offline' + NL)
+        self.assertEqual((self.remoteproc / 'cdsp1' / 'state').read_bytes(), b'offline' + NL)
 
     def test_running_cdsp_state_never_written(self):
         (self.cdsp / 'state').write_bytes(b'running' + NL)

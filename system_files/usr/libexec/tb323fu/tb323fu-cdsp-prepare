@@ -49,18 +49,48 @@ for src in "$src_mbn" "$src_dtb"; do
   fi
 done
 
-cdsp_path=
+WAIT_SECONDS=${TB323FU_CDSP_WAIT_SECONDS:-20}
+case $WAIT_SECONDS in
+  ''|*[!0-9]*) fail "invalid TB323FU_CDSP_WAIT_SECONDS: $WAIT_SECONDS" ;;
+esac
+
 cdsp_count=0
-for rp in "$REMOTEPROC_DIR"/*; do
-  [ -d "$rp" ] || continue
-  if [ "$(read_value "$rp/name")" != cdsp ]; then
-    continue
+cdsp_path=
+waited=0
+waited_logged=0
+deadline=$((SECONDS + WAIT_SECONDS))
+while :; do
+  cdsp_count=0
+  cdsp_path=
+  for rp in "$REMOTEPROC_DIR"/*; do
+    [ -d "$rp" ] || continue
+    if [ "$(read_value "$rp/name")" != cdsp ]; then
+      continue
+    fi
+    cdsp_count=$((cdsp_count + 1))
+    cdsp_path=$rp
+  done
+  if [ "$cdsp_count" -gt 0 ]; then
+    break
   fi
-  cdsp_count=$((cdsp_count + 1))
-  cdsp_path=$rp
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    break
+  fi
+  if [ "$waited_logged" -eq 0 ]; then
+    log "waiting up to ${WAIT_SECONDS}s for cdsp processor registration"
+    waited_logged=1
+  fi
+  sleep 0.2
+  waited=1
 done
+if [ "$cdsp_count" -eq 0 ]; then
+  fail "timed out after ${WAIT_SECONDS}s waiting for cdsp processor"
+fi
 if [ "$cdsp_count" -ne 1 ]; then
   fail "expected exactly one cdsp processor, found $cdsp_count"
+fi
+if [ "$waited" -eq 1 ]; then
+  log "cdsp processor registered after wait"
 fi
 cdsp_firmware=$(read_value "$cdsp_path/firmware")
 if [ "$cdsp_firmware" != "$CDSP_FIRMWARE" ]; then
