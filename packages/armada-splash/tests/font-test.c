@@ -12,6 +12,9 @@
 //   font-test cjk     <NotoSansCJK-Regular.ttc>
 //   font-test latin   <NotoSansMono-SemiBold.ttf>
 //   font-test missing <path-that-does-not-exist>
+//   font-test ttf     <single-face .ttf>          (e.g. generated splash font)
+//   font-test subset  <single-face .ttf>          (subset mode: real catalog
+//                                                  text must render)
 //
 // Every mode prints per-check "ok"/"FAIL" lines and a final "<mode>: PASS|FAIL".
 
@@ -226,15 +229,140 @@ static int run_missing(const char *path) {
     return g_fail;
 }
 
+// Single-face .ttf load: the generated splash font is exactly this shape.
+// No collection indexing, no face-name-based selection; the face at offset 0
+// is what load_font() picks and what stb_truetype reports as one face.
+static int run_ttf(const char *path) {
+    long sz = 0;
+    unsigned char *buf = slurp(path, &sz);
+    chk(buf != NULL, "read the single-face TTF");
+    if (!buf) return g_fail;
+
+    // The TTC header magic is one of "ttcf"; a single-face sfnt starts with
+    // 0x00010000 or "true" / "OTTO". This check keeps TTC regressions out.
+    chk(!(sz >= 4 && memcmp(buf, "ttcf", 4) == 0), "file is not a TTC collection");
+
+    int faces = stbtt_GetNumberOfFonts(buf);
+    int off0 = stbtt_GetFontOffsetForIndex(buf, 0);
+    printf("  info %s: %d faces, face0=%d\n", path, faces, off0);
+    chk(faces == 1, "single-face .ttf reports one face");
+    chk(off0 == 0, "single-face .ttf has its face at offset 0");
+
+    chk(load_font(path, 32) == 1, "load_font() loads the TTF");
+    chk(g_ttf_ok == 1, "g_ttf_ok is set after a successful load");
+    if (!g_ttf_ok) { free(buf); return g_fail; }
+    chk(g_ttf.fontstart == 0, "load_font() uses face 0 for a single-face file");
+
+    check_common_font_metrics();
+    check_ascii_metrics();
+
+    free(buf);
+    return g_fail;
+}
+
+// SplashMsg mirrors the struct that armada-splash.c's translation-unit
+// consumers define before including the locale headers. armada-splash.c only
+// includes splash-i18n.h, which does not define SplashMsg, so this local
+// definition does not conflict with the included production source.
+typedef struct {
+    const char *key;
+    const char *text;
+} SplashMsg;
+
+#include "../src/locales/en.h"
+#include "../src/locales/zh-CN.h"
+
+// For one catalog array, decode each .text with the production utf8_cps() and
+// assert every printable codepoint maps to a glyph in the loaded subset font.
+// This compiles the real catalog strings into this test binary, so a mistake by
+// the Python catalog parser cannot hide behind a hand-copied status line.
+static void check_catalog_coverage(const char *label,
+                                   const SplashMsg *cat, size_t count) {
+    int total = 0, missing = 0;
+    for (size_t e = 0; e < count; e++) {
+        uint32_t cps[256];
+        int n = utf8_cps(cat[e].text, cps, 256);
+        if (n <= 0) { missing++; continue; }
+        for (int i = 0; i < n; i++) {
+            // Skip controls (e.g. the spaces in placeholders) but require
+            // every printable glyph to be present in the subset face.
+            if (cps[i] < 0x20 && cps[i] != 0x20) continue;
+            total++;
+            if (stbtt_FindGlyphIndex(&g_ttf, (int)cps[i]) == 0) missing++;
+        }
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "%s catalog covers all %d printable glyphs (missing=%d)",
+             label, total, missing);
+    chk(total > 0 && missing == 0, msg);
+}
+
+// Subset mode: the generated font must cover every codepoint in every string
+// in the shipping en.h/zh-CN.h catalogs, plus ASCII. Rasterize real catalog
+// text (a Chinese status line) through production tt_draw_centered() so a
+// cmap-only subset that forgot, e.g., the hinting or advance metrics still
+// fails loudly.
+static int run_subset(const char *path) {
+    // Take real catalog strings straight from the compiled headers; these are
+    // the same .text values the coverage loop checks, so a rendering test and
+    // the glyph-presence test stay in lock-step.
+    const char *status_zh = SPLASH_ZH_CN_CATALOG[0].text;
+    const char *status_en = SPLASH_EN_CATALOG[0].text;
+
+    chk(load_font(path, 32) == 1, "load_font() loads the generated subset");
+    chk(g_ttf_ok == 1, "g_ttf_ok is set after a successful load");
+    if (!g_ttf_ok) return g_fail;
+
+    // ASCII must be present in full. Every printable codepoint 0x20..0x7E
+    // is required by the generator; this re-verifies the shipped face.
+    int ascii_missing = 0;
+    for (int cp = 0x20; cp <= 0x7E; cp++)
+        if (stbtt_FindGlyphIndex(&g_ttf, cp) == 0) ascii_missing++;
+    chk(ascii_missing == 0, "subset has a glyph for every printable ASCII codepoint");
+
+    // Full catalog coverage from the actual C headers, unconditionally.
+    check_catalog_coverage("en",
+                           SPLASH_EN_CATALOG,
+                           sizeof(SPLASH_EN_CATALOG) / sizeof(SPLASH_EN_CATALOG[0]));
+    check_catalog_coverage("zh-CN",
+                           SPLASH_ZH_CN_CATALOG,
+                           sizeof(SPLASH_ZH_CN_CATALOG) / sizeof(SPLASH_ZH_CN_CATALOG[0]));
+
+    // End-to-end: production tt_draw_centered() must paint the zh status line.
+    SW = 720; SH = 220;
+    shadow = malloc((size_t)SW * SH * 4);
+    if (!shadow) { chk(0, "shadow buffer allocated"); return g_fail; }
+    for (int i = 0; i < SW * SH; i++) shadow[i] = bg;
+    tt_draw_centered(status_zh, 140, 0xFFFFFFFF);
+    long zh_painted = 0;
+    for (int i = 0; i < SW * SH; i++)
+        if (shadow[i] != bg) zh_painted++;
+    chk(zh_painted > 0, "production tt_draw_centered() paints zh-CN status text");
+
+    // English status must also paint (ASCII-only sanity for the subset).
+    for (int i = 0; i < SW * SH; i++) shadow[i] = bg;
+    tt_draw_centered(status_en, 140, 0xFFFFFFFF);
+    long en_painted = 0;
+    for (int i = 0; i < SW * SH; i++)
+        if (shadow[i] != bg) en_painted++;
+    chk(en_painted > 0, "production tt_draw_centered() paints en status text");
+
+    free(shadow); shadow = NULL;
+    return g_fail;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "usage: %s {cjk|latin|missing} <font-path>\n", argv[0]);
+        fprintf(stderr, "usage: %s {cjk|latin|missing|ttf|subset} <font-path>\n", argv[0]);
         return 2;
     }
     int rc;
     if (!strcmp(argv[1], "cjk")) rc = run_cjk(argv[2]);
     else if (!strcmp(argv[1], "latin")) rc = run_latin(argv[2]);
     else if (!strcmp(argv[1], "missing")) rc = run_missing(argv[2]);
+    else if (!strcmp(argv[1], "ttf")) rc = run_ttf(argv[2]);
+    else if (!strcmp(argv[1], "subset")) rc = run_subset(argv[2]);
     else { fprintf(stderr, "unknown mode %s\n", argv[1]); return 2; }
 
     printf("%s: %s\n", argv[1], rc == 0 ? "PASS" : "FAIL");

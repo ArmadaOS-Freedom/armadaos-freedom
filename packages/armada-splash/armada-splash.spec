@@ -2,10 +2,10 @@
 
 Name:           armada-splash
 # Always update the version when you update the package
-Version:        1
+Version:        2
 Release:        1%{?dist}.armada
 Summary:        Boot splash for Armada
-License:        GPL-2.0-or-later
+License:        GPL-2.0-or-later AND OFL-1.1
 URL:            https://github.com/armada-os/armada-packages
 
 Source0:        armada-splash.tar.gz
@@ -14,6 +14,8 @@ BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  libX11-devel
 BuildRequires:  libdrm-devel
+BuildRequires:  python3-fonttools
+BuildRequires:  google-noto-sans-cjk-fonts
 
 %description
 %{name} is the boot splash that Armada uses instead of Plymouth
@@ -30,6 +32,7 @@ BuildRequires:  libdrm-devel
 %files
 %license LICENSE.md
 %doc README.md
+%{_datadir}/armada/splash/font.ttf
 %{_prefix}/lib/dracut/modules.d/91armada-splash/*
 %{_prefix}/lib/systemd/system/sddm.service.d/armada*.conf
 %{_prefix}/lib/systemd/system/armada*.service

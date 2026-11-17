@@ -7,10 +7,22 @@
 # or run.
 #
 # Usage:
-#   tests/splash-font-test.sh <fixture-dir>
+#   tests/splash-font-test.sh [<fixture-dir>]
+#   tests/splash-font-test.sh subset [<fixture-dir>]
+#
+# With no arguments the script prints SKIP (accepts no fixture and does not
+# silently run against unverified system fonts). To run the legacy TTC /
+# Latin / missing checks pass a fixture directory. To run the generated
+# subset regression (determinism, single-face, catalog coverage, missing-
+# glyph failure, added-catalog propagation) pass the literal word `subset`,
+# optionally followed by a fixture directory; without a fixture the subset
+# test searches Fedora default Noto Sans CJK paths and skips accurately if
+# they are absent.
 #
 # <fixture-dir> must hold the verified fonts:
-#   NotoSansCJK-Regular.ttc      10 faces; index 7 is Noto Sans Mono CJK SC
+#   NotoSansCJK-Regular.ttc      Noto Sans CJK collection (face index is
+#                                resolved by family name inside the
+#                                generator, not by index)
 #   NotoSansMono-SemiBold.ttf    ordinary single-face Latin mono
 #
 # Every object file, binary and log lands under a task-controlled output
@@ -22,8 +34,23 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/packages/armada-splash/src"
 HARNESS="$ROOT/packages/armada-splash/tests/font-test.c"
+SUBSET_TEST="$ROOT/tests/splash-font-subset-test.sh"
 
+mode="legacy"
+if [[ "${1:-}" == "subset" ]]; then
+    mode="subset"
+    shift
+fi
 fixture_dir="${1:-}"
+
+if [[ "$mode" == "subset" ]]; then
+    if [[ -n "$fixture_dir" ]]; then
+        exec "$SUBSET_TEST" "$fixture_dir"
+    else
+        exec "$SUBSET_TEST"
+    fi
+fi
+
 if [[ -z "$fixture_dir" ]]; then
     echo "SKIP: no fixture directory; pass one to run the splash font test"
     exit 0

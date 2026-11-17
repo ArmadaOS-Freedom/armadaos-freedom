@@ -21,13 +21,15 @@ install -Dm0644 /packages/mesa-x86/ArmadaMesa.sqsh "${mesa_sqsh}"
 # A separate rechunk component keeps Mesa-only updates from invalidating ArchLinux.sqsh.
 python3 -c 'import os,sys; os.setxattr(sys.argv[1],"user.component",b"fex-mesa")' "${mesa_sqsh}"
 
-# Status text font for armada-splash (falls back to its embedded bitmap font
-# if this link dangles). Localized status text is CJK, so point at the
-# Simplified-Chinese monospace face; load_font() selects it from the
-# collection by name.
-splash_font="$(rpm -ql google-noto-sans-cjk-fonts | grep -m1 '/NotoSansCJK-Regular\.ttc$')"
-[ -n "${splash_font}" ]
-ln -sf "${splash_font}" /usr/share/armada/splash/font.ttf
+# Status text font for armada-splash. The armada-splash RPM ships a
+# pre-subsetted single-face TTF at this exact path; load_font() opens it as
+# a standalone font. Do not symlink the full system TTC here -- that file
+# belongs to the desktop fonts and must not be duplicated or replaced.
+splash_font=/usr/share/armada/splash/font.ttf
+if [ -L "${splash_font}" ] || [ ! -f "${splash_font}" ] || [ ! -s "${splash_font}" ]; then
+    echo "ERROR: armada-splash font missing, empty, or a symlink at ${splash_font}" >&2
+    exit 1
+fi
 
 # mkbootimg must be present for on-device /KERNEL rebuilds after OTA.
 install -Dpm 0755 /ctx/build_files/vendor/mkbootimg/mkbootimg.py /usr/libexec/armada/mkbootimg.py
