@@ -145,6 +145,7 @@ def apply_type(value):
     if not paths:
         return False
     ok = False
+    unresolved = False
     for path in paths:
         # Read the composite name exactly once. Skip when the name cannot be
         # resolved (empty/falsy) so an unidentified plugin composite is never
@@ -152,7 +153,10 @@ def apply_type(value):
         # owns this virtual composite and feeds its deck-uhid target; leaving
         # physical controllers, including the G9, on the existing apply path.
         name = composite_name(path)
-        if not name or name == "Freedom Touch Controller":
+        if not name:
+            unresolved = True
+            continue
+        if name == "Freedom Touch Controller":
             continue
         targets = [value] + extra_targets(path)
         try:
@@ -166,7 +170,7 @@ def apply_type(value):
             ok = True
         except (OSError, subprocess.SubprocessError):
             pass
-    return ok
+    return ok and not unresolved
 
 
 def apply_with_retry(value):

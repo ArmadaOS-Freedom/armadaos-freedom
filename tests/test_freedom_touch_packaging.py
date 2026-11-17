@@ -263,12 +263,59 @@ class ControllerTypeSkip(unittest.TestCase):
             "/org/shadowblip/InputPlumber/CompositeDevice2": "G9",
         }
         ok, calls = self._run(list(names), names, {})
-        self.assertTrue(ok)
+        self.assertFalse(ok)
         self.assertEqual(len(calls), 1)
         cmd = calls[0]
         self.assertEqual(cmd[4], "/org/shadowblip/InputPlumber/CompositeDevice2")
         self.assertEqual(cmd[6], "SetTargetDevices")
         self.assertEqual(cmd[9], "ds5")
+
+    def test_apply_with_retry_retries_until_known_physical(self):
+        paths = [
+            "/org/shadowblip/InputPlumber/CompositeDevice0",
+            "/org/shadowblip/InputPlumber/CompositeDevice1",
+            "/org/shadowblip/InputPlumber/CompositeDevice2",
+        ]
+        reads = {p: 0 for p in paths}
+        calls = []
+        sleeps = []
+
+        def name_for(path):
+            reads[path] += 1
+            if path == paths[0]:
+                return "Xbox Series" if reads[path] > 1 else ""
+            if path == paths[1]:
+                return "G9"
+            return PROFILE_NAME
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            self.fn.__globals__,
+            {
+                "composite_paths": lambda: list(paths),
+                "composite_name": name_for,
+                "extra_targets": lambda _: [],
+            },
+        ), mock.patch.object(
+            self.ns["subprocess"], "run", side_effect=fake_run
+        ), mock.patch.object(
+            self.ns["time"], "sleep", side_effect=sleeps.append
+        ):
+            ok = self.ns["apply_with_retry"]("ds5")
+
+        self.assertTrue(ok)
+        self.assertEqual(len(sleeps), 1)
+        for path in paths:
+            self.assertEqual(reads[path], 2)
+        set_calls = [c for c in calls if "SetTargetDevices" in c]
+        self.assertEqual(len(set_calls), 3)
+        self.assertEqual(
+            [c[4] for c in set_calls],
+            [paths[1], paths[0], paths[1]],
+        )
 
     def test_composite_name_timeout_does_not_retarget(self):
         paths = ["/org/shadowblip/InputPlumber/CompositeDevice0"]
