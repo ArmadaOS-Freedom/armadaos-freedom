@@ -87,7 +87,9 @@ jobs:
             ostree-libs ostree gtk3 gtk4 libadwaita \
             xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 \
             python3-vdf python3-pytest jq gdisk openssh-clients \
-            shadow-utils diffutils openssl procps-ng
+            shadow-utils diffutils openssl procps-ng \
+            python3-fonttools google-noto-sans-cjk-fonts libdrm-devel \
+            pkgconf-pkg-config
 
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

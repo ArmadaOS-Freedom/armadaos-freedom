@@ -168,8 +168,23 @@ jobs:
           python3 -m unittest discover -s tests -p test_edl_boot_requirements.py
           python3 -m unittest discover -s tests -p test_tb322fc_bluetooth.py
           python3 -m unittest discover -s tests -p test_initramfs_requirement_failure.py
+          python3 -m unittest discover -s tests -p test_initramfs_profile.py
           python3 -m unittest discover -s tests -p 'test_update_*.py'
           TMPDIR="$RUNNER_TEMP" python3 tests/armada-reboot-edl-test.py
+
+      - name: Check splash font subset
+        run: |
+          set -euxo pipefail
+          # Fixtures are installed explicitly so the subset test cannot pass by
+          # skipping: the CJK collection and the fonttools subsetter must exist.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-fonttools fonts-noto-cjk libdrm-dev build-essential pkg-config
+          test -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+          SPLASH_FONT_SUBSET_OUT="$RUNNER_TEMP/splash-subset" \
+            bash tests/splash-font-subset-test.sh
+          SPLASH_I18N_TEST_OUT="$RUNNER_TEMP/splash-i18n" \
+            bash tests/splash-i18n-test.sh --run
 
       # Resolve before the image build so the OCI layers bundle the latest
       # plugin sources instead of a cached earlier resolution.

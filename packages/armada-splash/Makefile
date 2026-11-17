@@ -14,7 +14,30 @@ INSTALL_DATA    := $(INSTALL) -Dm644
 
 .PHONY: all clean install uninstall
 
-all: $(TARGET)
+all: $(TARGET) build/font.ttf
+
+# Deterministic single-face subset for the splash status text. The source
+# collection is selected by family name inside the generator (matching
+# load_font's face-selection), so the override only needs to name the TTC.
+# Set SPLASH_FONT_SOURCE to a path to build against a non-system fixture.
+SPLASH_FONT_SOURCE ?= $(firstword $(wildcard \
+    /usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc \
+    /usr/share/fonts/noto-sans-cjk/NotoSansCJK-Regular.ttc \
+    /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc))
+SPLASH_FONT_GEN    := scripts/gen-splash-font.py
+SPLASH_FONT_CATALOGS := src/locales/en.h src/locales/zh-CN.h
+
+empty :=
+space := $(empty) $(empty)
+
+build/font.ttf: $(SPLASH_FONT_GEN) $(SPLASH_FONT_CATALOGS) $(subst $(space),\ ,$(SPLASH_FONT_SOURCE))
+	@mkdir -p build
+	@test -n "$(SPLASH_FONT_SOURCE)" || { \
+	    echo "ERROR: set SPLASH_FONT_SOURCE to a NotoSansCJK-Regular.ttc" >&2; exit 1; }
+	python3 $(SPLASH_FONT_GEN) \
+	    --source "$(SPLASH_FONT_SOURCE)" \
+	    --output $@ \
+	    $(foreach c,$(SPLASH_FONT_CATALOGS),--catalog $(c))
 
 $(TARGET): src/armada-splash.c src/splash-i18n.c src/stb_impl.c \
            src/splash-i18n.h src/locales/en.h src/locales/zh-CN.h
@@ -67,7 +90,15 @@ install: all
 	$(INSTALL_PROGRAM) system/usr/libexec/armada/armada-splash-stall \
 		$(DESTDIR)$(PREFIX)/libexec/armada/
 
+	# Generated single-face subset for the status text. load_font() opens
+	# this plain TTF; no code change is needed to consume it.
+	$(INSTALL_DIR) $(DESTDIR)$(PREFIX)/share/armada/splash
+	$(INSTALL_DATA) build/font.ttf \
+		$(DESTDIR)$(PREFIX)/share/armada/splash/font.ttf
+
 uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/share/armada/splash/font.ttf
+	rmdir $(DESTDIR)$(PREFIX)/share/armada/splash 2>/dev/null || true
 	rm -f $(DESTDIR)$(PREFIX)/libexec/armada-splash
 	rm -rf $(DESTDIR)$(PREFIX)/lib/dracut/modules.d/91armada-splash
 	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/system/armada-splash-early.service
