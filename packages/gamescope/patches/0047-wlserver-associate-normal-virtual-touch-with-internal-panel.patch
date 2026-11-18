@@ -1,0 +1,17 @@
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 55d5594..b27bc73 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -523,6 +523,12 @@ static void wlserver_touch_associate_connector(struct wlserver_touch *touch)
+ 		if (pszCalibration != nullptr && strcmp(pszCalibration, "right") == 0) {
+ 			connector = GetBackend()->GetConnector(gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL);
+ 			bUndoRightCalibration = connector != nullptr;
++		} else if (pszCalibration != nullptr && strcmp(pszCalibration, "normal") == 0) {
++			// A virtual touch on a panel whose native axes are the desktop's
++			// (no calibration matrix to undo), for example a pen replayed as
++			// touch: associate it with the internal panel so the output
++			// orientation rotates it like the real touchscreen.
++			connector = GetBackend()->GetConnector(gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL);
+ 		}
+ 	}
+ 	udev_device_unref(dev);
