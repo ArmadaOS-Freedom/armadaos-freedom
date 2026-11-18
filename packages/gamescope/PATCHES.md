@@ -110,3 +110,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0045-steamcompmgr-freedom-touch-placeholder.patch`
   source: armadaos-freedom
   notes: Extends the transparent Steam placeholder suppression to a visible Freedom Touch overlay; real Steam menus, the no-overlay fallback and normal layer reservations are kept.
+
+- `patches/0048-wlserver-add-rotate-display-command.patch`
+  source: armada
+  notes: Adds the `rotate_display` console command (`gamescopectl rotate_display normal|left|right|upsidedown`), which rotates the internal display at runtime through the existing `gamescope_control.rotate_display` handler (orientation, mode/EDID update and touch mapping unchanged). Lets `armada-gamemode-autorotate` follow the accelerometer with the shipped gamescopectl.

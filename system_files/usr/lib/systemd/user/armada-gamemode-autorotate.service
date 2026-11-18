@@ -1,0 +1,15 @@
+[Unit]
+Description=Armada Game Mode automatic rotation (accelerometer)
+Documentation=file:/usr/libexec/armada/armada-gamemode-autorotate
+After=gamescope-session-plus@steam.service
+BindsTo=gamescope-session-plus@steam.service
+PartOf=gamescope-session-plus@steam.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecCondition=/usr/bin/python3 /usr/libexec/armada/armada-gamemode-autorotate --supported
+ExecStart=/usr/bin/python3 /usr/libexec/armada/armada-gamemode-autorotate
+Restart=on-failure
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=60
