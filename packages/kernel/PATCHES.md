@@ -1184,15 +1184,55 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Moves Elden's aggregate bandwidth check after every CRTC/plane helper has prepared its candidate resources. Locks untouched CRTC states through the transaction acquire context and propagates -EDEADLK for normal retries. Real C host checks cover multi-CRTC callback order, stale-state rejection, pending disables, the exact bandwidth boundary and lock retry.
-- `patches/0240`–`patches/0249` (SM8750 camera bus and idle release)
-  source: h0cheung/tb322fc-linux-kernel camera-only deltas at bf96c3d4048973298ede78487177c6f1b4f6bc0f plus local lifecycle fixes; individual provenance is in [camera/SOURCES.md](../../devices/lenovo-tb322fc/camera/SOURCES.md).
-  upstream: downstream port, not submitted to Linux upstream
-  notes: Adds legacy SM8750 CSID980/VFE/PHY, S5KJNS, GC08A8, GT9764 and WL2868C, balances startup/stop failures, serializes regulator outputs, unwinds partial GDSC registration, and gives TITAN_TOP provider-owned minimum ICC votes until physical power-off. The PM8550 flash V4L2 dependency completes rear async registration; its release loop is bounded and unwound on probe failure and remove. The normal Elden DTB receives the two consumed CAMSS paths and separate CAMCC floor through its board adaptation patch. SM8750 CAMCC is built in so shared genpd consumers cannot outlive it; sensor/flash drivers are modules.
-  validation: Original camera2 source passed complete kernel/module/DT/schema builds, actual-C host fault checks, both RAW streams, manual rear focus, idle resource release and battery-only 10/20-minute RTC s2idle. Four NoCs completed sync_state and DDR exited the 4761-MHz lock. DDR/CX/AOSS deep residency remained unchanged and watts were not measurable; full hardware ISP, software-ISP integration and AE/AWB/AF are not claimed. See [device evidence](../../devices/lenovo-tb322fc/camera/DEVICE-TEST-20261118.md).
+- `patches/0240-media-camss-unwind-power-and-stream-failures.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474
+  upstream: not submitted (downstream port)
+  notes: Balances CSID parent power and unwinds every started pipeline component after a stream failure. Keeps buffer flushing and teardown after cleanup errors.
+- `patches/0241-media-camss-add-sm8750-csid980-capture.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/bf96c3d4048973298ede78487177c6f1b4f6bc0f
+  upstream: not submitted (legacy CAMSS ABI)
+  notes: SM8750 CSID980/VFE/PHY resources and RAW capture; retains original PHY delays and same-index routing without the extra SG-contiguity restriction. Gen5 addresses and independent PHY ABI are not reused.
+- `patches/0242-media-i2c-add-y700-camera-sensors-and-vcm.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474
+  upstream: not submitted (downstream port)
+  notes: S5KJNS, GC08A8 and GT9764 drivers and bindings with Gen4 supply names and raw gain units. Register table provenance and outstanding image-processing scope are in [camera/SOURCES.md](../../devices/lenovo-tb322fc/camera/SOURCES.md).
+- `patches/0243-regulator-add-wl2868c-camera-pmic.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474
+  upstream: not submitted (downstream port)
+  notes: WL2868C camera regulator and binding. Does not invent unresolved parent VIN supplies.
+- `patches/0244-dt-bindings-sm8750-camera-interconnect-contract.patch`
+  source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474 plus local ICC contract
+  upstream: local (legacy CAMSS ABI)
+  notes: The two consumed CAMSS throughput paths and separate SM8750 CAMCC provider floor. Patch 0250 preserves optional ICC properties on other boards.
+- `patches/0245-media-i2c-check-camera-power-cleanup.patch`
+  source: armada
+  upstream: local
+  notes: Checks sensor/lens clock, reset and rail shutdown; preserves the first error and rejects reuse when regulator reference ownership is unknown. Probe does not register a sensor after failed ID-check shutdown.
+- `patches/0246-clk-qcom-gdsc-unwind-partial-registration.patch`
+  source: armada
+  upstream: local
+  notes: Unwinds initialized genpd objects and subdomain links after partial registration failure. Existing hardware power-transition helpers remain unchanged.
+- `patches/0247-clk-qcom-sm8750-titan-top-minimum-icc.patch`
+  source: armada
+  upstream: local
+  notes: Provider-owned dual-path presence votes keep TITAN_TOP safe for CCI/PHY users independently of CAMSS throughput. Votes precede power-on and release only after confirmed physical power-off. CAMCC is built in and force-unbind is suppressed; 0250 limits the new ICC contract to Elden. RPMh commit failures remain a log-based acceptance constraint.
+- `patches/0248-regulator-wl2868c-control-output-lifecycle.patch`
+  source: https://github.com/xiaquwan1001/lenovo-legion-y700-gen4-tb322fc-elden-linux/tree/f2763c98e36868caea52f4d9dbcbf935c19af307/patches/upstream/wl2868c-v11-20261113
+  upstream: local (adapted from Qianhui Xu's v11)
+  notes: Serializes the full output mask, clears SEQ, seeds physical state, and clears SYS_EN after the last output. The cited datasheet and parent VIN contract still need independent confirmation.
+- `patches/0249-leds-qcom-flash-fix-v4l2-release.patch`
+  source: armada
+  upstream: local
+  notes: Bounds and reverses the V4L2 flash release loop, releases index zero, and cleans up after the final torch-clamp write fails or the driver is removed. Enabling its module dependencies completes rear async registration. Sensor RAW was tested; flash hardware was not.
+  validation: The camera2 stack passed full kernel/module/DT/schema builds, actual-C fault checks, both RAW streams, manual focus and battery-only 10/20-minute RTC s2idle. Four NoCs synced and DDR exited its maximum-frequency lock. Deep DDR/CX/AOSS residency and watts remain unverified; full ISP and AE/AWB/AF are not claimed. See [device evidence](../../devices/lenovo-tb322fc/camera/DEVICE-TEST-20261118.md).
 - `patches/0250-clk-qcom-limit-camera-icc-to-elden.patch`
   source: armada
   upstream: local
   notes: The tested provider-owned ICC contract is selected only for lenovo,elden before CAMCC registration. Other SM8750 boards keep zero optional paths and their existing probe behavior. The binding allows existing no-ICC nodes and requires both properties together when present. This is a shared-build integration fix beyond the original camera2 checkpoint.
+- `dts/sm8750-lenovo-elden-camera-bus.patch`
+  source: armada
+  upstream: local
+  notes: Promotes the camera2 overlay's two CAMCC and two CAMSS ICC paths into the ordinary Elden DTB without editing the raw vendor sources. Matches the tested board's effective properties.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local
