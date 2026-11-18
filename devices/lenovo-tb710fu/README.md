@@ -55,6 +55,7 @@ ArmadaOS Freedom 统一内核与 kShimC 启动菜单对小新 Pad Pro GT 的适�
 | 亮度 | SY7758 主从两颗背光同步，0–4080 |
 | 休眠 | s2idle 睡眠与唤醒后显示、触摸、笔、WiFi、声音恢复正常 |
 | USB | 作为设备端正常；OTG 主机模式未测试 |
+| 传感器 | 加速度计、光线经 ADSP 传感器中枢（SSC）读出，供桌面自动旋转和 Steam 自适应亮度使用（见下文“传感器”；原型已在本机验证，镜像集成待新镜像复测） |
 | 游戏 | Steam 游戏模式正常；游戏兼容性与其它机型相同（FEX／Proton ARM64）。实测 Two Point Campus（带 Denuvo）无法运行 |
 
 ## 已知问题与待完成项
@@ -63,7 +64,7 @@ ArmadaOS Freedom 统一内核与 kShimC 启动菜单对小新 Pad Pro GT 的适�
 - **桌面模式：** 当前镜像里 KWin 与 Plasma 组件版本不一致，切换到桌面会退回游戏模式。这个问题与机型无关，所有设备都受影响。
 - **手写笔（游戏模式）：** gamescope 不处理手写笔（tablet-tool）事件，游戏模式下需要另外把笔转成触摸。
 - **充电上限：** 充到 80% 后停止，与 sysfs 的 `charge_control_*_threshold` 无关，推测是 ADSP 一侧保存的上限（可能来自 Android 下的“智能充电”设置），尚未查清。
-- **屏幕方向：** 加速度计在 ADSP 的传感器中枢后面，Linux 下没有可用的方向传感器，固定为横屏（方向正确），不能自动旋转。
+- **传感器：** 加速度计与光线的读取在本机原型上验证过（方向四个角度都对）；镜像集成后的桌面自动旋转、Steam 自适应亮度、休眠时停止传感器流还要在新镜像上复测。接近传感器、磁力计、陀螺仪未验证。
 - **CPU：** TB710FU 是六核版骁龙 8 Gen 3，设备树仍按 8 核描述，cpu1、cpu2 启动失败（`psci: failed to boot`）后保持离线。机型配置按实际在线的核（cpu0、cpu3–7）划分；设备树还没改。
 - **fastboot：** 本机从 Android 重启到 fastboot 后会崩溃进 900E 转储模式（触发条件未查清），所以安装器不使用 fastboot。
 - **音频：** 只验证了扬声器。耳机、麦克风未测试。前端必须使用 S16：24 位输入会让 ADSP 的音频处理出错。
@@ -83,7 +84,7 @@ bash packages/kernel/scripts/build-kernel.sh
 
 | 部分 | 补丁 | 设备树（`dts/sm8650-lenovo-tb710fu.dts.patch`） |
 |---|---|---|
-| 板级、显示、GPU、背光 | `071x`：SY7758 跟随芯片、NT36532 面板、msm DSI 命令触发口与 ABL 控制器/PHY 状态、DSC 宽度取整、A750 不启用 IFPC | kShimC framebuffer 模板、GPU 903 MHz、ADSP/CDSP 固件路径、触摸 compatible |
+| 板级、显示、GPU、背光 | `071x`：SY7758 跟随芯片、NT36532 面板、msm DSI 命令触发口与 ABL 控制器/PHY 状态、DSC 宽度取整、A750 不启用 IFPC | kShimC framebuffer 模板、GPU 903 MHz、ADSP/CDSP 固件路径、ADSP FastRPC 只用 secure 会话、触摸 compatible |
 | 触摸与手写笔 | `072x`：NT36532 SPI 厂商驱动（`novatek,nt36532-ts-spi`）、开机打开笔扫描 | 笔 |
 | 蓝牙与 WiFi | `073x`：DT 蓝牙地址、WCN7850 复位脉冲、ath12k 变通 | — |
 | 扬声器 | `074x`：上游 TDM 时隙辅助函数（回移植）、q6apm TDM DAI、TDM 输出端点、4 声道上混、`lenovo,tb710fu-sndcard` | 4 颗 AW882xx 与声卡 |
@@ -113,6 +114,25 @@ bash packages/kernel/scripts/build-kernel.sh
 - **手写笔：** 补丁 0721 让驱动开机即打开笔扫描，并给坐标设好分辨率，桌面（KWin/libinput）可以直接使用；`/proc/support_pen` 仍可手动开关。游戏模式下 gamescope 不处理手写笔（tablet-tool）事件，需要另外把笔转成触摸。
 - **PipeWire：** WirePlumber 规则 `53-lenovo-tb710fu-speakers.conf`（只匹配声卡名 `Lenovo-TB710FU`）把输出固定为 `S16LE`，并关闭空闲挂起：24 位输入会让 ADSP 的音频处理出错；每次从挂起恢复都会重新启动 4 颗功放，偶尔会锁不上 TDM 时钟。
 
+## 传感器
+
+加速度计、光线等传感器挂在 ADSP 的传感器中枢（SSC）上，不是 IIO 设备。读取链路：
+
+1. **设备树**：ADSP 的 FastRPC 节点去掉 `qcom,non-secure-domain`，内核只建 `/dev/fastrpc-adsp-secure`。SM8650 的传感器 PD 只在 secure 会话下加载传感器；用普通节点时 ADSP 每秒报 `Handover signaled, but it already happened`，传感器列表为空。这个节点只有 hexagonrpcd 使用，音频走 GPR，CDSP 不变。
+2. **传感器文件**：传感器中枢运行时向主机要 DSP 库、传感器配置和注册表（含本机校准）。这些是联想的私有文件，镜像不带；`tb710fu-sensors-prepare.service` 开机时从当前 Android 槽**只读**复制到 `/var/lib/tb710fu-sensors`：
+
+   | 来源 | 目标 |
+   |---|---|
+   | `dsp_<槽>` 分区（ext4）的 `/adsp` | `fw/dsp/adsp/` |
+   | super 里 `vendor_<槽>`（erofs）的 `/etc/sensors/config/`、`/etc/sensors/sns_reg_config` | `fw/sensors/config/`、`fw/sensors/sns_reg.conf` |
+   | `persist` 分区（ext4）的 `/sensors/registry/` | `registry/`（只在第一次复制） |
+
+   当前槽取自 GPT 属性（`boot_a`/`boot_b` 的 active 位）；super 的动态分区表在脚本里解析，ext4 用 `debugfs`（不带 `-w`），erofs 用 `dump.erofs --offset`，都只读打开，不挂载、**不写任何分区**。`fw/` 在槽或源分区变化时重新提取（`stamp.json` 记录来源）。
+3. **hexagonrpcd**（`tb710fu-hexagonrpcd.service`）：传感器中枢启动时会写注册表目录（写 `DIR` 探测可写、写临时文件后改名为 `parsed_file_list.csv`），失败就不加载传感器。镜像里的 hexagonrpcd 带两个补丁（[`packages/hexagonrpc`](../../packages/hexagonrpc/PATCHES.md)）：`HEXAGONRPCD_WRITABLE_REGISTRY` 指向的主机目录作为可写注册表（只允许该目录及其 `registry/` 子目录里的普通文件），以及超过 256 字节的输入缓冲。这里指向 `/var/lib/tb710fu-sensors/registry`，persist 本身保持原样。要恢复成 persist 里的原始注册表，删除这个目录后重启即可。
+4. **iio-sensor-proxy**：镜像改用带 libssc 后端的 3.9（[`packages/iio-sensor-proxy`](../../packages/iio-sensor-proxy/BASE.env)），其它机型的 IIO 传感器行为不变。`81-armada-tb710fu-sensors.rules` 给 secure 节点设 `IIO_SENSOR_PROXY_TYPE=ssc-accel ssc-light ssc-proximity` 和挂载矩阵 `0, 1, 0; -1, 0, 0; 0, 0, 1`（面板原生横屏；顺时针转一圈依次报 normal → left-up → bottom-up → right-up），并在节点出现时启动上面两个服务。传感器中枢在 hexagonrpcd 启动几秒后才就绪，`tb710fu-sensors-generator` 只在本机给 iio-sensor-proxy 加上找不到传感器时重试。休眠前停止 iio-sensor-proxy、唤醒后恢复（`45-tb710fu-sensors`），避免加速度计流在 s2idle 中反复唤醒 ADSP（五代上测得的现象）。
+
+以上单元和规则都只在 `lenovo,tb710fu` 上生效。光线读数经 `armada-als-bridge` 提供给 Steam 的自适应亮度。
+
 ## 源码与来源
 
 | 组件 | 来源 |
@@ -122,4 +142,5 @@ bash packages/kernel/scripts/build-kernel.sh
 | TDM 时隙辅助函数 | 上游 Linux `1e844ecbc9cb`、`0a9e00d5ebdf`（原作者署名保留在补丁中） |
 | TDM DAI 操作 | 参照上游 Linux `4d0840175893`，按本树（无 MI2S 时钟控制）改写 |
 | TDM 端点参数 | 在本机 HyperOS 上抓取 AudioReach 用户空间实际下发的参数 |
+| 传感器 | [linux-msm/hexagonrpc](https://github.com/linux-msm/hexagonrpc)（GPL-3.0-or-later）`da7a3742ab8d5273a281b70ee11f16fb2cb6a690` 加本项目补丁；[libssc](https://codeberg.org/DylanVanAssche/libssc)（GPL-3.0-or-later）`033e2a32095c024d6dbdfb1d4ae1db4a94be32f1`；[iio-sensor-proxy](https://gitlab.freedesktop.org/hadess/iio-sensor-proxy) 3.9（GPL-3.0-or-later）；做法参考五代的 tb323fu-linux |
 | kShimC、DualBootKernelPatcher | 与五代共用，见[五代组件来源](../lenovo-tb323fu/docs/SOURCES.md) |

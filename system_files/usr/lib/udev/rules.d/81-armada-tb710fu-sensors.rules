@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# TB710FU sensor hub (SSC) on the ADSP's secure FastRPC node: the libssc sensor
+# types for iio-sensor-proxy, and the units that serve and read it. The image's
+# 80-iio-sensor-proxy.rules names no SSC types (see packages/iio-sensor-proxy),
+# so nothing else starts the proxy for these sensors.
+#
+# Mount matrix from a hand rotation test on the native landscape panel: with it
+# the proxy reports normal, left-up, bottom-up, right-up, normal for one turn
+# clockwise.
+ACTION=="remove", GOTO="armada_tb710fu_sensors_end"
+SUBSYSTEM!="misc", GOTO="armada_tb710fu_sensors_end"
+KERNEL!="fastrpc-adsp-secure", GOTO="armada_tb710fu_sensors_end"
+PROGRAM=="/usr/bin/grep -azFxq lenovo,tb710fu /sys/firmware/devicetree/base/compatible", ENV{IIO_SENSOR_PROXY_TYPE}="ssc-accel ssc-light ssc-proximity", ENV{ACCEL_MOUNT_MATRIX}="0, 1, 0; -1, 0, 0; 0, 0, 1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="tb710fu-hexagonrpcd.service iio-sensor-proxy.service"
+LABEL="armada_tb710fu_sensors_end"

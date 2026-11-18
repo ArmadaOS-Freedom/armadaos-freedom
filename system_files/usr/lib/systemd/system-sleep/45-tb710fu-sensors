@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# TB710FU: stop the sensor stream across system sleep. With automatic rotation
+# on, iio-sensor-proxy keeps the SSC accelerometer streaming, which wakes the
+# ADSP during s2idle (measured on the TB323FU's SSC). Start it again only if it
+# was running.
+compatible=${TB710FU_DT_COMPATIBLE:-/sys/firmware/devicetree/base/compatible}
+tr '\0' '\n' <"$compatible" 2>/dev/null | grep -qx 'lenovo,tb710fu' || exit 0
+
+marker=${TB710FU_SENSORS_RUN:-/run/tb710fu-sensors}/proxy-stopped
+case "$1" in
+pre)
+	if systemctl -q is-active iio-sensor-proxy.service; then
+		mkdir -p "${marker%/*}" && : >"$marker"
+		systemctl stop iio-sensor-proxy.service
+	fi
+	;;
+post)
+	if [ -e "$marker" ]; then
+		rm -f "$marker"
+		systemctl start --no-block iio-sensor-proxy.service
+	fi
+	;;
+esac
+exit 0
