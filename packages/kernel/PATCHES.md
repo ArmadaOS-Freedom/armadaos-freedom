@@ -1184,6 +1184,11 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Moves Elden's aggregate bandwidth check after every CRTC/plane helper has prepared its candidate resources. Locks untouched CRTC states through the transaction acquire context and propagates -EDEADLK for normal retries. Real C host checks cover multi-CRTC callback order, stale-state rejection, pending disables, the exact bandwidth boundary and lock retry.
+- `patches/0234-drm-msm-dpu-qseed-v11-reflected-fetch.patch`
+  source: armada
+  upstream: local
+  notes: Mirrors QSEED's left/right fetch fields under final horizontal reflection and top/bottom fetch fields under final vertical reflection. The physical source extent, QSEED phase, preload and total dimensions, ROI, UBWC and source-split order are unchanged. The no-reflection right 270-degree path remains identical.
+  validation: Host C tests execute the production QSEED setup and PE packing functions across no reflection, X-only, Y-only and combined reflection, including clean303 split-pipe geometry and signed extension cases. Physical left-90 and right-270 validation remains a separate device gate.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local

@@ -51,6 +51,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int32_t s32;
 typedef int64_t s64;
+typedef uint8_t u8;
 #define BIT(n) (1UL << (n))
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -73,6 +74,7 @@ static u64 __attribute__((unused)) div_u64(u64 dividend, u32 divisor)
 #define DPU_SSPP_SMART_DMA_V2 4
 #define PIPES_PER_STAGE 2
 #define PIPES_PER_PLANE 4
+#define DPU_MAX_PLANES 4
 #define DPU_DEBUG_PLANE(pdpu,...) ((void)(pdpu))
 #define DPU_ERROR(...) ((void)0)
 #define test_bit(n,p) (!!(*(p) & BIT(n)))
@@ -109,6 +111,38 @@ struct dpu_qseed3_axis {
  u32 phase_step, init_phase, preload, src_size;
  s32 fetch_before, fetch_after;
 };
+struct dpu_hw_scaler3_cfg {
+ u32 enable;
+ s32 init_phase_x[DPU_MAX_PLANES];
+ s32 phase_step_x[DPU_MAX_PLANES];
+ s32 init_phase_y[DPU_MAX_PLANES];
+ s32 phase_step_y[DPU_MAX_PLANES];
+ u32 preload_x[DPU_MAX_PLANES];
+ u32 preload_y[DPU_MAX_PLANES];
+ u32 src_width[DPU_MAX_PLANES];
+ u32 src_height[DPU_MAX_PLANES];
+};
+struct dpu_hw_pixel_ext {
+ u8 enable_pxl_ext;
+ s32 init_phase_x[DPU_MAX_PLANES];
+ s32 phase_step_x[DPU_MAX_PLANES];
+ s32 init_phase_y[DPU_MAX_PLANES];
+ s32 phase_step_y[DPU_MAX_PLANES];
+ s32 num_ext_pxls_left[DPU_MAX_PLANES];
+ s32 num_ext_pxls_right[DPU_MAX_PLANES];
+ s32 num_ext_pxls_top[DPU_MAX_PLANES];
+ s32 num_ext_pxls_btm[DPU_MAX_PLANES];
+ s32 left_ftch[DPU_MAX_PLANES];
+ s32 right_ftch[DPU_MAX_PLANES];
+ s32 top_ftch[DPU_MAX_PLANES];
+ s32 btm_ftch[DPU_MAX_PLANES];
+ s32 left_rpt[DPU_MAX_PLANES];
+ s32 right_rpt[DPU_MAX_PLANES];
+ s32 top_rpt[DPU_MAX_PLANES];
+ s32 btm_rpt[DPU_MAX_PLANES];
+ u32 roi_w[DPU_MAX_PLANES];
+ u32 roi_h[DPU_MAX_PLANES];
+};
 struct dpu_sw_pipe_cfg {
  struct drm_rect src_rect, src_ext_rect, dst_rect;
  unsigned int rotation;
@@ -142,7 +176,11 @@ struct dpu_mdss_cfg {
 };
 struct dpu_plane { struct drm_plane base; int pipe; const struct dpu_mdss_cfg *catalog; };
 struct dpu_kms { struct { u64 max_core_clk_rate; } perf; };
-struct dpu_hw_sspp { const struct dpu_sspp_cfg *cap; };
+struct dpu_hw_blk_reg_map { int unused; };
+struct dpu_hw_sspp {
+ const struct dpu_sspp_cfg *cap;
+ struct dpu_hw_blk_reg_map hw;
+};
 struct dpu_sw_pipe { struct dpu_hw_sspp *sspp; };
 struct msm_format { bool is_yuv, ubwc; u32 pixel_format, bpp; };
 static bool fixture_elden = true;
@@ -160,6 +198,28 @@ static struct dpu_kms *_dpu_plane_get_kms(struct drm_plane *p)
 { (void)p; return &kms; }
 static unsigned int dpu_crtc_get_num_lm(const struct drm_crtc_state *s)
 { return s->num_lm; }
+#define SSPP_SW_PIX_EXT_C0_LR 0x100
+#define SSPP_SW_PIX_EXT_C0_TB 0x104
+#define SSPP_SW_PIX_EXT_C0_REQ_PIXELS 0x108
+#define SSPP_SW_PIX_EXT_C1C2_LR 0x110
+#define SSPP_SW_PIX_EXT_C1C2_TB 0x114
+#define SSPP_SW_PIX_EXT_C1C2_REQ_PIXELS 0x118
+#define SSPP_SW_PIX_EXT_C3_LR 0x120
+#define SSPP_SW_PIX_EXT_C3_TB 0x124
+#define SSPP_SW_PIX_EXT_C3_REQ_PIXELS 0x128
+struct fixture_reg_write { u32 offset, value; };
+static struct fixture_reg_write fixture_writes[16];
+static int fixture_write_count;
+static void fixture_capture_reg_write(struct dpu_hw_blk_reg_map *map,
+                                       u32 offset, u32 value)
+{
+ (void)map;
+ if (fixture_write_count < (int)ARRAY_SIZE(fixture_writes))
+  fixture_writes[fixture_write_count++] =
+   (struct fixture_reg_write){.offset=offset,.value=value};
+}
+#define DPU_REG_WRITE(map,offset,value) \
+ fixture_capture_reg_write((map),(offset),(value))
 """
 
 TESTS = r"""
@@ -266,7 +326,7 @@ static void inline_case(int width, int height, int dest_height, bool limited,
  const struct dpu_rotation_cfg rot={1088,limited?11:0,limited?5:0,2,formats};
  const struct dpu_sspp_sub_blks sblk={.rotation_cfg=&rot};
  const struct dpu_sspp_cfg caps={1,BIT(DPU_SSPP_INLINE_ROTATION),&sblk};
- struct dpu_hw_sspp sspp={&caps};
+ struct dpu_hw_sspp sspp={.cap=&caps};
  struct dpu_sw_pipe pipe={&sspp};
  struct dpu_plane plane={0};
  struct drm_rect src={0,0,width,height};
@@ -299,6 +359,98 @@ static void qseed_src_size_case(u32 full_src, u32 full_dst, u32 src_start,
 #endif
 
 #ifdef HAS_QSEED_V11
+static void qseed_setup_case(const char *name, unsigned int rotation,
+                             struct drm_rect src, struct drm_rect ext,
+                             int left, int right, int top, int btm,
+                             u32 src_size_x, u32 src_size_y)
+{
+ struct dpu_sw_pipe_cfg pipe={
+  .src_rect=src,.src_ext_rect=ext,.rotation=rotation,
+  .qseed3_v11_valid=true,
+  .qseed3_v11={
+   {.phase_step=0x00123456,.init_phase=0x00234567,
+    .preload=12,.src_size=src_size_x,
+    .fetch_before=-5,.fetch_after=7},
+   {.phase_step=0x00345678,.init_phase=0x00456789,
+    .preload=4,.src_size=src_size_y,
+    .fetch_before=-9,.fetch_after=11},
+  },
+ };
+ const struct dpu_qseed3_axis axes_before[2]={
+  pipe.qseed3_v11[0],pipe.qseed3_v11[1],
+ };
+ struct dpu_hw_scaler3_cfg scaler;
+ struct dpu_hw_pixel_ext pixel;
+ int width=drm_rect_width(&src), height=drm_rect_height(&src);
+
+ memset(&scaler,0xa5,sizeof(scaler));
+ memset(&pixel,0xa5,sizeof(pixel));
+ cases++;
+ dpu_plane_setup_qseed3_v11(&pipe,&scaler,&pixel);
+
+#define QCHECK(c) do { if (!(c)) { \
+ fprintf(stderr,"%s: %s:%d: %s\n",name,__func__,__LINE__,#c); failures++; \
+} } while(0)
+
+ QCHECK(!memcmp(axes_before,pipe.qseed3_v11,sizeof(axes_before)));
+ QCHECK(scaler.enable==1);
+ QCHECK(pixel.enable_pxl_ext==1);
+ for(int i=0;i<DPU_MAX_PLANES;i++) {
+  QCHECK(scaler.phase_step_x[i]==0x00123456);
+  QCHECK(scaler.init_phase_x[i]==0x00234567);
+  QCHECK(scaler.preload_x[i]==12);
+  QCHECK(scaler.src_width[i]==src_size_x);
+  QCHECK(scaler.phase_step_y[i]==0x00345678);
+  QCHECK(scaler.init_phase_y[i]==0x00456789);
+  QCHECK(scaler.preload_y[i]==4);
+  QCHECK(scaler.src_height[i]==src_size_y);
+
+  QCHECK(pixel.left_ftch[i]==left);
+  QCHECK(pixel.right_ftch[i]==right);
+  QCHECK(pixel.top_ftch[i]==top);
+  QCHECK(pixel.btm_ftch[i]==btm);
+  QCHECK(pixel.num_ext_pxls_left[i]==left);
+  QCHECK(pixel.num_ext_pxls_right[i]==right);
+  QCHECK(pixel.num_ext_pxls_top[i]==top);
+  QCHECK(pixel.num_ext_pxls_btm[i]==btm);
+  QCHECK(pixel.left_rpt[i]==0);
+  QCHECK(pixel.right_rpt[i]==0);
+  QCHECK(pixel.top_rpt[i]==0);
+  QCHECK(pixel.btm_rpt[i]==0);
+  QCHECK(pixel.roi_w[i]==(u32)width);
+  QCHECK(pixel.roi_h[i]==(u32)height);
+ }
+
+#ifdef HAS_PE_PACK
+ {
+  const struct dpu_hw_sspp sspp={0};
+  const u32 lr=((u32)(right & 0xff) << 24) |
+               ((u32)(left & 0xff) << 8);
+  const u32 tb=((u32)(btm & 0xff) << 24) |
+               ((u32)(top & 0xff) << 8);
+  const u32 total=(((u32)(height+top+btm) & 0xffff) << 16) |
+                  ((u32)(width+left+right) & 0xffff);
+  const u32 offsets[]={
+   SSPP_SW_PIX_EXT_C0_LR,SSPP_SW_PIX_EXT_C0_TB,
+   SSPP_SW_PIX_EXT_C0_REQ_PIXELS,SSPP_SW_PIX_EXT_C1C2_LR,
+   SSPP_SW_PIX_EXT_C1C2_TB,SSPP_SW_PIX_EXT_C1C2_REQ_PIXELS,
+   SSPP_SW_PIX_EXT_C3_LR,SSPP_SW_PIX_EXT_C3_TB,
+   SSPP_SW_PIX_EXT_C3_REQ_PIXELS,
+  };
+  const u32 values[]={lr,tb,total,lr,tb,total,lr,tb,total};
+
+  fixture_write_count=0;
+  dpu_hw_sspp_setup_pe_config((struct dpu_hw_sspp *)&sspp,&pixel);
+  QCHECK(fixture_write_count==(int)ARRAY_SIZE(offsets));
+  for(int i=0;i<(int)ARRAY_SIZE(offsets);i++) {
+   QCHECK(fixture_writes[i].offset==offsets[i]);
+   QCHECK(fixture_writes[i].value==values[i]);
+  }
+ }
+#endif
+#undef QCHECK
+}
+
 /* Exercise the actual catalog/rotation entry guard, not only the axis helper. */
 static void qseed_guard_case(unsigned int rotation, u32 scaler_version,
                               bool elden, bool yuv, bool expected)
@@ -551,6 +703,57 @@ int main(void)
  inline_case(3040,952,3040,true,false,1,-EINVAL);
  inline_case(3040,952,3040,true,true,3,-EINVAL);
 #ifdef HAS_QSEED_V11
+ qseed_setup_case("exact-boundary",DRM_MODE_ROTATE_90,
+                  (struct drm_rect){100,120,200,220},
+                  (struct drm_rect){100,120,200,220},
+                  0,0,0,0,3040,952);
+ /* clean303 left90 SSPP0-SSPP3 PE LR/TB geometry. */
+ qseed_setup_case("left90-sspp0",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  6,0,6,0,958,958);
+ qseed_setup_case("left90-sspp1",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){952,952,1904,1904},
+                  (struct drm_rect){947,947,1904,1904},
+                  0,5,0,5,958,957);
+ qseed_setup_case("left90-sspp2",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  6,0,6,0,546,546);
+ qseed_setup_case("left90-sspp3",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){952,952,1904,1904},
+                  (struct drm_rect){946,946,1904,1904},
+                  0,6,0,6,546,546);
+ /* right270 has no final reflection and must retain the original fields. */
+ qseed_setup_case("right270-no-reflection",DRM_MODE_ROTATE_270,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  0,6,0,6,958,958);
+ qseed_setup_case("x-only-reflection",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  6,0,0,6,958,958);
+ qseed_setup_case("y-only-reflection",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  0,6,6,0,958,958);
+ qseed_setup_case("xy-reflection",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){0,0,3040,952},
+                  (struct drm_rect){0,0,3046,958},
+                  6,0,6,0,958,958);
+ /* Signed crop extensions must remain directional without unsigned wrap. */
+ qseed_setup_case("negative-crop",DRM_MODE_ROTATE_90 |
+                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                  (struct drm_rect){0,0,100,100},
+                  (struct drm_rect){-6,-7,106,108},
+                  6,6,8,7,113,115);
  qseed_guard_case(DRM_MODE_ROTATE_270,0x30004,true,false,true);
  qseed_guard_case(DRM_MODE_ROTATE_90,0x30004,true,false,true);
  qseed_guard_case(DRM_MODE_ROTATE_0,0x30004,true,false,false);
@@ -618,6 +821,7 @@ def main():
         parts.append("#define HAS_QSEED_V11 1")
         parts.append(function(qseed,"dpu_qseed3_min64"))
         parts.append(function(qseed,"dpu_qseed3_v11_axis"))
+        parts.append(function(plane,"dpu_plane_setup_qseed3_v11"))
     parts.append(function(plane,"_dpu_plane_calc_bw"))
     parts.append(function(plane,"_dpu_plane_calc_clk"))
     parts.append(function(plane,"dpu_plane_calc_perf"))
@@ -631,6 +835,12 @@ def main():
         parts.append(function(plane,"dpu_plane_get_max_linewidth"))
     if qseed_path.exists():
         parts.append(function(plane,"dpu_plane_check_qseed3_v11"))
+    sspp_path = (a.source/"drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c")
+    if sspp_path.exists():
+        sspp = sspp_path.read_text(encoding="utf-8")
+        if "static void dpu_hw_sspp_setup_pe_config(" in sspp:
+            parts.append("#define HAS_PE_PACK 1")
+            parts.append(function(sspp,"dpu_hw_sspp_setup_pe_config"))
     if "dpu_plane_set_src_split_order(" in plane:
         parts.append("#define HAS_SRC_SPLIT_ORDER 1")
         parts.append(function(plane,"dpu_plane_set_src_split_order"))
@@ -678,6 +888,11 @@ def main():
         manifest["inputs"]["qseed"] = {
             "path": str(qseed_path),
             "sha256": sha256(qseed_path),
+        }
+    if sspp_path.exists():
+        manifest["inputs"]["sspp"] = {
+            "path": str(sspp_path),
+            "sha256": sha256(sspp_path),
         }
     (a.work/"run-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
