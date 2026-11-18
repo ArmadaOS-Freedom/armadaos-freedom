@@ -187,6 +187,28 @@ kernel, with the same CAMCC/CAMSS properties in the ordinary board DTB.
 The validation above names the original camera2 build explicitly; it is
 not a claim that every new system image has been retested on hardware.
 
+The default-build integration was separately compiled against Armada main
+`5c4454f23cd72b05267645da4459b7af70e24f03`. All 313 patches applied with
+zero fuzz and full hunk counts; Image, all DTBs and 1602 modules (including
+both external audio modules), depmod and the final archive passed. Release
+is `7.2.6`, build ID `c071e91b9eaab60aa6066d2b03cd806482473e81`.
+The 47621050-byte archive has SHA-256
+`849e54055a4ec947b057e5d3d5bcfe1da0fe1c07182cc561f5823511a32e725e`;
+all 1648 archived payloads match staging. Compared with camera2, the
+resolved configuration changes only the local release suffix and AUTO.
+
+The ordinary Elden DTB has 4333 effective properties identical to the tested
+overlay result after excluding compiler overlay metadata and unused phandle
+declarations. Camera/clock schema checks also passed Elden, KONKR PF Elite,
+SM8750 MTP and QRD with no diagnostics. Five extracted-C ASAN/UBSAN suites
+passed ICC transactions and partial rollback, GDSC registration unwind,
+flash release, CSID power errors and Elden/other-board probe isolation.
+The default build includes patch 0250's board gate and is validated here
+by compile, schema and host checks; the hardware results remain scoped to
+the original camera2 source. The initial full build received SIGHUP and
+was resumed after checking no compiler remained; it is not counted as a
+successful run on its own.
+
 Software ISP, AE/AWB, calibrated colors, sensor mounting orientation and
 application integration remain future work. Any sensor helpers must use
 rear raw gain divided by 32 and front raw gain divided by 1024. Autofocus,
