@@ -359,30 +359,143 @@ static void qseed_src_size_case(u32 full_src, u32 full_dst, u32 src_start,
 #endif
 
 #ifdef HAS_QSEED_V11
+static const struct dpu_qseed3_axis synthetic_axes[2]={
+ {
+  .phase_step=0x00123456,.init_phase=0x00234567,
+  .preload=12,.src_size=3040,
+  .fetch_before=-5,.fetch_after=7,
+ },
+ {
+  .phase_step=0x00345678,.init_phase=0x00456789,
+  .preload=4,.src_size=952,
+  .fetch_before=-9,.fetch_after=11,
+ },
+};
+
+/*
+ * Frozen left90 state from:
+ * reports/device-tests/qseed302-runtime-20261116/right-left-register-summary.json
+ * and the matching before-capture scaler_blk dumps.
+ */
+static const struct dpu_qseed3_axis clean303_left90_axes[4][2]={
+ {
+  {.phase_step=0x00200000,.init_phase=0x00004000,
+   .preload=7,.src_size=958,
+   .fetch_before=0,.fetch_after=6},
+  {.phase_step=0x00200000,.init_phase=0x00004000,
+   .preload=3,.src_size=3040,
+   .fetch_before=0,.fetch_after=0},
+ },
+ {
+  {.phase_step=0x00200000,.init_phase=0x00004000,
+   .preload=12,.src_size=957,
+   .fetch_before=5,.fetch_after=0},
+  {.phase_step=0x00200000,.init_phase=0x00004000,
+   .preload=3,.src_size=3040,
+   .fetch_before=0,.fetch_after=0},
+ },
+ {
+  {.phase_step=0x001226b9,.init_phase=0x0019535c,
+   .preload=6,.src_size=546,
+   .fetch_before=0,.fetch_after=6},
+  {.phase_step=0x001435e5,.init_phase=0x001a5af2,
+   .preload=2,.src_size=1920,
+   .fetch_before=0,.fetch_after=0},
+ },
+ {
+  {.phase_step=0x001226b9,.init_phase=0x00195354,
+   .preload=12,.src_size=546,
+   .fetch_before=6,.fetch_after=0},
+  {.phase_step=0x001435e5,.init_phase=0x001a5af2,
+   .preload=2,.src_size=1920,
+   .fetch_before=0,.fetch_after=0},
+ },
+};
+
+static const struct drm_rect clean303_left90_src[4]={
+ {0,0,3040,952},
+ {0,952,3040,1904},
+ {0,0,1920,540},
+ {0,540,1920,1080},
+};
+
+static const struct drm_rect clean303_left90_ext[4]={
+ {0,0,3040,958},
+ {0,947,3040,1904},
+ {0,0,1920,546},
+ {0,534,1920,1080},
+};
+
+static void clean303_left90_guard_case(int index)
+{
+ const int main_layer=index<2;
+ const int width=main_layer ? 3040 : 1920;
+ const int height=main_layer ? 1904 : 1080;
+ const int dst_x=index==1 || index==3 ? 952 : 0;
+ const struct dpu_rotation_cfg rot={.rot_maxheight=1088};
+ const struct dpu_sspp_sub_blks sblk={
+  .rotation_cfg=&rot,.scaler_blk={.version=0x30004},
+ };
+ const struct dpu_sspp_cfg caps={.sblk=&sblk};
+ struct dpu_hw_sspp sspp={.cap=&caps};
+ struct dpu_sw_pipe pipe={.sspp=&sspp};
+ struct drm_framebuffer fb={.width=width,.height=height};
+ struct drm_plane_state state={
+  .src={0,0,width<<16,height<<16},
+  .dst={0,0,1904,3040},
+  .fb=&fb,.rotation=DRM_MODE_ROTATE_90,
+ };
+ struct dpu_sw_pipe_cfg cfg={
+  .src_rect=clean303_left90_src[index],
+  .dst_rect={dst_x,0,dst_x+952,3040},
+  .rotation=DRM_MODE_ROTATE_90 |
+             DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+ };
+ const struct msm_format fmt={.bpp=4};
+
+ cases++;
+ CHECK(dpu_plane_check_qseed3_v11(&pipe,&cfg,&state,&fmt)==0);
+ CHECK(cfg.qseed3_v11_valid);
+ CHECK(!memcmp(&cfg.src_ext_rect,&clean303_left90_ext[index],
+               sizeof(cfg.src_ext_rect)));
+ if (memcmp(cfg.qseed3_v11,clean303_left90_axes[index],
+            sizeof(cfg.qseed3_v11))) {
+  for(int axis=0;axis<2;axis++)
+   fprintf(stderr,
+           "sspp%d axis%d: step=%#x init=%#x preload=%u size=%u fetch=%d/%d "
+           "expected step=%#x init=%#x preload=%u size=%u fetch=%d/%d\n",
+           index,axis,cfg.qseed3_v11[axis].phase_step,
+           cfg.qseed3_v11[axis].init_phase,cfg.qseed3_v11[axis].preload,
+           cfg.qseed3_v11[axis].src_size,
+           cfg.qseed3_v11[axis].fetch_before,
+           cfg.qseed3_v11[axis].fetch_after,
+           clean303_left90_axes[index][axis].phase_step,
+           clean303_left90_axes[index][axis].init_phase,
+           clean303_left90_axes[index][axis].preload,
+           clean303_left90_axes[index][axis].src_size,
+           clean303_left90_axes[index][axis].fetch_before,
+           clean303_left90_axes[index][axis].fetch_after);
+ }
+ CHECK(!memcmp(cfg.qseed3_v11,clean303_left90_axes[index],
+               sizeof(cfg.qseed3_v11)));
+}
+
 static void qseed_setup_case(const char *name, unsigned int rotation,
                              struct drm_rect src, struct drm_rect ext,
                              int left, int right, int top, int btm,
-                             u32 src_size_x, u32 src_size_y)
+                             const struct dpu_qseed3_axis axes[2])
 {
  struct dpu_sw_pipe_cfg pipe={
   .src_rect=src,.src_ext_rect=ext,.rotation=rotation,
   .qseed3_v11_valid=true,
-  .qseed3_v11={
-   {.phase_step=0x00123456,.init_phase=0x00234567,
-    .preload=12,.src_size=src_size_x,
-    .fetch_before=-5,.fetch_after=7},
-   {.phase_step=0x00345678,.init_phase=0x00456789,
-    .preload=4,.src_size=src_size_y,
-    .fetch_before=-9,.fetch_after=11},
-  },
  };
- const struct dpu_qseed3_axis axes_before[2]={
-  pipe.qseed3_v11[0],pipe.qseed3_v11[1],
- };
+ struct dpu_qseed3_axis axes_before[2];
  struct dpu_hw_scaler3_cfg scaler;
  struct dpu_hw_pixel_ext pixel;
  int width=drm_rect_width(&src), height=drm_rect_height(&src);
 
+ memcpy(pipe.qseed3_v11,axes,sizeof(pipe.qseed3_v11));
+ memcpy(axes_before,axes,sizeof(axes_before));
  memset(&scaler,0xa5,sizeof(scaler));
  memset(&pixel,0xa5,sizeof(pixel));
  cases++;
@@ -396,14 +509,14 @@ static void qseed_setup_case(const char *name, unsigned int rotation,
  QCHECK(scaler.enable==1);
  QCHECK(pixel.enable_pxl_ext==1);
  for(int i=0;i<DPU_MAX_PLANES;i++) {
-  QCHECK(scaler.phase_step_x[i]==0x00123456);
-  QCHECK(scaler.init_phase_x[i]==0x00234567);
-  QCHECK(scaler.preload_x[i]==12);
-  QCHECK(scaler.src_width[i]==src_size_x);
-  QCHECK(scaler.phase_step_y[i]==0x00345678);
-  QCHECK(scaler.init_phase_y[i]==0x00456789);
-  QCHECK(scaler.preload_y[i]==4);
-  QCHECK(scaler.src_height[i]==src_size_y);
+  QCHECK(scaler.phase_step_x[i]==axes[0].phase_step);
+  QCHECK(scaler.init_phase_x[i]==axes[0].init_phase);
+  QCHECK(scaler.preload_x[i]==axes[0].preload);
+  QCHECK(scaler.src_width[i]==axes[0].src_size);
+  QCHECK(scaler.phase_step_y[i]==axes[1].phase_step);
+  QCHECK(scaler.init_phase_y[i]==axes[1].init_phase);
+  QCHECK(scaler.preload_y[i]==axes[1].preload);
+  QCHECK(scaler.src_height[i]==axes[1].src_size);
 
   QCHECK(pixel.left_ftch[i]==left);
   QCHECK(pixel.right_ftch[i]==right);
@@ -703,57 +816,55 @@ int main(void)
  inline_case(3040,952,3040,true,false,1,-EINVAL);
  inline_case(3040,952,3040,true,true,3,-EINVAL);
 #ifdef HAS_QSEED_V11
- qseed_setup_case("exact-boundary",DRM_MODE_ROTATE_90,
+ qseed_setup_case("synthetic-exact-boundary",DRM_MODE_ROTATE_90,
                   (struct drm_rect){100,120,200,220},
                   (struct drm_rect){100,120,200,220},
-                  0,0,0,0,3040,952);
- /* clean303 left90 SSPP0-SSPP3 PE LR/TB geometry. */
- qseed_setup_case("left90-sspp0",DRM_MODE_ROTATE_90 |
-                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
-                  (struct drm_rect){0,0,3040,952},
-                  (struct drm_rect){0,0,3046,958},
-                  6,0,6,0,958,958);
- qseed_setup_case("left90-sspp1",DRM_MODE_ROTATE_90 |
-                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
-                  (struct drm_rect){952,952,1904,1904},
-                  (struct drm_rect){947,947,1904,1904},
-                  0,5,0,5,958,957);
- qseed_setup_case("left90-sspp2",DRM_MODE_ROTATE_90 |
-                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
-                  (struct drm_rect){0,0,3040,952},
-                  (struct drm_rect){0,0,3046,958},
-                  6,0,6,0,546,546);
- qseed_setup_case("left90-sspp3",DRM_MODE_ROTATE_90 |
-                  DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
-                  (struct drm_rect){952,952,1904,1904},
-                  (struct drm_rect){946,946,1904,1904},
-                  0,6,0,6,546,546);
+                  0,0,0,0,synthetic_axes);
+ {
+  static const char *names[4]={
+   "clean303-left90-sspp0","clean303-left90-sspp1",
+   "clean303-left90-sspp2","clean303-left90-sspp3",
+  };
+  static const int expected[4][4]={
+   {0,0,6,0},{0,0,0,5},{0,0,6,0},{0,0,0,6},
+  };
+
+  for(int i=0;i<4;i++) {
+   clean303_left90_guard_case(i);
+   qseed_setup_case(names[i],DRM_MODE_ROTATE_90 |
+                    DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+                    clean303_left90_src[i],clean303_left90_ext[i],
+                    expected[i][0],expected[i][1],
+                    expected[i][2],expected[i][3],
+                    clean303_left90_axes[i]);
+  }
+ }
  /* right270 has no final reflection and must retain the original fields. */
- qseed_setup_case("right270-no-reflection",DRM_MODE_ROTATE_270,
+ qseed_setup_case("synthetic-right270-no-reflection",DRM_MODE_ROTATE_270,
                   (struct drm_rect){0,0,3040,952},
                   (struct drm_rect){0,0,3046,958},
-                  0,6,0,6,958,958);
- qseed_setup_case("x-only-reflection",DRM_MODE_ROTATE_90 |
+                  0,6,0,6,synthetic_axes);
+ qseed_setup_case("synthetic-x-only-reflection",DRM_MODE_ROTATE_90 |
                   DRM_MODE_REFLECT_X,
                   (struct drm_rect){0,0,3040,952},
                   (struct drm_rect){0,0,3046,958},
-                  6,0,0,6,958,958);
- qseed_setup_case("y-only-reflection",DRM_MODE_ROTATE_90 |
+                  6,0,0,6,synthetic_axes);
+ qseed_setup_case("synthetic-y-only-reflection",DRM_MODE_ROTATE_90 |
                   DRM_MODE_REFLECT_Y,
                   (struct drm_rect){0,0,3040,952},
                   (struct drm_rect){0,0,3046,958},
-                  0,6,6,0,958,958);
- qseed_setup_case("xy-reflection",DRM_MODE_ROTATE_90 |
+                  0,6,6,0,synthetic_axes);
+ qseed_setup_case("synthetic-xy-reflection",DRM_MODE_ROTATE_90 |
                   DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
                   (struct drm_rect){0,0,3040,952},
                   (struct drm_rect){0,0,3046,958},
-                  6,0,6,0,958,958);
+                  6,0,6,0,synthetic_axes);
  /* Signed crop extensions must remain directional without unsigned wrap. */
- qseed_setup_case("negative-crop",DRM_MODE_ROTATE_90 |
+ qseed_setup_case("synthetic-negative-crop",DRM_MODE_ROTATE_90 |
                   DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
                   (struct drm_rect){0,0,100,100},
-                  (struct drm_rect){-6,-7,106,108},
-                  6,6,8,7,113,115);
+                  (struct drm_rect){2,3,105,107},
+                  5,-2,7,-3,synthetic_axes);
  qseed_guard_case(DRM_MODE_ROTATE_270,0x30004,true,false,true);
  qseed_guard_case(DRM_MODE_ROTATE_90,0x30004,true,false,true);
  qseed_guard_case(DRM_MODE_ROTATE_0,0x30004,true,false,false);
