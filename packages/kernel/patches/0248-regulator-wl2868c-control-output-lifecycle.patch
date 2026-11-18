@@ -1,0 +1,228 @@
+Subject: [PATCH] regulator: wl2868c: serialize software output control
+
+Adapt the software-output control from Qianhui Xu's posted v11 while
+retaining the existing Gen4 supply contract. Serialize updates, seed from
+the actual enable register, and clear SYS_EN when the last output stops.
+Clear sequencer slots before software takeover; never enable outputs just
+to read the chip ID. Commit the expected channel mask only on successful
+full writes, and report reset failures during devres teardown.
+
+The SYS_EN/SEQ behavior is traced to v11 and its cited Rev 1.4 p.35;
+the original datasheet and this tablet's register state are not yet
+independently verified. VSYS/VIN7 wiring is still unresolved and no
+mandatory parent supply or guessed rail is added by this backport.
+
+diff --git a/drivers/regulator/wl2868c-regulator.c b/drivers/regulator/wl2868c-regulator.c
+index beeb6e3..46c2a48 100644
+--- a/drivers/regulator/wl2868c-regulator.c
++++ b/drivers/regulator/wl2868c-regulator.c
+@@ -1,33 +1,111 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Will Semiconductor WL2868C seven-channel camera regulator. */
++/*
++ * Will Semiconductor WL2868C seven-channel camera regulator.
++ *
++ * Enable-state control adapted from Qianhui Xu's WL2868C v11 driver.
++ * Copyright (C) 2026 Qianhui Xu
++ */
+ 
++#include <linux/cleanup.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/driver.h>
+ 
+ #define WL2868C_DEVICE_ID		0x00
+ #define WL2868C_LDO_ENABLE	0x0e
+ #define WL2868C_SYS_ENABLE	BIT(7)
++#define WL2868C_LDO_ENABLE_MASK	GENMASK(6, 0)
++#define WL2868C_LDO_SEQ		0x0a
++#define WL2868C_LDO_SEQ_LEN	4
++
++struct wl2868c {
++	struct device *dev;
++	struct gpio_desc *reset;
++	struct regmap *regmap;
++	/* LDO enable bits owned by consumers, in WL2868C_LDO_ENABLE layout. */
++	unsigned int enabled;
++	/* Protects enabled. */
++	struct mutex lock;
++};
+ 
+ static int wl2868c_enable(struct regulator_dev *rdev)
+ {
+-	return regmap_update_bits(rdev->regmap, WL2868C_LDO_ENABLE,
+-				  WL2868C_SYS_ENABLE | rdev->desc->enable_mask,
+-				  WL2868C_SYS_ENABLE | rdev->desc->enable_mask);
++	struct wl2868c *chip = rdev_get_drvdata(rdev);
++	unsigned int bits = rdev->desc->enable_mask;
++	unsigned int ldos;
++	int ret;
++
++	guard(mutex)(&chip->lock);
++
++	/*
++	 * The enable register is written as a whole on purpose. SYS_EN gates
++	 * every output of the chip, and the per-LDO bits may be preset by the
++	 * firmware while SYS_EN is still clear: setting only SYS_EN and our own
++	 * bit would then bring the preset LDOs up as well. Writing the register
++	 * with the bits of the LDOs consumers have enabled, and only those,
++	 * keeps the other outputs off. chip->enabled was seeded from the
++	 * register in probe() when SYS_EN was set, so an output the firmware
++	 * left on is carried over instead of being cleared by the first
++	 * enable; when SYS_EN was clear no output is on at all.
++	 */
++	ldos = (chip->enabled | bits) & WL2868C_LDO_ENABLE_MASK;
++	ret = regmap_write(chip->regmap, WL2868C_LDO_ENABLE,
++			   WL2868C_SYS_ENABLE | ldos);
++	if (ret)
++		return ret;
++
++	chip->enabled = ldos;
++
++	return 0;
++}
++
++static int wl2868c_disable(struct regulator_dev *rdev)
++{
++	struct wl2868c *chip = rdev_get_drvdata(rdev);
++	unsigned int bits = rdev->desc->enable_mask;
++	unsigned int ldos;
++	int ret;
++
++	guard(mutex)(&chip->lock);
++
++	/*
++	 * SYS_EN stays set while at least one output is enabled; the per-LDO
++	 * bits of the other outputs stay clear so that setting it cannot
++	 * switch anything else on.
++	 */
++	ldos = (chip->enabled & ~bits) & WL2868C_LDO_ENABLE_MASK;
++
++	/*
++	 * The tracked state is committed only once the register write went
++	 * through. On error the regulator core retains its use count, so keep
++	 * the expected output set as well. A bus error does not establish the
++	 * physical register state; the next successful full write restores it.
++	 */
++	ret = regmap_write(chip->regmap, WL2868C_LDO_ENABLE,
++			   ldos ? WL2868C_SYS_ENABLE | ldos : 0);
++	if (ret)
++		return ret;
++
++	chip->enabled = ldos;
++
++	return 0;
+ }
+ 
+ static int wl2868c_is_enabled(struct regulator_dev *rdev)
+ {
++	struct wl2868c *chip = rdev_get_drvdata(rdev);
+ 	unsigned int mask = WL2868C_SYS_ENABLE | rdev->desc->enable_mask;
+ 	unsigned int value;
+ 	int ret;
+ 
+-	ret = regmap_read(rdev->regmap, WL2868C_LDO_ENABLE, &value);
++	ret = regmap_read(chip->regmap, WL2868C_LDO_ENABLE, &value);
+ 	if (ret)
+ 		return ret;
++
+ 	return (value & mask) == mask;
+ }
+ 
+@@ -37,7 +115,7 @@ static const struct regulator_ops wl2868c_ops = {
+ 	.set_voltage_sel = regulator_set_voltage_sel_regmap,
+ 	.get_voltage_sel = regulator_get_voltage_sel_regmap,
+ 	.enable = wl2868c_enable,
+-	.disable = regulator_disable_regmap,
++	.disable = wl2868c_disable,
+ 	.is_enabled = wl2868c_is_enabled,
+ };
+ 
+@@ -78,7 +156,38 @@ static const struct regmap_config wl2868c_regmap_config = {
+ 
+ static void wl2868c_reset(void *data)
+ {
+-	gpiod_set_value_cansleep(data, 1);
++	struct wl2868c *chip = data;
++	int ret;
++
++	ret = gpiod_set_value_cansleep(chip->reset, 1);
++	if (ret)
++		dev_err(chip->dev, "Failed to assert reset during teardown: %d\n", ret);
++}
++
++static int wl2868c_init_outputs(struct wl2868c *chip)
++{
++	static const u8 no_seq[WL2868C_LDO_SEQ_LEN];
++	unsigned int value;
++	int ret;
++
++	/*
++	 * v11 cites WL2868C Rev 1.4 p.35: non-zero LDOx_SEQ slots bypass
++	 * the LDOx_EN bits. Clear slots before taking over software control.
++	 * Do not set SYS_EN or start outputs to make the device answer I2C.
++	 */
++	ret = regmap_bulk_write(chip->regmap, WL2868C_LDO_SEQ, no_seq,
++				WL2868C_LDO_SEQ_LEN);
++	if (ret)
++		return ret;
++
++	/* Seed only from real readback; off-state bits are firmware presets. */
++	ret = regmap_read(chip->regmap, WL2868C_LDO_ENABLE, &value);
++	if (ret)
++		return ret;
++	chip->enabled = value & WL2868C_SYS_ENABLE ?
++			value & WL2868C_LDO_ENABLE_MASK : 0;
++
++	return 0;
+ }
+ 
+ static int wl2868c_probe(struct i2c_client *client)
+@@ -87,15 +196,24 @@ static int wl2868c_probe(struct i2c_client *client)
+ 	struct regulator_config config = { .dev = dev };
+ 	struct regulator_dev *rdev;
+ 	struct gpio_desc *reset;
++	struct wl2868c *chip;
+ 	unsigned int id;
+ 	int ret, i;
+ 
++	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++	chip->dev = dev;
++	mutex_init(&chip->lock);
++	config.driver_data = chip;
++
+ 	reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+ 	if (IS_ERR(reset))
+ 		return dev_err_probe(dev, PTR_ERR(reset), "Failed to get reset GPIO\n");
+ 
+ 	if (reset) {
+-		ret = devm_add_action_or_reset(dev, wl2868c_reset, reset);
++		chip->reset = reset;
++		ret = devm_add_action_or_reset(dev, wl2868c_reset, chip);
+ 		if (ret)
+ 			return ret;
+ 		fsleep(1000);
+@@ -105,12 +223,17 @@ static int wl2868c_probe(struct i2c_client *client)
+ 	if (IS_ERR(config.regmap))
+ 		return dev_err_probe(dev, PTR_ERR(config.regmap), "Failed to create regmap\n");
+ 
++	chip->regmap = config.regmap;
+ 	ret = regmap_read(config.regmap, WL2868C_DEVICE_ID, &id);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to read device ID\n");
+ 	if (id != 0x82)
+ 		return dev_err_probe(dev, -ENODEV, "Unexpected device ID: %#x\n", id);
+ 
++	ret = wl2868c_init_outputs(chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to take over LDO software control\n");
++
+ 	for (i = 0; i < ARRAY_SIZE(wl2868c_regulators); i++) {
+ 		rdev = devm_regulator_register(dev, &wl2868c_regulators[i], &config);
+ 		if (IS_ERR(rdev))

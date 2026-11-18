@@ -1184,6 +1184,15 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Moves Elden's aggregate bandwidth check after every CRTC/plane helper has prepared its candidate resources. Locks untouched CRTC states through the transaction acquire context and propagates -EDEADLK for normal retries. Real C host checks cover multi-CRTC callback order, stale-state rejection, pending disables, the exact bandwidth boundary and lock retry.
+- `patches/0240`–`patches/0249` (SM8750 camera bus and idle release)
+  source: h0cheung/tb322fc-linux-kernel camera-only deltas at bf96c3d4048973298ede78487177c6f1b4f6bc0f plus local lifecycle fixes; individual provenance is in [camera/SOURCES.md](../../devices/lenovo-tb322fc/camera/SOURCES.md).
+  upstream: downstream port, not submitted to Linux upstream
+  notes: Adds legacy SM8750 CSID980/VFE/PHY, S5KJNS, GC08A8, GT9764 and WL2868C, balances startup/stop failures, serializes regulator outputs, unwinds partial GDSC registration, and gives TITAN_TOP provider-owned minimum ICC votes until physical power-off. The PM8550 flash V4L2 dependency completes rear async registration; its release loop is bounded and unwound on probe failure and remove. The normal Elden DTB receives the two consumed CAMSS paths and separate CAMCC floor through its board adaptation patch. SM8750 CAMCC is built in so shared genpd consumers cannot outlive it; sensor/flash drivers are modules.
+  validation: Original camera2 source passed complete kernel/module/DT/schema builds, actual-C host fault checks, both RAW streams, manual rear focus, idle resource release and battery-only 10/20-minute RTC s2idle. Four NoCs completed sync_state and DDR exited the 4761-MHz lock. DDR/CX/AOSS deep residency remained unchanged and watts were not measurable; full hardware ISP, software-ISP integration and AE/AWB/AF are not claimed. See [device evidence](../../devices/lenovo-tb322fc/camera/DEVICE-TEST-20261118.md).
+- `patches/0250-clk-qcom-limit-camera-icc-to-elden.patch`
+  source: armada
+  upstream: local
+  notes: The tested provider-owned ICC contract is selected only for lenovo,elden before CAMCC registration. Other SM8750 boards keep zero optional paths and their existing probe behavior. The binding allows existing no-ICC nodes and requires both properties together when present. This is a shared-build integration fix beyond the original camera2 checkpoint.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local

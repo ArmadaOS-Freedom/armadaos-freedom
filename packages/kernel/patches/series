@@ -349,3 +349,16 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0229-drm-msm-dpu-program-source-split-order.patch
 0230-drm-msm-dpu-elden-candidate-performance.patch
 0232-drm-msm-dpu-elden-final-atomic-bandwidth.patch
+
+# SM8750 Elden camera dependencies must bind before NoC sync_state can run.
+0240-media-camss-unwind-power-and-stream-failures.patch
+0241-media-camss-add-sm8750-csid980-capture.patch
+0242-media-i2c-add-y700-camera-sensors-and-vcm.patch
+0243-regulator-add-wl2868c-camera-pmic.patch
+0244-dt-bindings-sm8750-camera-interconnect-contract.patch
+0245-media-i2c-check-camera-power-cleanup.patch
+0246-clk-qcom-gdsc-unwind-partial-registration.patch
+0247-clk-qcom-sm8750-titan-top-minimum-icc.patch
+0248-regulator-wl2868c-control-output-lifecycle.patch
+0249-leds-qcom-flash-fix-v4l2-release.patch
+0250-clk-qcom-limit-camera-icc-to-elden.patch
