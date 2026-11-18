@@ -1,0 +1,43 @@
+From: Armada <noreply@armada.local>
+Date: Wed, 18 Nov 2026 00:00:00 +0800
+Subject: [PATCH] drm/msm/dpu: mirror QSEED fetch under final reflection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The final DPU pipe orientation can add horizontal and vertical reflection
+when DRM rotation is converted into the rotator's clockwise representation.
+QSEED derives directional fetch extensions from the unreflected source and
+extended rectangles, so the left/right and top/bottom fields must follow the
+final reflected orientation.
+
+On TB322FC with left 90-degree rotation, the primary pipe retains source
+y=0 while programming both reflection bits. It programs top=0 and bottom=6,
+but the final reflection requires the directional fetch to be interpreted
+from the opposite side of the physical extent. The previous programming
+correlates with UBWC error 0x00ff0001 and a half-panel failure. Mirroring
+fetch directions under final reflection preserves the same physical extent
+and fetch totals.
+
+This changes only the directional PE fetch fields. QSEED phase, preload and
+source totals, source rectangles, UBWC and source-split ordering are
+unchanged. The no-reflection right 270-degree path retains its existing
+programming.
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -600,6 +600,10 @@ static void dpu_plane_setup_qseed3_v11(struct dpu_sw_pipe_cfg *pipe_cfg,
+ 	fetch_right = ext->x2 - src->x2;
+ 	fetch_top = src->y1 - ext->y1;
+ 	fetch_btm = ext->y2 - src->y2;
++	if (pipe_cfg->rotation & DRM_MODE_REFLECT_X)
++		swap(fetch_left, fetch_right);
++	if (pipe_cfg->rotation & DRM_MODE_REFLECT_Y)
++		swap(fetch_top, fetch_btm);
+ 
+ 	for (i = 0; i < DPU_MAX_PLANES; i++) {
+ 		pixel_ext->left_ftch[i] = fetch_left;
