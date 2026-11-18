@@ -1,0 +1,12 @@
+diff --git a/src/input/manager.rs b/src/input/manager.rs
+index 1696f67..d273719 100644
+--- a/src/input/manager.rs
++++ b/src/input/manager.rs
+@@ -58,6 +58,7 @@ const VIRT_DEVICE_WHITELIST: &[&str] = &[
+     "Sunshine gamepad (virtual) motion sensors",
+     "Sunshine Nintendo (virtual) pad",
+     "MSI WMI hotkeys",
++    "Freedom Touch Controller Source",
+ ];
+ 
+ #[derive(Error, Debug)]

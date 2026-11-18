@@ -266,6 +266,9 @@ typedef enum kshim_menu_text_id {
     KSHIM_TEXT_SYSTEM_ANDROID,
     KSHIM_TEXT_SYSTEM_INTERNAL,
     KSHIM_TEXT_SYSTEM_TF,
+    /* TB710FU names: appended so every earlier text id keeps its value. */
+    KSHIM_TEXT_DEVICE_TB710FU_NAME,
+    KSHIM_TEXT_BOARD_TB710FU_NAME,
     KSHIM_TEXT_COUNT
 } kshim_menu_text_id;
 

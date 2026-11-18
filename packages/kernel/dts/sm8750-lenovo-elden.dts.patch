@@ -1,5 +1,5 @@
 From: Armada <noreply@armada.local>
-Subject: [PATCH] arm64: dts: qcom: sm8750-lenovo-elden: adapt TB322FC board to runtime RAM and framebuffer handoff
+Subject: [PATCH] arm64: dts: qcom: sm8750-lenovo-elden: adapt TB322FC RAM, framebuffer handoff and panel orientation
 
 diff --git a/arch/arm64/boot/dts/qcom/sm8750-lenovo-elden.dts b/arch/arm64/boot/dts/qcom/sm8750-lenovo-elden.dts
 --- a/arch/arm64/boot/dts/qcom/sm8750-lenovo-elden.dts
@@ -75,7 +75,15 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750-lenovo-elden.dts b/arch/arm64/boot/
  	/delete-property/ iommus;
  	status = "okay";
  };
-@@ -2371,13 +2349,12 @@
+@@ -1727,3 +1705,4 @@
+-	panel0: panel@0 {
+-		compatible = "csot,pp8807hb1-1", "novatek,nt36536";
+-		reg = <0>;
++	panel0: panel@0 {
++		compatible = "csot,pp8807hb1-1", "novatek,nt36536";
++		reg = <0>;
++		rotation = <270>;
+@@ -2371,13 +2350,12 @@
  
  	status = "okay";
  

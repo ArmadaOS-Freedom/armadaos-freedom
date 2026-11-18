@@ -94,8 +94,11 @@ def select_preview(releases: Any) -> DeckyRelease:
         if not isinstance(item, dict):
             raise DeckyReleaseError("Release entry must be an object")
         draft = _require_bool(item.get("draft"), "draft")
-        prerelease = _require_bool(item.get("prerelease"), "prerelease")
-        if draft or not prerelease:
+        _require_bool(item.get("prerelease"), "prerelease")
+        # Official loader branch 1 (preview) accepts v* tags from both
+        # branches, so a stable promotion is included alongside prereleases.
+        tag_name = item.get("tag_name")
+        if draft or not isinstance(tag_name, str) or not tag_name.startswith("v"):
             continue
         rel_id = _require_pos_int(item.get("id"), "release id")
         dt = _parse_iso8601(item.get("published_at"))

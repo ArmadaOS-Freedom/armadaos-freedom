@@ -1,11 +1,11 @@
 mainmenu "kShimC $(VERSION) Configuration"
 
 config KSHIM_STORAGE_ENTRY_PROBE
-    bool "Capture read-only TB322FC/TB323FU UFS/SMMU entry state"
+    bool "Capture read-only TB322FC/TB323FU/TB710FU UFS/SMMU entry state"
     default n
     help
         Diagnostic only. Reads a bounded register whitelist on an actual
-        TB322FC or TB323FU at EL1 with the early MMU enabled, then exports
+        TB322FC, TB323FU or TB710FU at EL1 with the early MMU enabled, then exports
         it to the selected Linux tree. Does not initialize storage or submit
         DMA. A precise synchronous read abort can be reported; a bus lockup
         or asynchronous error still requires physical recovery.

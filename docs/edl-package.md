@@ -198,7 +198,14 @@ The build also runs automatically. On `main`, the `build_edl_package` job in
 job and builds one EDL package from the image it just pushed, using the
 `testing` channel, that image's digest, its actual source revision, and its
 `org.opencontainers.image.version` label. The artifact is
-`edl-package-<run id>`. It contains every registered profile, including
+`ArmadaOS-Freedom-<version>-preview`, e.g.
+`ArmadaOS-Freedom-20261117.1f28617-preview`. The `.zip` is supplied by
+GitHub Actions on download as
+`ArmadaOS-Freedom-<version>-<channel>.zip`; the current CI build is `preview`,
+which maps to the internal `testing` channel. Beta and stable promotions reuse
+the immutable signed payloads without renaming the signed inner contents. A
+previous completed build's `edl-package-<run id>` artifact remains consumable.
+It contains every registered profile, including
 `TB710FU`, and its signed descriptor declares both `install` and
 `offline-upgrade`: installation is available for every listed model, while an
 offline-upgrade request is accepted only for the selected models with the
@@ -215,7 +222,8 @@ described below.
 started by hand. It takes the same four values as the recipe, checks out the
 requested revision with submodules, and runs the same all-profile build,
 uploading the split package, `parts.json`, `SHA256SUMS`, and the package
-README under `edl-package-<run id>`.
+README under `ArmadaOS-Freedom-<version>-preview` (or, for older completed
+builds, the legacy `edl-package-<run id>`).
 
 ## Publish an update channel
 
@@ -232,7 +240,9 @@ The flow is build, publish testing, then promote.
 1. Build the package: `Build images` on `main`, or `Build EDL package` by hand.
 2. Run **Publish update channel** with the completed run ID and `testing`. It
    checks that the run belongs to this repository, that it completed
-   successfully, and that it produced `edl-package-<run id>`. It then
+   successfully, and that it produced exactly one package artifact: either
+   `ArmadaOS-Freedom-<version>-preview` (whose version must match the signed
+   package) or the legacy `edl-package-<run id>`. It then
    verifies the descriptor signature, the split parts, the parts manifest, the
    `offline-upgrade` capability, and that the OCI digest resolves to the signed
    image built from the descriptor's source revision. It creates the draft
@@ -356,8 +366,10 @@ outside the source tree.
 
 GHCR packages must be public and grant this repository Actions access. The
 workflow checks anonymous image access before publishing channel tags. A
-built package stays in its `edl-package-<run-id>` artifact until **Publish
-update channel** turns it into a release and a signed `testing` channel; beta
+built package stays in its `ArmadaOS-Freedom-<version>-preview` artifact (or a
+legacy `edl-package-<run-id>` artifact from a previous completed build) until
+**Publish update channel** turns it into a release and a signed `testing`
+channel; beta
 and stable follow only through **Promote release**. The shipped
 `system_files/etc/armada/updates/channels.json` names all three channels, and
 each becomes usable only once its document exists on the `update-channels`

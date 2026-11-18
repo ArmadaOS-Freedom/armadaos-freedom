@@ -33,17 +33,35 @@ if [ "${#drivers[@]}" -gt 0 ]; then
     optional_args+=(--add-drivers "${drivers[*]}")
 fi
 
+# Modules proven out of scope for supported Freedom setups: no supported
+# network-root, VM, LVM/RAID, NVDIMM, FIPS/Clevis or agent-root unlock path.
+# --no-hostonly would otherwise pull PC/network helpers from the builder host.
+# Do not add crypt/dm, kernel-modules or kernel-modules-extra here: block root
+# and the explicit earlyDrivers (btqca/hci_uart) still need them installed.
+omitted_modules=(
+    network-manager network net-lib kernel-network-modules
+    nfs cifs qemu qemu-net virtiofs lvm mdraid nvdimm
+    fips fips-crypto-policies
+    clevis clevis-pin-file clevis-pin-null clevis-pin-sss
+    clevis-pin-tang clevis-pin-tpm2
+    fido2 pkcs11 tpm2-tss systemd-pcrphase walinuxagent
+)
+omit_args=(--omit "${omitted_modules[*]}")
+
 # --xz: the Zstd default exceeds the 96MiB Android boot partition envelope;
 # XZ keeps the early CPIO bytes and main CPIO content unchanged.
+# --no-early-microcode: ARM64-only images have no x86 microcode to load.
 dracut \
     --force \
     --no-hostonly \
     --reproducible \
     --xz \
+    --no-early-microcode \
     --kver "${KVER}" \
     --add ostree \
     --add armada-splash \
     --add armada-ostree-fallback \
+    "${omit_args[@]}" \
     "${optional_args[@]}" \
     "${IMG}" "${KVER}"
 

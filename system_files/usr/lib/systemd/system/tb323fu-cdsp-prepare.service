@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# CDSP firmware for the TB323FU Hexagon path. The helper exits 0 without
+# touching anything unless the exact lenovo,baldur device-tree token is
+# present, so this unit is safe on every other device.
+[Unit]
+Description=TB323FU CDSP firmware prepare
+# Runs on the real root filesystem with the device nodes present, after the
+# audio unit has staged its own firmware, and before a session starts.
+After=local-fs.target systemd-udev-trigger.service tb323fu-audio-prepare.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/tb323fu/tb323fu-cdsp-prepare
+StandardOutput=journal
+StandardError=journal
+# No ExecStop: this unit never stops or restarts a DSP.
+
+[Install]
+WantedBy=multi-user.target

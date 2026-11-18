@@ -47,7 +47,7 @@ class TestSelectPreview(unittest.TestCase):
     def select(self, releases):
         return select_preview(releases)
 
-    def test_newest_preview_ignores_draft_stable(self):
+    def test_newest_preview_skips_draft_and_orders_versions(self):
         releases = [
             rel(1, "v1", "2024-01-01T00:00:00Z", prerelease=True),
             rel(2, "v2", "2024-06-01T00:00:00Z", draft=True),
@@ -55,7 +55,55 @@ class TestSelectPreview(unittest.TestCase):
             rel(4, "v4", "2024-05-01T00:00:00Z"),
         ]
         r = self.select(releases)
-        self.assertEqual((r.release_id, r.tag, r.asset_id, r.size, r.sha256), (4, "v4", 700, 123, SHA))
+        self.assertEqual((r.release_id, r.tag, r.asset_id, r.size, r.sha256), (3, "v3", 700, 123, SHA))
+
+    def test_stable_promotion_matches_loader_branch1(self):
+        # Official branch1 (preview) filters only tag_name.startswith("v"),
+        # accepting published stable promotions as well as prereleases.
+        releases = [
+            rel(1, "v3.3.1-pre1", "2024-01-01T00:00:00Z", prerelease=True),
+            rel(2, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False),
+        ]
+        r = self.select(releases)
+        self.assertEqual((r.release_id, r.tag), (2, "v3.3.1"))
+
+    def test_newer_prerelease_beats_older_stable(self):
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "v3.3.1-pre1", "2024-06-01T00:00:00Z", prerelease=True),
+        ]
+        r = self.select(releases)
+        self.assertEqual((r.release_id, r.tag), (2, "v3.3.1-pre1"))
+
+    def test_stable_only_list_works(self):
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False),
+        ]
+        r = self.select(releases)
+        self.assertEqual((r.release_id, r.tag), (2, "v3.3.1"))
+
+    def test_drafts_and_non_v_tags_ignored(self):
+        # v3.3.1-pre1 (id=5, May) is the newest valid published v* release;
+        # nightly/testing have non-v tags and v3.3.1 (id=4) is a draft.
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "nightly-2024", "2024-09-01T00:00:00Z", prerelease=False),
+            rel(3, "testing-2024", "2024-09-02T00:00:00Z", prerelease=True),
+            rel(4, "v3.3.1", "2024-08-01T00:00:00Z", prerelease=False, draft=True),
+            rel(5, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+        ]
+        r = self.select(releases)
+        self.assertEqual((r.release_id, r.tag), (5, "v3.3.1-pre1"))
+
+    def test_newest_stable_missing_arm64_fails_no_fallback(self):
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False,
+                assets=[{"id": 1, "name": "other", "size": 1}]),
+        ]
+        with self.assertRaises(DeckyReleaseError):
+            self.select(releases)
 
     def test_tz_equivalent_ordering_and_tie_break(self):
         same = rel(5, "v5", "2024-05-01T01:00:00+01:00")

@@ -354,10 +354,18 @@ class SourceTests(unittest.TestCase):
     def test_native_image_bindings(self):
         native = run("ostree", "commit", f"--repo={self.path}", "--branch=native",
                      "--parent=none", f"--tree=ref={self.commit}")
-        image = f"oci:{self.work}/native:latest"
+        image = f"oci:{self.work}/native-roundtrip:latest"
         run("bootc", "internals", "ostree-ext", "container", "encapsulate", "--repo", self.path, native, image)
+        before = {r for r in self.refs() if r.startswith('ostree/container/image/')}
         run(*EXT, "pull", self.path, "ostree-unverified-image:" + image)
-        image_ref = next(r for r in self.refs() if "/native_3A_latest" in r)
+        after = {r for r in self.refs() if r.startswith('ostree/container/image/')}
+        new_refs = sorted(after - before)
+        self.assertEqual(
+            len(new_refs), 1,
+            f"expected exactly one new image ref after pull; "
+            f"before={sorted(before)!r} after={sorted(after)!r} new={new_refs!r}",
+        )
+        image_ref = new_refs[0]
         self.commit = run("ostree", "rev-parse", f"--repo={self.path}", image_ref)
         self.deployment = OSTree.Deployment.new(0, "default", self.commit, 2, None, 0)
         self.deployment.set_origin(self.origin)

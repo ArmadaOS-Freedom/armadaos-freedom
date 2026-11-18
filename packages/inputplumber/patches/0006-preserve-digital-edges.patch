@@ -1,0 +1,422 @@
+diff --git a/rootfs/usr/share/inputplumber/schema/composite_device_v1.json b/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+index c62fc6d..5f05d24 100644
+--- a/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
++++ b/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+@@ -95,6 +95,11 @@
+           "description": "If true, InputPlumber will not stop the CompositeDevice if all the SourceDevices have stopped. This will persist the virtual TargetDevice to allow reconnecting a SourceDevice and resuming input. Defaults to 'false'",
+           "type": "boolean",
+           "default": false
++        },
++        "preserve_digital_edges": {
++          "description": "If true, digital input state changes will be written to the target device immediately instead of waiting for the next poll. This preserves rapid press/release edges. Defaults to 'false'",
++          "type": "boolean",
++          "default": false
+         }
+       },
+       "title": "Options"
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 714d121..c44210e 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -187,6 +187,12 @@ pub struct CompositeDeviceConfigOptions {
+     pub auto_manage: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub persist: Option<bool>,
++    /// If true, digital input state changes will be written to the target
++    /// device immediately instead of waiting for the next poll. This preserves
++    /// press/release edges that would otherwise be coalesced into a single
++    /// report. Defaults to false.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub preserve_digital_edges: Option<bool>,
+ }
+ 
+ /// Defines a platform match for loading a [CompositeDeviceConfig]
+@@ -1145,3 +1151,44 @@ impl CompositeDeviceConfig {
+         Some(matches)
+     }
+ }
++
++#[cfg(test)]
++mod preserve_digital_edges_tests {
++    use super::CompositeDeviceConfig;
++
++    fn parse(options: &str) -> CompositeDeviceConfig {
++        let yaml = format!(
++            "version: 1\nkind: CompositeDevice\nname: Freedom Touch Controller\nmatches: []\nsource_devices:\n  - group: gamepad\n{options}"
++        );
++        CompositeDeviceConfig::from_yaml(yaml).expect("should parse composite device config")
++    }
++
++    #[test]
++    fn missing_option_is_none() {
++        let config = parse("");
++        assert!(config.options.is_none());
++        assert_eq!(
++            config
++                .options
++                .as_ref()
++                .and_then(|options| options.preserve_digital_edges),
++            None
++        );
++    }
++
++    #[test]
++    fn false_option_parses() {
++        let config = parse("options:\n  preserve_digital_edges: false\n");
++        let options = config.options.expect("options should be present");
++        assert_eq!(options.preserve_digital_edges, Some(false));
++        assert!(!options.preserve_digital_edges.unwrap_or(false));
++    }
++
++    #[test]
++    fn true_option_parses() {
++        let config = parse("options:\n  preserve_digital_edges: true\n");
++        let options = config.options.expect("options should be present");
++        assert_eq!(options.preserve_digital_edges, Some(true));
++        assert!(options.preserve_digital_edges.unwrap_or(false));
++    }
++}
+diff --git a/src/input/target/steam_deck.rs b/src/input/target/steam_deck.rs
+index e4199ea..1d15320 100644
+--- a/src/input/target/steam_deck.rs
++++ b/src/input/target/steam_deck.rs
+@@ -54,6 +54,9 @@ pub struct SteamDeckConfig {
+     pub vendor: String,
+     pub name: String,
+     pub product_id: ProductId,
++    /// If true, digital input state changes are written to the device
++    /// immediately instead of waiting for the next poll.
++    pub preserve_digital_edges: bool,
+ }
+ 
+ impl Default for SteamDeckConfig {
+@@ -62,6 +65,7 @@ impl Default for SteamDeckConfig {
+             vendor: "InputPlumber".to_string(),
+             name: "Generic Steam Controller".to_string(),
+             product_id: ProductId::Generic,
++            preserve_digital_edges: false,
+         }
+     }
+ }
+diff --git a/src/input/target/steam_deck_uhid.rs b/src/input/target/steam_deck_uhid.rs
+index 786f205..af4e6fe 100644
+--- a/src/input/target/steam_deck_uhid.rs
++++ b/src/input/target/steam_deck_uhid.rs
+@@ -48,6 +48,11 @@ use super::{
+ // each other for chords.
+ const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
+ 
++// Byte range of the packed input report that contains every digital input
++// state (buttons, hat switch directions, and binary trigger bits).
++const DIGITAL_STATE_START: usize = 8;
++const DIGITAL_STATE_END: usize = 16;
++
+ pub struct SteamDeckUhidDevice {
+     chip_id: [u8; 15],
+     config: SteamDeckConfig,
+@@ -60,6 +65,10 @@ pub struct SteamDeckUhidDevice {
+     queued_events: Vec<ScheduledNativeEvent>,
+     serial_number: String,
+     state: PackedInputDataReport,
++    /// Every report packed by [Self::write_state]. This is a test-only seam
++    /// that allows verifying the exact reports that would be written.
++    #[cfg(test)]
++    recorded_reports: Vec<[u8; 64]>,
+ }
+ 
+ impl SteamDeckUhidDevice {
+@@ -79,6 +88,8 @@ impl SteamDeckUhidDevice {
+             queued_events: vec![],
+             serial_number: "1NPU7PLUMB3R".to_string(),
+             state: PackedInputDataReport::default(),
++            #[cfg(test)]
++            recorded_reports: vec![],
+         })
+     }
+ 
+@@ -101,8 +112,16 @@ impl SteamDeckUhidDevice {
+ 
+     /// Write the current device state to the device
+     fn write_state(&mut self) -> Result<(), Box<dyn Error>> {
++        // Increment the frame for every report so that immediate and periodic
++        // writes always have a unique frame.
++        let frame = self.state.frame.to_primitive();
++        self.state.frame = Integer::from_primitive(frame.wrapping_add(1));
++
+         let data = self.state.pack()?;
+ 
++        #[cfg(test)]
++        self.recorded_reports.push(data);
++
+         // Write the state to the virtual HID
+         let Some(device) = self.device.as_mut() else {
+             return Ok(());
+@@ -116,6 +135,14 @@ impl SteamDeckUhidDevice {
+         Ok(())
+     }
+ 
++    /// Returns the raw digital input bits (bytes 8..15) of the current state.
++    fn digital_state(&self) -> Result<[u8; 8], Box<dyn Error>> {
++        let data = self.state.pack()?;
++        let mut digital_state = [0u8; DIGITAL_STATE_END - DIGITAL_STATE_START];
++        digital_state.copy_from_slice(&data[DIGITAL_STATE_START..DIGITAL_STATE_END]);
++        Ok(digital_state)
++    }
++
+     /// Update the internal controller state when events are emitted.
+     fn update_state(&mut self, event: NativeEvent) {
+         let value = event.get_value();
+@@ -705,6 +732,14 @@ impl TargetInputDevice for SteamDeckUhidDevice {
+                 _ => {}
+             };
+ 
++            // Preserve rapid digital edges only when the composite device
++            // profile opts in. Defaults to false for every existing profile.
++            device_config.preserve_digital_edges = cd_config
++                .options
++                .as_ref()
++                .and_then(|options| options.preserve_digital_edges)
++                .unwrap_or(false);
++
+             log::debug!(
+                 "Found Steam Deck target config: {} {} PID: {:?}",
+                 device_config.vendor,
+@@ -725,8 +760,26 @@ impl TargetInputDevice for SteamDeckUhidDevice {
+     /// Update device state with input events
+     fn write_event(&mut self, event: NativeEvent) -> Result<(), InputError> {
+         log::trace!("Received event: {event:?}");
++
++        // Snapshot the raw digital bits before applying the event. Without
++        // this, a press/release/repress sequence can be coalesced into a
++        // single poll report and the intermediate edge is lost.
++        let previous_digital_state = if self.config.preserve_digital_edges {
++            Some(self.digital_state()?)
++        } else {
++            None
++        };
++
+         self.update_state(event);
+ 
++        if let Some(previous_digital_state) = previous_digital_state {
++            if previous_digital_state != self.digital_state()? {
++                // Write immediately so the edge is visible to the host before
++                // the next poll.
++                self.write_state()?;
++            }
++        }
++
+         Ok(())
+     }
+ 
+@@ -837,10 +890,6 @@ impl TargetOutputDevice for SteamDeckUhidDevice {
+             return Ok(vec![]);
+         };
+ 
+-        // Increment the frame
+-        let frame = self.state.frame.to_primitive();
+-        self.state.frame = Integer::from_primitive(frame.wrapping_add(1));
+-
+         let event = match device.read() {
+             Ok(event) => event,
+             Err(err) => match err {
+@@ -959,3 +1008,200 @@ impl Debug for SteamDeckUhidDevice {
+             .finish()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use packed_struct::types::{Integer, SizedInteger};
++
++    fn test_device(preserve_digital_edges: bool) -> SteamDeckUhidDevice {
++        SteamDeckUhidDevice::new_with_config(SteamDeckConfig {
++            preserve_digital_edges,
++            ..Default::default()
++        })
++        .expect("device should be created without opening UHID")
++    }
++
++    fn button(button: GamepadButton, pressed: bool) -> NativeEvent {
++        NativeEvent::new(
++            Capability::Gamepad(Gamepad::Button(button)),
++            InputValue::Bool(pressed),
++        )
++    }
++
++    fn hat_y(y: f64) -> NativeEvent {
++        NativeEvent::new(
++            Capability::Gamepad(Gamepad::Axis(GamepadAxis::Hat0)),
++            InputValue::Vector2 {
++                x: None,
++                y: Some(y),
++            },
++        )
++    }
++
++    fn trigger(trigger: GamepadTrigger, value: f64) -> NativeEvent {
++        NativeEvent::new(
++            Capability::Gamepad(Gamepad::Trigger(trigger)),
++            InputValue::Float(value),
++        )
++    }
++
++    fn left_stick(x: f64, y: f64) -> NativeEvent {
++        NativeEvent::new(
++            Capability::Gamepad(Gamepad::Axis(GamepadAxis::LeftStick)),
++            InputValue::Vector2 {
++                x: Some(x),
++                y: Some(y),
++            },
++        )
++    }
++
++    fn digital_bit(report: &[u8; 64], byte: usize, mask: u8) -> bool {
++        report[byte] & mask != 0
++    }
++
++    fn frame(report: &[u8; 64]) -> u32 {
++        u32::from_le_bytes([report[4], report[5], report[6], report[7]])
++    }
++
++    #[test]
++    fn opt_in_preserves_button_press_release_repress() {
++        let mut device = test_device(true);
++
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("press");
++        device
++            .write_event(button(GamepadButton::South, false))
++            .expect("release");
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("repress");
++
++        assert_eq!(device.recorded_reports.len(), 3);
++        assert!(digital_bit(&device.recorded_reports[0], 8, 0x80));
++        assert!(!digital_bit(&device.recorded_reports[1], 8, 0x80));
++        assert!(digital_bit(&device.recorded_reports[2], 8, 0x80));
++        assert_eq!(frame(&device.recorded_reports[0]), 1);
++        assert_eq!(frame(&device.recorded_reports[1]), 2);
++        assert_eq!(frame(&device.recorded_reports[2]), 3);
++    }
++
++    #[test]
++    fn opt_in_preserves_hat0_up_neutral_up() {
++        let mut device = test_device(true);
++
++        device.write_event(hat_y(-1.0)).expect("up");
++        device.write_event(hat_y(0.0)).expect("neutral");
++        device.write_event(hat_y(-1.0)).expect("up again");
++
++        assert_eq!(device.recorded_reports.len(), 3);
++        assert!(digital_bit(&device.recorded_reports[0], 9, 0x01));
++        assert!(!digital_bit(&device.recorded_reports[1], 9, 0x01));
++        assert!(digital_bit(&device.recorded_reports[2], 9, 0x01));
++    }
++
++    #[test]
++    fn opt_in_preserves_left_trigger_digital_bit() {
++        let mut device = test_device(true);
++
++        device
++            .write_event(trigger(GamepadTrigger::LeftTrigger, 1.0))
++            .expect("press");
++        device
++            .write_event(trigger(GamepadTrigger::LeftTrigger, 0.0))
++            .expect("release");
++        device
++            .write_event(trigger(GamepadTrigger::LeftTrigger, 1.0))
++            .expect("repress");
++
++        assert_eq!(device.recorded_reports.len(), 3);
++        assert!(digital_bit(&device.recorded_reports[0], 8, 0x02));
++        assert!(!digital_bit(&device.recorded_reports[1], 8, 0x02));
++        assert!(digital_bit(&device.recorded_reports[2], 8, 0x02));
++    }
++
++    #[test]
++    fn opt_in_preserves_right_trigger_digital_bit() {
++        let mut device = test_device(true);
++
++        device
++            .write_event(trigger(GamepadTrigger::RightTrigger, 1.0))
++            .expect("press");
++        device
++            .write_event(trigger(GamepadTrigger::RightTrigger, 0.0))
++            .expect("release");
++        device
++            .write_event(trigger(GamepadTrigger::RightTrigger, 1.0))
++            .expect("repress");
++
++        assert_eq!(device.recorded_reports.len(), 3);
++        assert!(digital_bit(&device.recorded_reports[0], 8, 0x01));
++        assert!(!digital_bit(&device.recorded_reports[1], 8, 0x01));
++        assert!(digital_bit(&device.recorded_reports[2], 8, 0x01));
++    }
++
++    #[test]
++    fn duplicate_digital_state_and_pure_stick_wait_for_periodic_write() {
++        let mut device = test_device(true);
++
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("press");
++        assert_eq!(device.recorded_reports.len(), 1);
++
++        // The same digital state must not produce another immediate report.
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("duplicate press");
++        assert_eq!(device.recorded_reports.len(), 1);
++
++        // Pure analog changes must not produce an immediate report either.
++        device.write_event(left_stick(1.0, 1.0)).expect("stick");
++        assert_eq!(device.recorded_reports.len(), 1);
++
++        // The next periodic write must include the final analog value.
++        device.write_state().expect("periodic write");
++        assert_eq!(device.recorded_reports.len(), 2);
++        let report = device.recorded_reports[1];
++        assert_eq!(i16::from_le_bytes([report[48], report[49]]), i16::MAX);
++        assert_eq!(
++            i16::from_le_bytes([report[50], report[51]]),
++            i16::MIN + 1
++        );
++    }
++
++    #[test]
++    fn default_config_only_writes_on_periodic_write() {
++        let mut device = test_device(false);
++
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("press");
++        device
++            .write_event(button(GamepadButton::South, false))
++            .expect("release");
++        device
++            .write_event(button(GamepadButton::South, true))
++            .expect("repress");
++        assert!(device.recorded_reports.is_empty());
++
++        device.write_state().expect("periodic write");
++        assert_eq!(device.recorded_reports.len(), 1);
++        assert!(digital_bit(&device.recorded_reports[0], 8, 0x80));
++        assert_eq!(frame(&device.recorded_reports[0]), 1);
++    }
++
++    #[test]
++    fn frame_wraps_without_skipping_values() {
++        let mut device = test_device(false);
++        device.state.frame = Integer::from_primitive(u32::MAX - 1);
++
++        device.write_state().expect("first write");
++        device.write_state().expect("wrap write");
++        device.write_state().expect("post-wrap write");
++
++        let frames: Vec<u32> = device.recorded_reports.iter().map(frame).collect();
++        assert_eq!(frames, vec![u32::MAX, 0, 1]);
++    }
++}

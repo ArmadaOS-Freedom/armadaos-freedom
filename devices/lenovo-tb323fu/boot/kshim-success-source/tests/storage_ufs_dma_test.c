@@ -136,6 +136,9 @@ static void test_captured_accepts(void)
     /* The same evidence is valid when reported for the sibling board. */
     snapshot.board = DEVICE_BOARD_TB323FU;
     assert(accepts(&snapshot, UINT64_C(0x1000), UINT64_C(0x2000)));
+    /* ...and for TB710FU, whose SM8650 profile shares the windows and SID. */
+    snapshot.board = DEVICE_BOARD_TB710FU;
+    assert(accepts(&snapshot, UINT64_C(0x1000), UINT64_C(0x2000)));
 }
 
 static void test_gen5_inherited_context(void)

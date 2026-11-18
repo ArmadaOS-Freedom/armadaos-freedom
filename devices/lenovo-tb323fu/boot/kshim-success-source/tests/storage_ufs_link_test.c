@@ -216,7 +216,7 @@ static void delay_us(void *ctx, uint32_t us)
 static struct kshim_ufs_ops ops_of(struct fixture *f)
 {
     return (struct kshim_ufs_ops){f, rd32, wr32, dev_sync, cpu_sync,
-                                  now_ms, delay_us, f->manage};
+                                  now_ms, delay_us, f->manage, false};
 }
 static void init(struct fixture *f)
 {

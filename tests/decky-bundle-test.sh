@@ -3,9 +3,10 @@
 # curl and systemctl are stubbed; a rewritten copy of the production script
 # points its hard-coded image paths at a per-case sandbox.
 #
-# Decky platform policy is preview: the newest non-draft prerelease, taken from
-# prefetched release metadata when supplied and otherwise fetched from the exact
-# release-list endpoint. /releases/latest is never used.
+# Decky platform policy is preview: the newest non-draft eligible stable or
+# prerelease, taken from prefetched release metadata when supplied and otherwise
+# fetched from the exact release-list endpoint. Drafts and non-v tags are excluded.
+# /releases/latest is never used.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,7 +16,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 LIST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
 LATEST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest'
-TARGET_TAG='v3.3.0-pre1'
+TARGET_TAG='v3.3.0'
 
 FAKE="$WORK/fake"
 FIXTURES="$WORK/fixtures"
@@ -123,7 +124,7 @@ import struct
 import sys
 
 out, mode = sys.argv[1], sys.argv[2]
-tag = "v3.3.0-pre1"
+tag = "v3.3.0"
 base = "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/" + tag
 
 
@@ -159,7 +160,7 @@ x86 = elf(62, b"x86-fixture")
 served_arm = x86 if mode == "wrong-arch" else arm
 ARM_ID = 9002
 
-if mode == "success":
+if mode in ("success", "stable-only"):
     assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
 elif mode == "missing-arm64":
     assets = [asset("PluginLoader", x86, 9001)]
@@ -183,7 +184,7 @@ elif mode == "bad-origin":
     ]
 elif mode == "wrong-arch":
     assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
-elif mode == "no-preview":
+elif mode == "no-eligible":
     assets = [asset("PluginLoader", x86, 9001), asset("PluginLoader-arm64", served_arm, ARM_ID)]
 else:
     raise SystemExit("unknown fixture mode: " + mode)
@@ -194,6 +195,14 @@ older_base = "https://github.com/SteamDeckHomebrew/decky-loader/releases/downloa
 older_assets = [
     asset("PluginLoader", x86, 8001, url=older_base + "/PluginLoader"),
     asset("PluginLoader-arm64", arm, 8002, url=older_base + "/PluginLoader-arm64"),
+]
+
+# The older prerelease v3.3.0-pre1 carries its own coherent valid ARM64 asset
+# with distinct IDs, so a corrupted target stable release cannot fall back to it.
+pre_base = "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.0-pre1"
+pre_assets = [
+    asset("PluginLoader", x86, 8101, url=pre_base + "/PluginLoader"),
+    asset("PluginLoader-arm64", arm, 8102, url=pre_base + "/PluginLoader-arm64"),
 ]
 
 
@@ -211,22 +220,28 @@ def release(rel_id, tag_name, published_at, prerelease, draft, rel_assets=None):
     }
 
 
-if mode == "no-preview":
-    # Stable plus a draft prerelease only: no eligible preview release.
+if mode == "no-eligible":
+    # Only a draft v* release and a published non-v tag: no eligible release.
+    releases = [
+        release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
+        release(105, "nightly-build", "2026-10-22T00:00:00Z", False, False),
+    ]
+elif mode == "stable-only":
+    # Only the stable release is present; stable selection must succeed.
     releases = [
         release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
-        release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
     ]
 else:
     releases = [
-        # Newest stable, listed first: preview filtering must skip it.
-        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
-        # Older prerelease with a valid ARM64 asset: latest-by-published_at
-        # must win, not the first preview in array order, and refusal cases
-        # must not fall back to this release's assets.
+        # Older prerelease with its own valid ARM64 asset: latest-by-published_at
+        # must win over array order, and refusal cases must not fall back here.
         release(102, "v3.2.10-pre1", "2026-09-02T03:04:05Z", True, False, older_assets),
-        # Target: newest published non-draft prerelease.
-        release(103, "v3.3.0-pre1", "2026-10-18T01:21:08Z", True, False),
+        # Older prerelease v3.3.0-pre1 with its own coherent assets: must not
+        # be selected over the newer stable v3.3.0, and must not be reused as
+        # fallback assets for the target stable.
+        release(103, "v3.3.0-pre1", "2026-10-18T01:21:08Z", True, False, pre_assets),
+        # Target: newest published non-draft stable v3.3.0.
+        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
         # Still newer draft prerelease: drafts must be filtered out.
         release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
     ]
@@ -266,11 +281,11 @@ case_fail() { printf '  FAIL: %s\n' "$*" >&2; CASE_FAILED=1; }
 assert_exists() { [[ -e "$1" ]] || case_fail "missing $1"; }
 assert_absent() { [[ ! -e "$1" ]] || case_fail "unexpected $1"; }
 
-# Every case must prove the preview policy was exercised: the exact release
-# list with per_page=100 was requested and releases/latest never was.
+# Every case must prove the preview-channel policy was exercised: the exact
+# release list with per_page=100 was requested and releases/latest never was.
 assert_preview_release_list() {
     grep -qxF "$LIST_URL" "$CURL_LOG" ||
-        case_fail "did not request the preview release list"
+        case_fail "did not request the release list"
     if grep -qF "$LATEST_URL" "$CURL_LOG"; then
         case_fail "requested releases/latest instead of the release list"
     fi
@@ -346,9 +361,9 @@ run_bundle() {
 }
 
 success_case() {
-    local name=${1:-success} source=${2:-api}
+    local name=${1:-success} source=${2:-api} mode=${3:-success}
     setup_case "$name"
-    make_fixtures "$FIXTURES/$name" success
+    make_fixtures "$FIXTURES/$name" "$mode"
     if [[ "$source" != api ]]; then
         install_prefetched_releases "$source"
     fi
@@ -393,11 +408,11 @@ with open(meta_path) as handle:
 with open(blob_path, "rb") as handle:
     blob = handle.read()
 expected = {
-    "release_id": 103,
-    "tag": "v3.3.0-pre1",
-    "published_at": "2026-10-18T01:21:08Z",
+    "release_id": 101,
+    "tag": "v3.3.0",
+    "published_at": "2026-10-20T12:00:00Z",
     "asset_id": 9002,
-    "url": "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.0-pre1/PluginLoader-arm64",
+    "url": "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.0/PluginLoader-arm64",
     "size": len(blob),
     "sha256": hashlib.sha256(blob).hexdigest(),
 }
@@ -469,7 +484,7 @@ PY
         case_fail "downloaded the x86 PluginLoader asset"
     fi
 
-    grep -qE "(raw\.githubusercontent\.com/SteamDeckHomebrew/decky-loader/|github\.com/SteamDeckHomebrew/decky-loader/raw/)(refs/tags/)?v3\.3\.0-pre1/dist/plugin_loader-prerelease\.service$" "$CURL_LOG" ||
+    grep -qE "(raw\.githubusercontent\.com/SteamDeckHomebrew/decky-loader/|github\.com/SteamDeckHomebrew/decky-loader/raw/)(refs/tags/)?v3\.3\.0/dist/plugin_loader-prerelease\.service$" "$CURL_LOG" ||
         case_fail "service not fetched from the $TARGET_TAG prerelease service"
     if grep -qF 'plugin_loader-release.service' "$CURL_LOG"; then
         case_fail "fetched the stable plugin_loader-release.service"
@@ -551,16 +566,16 @@ refusal_case() {
                 case_fail "downloaded an asset whose metadata lacks a digest"
             fi
             ;;
-        no-preview)
+        no-eligible)
             local downloads
             downloads=$(grep -c '/releases/download/' "$CURL_LOG" || true)
             [[ "$downloads" -eq 0 ]] ||
-                case_fail "attempted $downloads asset download(s) without an eligible preview"
+                case_fail "attempted $downloads asset download(s) without an eligible release"
             if grep -qE '/PluginLoader(-arm64)?$' "$CURL_LOG"; then
-                case_fail "attempted a PluginLoader download without an eligible preview"
+                case_fail "attempted a PluginLoader download without an eligible release"
             fi
             if grep -qE 'plugin_loader-(release|prerelease)\.service' "$CURL_LOG"; then
-                case_fail "attempted a service fetch without an eligible preview"
+                case_fail "attempted a service fetch without an eligible release"
             fi
             assert_absent "$FAKE/usr/share/decky-loader/PluginLoader"
             assert_absent "$FAKE/etc/systemd/system/plugin_loader.service"
@@ -590,13 +605,15 @@ sed 's#${HOMEBREW_FOLDER}#/var/home/armada/homebrew#g' \
 
 run_case success success_case
 run_case prefetched-success success_case prefetched-success prefetch
+run_case stable-only success_case stable-only api stable-only
+run_case prefetched-stable-only success_case prefetched-stable-only prefetch stable-only
 run_case missing-arm64 refusal_case missing-arm64
 run_case digest-mismatch refusal_case digest-mismatch
 run_case wrong-arch refusal_case wrong-arch
 run_case size-mismatch refusal_case size-mismatch
 run_case bad-origin refusal_case bad-origin
 run_case missing-digest refusal_case missing-digest
-run_case no-preview refusal_case no-preview
+run_case no-eligible refusal_case no-eligible
 run_case prefetched-empty refusal_case prefetched-empty success prefetch-empty
 run_case prefetched-malformed refusal_case prefetched-malformed success prefetch-malformed
 run_case prefetched-digest-mismatch refusal_case prefetched-digest-mismatch digest-mismatch prefetch

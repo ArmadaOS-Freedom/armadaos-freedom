@@ -26,6 +26,11 @@ struct kshim_ufs_ops {
      * the first command; release restores the original state. Boards that
      * already own the link keep it false and retain the legacy semantics. */
     bool manage_link;
+    /* Opt-in, default false: ignore CAP.LSDBS (bit 29, "legacy single
+     * doorbell not supported"). Qualcomm SM8550-family hosts, SM8650
+     * included, set it although they run the legacy doorbell; Linux treats
+     * them with UFSHCD_QUIRK_BROKEN_LSDBS_CAP. MCQ mode must still be off. */
+    bool broken_lsdbs_cap;
 };
 /* Link state for the opt-in manage_link path. phase is 0 when no link work
  * ran, 1 while querying the entry state, 2 while exiting HIBERN8, 3 while

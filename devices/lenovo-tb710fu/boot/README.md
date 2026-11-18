@@ -20,7 +20,9 @@ python3 tools/build_runtime.py --config configs/tb710fu_android_defconfig --out 
 # 产物 <runtime-out>/kShimC.bin，必须恰好 4 MiB
 ```
 
-`tb710fu_android_defconfig` 基于四代配置：横屏原生方向（旋转 0）、LVGL 缓冲 256000 字节（20 行 3200 像素）；按键为 PMK8550 pwrkey/resin 与 PM8550 GPIO6（音量+），没有触屏；不启用会话设置；启用 `KSHIM_QCOM_REBOOT`（白名单已包含 `qcom,pineapple`）。
+`tb710fu_android_defconfig` 基于四代配置：横屏原生方向（旋转 0）、LVGL 缓冲 256000 字节（20 行 3200 像素）；按键为 PMK8550 pwrkey/resin 与 PM8550 GPIO6（音量+），没有触屏；启用 `KSHIM_QCOM_REBOOT`（白名单已包含 `qcom,pineapple`）。
+
+菜单设置（默认启动项、语言、记住上次启动）、A/B 槽位读取和系统更新的试启动记录都保存在安装器准备的 ARMADA_BACKUP 设置区（板号 3），由 kShim 直接读写 UFS（`KSHIM_UFS_NATIVE_IO` / `KSHIM_UFS_SETTINGS`）。SM8650 的 UFS 控制器把 CAP.LSDBS 报成“不支持传统单门铃”，但 ABL 实际用的就是单门铃模式，kShim 对 TB710FU 按 Linux 的 `UFSHCD_QUIRK_BROKEN_LSDBS_CAP` 同样忽略这一位（MCQ 模式必须关闭）。
 
 ## 2. 准备 Linux 载荷
 

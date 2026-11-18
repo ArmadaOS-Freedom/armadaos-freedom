@@ -1,0 +1,244 @@
+From: Armada <noreply@armada.local>
+Date: Sun, 15 Nov 2026 00:00:00 +0800
+Subject: [PATCH] drm/msm/dpu: use Elden candidate performance in atomic check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Elden's bandwidth check still aggregates committed CRTC new_perf values even
+though the plane bandwidth values are meant to describe the frame under
+review. A successful high-bandwidth commit can therefore make every later
+lower-refresh or lower-layer transaction fail with -E2BIG.
+
+The cached plane_fetch_bw and plane_clk fields are also populated from
+atomic_update(), after the performance check has already run. Recalculate the
+candidate geometry from the pending plane states and adjusted mode instead of
+reusing those committed values.
+
+For inline 90/270 rotation, source width and height are expressed in the
+destination scan direction. Each 3040x952 slice becomes 952 pixels per output
+scan line, and fractional downscales remain in the bandwidth arithmetic. Keep
+the existing prefill allowance, 120% bandwidth factor, minimum peak vote and
+28.5 GB/s hardware limit unchanged.
+
+These changes are restricted to lenovo,elden. The post-commit interconnect
+vote and every other machine continue to use committed state.
+
+---
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -120,7 +120,7 @@
+ static u64 _dpu_plane_calc_bw(const struct dpu_mdss_cfg *catalog,
+ 	const struct msm_format *fmt,
+ 	const struct drm_display_mode *mode,
+-	struct dpu_sw_pipe_cfg *pipe_cfg)
++	const struct dpu_sw_pipe_cfg *pipe_cfg)
+ {
+ 	int src_width, src_height, dst_height, fps;
+ 	u64 plane_pixel_rate, plane_bit_rate;
+@@ -129,6 +129,8 @@
+ 	u32 hw_latency_lines;
+ 	u64 scale_factor;
+ 	int vbp, vpw, vfp;
++	bool rotated = of_machine_is_compatible("lenovo,elden") &&
++		drm_rotation_90_or_270(pipe_cfg->rotation);
+ 
+ 	if (pipe_cfg->qseed3_v11_valid) {
+ 		src_width = drm_rect_width(&pipe_cfg->src_ext_rect);
+@@ -138,6 +140,13 @@
+ 		src_height = drm_rect_height(&pipe_cfg->src_rect);
+ 	}
+ 	dst_height = drm_rect_height(&pipe_cfg->dst_rect);
++	/* Destination scan lines are post-rotation. */
++	if (rotated) {
++		int tmp = src_width;
++
++		src_width = src_height;
++		src_height = tmp;
++	}
+ 	fps = drm_mode_vrefresh(mode);
+ 	vbp = mode->vtotal - mode->vsync_end;
+ 	vpw = mode->vsync_end - mode->vsync_start;
+@@ -146,10 +155,14 @@
+ 	scale_factor = src_height > dst_height ?
+ 		mult_frac(src_height, 1, dst_height) : 1;
+ 
+-	plane_pixel_rate = src_width * mode->vtotal * fps;
++	plane_pixel_rate = (u64)src_width * mode->vtotal * fps;
+ 	plane_bit_rate = plane_pixel_rate * fmt->bpp;
+ 
+-	plane_bw = plane_bit_rate * scale_factor;
++	/* Do not round a rotated downscale ratio down before multiplying. */
++	if (rotated && src_height > dst_height)
++		plane_bw = mult_frac(plane_bit_rate, src_height, dst_height);
++	else
++		plane_bw = plane_bit_rate * scale_factor;
+ 
+ 	plane_prefill_bw = plane_bw * hw_latency_lines;
+ 
+@@ -172,7 +185,7 @@
+  * Clock equation: dst_w * v_total * fps * (src_h / dst_h)
+  */
+ static u64 _dpu_plane_calc_clk(const struct drm_display_mode *mode,
+-		struct dpu_sw_pipe_cfg *pipe_cfg)
++		const struct dpu_sw_pipe_cfg *pipe_cfg)
+ {
+ 	int dst_width, src_height, dst_height, fps;
+ 	u64 plane_clk;
+@@ -194,6 +207,35 @@
+ 	return plane_clk;
+ }
+ 
++/*
++ * Evaluate candidate geometry without modifying a plane state. A CRTC-only
++ * refresh update can carry committed plane states, while the cached fields
++ * were populated by the previous atomic_update.
++ */
++void dpu_plane_calc_perf(const struct drm_plane_state *state,
++		const struct drm_display_mode *mode, u64 *bw, u64 *clk)
++{
++	const struct dpu_plane_state *pstate = to_dpu_plane_state(state);
++	const struct dpu_plane *pdpu = to_dpu_plane(state->plane);
++	const struct msm_format *fmt;
++	int i;
++
++	*bw = 0;
++	*clk = 0;
++	if (!state->visible || !state->fb)
++		return;
++
++	fmt = msm_framebuffer_format(state->fb);
++	for (i = 0; i < PIPES_PER_PLANE; i++) {
++		const struct dpu_sw_pipe_cfg *cfg = &pstate->pipe_cfg[i];
++
++		if (!drm_rect_width(&cfg->src_rect))
++			continue;
++		*bw += _dpu_plane_calc_bw(pdpu->catalog, fmt, mode, cfg);
++		*clk = max(*clk, _dpu_plane_calc_clk(mode, cfg));
++	}
++}
++
+ /**
+  * _dpu_plane_calc_fill_level - calculate fill level of the given source format
+  * @plane:		Pointer to drm plane
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h
+@@ -52,6 +52,9 @@
+ 
+ void dpu_plane_set_error(struct drm_plane *plane, bool error);
+ 
++void dpu_plane_calc_perf(const struct drm_plane_state *state,
++		const struct drm_display_mode *mode, u64 *bw, u64 *clk);
++
+ struct drm_plane *dpu_plane_init(struct drm_device *dev,
+ 		uint32_t pipe, enum drm_plane_type type,
+ 		unsigned long possible_crtcs);
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -17,6 +17,7 @@
+ #include "dpu_trace.h"
+ #include "dpu_crtc.h"
+ #include "dpu_core_perf.h"
++#include "dpu_plane.h"
+ 
+ /**
+  * enum dpu_perf_mode - performance tuning mode
+@@ -139,6 +140,29 @@
+ 	return to_dpu_kms(priv->kms);
+ }
+ 
++static void dpu_core_perf_calc_atomic(const struct dpu_perf_cfg *cfg,
++		struct drm_crtc_state *state, struct dpu_core_perf_params *perf)
++{
++	const struct drm_display_mode *mode = &state->adjusted_mode;
++	const struct drm_plane_state *plane_state;
++	struct drm_plane *plane;
++	u64 bw, clk;
++	u64 mode_clk = (u64)mode->vtotal * mode->hdisplay *
++		drm_mode_vrefresh(mode);
++
++	perf->bw_ctl = 0;
++	drm_atomic_crtc_state_for_each_plane_state(plane, plane_state, state) {
++		dpu_plane_calc_perf(plane_state, mode, &bw, &clk);
++		perf->bw_ctl += bw;
++		mode_clk = max(mode_clk, clk);
++	}
++	if (cfg->bw_inefficiency_factor) {
++		perf->bw_ctl *= cfg->bw_inefficiency_factor;
++		do_div(perf->bw_ctl, 100);
++	}
++	perf->core_clk_rate = dpu_core_perf_adjusted_mode_clk(mode_clk, cfg);
++}
++
+ static void _dpu_core_perf_calc_crtc(const struct dpu_core_perf *core_perf,
+ 				     struct drm_crtc *crtc,
+ 				     struct drm_crtc_state *state,
+@@ -151,9 +175,14 @@
+ 		return;
+ 	}
+ 
+-	perf->bw_ctl = _dpu_core_perf_calc_bw(perf_cfg, crtc, state);
++	if (of_machine_is_compatible("lenovo,elden")) {
++		dpu_core_perf_calc_atomic(perf_cfg, state, perf);
++	} else {
++		perf->bw_ctl = _dpu_core_perf_calc_bw(perf_cfg, crtc, state);
++		perf->core_clk_rate = _dpu_core_perf_calc_clk(perf_cfg, crtc,
++							      state);
++	}
+ 	perf->max_per_pipe_ib = perf_cfg->min_dram_ib;
+-	perf->core_clk_rate = _dpu_core_perf_calc_clk(perf_cfg, crtc, state);
+ 	DRM_DEBUG_ATOMIC(
+ 		"crtc=%d clk_rate=%llu core_ib=%u core_ab=%u\n",
+ 			crtc->base.id, perf->core_clk_rate,
+@@ -185,6 +214,35 @@
+ 	}
+ }
+ 
++/*
++ * Check pending active CRTC states while retaining committed state for CRTCs
++ * outside this transaction. Post-commit bus voting still uses the committed
++ * states through dpu_core_perf_aggregate().
++ */
++static void dpu_core_perf_aggregate_atomic(struct drm_crtc *crtc,
++		struct drm_crtc_state *state, struct dpu_core_perf_params *perf)
++{
++	enum dpu_crtc_client_type client_type = dpu_crtc_get_client_type(crtc);
++	struct drm_crtc *tmp_crtc;
++
++	drm_for_each_crtc(tmp_crtc, crtc->dev) {
++		struct drm_crtc_state *tmp_state;
++		struct dpu_crtc_state *dpu_cstate;
++
++		tmp_state = drm_atomic_get_new_crtc_state(state->state, tmp_crtc);
++		if (!tmp_state)
++			tmp_state = tmp_crtc->state;
++		if (!tmp_state->active ||
++		    client_type != dpu_crtc_get_client_type(tmp_crtc))
++			continue;
++
++		dpu_cstate = to_dpu_crtc_state(tmp_state);
++		perf->max_per_pipe_ib = max(perf->max_per_pipe_ib,
++					    dpu_cstate->new_perf.max_per_pipe_ib);
++		perf->bw_ctl += dpu_cstate->new_perf.bw_ctl;
++	}
++}
++
+ /**
+  * dpu_core_perf_crtc_check - validate performance of the given crtc state
+  * @crtc: Pointer to crtc
+@@ -215,7 +273,11 @@
+ 	/* obtain new values */
+ 	_dpu_core_perf_calc_crtc(&kms->perf, crtc, state, &dpu_cstate->new_perf);
+ 
+-	dpu_core_perf_aggregate(crtc->dev, dpu_crtc_get_client_type(crtc), &perf);
++	if (of_machine_is_compatible("lenovo,elden"))
++		dpu_core_perf_aggregate_atomic(crtc, state, &perf);
++	else
++		dpu_core_perf_aggregate(crtc->dev,
++					dpu_crtc_get_client_type(crtc), &perf);
+ 
+ 	/* convert bandwidth to kb */
+ 	bw = DIV_ROUND_UP_ULL(perf.bw_ctl, 1000);

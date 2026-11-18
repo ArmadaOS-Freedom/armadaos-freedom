@@ -21,13 +21,25 @@ install -Dm0644 /packages/mesa-x86/ArmadaMesa.sqsh "${mesa_sqsh}"
 # A separate rechunk component keeps Mesa-only updates from invalidating ArchLinux.sqsh.
 python3 -c 'import os,sys; os.setxattr(sys.argv[1],"user.component",b"fex-mesa")' "${mesa_sqsh}"
 
-# Status text font for armada-splash (falls back to its embedded bitmap font
-# if this link dangles). Localized status text is CJK, so point at the
-# Simplified-Chinese monospace face; load_font() selects it from the
-# collection by name.
-splash_font="$(rpm -ql google-noto-sans-cjk-fonts | grep -m1 '/NotoSansCJK-Regular\.ttc$')"
-[ -n "${splash_font}" ]
-ln -sf "${splash_font}" /usr/share/armada/splash/font.ttf
+# Status text font for armada-splash. The armada-splash RPM ships a
+# pre-subsetted single-face TTF at this exact path; load_font() opens it as
+# a standalone font. Do not symlink the full system TTC here -- that file
+# belongs to the desktop fonts and must not be duplicated or replaced.
+splash_font=/usr/share/armada/splash/font.ttf
+if [ -L "${splash_font}" ] || [ ! -f "${splash_font}" ] || [ ! -s "${splash_font}" ]; then
+    echo "ERROR: armada-splash font missing, empty, or a symlink at ${splash_font}" >&2
+    exit 1
+fi
+
+# Steam's startup splash reuses the system Noto CJK TTC (installed by
+# 10-base-packages.sh) as its desktop font source; the armada-splash binary
+# only needs a stable path, so link the first matching Regular face here.
+splash_ttc=$(rpm -ql google-noto-sans-cjk-fonts | awk '/NotoSansCJK-Regular\.ttc$/ { print; exit }')
+if [ ! -s "${splash_ttc}" ]; then
+    echo "ERROR: google-noto-sans-cjk-fonts NotoSansCJK-Regular.ttc not found" >&2
+    exit 1
+fi
+ln -sfn "${splash_ttc}" /usr/share/armada/splash/font-desktop.ttc
 
 # mkbootimg must be present for on-device /KERNEL rebuilds after OTA.
 install -Dpm 0755 /ctx/build_files/vendor/mkbootimg/mkbootimg.py /usr/libexec/armada/mkbootimg.py
@@ -96,6 +108,22 @@ install -Dpm 0644 "${fw_bundle}/qcom/kaanapali/lenovo/baldur/adsp_dtb.mbn" \
 install -Dpm 0644 "${fw_bundle}/aw882xx_acf.bin" "${fw_audio}/aw882xx_acf.bin"
 install -Dpm 0644 "${fw_bundle}/SHA256SUMS" "${fw_audio}/SHA256SUMS"
 
+# TB323FU CDSP: the signed vendor compute firmware, shipped in this repository
+# beside its SHA256SUMS. It is installed at a board-only path and copied into
+# the kernel firmware search path at run time by tb323fu-cdsp-prepare.service;
+# nothing is extracted from or read off a partition.
+cdsp_bundle=/ctx/tb323fu-cdsp/firmware
+cdsp_fw=/usr/share/tb323fu/firmware/compute
+(
+    cd "${cdsp_bundle}"
+    sha256sum -c --strict SHA256SUMS
+)
+install -Dpm 0644 "${cdsp_bundle}/qcom/kaanapali/lenovo/baldur/cdsp.mbn" \
+    "${cdsp_fw}/qcom/kaanapali/lenovo/baldur/cdsp.mbn"
+install -Dpm 0644 "${cdsp_bundle}/qcom/kaanapali/lenovo/baldur/cdsp_dtb.mbn" \
+    "${cdsp_fw}/qcom/kaanapali/lenovo/baldur/cdsp_dtb.mbn"
+install -Dpm 0644 "${cdsp_bundle}/SHA256SUMS" "${cdsp_fw}/SHA256SUMS"
+
 # TB710FU firmware: every file sits at a path only this board's device tree
 # names (qcom/sm8650/xiaoxin/gt/, novatek/novatek_nt36532_*), so it goes
 # straight into the firmware search root and nothing is staged at run time.
@@ -112,6 +140,7 @@ chmod 0755 /usr/libexec/armada/*
 chmod 0755 /usr/libexec/os-session-select
 chmod 0755 /usr/libexec/tb323fu/tb323fu-usb-port
 chmod 0755 /usr/libexec/tb323fu/tb323fu-audio-prepare
+chmod 0755 /usr/libexec/tb323fu/tb323fu-cdsp-prepare
 
 sed -i '/const allPanels/,$d' /usr/share/plasma/layout-templates/org.kde.plasma.desktop.defaultPanel/contents/layout.js
 sed -i '$r /usr/share/plasma/shells/org.kde.plasma.desktop/contents/updates/armada-pins.js' /usr/share/plasma/layout-templates/org.kde.plasma.desktop.defaultPanel/contents/layout.js
@@ -129,6 +158,7 @@ systemctl enable tb323fu-btaddr.service
 systemctl enable tb323fu-usb-port.service
 systemctl enable tb323fu-audio.service
 systemctl enable tb323fu-audio-prepare.service
+systemctl enable tb323fu-cdsp-prepare.service
 systemctl enable tb323fu-bluetooth-firmware.service
 # The user unit is enabled on every device; the helper itself exits 0 unless
 # the exact lenovo,baldur token and the exact LENOVOTB323FU card are present.

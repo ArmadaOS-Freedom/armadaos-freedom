@@ -7,9 +7,9 @@
  * All device trees are synthesized in-process with libfdt; there are no
  * external fixtures. The function is a pure read-only decoder: the input blob
  * is byte-compared before and after the representative call, and the whole
- * record must be reset on every call. The only exception is the opt-in
- * --stock-tb323fu <dtb> acceptance run, which reads a caller-named blob and
- * performs the same byte comparison.
+ * record must be reset on every call. The only exceptions are the opt-in
+ * --stock-tb323fu <dtb> and --stock-tb710fu <dtb> acceptance runs, which read
+ * a caller-named blob and perform the same byte comparison.
  */
 #include <assert.h>
 #include <stdint.h>
@@ -600,6 +600,175 @@ static void test_stock_panel_tb323fu_conflict(void)
     run(f, &info);
     assert(info.board == DEVICE_BOARD_UNKNOWN);
     assert(info.soc == DEVICE_SOC_SM8750);
+}
+
+/* ---- TB710FU (SM8650) identities ----------------------------------------- */
+
+/* Measured stock TB710FU shape (ZUXOS vendor_boot + dtbo, MTP board-id 8):
+ * the root compatible is the generic Pineapple family only, and the primary
+ * display's single-cell qcom,dsi-default-panel resolves to the enabled NT36532
+ * dual-DSI panel under /soc/qcom,mdss_mdp@ae00000. The reference is symbolic:
+ * the captured phandle is not part of the fingerprint. */
+#define NT36532_NODE    "qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid"
+#define NT36532_PANEL   "nt36532_wqhd_dual_dsi_dsc_vid"
+#define NT36532_PHANDLE 0x186u
+
+static void build_stock_display_tb710fu(void *f)
+{
+    uint32_t one[1] = { NT36532_PHANDLE };
+    int soc = add_child(f, 0, "soc");
+    int mdp = add_child(f, soc, MDSS_MDP);
+
+    add_panel(f, mdp, NT36532_NODE, NT36532_PHANDLE, NT36532_PANEL, 1);
+    add_primary(f, soc, DSI_DISPLAY, "primary", one, 1, 1);
+}
+
+static void test_tb710fu_linux_identity(void)
+{
+    static const char *const linux_dt[] = { "lenovo,tb710fu", "qcom,sm8650" };
+    static const char *const sm8650[] = { "qcom,sm8650" };
+    struct device_info info;
+    void *f;
+
+    f = new_tree();
+    set_compat(f, linux_dt, 2);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_TB710FU);
+    assert(info.soc == DEVICE_SOC_SM8650);
+
+    /* The SoC alone never names a board. */
+    f = new_tree();
+    set_compat(f, sm8650, 1);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_SM8650);
+}
+
+static void test_tb710fu_stock_panel(void)
+{
+    static const char *const mtp[] = {
+        "qcom,pineapple-mtp", "qcom,pineapple", "qcom,pineapplep-mtp",
+        "qcom,pineapplep", "qcom,mtp"
+    };
+    static const char *const pineapple[] = { "qcom,pineapple" };
+    static const char *const pineapplep[] = { "qcom,pineapplep" };
+    struct device_info info;
+    void *f;
+
+    f = new_tree();
+    set_compat(f, mtp, 5);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_TB710FU);
+    assert(info.soc == DEVICE_SOC_SM8650);
+
+    f = new_tree();
+    set_compat(f, pineapple, 1);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_TB710FU);
+
+    f = new_tree();
+    set_compat(f, pineapplep, 1);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_TB710FU);
+
+    /* Pineapple without the panel is only an SoC. */
+    f = new_tree();
+    set_compat(f, mtp, 5);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_SM8650);
+}
+
+/* Only the actively referenced, enabled NT36532 node with the exact panel
+ * name counts; a standby NT36532 panel is never used. */
+static void test_tb710fu_stock_panel_wrong_panel(void)
+{
+    static const char *const compat[] = { "qcom,pineapple" };
+    uint32_t nt[1] = { NT36532_PHANDLE };
+    struct device_info info;
+    void *f;
+    int soc, mdp;
+
+    f = new_tree();
+    set_compat(f, compat, 1);
+    soc = add_child(f, 0, "soc");
+    mdp = add_child(f, soc, MDSS_MDP);
+    add_panel(f, mdp, NT36532_NODE, NT36532_PHANDLE, "wrong panel name", 1);
+    add_primary(f, soc, DSI_DISPLAY, "primary", nt, 1, 1);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_SM8650);
+
+    /* Stock overlays where the primary display aims at another panel and the
+     * NT36532 node is only present (board-ids other than TB710FU's). */
+    f = new_tree();
+    set_compat(f, compat, 1);
+    soc = add_child(f, 0, "soc");
+    mdp = add_child(f, soc, MDSS_MDP);
+    add_panel(f, mdp, NT36532_NODE, 0x1b1u, NT36532_PANEL, 1);
+    add_panel(f, mdp, "qcom,mdss_dsi_other_panel", NT36532_PHANDLE, "other panel", 1);
+    add_primary(f, soc, DSI_DISPLAY, "primary", nt, 1, 1);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+
+    /* disabled target */
+    f = new_tree();
+    set_compat(f, compat, 1);
+    soc = add_child(f, 0, "soc");
+    mdp = add_child(f, soc, MDSS_MDP);
+    add_panel(f, mdp, NT36532_NODE, NT36532_PHANDLE, NT36532_PANEL, 0);
+    add_primary(f, soc, DSI_DISPLAY, "primary", nt, 1, 1);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+}
+
+/* The fingerprint is consulted only for an exact Pineapple root without any
+ * SM8750- or SM8850-family marker, and other board evidence conflicts. */
+static void test_tb710fu_root_gating_and_conflicts(void)
+{
+    static const char *const with8750[] = { "qcom,pineapple", "qcom,sm8750" };
+    static const char *const with8850[] = { "qcom,pineapplep", "qcom,canoe" };
+    static const char *const generic[] = { "qcom,pineapple-mtp", "qcom,mtp" };
+    static const char *const elden[] = { "qcom,pineapple", "lenovo,elden", "qcom,sm8750" };
+    static const char *const tb323[] = { "lenovo,tb710fu", "lenovo,tb323fu" };
+    struct device_info info;
+    void *f;
+
+    f = new_tree();
+    set_compat(f, with8750, 2);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_UNKNOWN);
+
+    f = new_tree();
+    set_compat(f, with8850, 2);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_UNKNOWN);
+
+    /* "-mtp" style entries are not exact Pineapple roots. */
+    f = new_tree();
+    set_compat(f, generic, 2);
+    build_stock_display_tb710fu(f);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
+    assert(info.soc == DEVICE_SOC_UNKNOWN);
+
+    f = new_tree();
+    set_compat(f, elden, 3);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_TB322FC);
+    assert(info.soc == DEVICE_SOC_UNKNOWN);
+
+    f = new_tree();
+    set_compat(f, tb323, 2);
+    run(f, &info);
+    assert(info.board == DEVICE_BOARD_UNKNOWN);
 }
 
 /* ---- stock Gen5 TB323FU active-panel fingerprint ------------------------- */
@@ -1194,8 +1363,9 @@ static void test_read_only(void)
 
 /* Not a harness: only the no-argument run above is the test suite. This reads
  * a captured stock DTB the caller names explicitly, validates it, checks the
- * measured board/SoC classification and that the blob was not modified. */
-static int stock_accept(const char *path)
+ * expected board/SoC classification and that the blob was not modified. */
+static int stock_accept(const char *path, enum device_board board,
+                        enum device_soc soc, const char *label)
 {
     struct device_info info;
     unsigned char *blob, *copy;
@@ -1232,8 +1402,8 @@ static int stock_accept(const char *path)
         return 1;
     }
     device_info_read(blob, &info);
-    if (info.board != DEVICE_BOARD_TB323FU ||
-        info.soc != DEVICE_SOC_SM8850 || memcmp(blob, copy, size)) {
+    if (info.board != board ||
+        info.soc != soc || memcmp(blob, copy, size)) {
         fprintf(stderr, "stock: %s board/soc/mutation mismatch\n", path);
         free(blob);
         free(copy);
@@ -1241,7 +1411,7 @@ static int stock_accept(const char *path)
     }
     free(blob);
     free(copy);
-    printf("stock-tb323fu PASS\n");
+    printf("%s PASS\n", label);
     return 0;
 }
 
@@ -1249,8 +1419,13 @@ int main(int argc, char **argv)
 {
     if (argc > 1) {
         if (argc == 3 && strcmp(argv[1], "--stock-tb323fu") == 0)
-            return stock_accept(argv[2]);
-        fprintf(stderr, "usage: %s [--stock-tb323fu <dtb>]\n", argv[0]);
+            return stock_accept(argv[2], DEVICE_BOARD_TB323FU, DEVICE_SOC_SM8850,
+                                "stock-tb323fu");
+        if (argc == 3 && strcmp(argv[1], "--stock-tb710fu") == 0)
+            return stock_accept(argv[2], DEVICE_BOARD_TB710FU, DEVICE_SOC_SM8650,
+                                "stock-tb710fu");
+        fprintf(stderr, "usage: %s [--stock-tb323fu <dtb> | --stock-tb710fu <dtb>]\n",
+                argv[0]);
         return 2;
     }
 
@@ -1269,6 +1444,10 @@ int main(int argc, char **argv)
     test_stock_panel_root_gating();
     test_stock_panel_wrong_names();
     test_stock_panel_tb323fu_conflict();
+    test_tb710fu_linux_identity();
+    test_tb710fu_stock_panel();
+    test_tb710fu_stock_panel_wrong_panel();
+    test_tb710fu_root_gating_and_conflicts();
     test_gen5_stock_panel_exact();
     test_gen5_stock_panel_wrong_panel();
     test_gen5_stock_panel_bad_reference();

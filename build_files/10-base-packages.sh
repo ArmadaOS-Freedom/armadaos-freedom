@@ -25,6 +25,7 @@ dnf5 -y install --setopt=install_weak_deps=False \
     bluez \
     dbus-broker \
     python3-gobject \
+    python3-evdev \
     iio-sensor-proxy \
     gtk4 \
     libadwaita \
