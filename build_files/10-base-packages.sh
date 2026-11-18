@@ -100,6 +100,18 @@ dnf5 -y install --setopt=install_weak_deps=False \
 dnf5 -y install --setopt=install_weak_deps=False \
     /packages/umtp-responder/umtp-responder-*.rpm
 
+# Sensors on a Qualcomm Sensor Core (SSC): iio-sensor-proxy with its libssc
+# backend replaces Fedora's build (IIO sensors behave the same), and hexagonrpcd
+# serves the DSP's files. The package starts no daemon; a board that needs it
+# ships its own unit (TB710FU: tb710fu-hexagonrpcd.service, whose file staging
+# reads the Android partitions with debugfs and dump.erofs).
+dnf5 -y install --setopt=install_weak_deps=False \
+    e2fsprogs \
+    erofs-utils \
+    /packages/iio-sensor-proxy/libssc-[0-9]*.aarch64.rpm \
+    /packages/iio-sensor-proxy/iio-sensor-proxy-[0-9]*.aarch64.rpm \
+    /packages/hexagonrpc/hexagonrpc-[0-9]*.aarch64.rpm
+
 # The Chinese btop fork is a separate package: Fedora's btop above stays the
 # English command, and this only adds /usr/libexec/armada/btop-cn beside it.
 dnf5 -y install --setopt=install_weak_deps=False \

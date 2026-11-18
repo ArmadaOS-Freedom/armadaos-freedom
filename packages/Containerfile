@@ -186,6 +186,24 @@ FROM scratch AS out-umtp-responder
 COPY --from=pkg-umtp-responder /work/out/ /rpms/
 
 
+FROM builder-base AS pkg-hexagonrpc
+COPY hexagonrpc/ /work/
+WORKDIR /work
+RUN ./build.sh && /src/scrub-scratch.sh
+
+FROM scratch AS out-hexagonrpc
+COPY --from=pkg-hexagonrpc /work/out/ /rpms/
+
+
+FROM builder-base AS pkg-iio-sensor-proxy
+COPY iio-sensor-proxy/ /work/
+WORKDIR /work
+RUN ./build.sh && /src/scrub-scratch.sh
+
+FROM scratch AS out-iio-sensor-proxy
+COPY --from=pkg-iio-sensor-proxy /work/out/ /rpms/
+
+
 FROM builder-base AS pkg-fex-sysroot
 COPY fex/ /work/
 WORKDIR /work
