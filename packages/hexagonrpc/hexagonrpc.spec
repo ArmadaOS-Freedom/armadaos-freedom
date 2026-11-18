@@ -13,6 +13,7 @@ Source0:        %{forgeurl}/archive/%{commit}/%{name}-%{commit}.tar.gz
 
 Patch1:         0001-rpcd-listener-fetch-large-input-buffers-with-get_in_.patch
 Patch2:         0002-rpcd-apps_std-optional-writable-sensor-registry.patch
+Patch3:         0003-rpcd-listener-keep-serving-after-a-call-fails.patch
 
 BuildRequires:  gcc
 BuildRequires:  meson
@@ -21,7 +22,8 @@ BuildRequires:  meson
 hexagonrpcd serves the files and calls that a Qualcomm Hexagon DSP requests
 from the application processor over FastRPC, such as the sensor hub's
 configuration and registry. This build adds large input buffers and an
-optional writable sensor registry (HEXAGONRPCD_WRITABLE_REGISTRY).
+optional writable sensor registry (HEXAGONRPCD_WRITABLE_REGISTRY), and keeps
+serving when a call fails instead of ending the DSP's session.
 
 %prep
 %autosetup -n %{name}-%{commit} -p1

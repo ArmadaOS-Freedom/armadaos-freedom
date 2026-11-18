@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: "lich.wang" <lich.wang@gmail.com>
 Date: Wed, 18 Nov 2026 16:30:47 +0800
-Subject: [PATCH 2/2] rpcd: apps_std: optional writable sensor registry
+Subject: [PATCH 2/3] rpcd: apps_std: optional writable sensor registry
 
 The sensor hub (SSC) of SM8650 writes its registry directory: it opens a
 probe file for writing, writes a temporary file and renames it to
