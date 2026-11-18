@@ -93,7 +93,6 @@ dnf5 -y install --setopt=install_weak_deps=False \
     ffmpeg \
     ffmpeg-libs \
     libavcodec \
-    liboapv \
     libfdk-aac \
     gstreamer1-plugins-ugly \
     gstreamer1-plugin-libav
