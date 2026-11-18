@@ -1188,7 +1188,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Mirrors QSEED's left/right fetch fields under final horizontal reflection and top/bottom fetch fields under final vertical reflection. The physical source extent, QSEED phase, preload and total dimensions, ROI, UBWC and source-split order are unchanged. The no-reflection right 270-degree path remains identical.
-  validation: Host C tests execute the production QSEED setup and PE packing functions across no reflection, X-only, Y-only and combined reflection, including clean303 split-pipe geometry and signed extension cases. Physical left-90 and right-270 validation remains a separate device gate.
+  validation: 135 host C cases execute the production QSEED setup, geometry check and PE packing functions across no reflection, X-only, Y-only and combined reflection, including captured left-90 split-pipe geometry and signed extension cases. The unpatched negative control fails 190 assertions. TB322FC device checks confirm the expected KMS and active SSPP orientation bits in all four directions, with zero sampled UBWC errors; left-90 fullscreen gears also passed a 30-second technical check. See devices/lenovo-tb322fc/rotation.md for the tested build, physical-validation limits and separate session-restart issues.
 - `dts/0201-baldur-panel-orientation.patch`
   source: armadaos-freedom
   upstream: local
