@@ -316,9 +316,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          tag="$(tr -d '\r\n' < build_files/decky-preview-version)"
+          if [[ ! "${tag}" =~ ^v[A-Za-z0-9._+-]+$ ]]; then
+            echo "Invalid pinned Decky tag: ${tag}" >&2
+            exit 1
+          fi
           gh api \
             -H "Accept: application/vnd.github+json" \
-            'repos/SteamDeckHomebrew/decky-loader/releases?per_page=100' \
+            --jq '[.]' \
+            "repos/SteamDeckHomebrew/decky-loader/releases/tags/${tag}" \
             >"$RUNNER_TEMP/decky-releases.json"
 
       - name: Prepare BootTool sources
