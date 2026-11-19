@@ -265,6 +265,8 @@ python3 "${REPO_ROOT}/tests/test_dpu_sspp_format.py" "${SRC_DIR}" \
     --work "${KERNEL_CHECK_WORK}/dpu-sspp-format"
 python3 "${REPO_ROOT}/tests/test_y700_camera_pm.py" "${SRC_DIR}" \
     --work "${KERNEL_CHECK_WORK}/y700-camera-pm"
+python3 "${REPO_ROOT}/tests/test_q6apm_lifecycle.py" "${SRC_DIR}" \
+    --work "${KERNEL_CHECK_WORK}/q6apm-lifecycle"
 KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_msm_telemetry_pm.py"
 KERNEL_TREE="${SRC_DIR}" python3 "${REPO_ROOT}/tests/test_sm8850_lutdma.py"
 python3 "${REPO_ROOT}/tests/test_infinity_package.py"

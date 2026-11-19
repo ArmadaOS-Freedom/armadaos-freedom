@@ -1335,3 +1335,15 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: TDM BE fixup (4ch/S32) and DSP_B/IB_NF CPU format for `lenovo,tb710fu-sndcard` only. The TDM endpoint has no bit-clock inversion setting, so IB_NF is sent as plain DSP_B; the values match what the vendor userspace programs.
+- `patches/0750-ASoC-qcom-q6apm-complete-typed-unmap-responses.patch`
+  source: armada
+  upstream: local
+  notes: Use the command opcode and real DSP status for shared-memory UNMAP completion; carry the ordinary/position buffer token type and clear only the successfully unmapped handle. Shared AudioReach code, not board-gated.
+- `patches/0751-ASoC-qcom-q6apm-retain-reference-after-failed-stop.patch`
+  source: armada
+  upstream: local
+  notes: Serialize graph START/STOP and their reference count with a shared audioreach_graph mutex, retaining the final reference when STOP fails. Concurrent START waits for STOP completion and then sends its command when needed. This does not guarantee recovery of an unresponsive DSP or repair final-close callback lifetime.
+- `patches/0752-ASoC-qcom-q6apm-stop-capture-before-backend-shutdown.patch`
+  source: armada
+  upstream: local
+  notes: Capture component hw_free stops the FE before BE shutdown, synchronizes read requeue, retains fragments until existing close/reprepare and avoids duplicate successful STOP. Shared capture code; successful ordering was traced on TB322FC. Final close after DSP failure and late callback lifetime remain separate risks.
