@@ -390,8 +390,8 @@ grep -Fxq 'HandleLidSwitchDocked=ignore' "$LOGIND"
 
 # --- the daemon itself: display-only toggle, no sleep fallback ----------
 grep -Fq 'powerbutton_screen_toggle' "$POWERBUTTOND"
-# The only remaining shortpowerpress is the lid-close path.
-(( $(grep -c 'steam_uri shortpowerpress' "$POWERBUTTOND") == 1 ))
+# Steam sleep is requested on lid close or through the short-action opt-in.
+(( $(grep -c 'steam_uri shortpowerpress' "$POWERBUTTOND") == 2 ))
 if grep -Fq 'bl_power' "$POWERBUTTOND"; then
     printf 'the button handler must not poke backlight sysfs\n' >&2
     exit 1

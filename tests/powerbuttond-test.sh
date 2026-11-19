@@ -133,4 +133,40 @@ for child_pid in "${lid_children[@]}"; do
     fi
 done
 
-printf 'powerbutton resume and cleanup test passed\n'
+# Check the sleep opt-in without touching Steam, systemd or the device clock.
+(
+    SHORT_ACTION=sleep
+    last_suspend_offset_ms=3100
+    resume_block_until_ms=0
+    press_log="$tmp/opt-in-actions"
+    powerbutton_clock_pair() { printf '%s %s\n' "$sample_ms" "$sample_offset_ms"; }
+    log() { :; }
+    steam_uri() { printf '%s\n' "$1" >>"$press_log"; }
+    powerbutton_screen_toggle() { printf 'display\n' >>"$press_log"; }
+
+    sample_ms=5000 sample_offset_ms=3100
+    powerbutton_short_press
+    grep -Fxq shortpowerpress "$press_log"
+    rm -- "$press_log"
+
+    sample_ms=7000 sample_offset_ms=4100
+    powerbutton_ignore_resume_press
+    [[ "$resume_block_until_ms" = 8000 ]]
+    sample_ms=7500
+    powerbutton_short_press
+    [[ ! -e "$press_log" ]]
+    sample_ms=8000
+    powerbutton_short_press
+    grep -Fxq shortpowerpress "$press_log"
+
+    # Exercise a deadline inherited from reexec with no clock jump.
+    rm -- "$press_log"
+    resume_block_until_ms=9500
+    sample_ms=9000
+    powerbutton_short_press
+    [[ ! -e "$press_log" ]]
+    SHORT_ACTION=display\n    powerbutton_short_press
+    grep -Fxq display "$press_log"
+)
+
+printf 'powerbutton resume, cleanup and short-action test passed\n'

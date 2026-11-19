@@ -1,5 +1,5 @@
 [Unit]
-Description=Armada Game Mode power-button handler (short press toggles the display)
+Description=Armada Game Mode power-button handler
 PartOf=gamescope-session-plus@steam.service
 StartLimitIntervalSec=0
 

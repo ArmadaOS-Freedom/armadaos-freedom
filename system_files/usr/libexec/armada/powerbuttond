@@ -1,13 +1,13 @@
 #!/bin/bash
-# Power button + lid while Game Mode owns the keys: a short press toggles the
-# display only (no sleep, no frozen apps, no muted audio), a long press opens
-# Steam's power menu, and lid close still runs Steam's sleep flow.
+# In Game Mode a short press toggles the display unless opted into Steam sleep.
+# A long press opens Steam's power menu. Lid close still requests Steam sleep.
 set -uo pipefail
 
 SESSION_USER="${ARMADA_SESSION_USER:-armada}"
 STEAM_DIR="/var/home/${SESSION_USER}/.local/share/Steam/steamrtarm64"
 STEAM_BIN="${STEAM_DIR}/steam"
 LONG_MS="${ARMADA_POWERBUTTON_LONG_MS:-1000}"
+SHORT_ACTION="${ARMADA_POWERBUTTON_SHORT_ACTION:-display}"
 POWER_DEVICE_WAIT_SEC="${ARMADA_POWERBUTTON_DEVICE_WAIT_SEC:-15}"
 USER_RUNTIME_DIR="${ARMADA_USER_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
 PID_FILE="${ARMADA_POWERBUTTON_PID_FILE:-${USER_RUNTIME_DIR}/armada-powerbuttond/pid}"
@@ -174,7 +174,37 @@ powerbutton_mark_lid_close() {
     chmod 0600 "$LID_CLOSE_MARKER"
 }
 
+powerbutton_clock_pair() {
+    /usr/bin/python3 -c 'import time; t = time.monotonic_ns(); print(t // 1000000, (time.clock_gettime_ns(time.CLOCK_BOOTTIME) - t) // 1000000)'
+}
+
+# The wake key can reach evtest before the systemd post-resume hook.
+# Check both the key down and the key up to avoid sleeping again.
+powerbutton_ignore_resume_press() {
+    [[ "$SHORT_ACTION" == sleep ]] || return 1
+    local now_ms offset_ms
+    read -r now_ms offset_ms < <(powerbutton_clock_pair) || return 0
+    if (( offset_ms > last_suspend_offset_ms + 100 )); then
+        last_suspend_offset_ms=$offset_ms
+        resume_block_until_ms=$((now_ms + 1000))
+    fi
+    (( now_ms < resume_block_until_ms ))
+}
+
+powerbutton_short_press() {
+    if powerbutton_ignore_resume_press; then
+        log "ignored power release during resume"
+    elif [[ "$SHORT_ACTION" == sleep ]]; then
+        log "short press -> shortpowerpress"
+        steam_uri shortpowerpress
+    else
+        log "short press -> display toggle"
+        powerbutton_screen_toggle
+    fi
+}
+
 powerbutton_reexec() {
+    local now_ms offset_ms
     trap - USR1
     # The reexecuted daemon starts with SCREEN_OFF=0, so an owned off state must
     # be restored before the watchers go away. If that restore fails, keep this
@@ -183,6 +213,9 @@ powerbutton_reexec() {
         log "display restore failed before reexec; keeping daemon and off state"
         trap powerbutton_reexec USR1
         return 0
+    fi
+    if [[ "$SHORT_ACTION" == sleep ]] && read -r now_ms offset_ms < <(powerbutton_clock_pair); then
+        export ARMADA_POWERBUTTON_RESUME_BLOCK_UNTIL_MS=$((now_ms + 1000))
     fi
     powerbutton_stop_watchers
     exec /bin/bash "$0"
@@ -199,6 +232,18 @@ powerbutton_write_pid() {
 
 powerbutton_main() {
     local liddev lid_line pdev line rem read_result state press_ms
+    local now_ms last_suspend_offset_ms=0 resume_block_until_ms=0
+
+    if [[ "$SHORT_ACTION" == sleep ]]; then
+        if read -r now_ms last_suspend_offset_ms < <(powerbutton_clock_pair); then
+            if [[ "${ARMADA_POWERBUTTON_RESUME_BLOCK_UNTIL_MS:-}" =~ ^[1-9][0-9]{0,14}$ ]]; then
+                resume_block_until_ms=$ARMADA_POWERBUTTON_RESUME_BLOCK_UNTIL_MS
+            fi
+        else
+            log "monotonic/boottime clock sample failed; using display toggle"
+            SHORT_ACTION=display
+        fi
+    fi
 
     trap 'exit 0' INT TERM
     trap powerbutton_reexec USR1
@@ -268,9 +313,8 @@ powerbutton_main() {
             held)
                 case "$line" in
                     *"(KEY_POWER), value 0"*)
-                        log "short press -> display toggle"
-                        powerbutton_screen_toggle
                         state=idle
+                        powerbutton_short_press
                         ;;
                 esac
                 ;;
@@ -283,7 +327,10 @@ powerbutton_main() {
                 # fake-suspend owns wake and can leave a release while idle.
                 case "$line" in
                     *"(KEY_POWER), value 1"*)
-                        if armada_lid_closed 2>/dev/null; then
+                        if powerbutton_ignore_resume_press; then
+                            log "ignored wake press"
+                            state=draining
+                        elif armada_lid_closed 2>/dev/null; then
                             log "power w/ lid closed -> ignored"
                         else
                             press_ms=$(date +%s%3N)
