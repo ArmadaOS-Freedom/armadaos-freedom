@@ -103,10 +103,9 @@ class SourceTests(unittest.TestCase):
         self.work = Path(self.temp.name)
         self.path = self.work / "repo"
         run("ostree", "init", f"--repo={self.path}", "--mode=bare")
-        run(*EXT, "pull", self.path, oci(self.work / "v1", "running image"))
+        self.image_ref = self.pull_image("v1", "running image")
         self.repo = OSTree.Repo.new(Gio.File.new_for_path(str(self.path)))
         self.repo.open(None)
-        self.image_ref = next(r for r in self.refs() if r.startswith("ostree/container/image/"))
         self.commit = run("ostree", "rev-parse", f"--repo={self.path}", self.image_ref)
         self.origin = GLib.KeyFile.new()
         self.origin.set_string("origin", "container-image-reference", ORIGIN)
@@ -140,6 +139,19 @@ class SourceTests(unittest.TestCase):
 
     def refs(self):
         return run("ostree", "refs", f"--repo={self.path}").splitlines()
+
+    def pull_image(self, fixture, marker, source=None):
+        """Return the ref created by this pull without assuming OSTree's ref encoding."""
+        before = set(self.refs())
+        if source is None:
+            source = oci(self.work / fixture, marker)
+        run(*EXT, "pull", self.path, source)
+        added = sorted(
+            ref for ref in set(self.refs()) - before
+            if ref.startswith("ostree/container/image/")
+        )
+        self.assertEqual(len(added), 1, f"expected one image ref from {fixture}, got {added}")
+        return added[0]
 
     def prepare(self):
         self.source = SourceImage.read(self.repo, self.deployment)
@@ -187,11 +199,10 @@ class SourceTests(unittest.TestCase):
         origin_file.write_text(self.origin.to_data()[0])
         images = {}
         for version in range(5):
-            ref = oci(self.work / f"history-{version}", f"image {version}")
-            run(*EXT, "pull", self.path, ref)
-            image_ref = next(r for r in self.refs() if r.startswith("ostree/container/image/"))
+            source = oci(self.work / f"history-{version}", f"image {version}")
+            image_ref = self.pull_image(f"history-{version}", f"image {version}", source=source)
             checksum = run("ostree", "rev-parse", f"--repo={self.path}", image_ref)
-            images[checksum] = ref
+            images[checksum] = source
             run("ostree", "admin", "deploy", "--no-merge", "--retain", f"--sysroot={sd}",
                 "--os=default", f"--origin-file={origin_file}", checksum)
             history = OSTree.Sysroot.new(Gio.File.new_for_path(str(sd)))
@@ -247,8 +258,7 @@ class SourceTests(unittest.TestCase):
         self.check_deployment_history(1)
 
     def test_pending_image_does_not_change_selected_commit(self):
-        run(*EXT, "pull", self.path, oci(self.work / "v2", "pending image"))
-        pending_ref = next(r for r in self.refs() if "/v2_3A_latest" in r)
+        pending_ref = self.pull_image("v2", "pending image")
         pending = run("ostree", "rev-parse", f"--repo={self.path}", pending_ref)
         run("ostree", "refs", f"--repo={self.path}", "--force", f"--create={self.image_ref}", pending)
         before = {ref: run("ostree", "rev-parse", f"--repo={self.path}", ref) for ref in self.refs()}
@@ -419,8 +429,7 @@ class SourceTests(unittest.TestCase):
                 SourceImage.from_seed(self.repo, self.commit, FREEDOM_ORIGIN, digest)
 
     def test_seed_selects_explicit_commit_over_newer_import(self):
-        run(*EXT, "pull", self.path, oci(self.work / "v2", "newer image"))
-        newer_ref = next(r for r in self.refs() if "/v2_3A_latest" in r)
+        newer_ref = self.pull_image("v2", "newer image")
         newer = run("ostree", "rev-parse", f"--repo={self.path}", newer_ref)
         self.assertNotEqual(newer, self.commit)
         self.source = SourceImage.from_seed(

@@ -191,3 +191,29 @@ step is to produce or obtain a TB322FC EDL package from the signed image source,
 run the installer's non-writing preflight, and only then perform a controlled
 EDL deployment with a verified recovery path. No Qualcomm A/B firmware slot was
 modified during this work.
+
+## 2026-11-20 installer fixture CI follow-up
+
+The PR head `cfb500dc` unit workflow `44582788286` failed only in
+`tests/installer-source-test.py::test_pending_image_does_not_change_selected_commit`:
+Fedora/bootc encoded the temporary OCI reference with the checkout path, while
+the test searched for the old literal `/v2_3A_latest`. The same hard-coded
+encoding also appeared in `test_seed_selects_explicit_commit_over_newer_import`.
+The test now finds the single new `ostree/container/image/` ref by comparing
+refs before and after each pull. History fixtures keep their original OCI
+input so the fresh-import comparison continues to exercise a real second pull.
+
+The root/container job cannot be rerun with the available GitHub credentials
+(`gh run rerun 44582788286 --failed` reports that repository admin rights are
+required). The targeted test was rerun locally in a privileged disposable
+Fedora 44 container with OSTree, bootc, PyGObject and e2fsprogs installed:
+29 tests passed, one existing mount-capability test skipped. No full image or
+kernel rebuild was started. The unrelated PR container image run
+`44582788186` was still in progress at the time of this update; its already
+successful baseline build for `069f304` remains the only completed disk image.
+
+The existing PR disk artifact is generic and the successful signed TB322FC EDL
+artifact from `44477168804` is based on source `585f39ec`, not this audio
+candidate. Neither artifact is suitable for deploying PR head `cfb500dc`.
+The device remains unchanged on `7.2.6-y700-camera2`; the new audio kernel has
+not been installed or booted, and Qualcomm A/B slots have not been modified.
