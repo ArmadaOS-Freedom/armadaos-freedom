@@ -1,13 +1,13 @@
 Subject: [PATCH] clk: qcom: retry idle GDSC interconnect vote release
 
-Once genpd considers a domain off, it stops calling power_off. After a
-successful power-off, use bounded delayed work to recheck an inconclusive
-status or retry failed vote drops. Hold the provider runtime PM reference
-while the work runs, and retain votes until the hardware confirms OFF.
-Serialize with switch transitions and drain work before devres teardown.
+When genpd considers a domain off, it stops calling power_off. Use
+bounded delayed work to confirm OFF after a successful power-off or
+failed power-on, then release retained ICC votes. Recheck failed vote
+drops too. Hold a provider PM reference during the retry and serialize
+it with power transitions. Drain it before devres teardown.
 
 diff --git a/drivers/clk/qcom/gdsc.c b/drivers/clk/qcom/gdsc.c
-index 34a4f5e..e0484cc 100755
+index 34a4f5e..a40572d 100755
 --- a/drivers/clk/qcom/gdsc.c
 +++ b/drivers/clk/qcom/gdsc.c
 @@ -299,7 +299,8 @@ static void gdsc_retain_ff_on(struct gdsc *sc)
@@ -120,7 +120,7 @@ index 34a4f5e..e0484cc 100755
  	return devm_add_action_or_reset(dev, gdsc_icc_release, sc);
  }
  
-@@ -539,21 +593,33 @@ static int gdsc_enable(struct generic_pm_domain *domain)
+@@ -539,21 +593,32 @@ static int gdsc_enable(struct generic_pm_domain *domain)
  		sc->rpm_held = true;
  	}
  
@@ -129,27 +129,31 @@ index 34a4f5e..e0484cc 100755
  	ret = gdsc_icc_enable(sc);
 -	if (ret)
 -		goto err_rpm;
+-
 +	if (ret) {
 +		if ((sc->icc_off || sc->icc_recheck_off) && sc->icc_votes)
 +			gdsc_icc_queue_retry(sc);
 +		goto unlock_icc;
 +	}
-+	if (sc->num_icc_paths) {
-+		sc->icc_off = false;
-+		sc->icc_recheck_off = false;
-+		cancel_delayed_work(&sc->icc_retry_work);
-+	}
- 
  	ret = gdsc_enable_hw(sc);
- 	if (ret && sc->num_icc_paths) {
- 		/* A failed enable can have left the switch powered. */
- 		if (gdsc_check_status(sc, GDSC_OFF) > 0)
+-	if (ret && sc->num_icc_paths) {
+-		/* A failed enable can have left the switch powered. */
+-		if (gdsc_check_status(sc, GDSC_OFF) > 0)
 -			gdsc_icc_drop(sc, sc->icc_votes);
+-		else
++	if (sc->num_icc_paths) {
++		if (!ret) {
++			sc->icc_off = false;
++			sc->icc_recheck_off = false;
++			cancel_delayed_work(&sc->icc_retry_work);
++		} else if (gdsc_check_status(sc, GDSC_OFF) > 0) {
 +			gdsc_icc_mark_off(sc);
- 		else
++		} else {
  			dev_err(sc->icc_dev,
  				"%s: enable failed, keeping votes until confirmed off\n",
  				sc->pd.name);
++			gdsc_icc_defer_off(sc);
++		}
  	}
 -err_rpm:
 +unlock_icc:
@@ -158,7 +162,7 @@ index 34a4f5e..e0484cc 100755
  	if (ret && sc->rpm_held) {
  		pm_runtime_put(sc->rpm_dev);
  		sc->rpm_held = false;
-@@ -567,21 +633,23 @@ static int gdsc_disable(struct generic_pm_domain *domain)
+@@ -567,21 +632,23 @@ static int gdsc_disable(struct generic_pm_domain *domain)
  	struct gdsc *sc = domain_to_gdsc(domain);
  	int off, ret;
  
@@ -189,7 +193,7 @@ index 34a4f5e..e0484cc 100755
  	if (!ret && sc->rpm_held) {
  		pm_runtime_put(sc->rpm_dev);
  		sc->rpm_held = false;
-@@ -857,7 +925,11 @@ int gdsc_register(struct gdsc_desc *desc,
+@@ -857,7 +924,11 @@ int gdsc_register(struct gdsc_desc *desc,
  		scs[i]->regmap = regmap;
  		scs[i]->rcdev = rcdev;
  		/* Cover a boot-on domain before initialization and publication. */
@@ -201,7 +205,7 @@ index 34a4f5e..e0484cc 100755
  		if (ret) {
  			dev_err_probe(dev, ret, "%s: failed to vote domain ICC\n",
  				      scs[i]->pd.name);
-@@ -867,8 +939,12 @@ int gdsc_register(struct gdsc_desc *desc,
+@@ -867,8 +938,12 @@ int gdsc_register(struct gdsc_desc *desc,
  		if (ret)
  			goto err_pm_genpd_remove;
  		initialized = i + 1;

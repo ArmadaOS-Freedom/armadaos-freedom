@@ -1,17 +1,15 @@
 Subject: [PATCH] media: fix Y700 camera power and sub-device lifetime
 
-Keep V4L2 node references independent of driver binding. For the opt-in
-nodes, serialize open and I/O with unregister, disconnect the bridge and
-keep sub-device callbacks, state and controls alive through the last close.
-Remove the media interface and links under the media graph mutex. Balance
-lens file and sensor stream PM references during detach.
+Keep opt-in V4L2 device nodes and controls alive through the final close,
+serialize node I/O with unregister, and remove the media interface and
+its links under the graph mutex. Balance lens and sensor PM references
+on detach. Reapply reset sequencing if a stream retry needs it.
 
-Require PM for the sensors and replay the reset exit sequence before I/O
-if a retained PM reference prevented a power cycle. Report recoverable
-power-off failures to runtime PM as -EAGAIN and preserve the original
-error. Reject I/O until a later idle or resume has cleared the fault. A
-post-release supply error remains fatal because another disable cannot
-repair it. Detach retries only references still held.
+Report retained supplies or a failed reset as a retryable suspend error.
+Bound delayed runtime suspend requests and drain them on detach. Treat
+post-release supply errors as fatal for I/O while still allowing the
+other retained votes to be released. Make system sleep attempt cleanup
+even when an earlier failed runtime resume left resources behind.
 
 diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
 index d1e1eb9..3df5a84 100755
@@ -36,10 +34,10 @@ index d1e1eb9..3df5a84 100755
  	select V4L2_FWNODE
  	help
 diff --git a/drivers/media/i2c/gc08a8.c b/drivers/media/i2c/gc08a8.c
-index 87a651b..4630bfa 100755
+index 87a651b..eb8954d 100755
 --- a/drivers/media/i2c/gc08a8.c
 +++ b/drivers/media/i2c/gc08a8.c
-@@ -5,9 +5,11 @@
+@@ -5,9 +5,12 @@
  #include <linux/delay.h>
  #include <linux/gpio/consumer.h>
  #include <linux/i2c.h>
@@ -48,10 +46,11 @@ index 87a651b..4630bfa 100755
  #include <linux/pm_runtime.h>
  #include <linux/regulator/consumer.h>
 +#include <linux/slab.h>
++#include <linux/workqueue.h>
  
  #include <media/v4l2-cci.h>
  #include <media/v4l2-ctrls.h>
-@@ -26,6 +28,7 @@ static const s64 gc08a8_link_freq[] = { 336000000 };
+@@ -26,6 +29,7 @@ static const s64 gc08a8_link_freq[] = { 336000000 };
  static const char * const gc08a8_supply_names[] = { "dovdd", "dvdd", "avdd" };
  
  struct gc08a8 {
@@ -59,12 +58,14 @@ index 87a651b..4630bfa 100755
  	struct v4l2_subdev sd;
  	struct media_pad pad;
  	struct v4l2_ctrl_handler ctrls;
-@@ -33,11 +36,14 @@ struct gc08a8 {
+@@ -33,11 +37,16 @@ struct gc08a8 {
  	struct clk *xclk;
  	struct gpio_desc *reset;
  	struct regulator_bulk_data supplies[ARRAY_SIZE(gc08a8_supply_names)];
 -	/* Only references whose ownership is still known are tracked here. */
++	struct delayed_work power_off_work;
  	unsigned long supplies_enabled;
++	unsigned int power_off_retries;
  	bool clock_enabled;
 +	bool reset_asserted;
 +	int reset_error;
@@ -75,7 +76,7 @@ index 87a651b..4630bfa 100755
  };
  
  static struct gc08a8 *to_gc08a8(struct v4l2_subdev *sd)
-@@ -45,6 +51,33 @@ static struct gc08a8 *to_gc08a8(struct v4l2_subdev *sd)
+@@ -45,6 +54,33 @@ static struct gc08a8 *to_gc08a8(struct v4l2_subdev *sd)
  	return container_of(sd, struct gc08a8, sd);
  }
  
@@ -109,7 +110,7 @@ index 87a651b..4630bfa 100755
  static const struct cci_reg_sequence gc08a8_init_regs[] = {
  	{ CCI_REG8(0x031c), 0x60 },
  	{ CCI_REG8(0x0337), 0x03 },
-@@ -489,57 +522,92 @@ static const struct cci_reg_sequence gc08a8_3264x2448_regs[] = {
+@@ -489,57 +525,106 @@ static const struct cci_reg_sequence gc08a8_3264x2448_regs[] = {
  	{ CCI_REG8(0x0102), 0x09 },
  };
  
@@ -214,18 +215,32 @@ index 87a651b..4630bfa 100755
 +	return reset_ret ?: ret;
 +}
 +
++static void gc08a8_retry_power_off(struct work_struct *work)
++{
++	struct gc08a8 *sensor = container_of(to_delayed_work(work), struct gc08a8,
++					    power_off_work);
++
++	pm_runtime_suspend(sensor->sd.dev);
++}
++
 +static int gc08a8_runtime_suspend(struct device *dev)
 +{
 +	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
 +	int ret = gc08a8_power_off(dev);
 +
-+	if (ret)
-+		return sensor->supply_error ? -EIO : -EAGAIN;
-+	return 0;
++	if (sensor->supplies_enabled || sensor->reset_error) {
++		if (sensor->power_off_retries &&
++		    queue_delayed_work(system_freezable_wq, &sensor->power_off_work,
++				       msecs_to_jiffies(100)))
++			sensor->power_off_retries--;
++		return -EAGAIN;
++	}
++	cancel_delayed_work(&sensor->power_off_work);
++	return ret ? -EIO : 0;
  }
  
  static int gc08a8_power_on(struct device *dev)
-@@ -547,11 +615,16 @@ static int gc08a8_power_on(struct device *dev)
+@@ -547,11 +632,16 @@ static int gc08a8_power_on(struct device *dev)
  	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
  	int i, ret;
  
@@ -246,7 +261,7 @@ index 87a651b..4630bfa 100755
  	fsleep(1000);
  	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
  		ret = regulator_enable(sensor->supplies[i].consumer);
-@@ -566,7 +639,7 @@ static int gc08a8_power_on(struct device *dev)
+@@ -566,7 +656,7 @@ static int gc08a8_power_on(struct device *dev)
  		goto power_off;
  	sensor->clock_enabled = true;
  	fsleep(10000);
@@ -255,7 +270,7 @@ index 87a651b..4630bfa 100755
  	if (ret)
  		goto power_off;
  	fsleep(3000);
-@@ -578,6 +651,21 @@ power_off:
+@@ -578,6 +668,23 @@ power_off:
  	return ret;
  }
  
@@ -264,8 +279,10 @@ index 87a651b..4630bfa 100755
 +	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
 +	int ret = gc08a8_power_on(dev);
 +
-+	if (!ret)
++	if (!ret) {
++		sensor->power_off_retries = 3;
 +		return 0;
++	}
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
 +	if (sensor->supply_error)
 +		return -EIO;
@@ -277,7 +294,7 @@ index 87a651b..4630bfa 100755
  static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct gc08a8 *sensor = container_of(ctrl->handler, struct gc08a8, ctrls);
-@@ -585,6 +673,9 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -585,6 +692,9 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  	u16 reg;
  	int ret = 0, release;
  
@@ -287,7 +304,7 @@ index 87a651b..4630bfa 100755
  	switch (ctrl->id) {
  	case V4L2_CID_EXPOSURE:
  		reg = 0x0202;
-@@ -596,12 +687,14 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -596,12 +706,14 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  		return 0;
  	}
  
@@ -305,7 +322,7 @@ index 87a651b..4630bfa 100755
  
  	cci_write(sensor->regmap, CCI_REG8(0x0104), 1, &ret);
  	cci_write(sensor->regmap, CCI_REG8(reg), ctrl->val >> 8, &ret);
-@@ -648,11 +741,8 @@ static int gc08a8_init_controls(struct gc08a8 *sensor)
+@@ -648,11 +760,8 @@ static int gc08a8_init_controls(struct gc08a8 *sensor)
  	v4l2_ctrl_new_std(hdl, &gc08a8_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
  			  1024, 16384, 1, 1024);
  	v4l2_ctrl_new_fwnode_properties(hdl, &gc08a8_ctrl_ops, &props);
@@ -319,7 +336,7 @@ index 87a651b..4630bfa 100755
  	sensor->sd.ctrl_handler = hdl;
  	return 0;
  }
-@@ -741,20 +831,18 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -741,20 +850,18 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  	int ret = 0, power_ret;
  
  	state = v4l2_subdev_lock_and_get_active_state(sd);
@@ -344,7 +361,7 @@ index 87a651b..4630bfa 100755
  		power_ret = pm_runtime_put_sync(sd->dev);
  		if (power_ret < 0) {
  			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
-@@ -768,6 +856,12 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -768,6 +875,12 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  	ret = pm_runtime_resume_and_get(sd->dev);
  	if (ret < 0)
  		goto unlock;
@@ -357,7 +374,7 @@ index 87a651b..4630bfa 100755
  	cci_multi_reg_write(sensor->regmap, gc08a8_init_regs,
  			    ARRAY_SIZE(gc08a8_init_regs), &ret);
  	cci_multi_reg_write(sensor->regmap, gc08a8_3264x2448_regs,
-@@ -776,14 +870,17 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -776,14 +889,17 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  		ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
  	cci_write(sensor->regmap, CCI_REG8(0x0100), 1, &ret);
  	if (ret) {
@@ -382,7 +399,7 @@ index 87a651b..4630bfa 100755
  unlock:
  	v4l2_subdev_unlock_state(state);
  	return ret;
-@@ -808,6 +905,8 @@ static const struct v4l2_subdev_ops gc08a8_ops = {
+@@ -808,6 +924,8 @@ static const struct v4l2_subdev_ops gc08a8_ops = {
  
  static const struct v4l2_subdev_internal_ops gc08a8_internal_ops = {
  	.init_state = gc08a8_init_state,
@@ -391,7 +408,7 @@ index 87a651b..4630bfa 100755
  };
  
  static int gc08a8_check_endpoint(struct device *dev)
-@@ -838,6 +937,26 @@ free:
+@@ -838,6 +956,27 @@ free:
  	return ret;
  }
  
@@ -403,6 +420,7 @@ index 87a651b..4630bfa 100755
 +	mutex_lock(sensor->ctrls.lock);
 +	sensor->detached = true;
 +	pm_runtime_disable(dev);
++	disable_delayed_work_sync(&sensor->power_off_work);
 +	if (sensor->streaming) {
 +		pm_runtime_put_noidle(dev);
 +		sensor->streaming = false;
@@ -418,7 +436,7 @@ index 87a651b..4630bfa 100755
  static int gc08a8_probe(struct i2c_client *client)
  {
  	struct device *dev = &client->dev;
-@@ -848,9 +967,13 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -848,9 +987,14 @@ static int gc08a8_probe(struct i2c_client *client)
  	ret = gc08a8_check_endpoint(dev);
  	if (ret)
  		return dev_err_probe(dev, ret, "Unsupported CSI-2 endpoint\n");
@@ -426,6 +444,7 @@ index 87a651b..4630bfa 100755
 +	sensor = kzalloc_obj(*sensor);
  	if (!sensor)
  		return -ENOMEM;
++	INIT_DELAYED_WORK(&sensor->power_off_work, gc08a8_retry_power_off);
 +	kref_init(&sensor->ref);
 +	ret = devm_add_action_or_reset(dev, gc08a8_put, sensor);
 +	if (ret)
@@ -433,7 +452,7 @@ index 87a651b..4630bfa 100755
  	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
  	if (IS_ERR(sensor->regmap))
  		return dev_err_probe(dev, PTR_ERR(sensor->regmap), "Failed to create regmap\n");
-@@ -875,10 +998,15 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -875,10 +1019,15 @@ static int gc08a8_probe(struct i2c_client *client)
  	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
  
  	ret = gc08a8_power_on(dev);
@@ -450,7 +469,7 @@ index 87a651b..4630bfa 100755
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
  	if (power_ret)
-@@ -891,29 +1019,19 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -891,29 +1040,19 @@ static int gc08a8_probe(struct i2c_client *client)
  		return ret;
  	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
  	if (ret)
@@ -484,7 +503,7 @@ index 87a651b..4630bfa 100755
  	return ret;
  }
  
-@@ -923,13 +1041,7 @@ static void gc08a8_remove(struct i2c_client *client)
+@@ -923,13 +1062,7 @@ static void gc08a8_remove(struct i2c_client *client)
  	struct gc08a8 *sensor = to_gc08a8(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -499,19 +518,20 @@ index 87a651b..4630bfa 100755
  }
  
  static int gc08a8_suspend(struct device *dev)
-@@ -942,17 +1054,19 @@ static int gc08a8_suspend(struct device *dev)
+@@ -942,17 +1075,21 @@ static int gc08a8_suspend(struct device *dev)
  	state = v4l2_subdev_lock_and_get_active_state(sd);
  	if (sensor->streaming)
  		ret = -EBUSY;
 -	else if (sensor->power_error)
 -		ret = sensor->power_error;
 -	else
--		ret = pm_runtime_force_suspend(dev);
 +	else {
-+		pm_runtime_barrier(dev);
-+		ret = READ_ONCE(sensor->power_error);
-+		if (!ret)
-+			ret = pm_runtime_force_suspend(dev);
+ 		ret = pm_runtime_force_suspend(dev);
++		if (!ret && READ_ONCE(sensor->power_error)) {
++			ret = gc08a8_power_off(dev);
++			if (ret)
++				pm_runtime_force_resume(dev);
++		}
 +	}
  	v4l2_subdev_unlock_state(state);
  	return ret;
@@ -525,10 +545,10 @@ index 87a651b..4630bfa 100755
  
  static const struct of_device_id gc08a8_of_match[] = {
 diff --git a/drivers/media/i2c/gt9764.c b/drivers/media/i2c/gt9764.c
-index 9cb8cca..d24c64b 100755
+index 9cb8cca..ee46893 100755
 --- a/drivers/media/i2c/gt9764.c
 +++ b/drivers/media/i2c/gt9764.c
-@@ -3,10 +3,12 @@
+@@ -3,10 +3,13 @@
  
  #include <linux/delay.h>
  #include <linux/i2c.h>
@@ -538,10 +558,11 @@ index 9cb8cca..d24c64b 100755
  #include <linux/property.h>
  #include <linux/regulator/consumer.h>
 +#include <linux/slab.h>
++#include <linux/workqueue.h>
  #include <media/v4l2-async.h>
  #include <media/v4l2-ctrls.h>
  #include <media/v4l2-device.h>
-@@ -19,13 +21,16 @@
+@@ -19,13 +22,18 @@
  #define GT9764_POSITION_INIT	512
  
  struct gt9764 {
@@ -551,7 +572,9 @@ index 9cb8cca..d24c64b 100755
  	struct v4l2_ctrl *focus;
  	struct regulator_bulk_data supplies[2];
 -	/* A disable error makes that reference's ownership unknowable. */
++	struct delayed_work power_off_work;
  	unsigned long supplies_enabled;
++	unsigned int power_off_retries;
 +	int supply_error;
  	int power_error;
 +	unsigned int open_count;
@@ -559,7 +582,7 @@ index 9cb8cca..d24c64b 100755
  	u32 aac_mode;
  	u32 aac_timing;
  	u32 settling_time;
-@@ -36,6 +41,32 @@ static struct gt9764 *to_gt9764(struct v4l2_subdev *sd)
+@@ -36,6 +44,32 @@ static struct gt9764 *to_gt9764(struct v4l2_subdev *sd)
  	return container_of(sd, struct gt9764, sd);
  }
  
@@ -592,7 +615,7 @@ index 9cb8cca..d24c64b 100755
  static int gt9764_set_position(struct gt9764 *lens, u16 position)
  {
  	struct i2c_client *client = v4l2_get_subdevdata(&lens->sd);
-@@ -51,24 +82,40 @@ static int gt9764_set_position(struct gt9764 *lens, u16 position)
+@@ -51,24 +85,54 @@ static int gt9764_set_position(struct gt9764 *lens, u16 position)
  static int gt9764_power_off(struct device *dev)
  {
  	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
@@ -633,18 +656,32 @@ index 9cb8cca..d24c64b 100755
 +	return error;
 +}
 +
++static void gt9764_retry_power_off(struct work_struct *work)
++{
++	struct gt9764 *lens = container_of(to_delayed_work(work), struct gt9764,
++					   power_off_work);
++
++	pm_runtime_suspend(lens->sd.dev);
++}
++
 +static int gt9764_runtime_suspend(struct device *dev)
 +{
 +	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
 +	int ret = gt9764_power_off(dev);
 +
-+	if (ret)
-+		return lens->supply_error ? -EIO : -EAGAIN;
-+	return 0;
++	if (lens->supplies_enabled) {
++		if (lens->power_off_retries &&
++		    queue_delayed_work(system_freezable_wq, &lens->power_off_work,
++				       msecs_to_jiffies(100)))
++			lens->power_off_retries--;
++		return -EAGAIN;
++	}
++	cancel_delayed_work(&lens->power_off_work);
++	return ret ? -EIO : 0;
  }
  
  static int gt9764_power_on(struct device *dev)
-@@ -86,10 +133,15 @@ static int gt9764_power_on(struct device *dev)
+@@ -86,10 +150,15 @@ static int gt9764_power_on(struct device *dev)
  		{ GT9764_AAC_TIMING, lens->aac_timing },
  	};
  	unsigned int i;
@@ -663,7 +700,7 @@ index 9cb8cca..d24c64b 100755
  	ret = regulator_enable(lens->supplies[0].consumer);
  	if (ret)
  		return ret;
-@@ -108,9 +160,10 @@ static int gt9764_power_on(struct device *dev)
+@@ -108,9 +177,10 @@ static int gt9764_power_on(struct device *dev)
  	}
  
  	fsleep(lens->settling_time);
@@ -676,7 +713,7 @@ index 9cb8cca..d24c64b 100755
  	if (!ret)
  		return 0;
  
-@@ -120,6 +173,21 @@ power_off:
+@@ -120,6 +190,23 @@ power_off:
  	return ret;
  }
  
@@ -685,8 +722,10 @@ index 9cb8cca..d24c64b 100755
 +	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
 +	int ret = gt9764_power_on(dev);
 +
-+	if (!ret)
++	if (!ret) {
++		lens->power_off_retries = 3;
 +		return 0;
++	}
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
 +	if (lens->supply_error)
 +		return -EIO;
@@ -698,7 +737,7 @@ index 9cb8cca..d24c64b 100755
  static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct gt9764 *lens = container_of(ctrl->handler, struct gt9764, ctrls);
-@@ -127,13 +195,13 @@ static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -127,13 +214,13 @@ static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
  
  	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
  		return -EINVAL;
@@ -715,7 +754,7 @@ index 9cb8cca..d24c64b 100755
  	pm_runtime_put(lens->sd.dev);
  	return ret;
  }
-@@ -148,7 +216,18 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -148,7 +235,18 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  	int ret;
  
  	mutex_lock(lens->ctrls.lock);
@@ -735,7 +774,7 @@ index 9cb8cca..d24c64b 100755
  	mutex_unlock(lens->ctrls.lock);
  	return ret;
  }
-@@ -156,10 +235,13 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -156,10 +254,13 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  {
  	struct gt9764 *lens = to_gt9764(sd);
@@ -751,7 +790,7 @@ index 9cb8cca..d24c64b 100755
  	mutex_unlock(lens->ctrls.lock);
  	return ret < 0 ? ret : 0;
  }
-@@ -167,19 +249,45 @@ static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -167,19 +268,47 @@ static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  static const struct v4l2_subdev_internal_ops gt9764_internal_ops = {
  	.open = gt9764_open,
  	.close = gt9764_close,
@@ -769,6 +808,7 @@ index 9cb8cca..d24c64b 100755
 +	mutex_lock(lens->ctrls.lock);
 +	lens->detached = true;
 +	pm_runtime_disable(dev);
++	disable_delayed_work_sync(&lens->power_off_work);
 +	while (lens->open_count) {
 +		pm_runtime_put_noidle(dev);
 +		lens->open_count--;
@@ -791,6 +831,7 @@ index 9cb8cca..d24c64b 100755
 +	lens = kzalloc_obj(*lens);
  	if (!lens)
  		return -ENOMEM;
++	INIT_DELAYED_WORK(&lens->power_off_work, gt9764_retry_power_off);
 +	kref_init(&lens->ref);
 +	ret = devm_add_action_or_reset(dev, gt9764_put, lens);
 +	if (ret)
@@ -798,7 +839,7 @@ index 9cb8cca..d24c64b 100755
  
  	ret = device_property_read_u32(dev, "giantec,aac-mode", &lens->aac_mode);
  	if (ret)
-@@ -212,29 +320,20 @@ static int gt9764_probe(struct i2c_client *client)
+@@ -212,29 +341,20 @@ static int gt9764_probe(struct i2c_client *client)
  					GT9764_POSITION_MAX, 1, GT9764_POSITION_INIT);
  	ret = lens->ctrls.error;
  	if (ret)
@@ -834,7 +875,7 @@ index 9cb8cca..d24c64b 100755
  	return ret;
  }
  
-@@ -244,11 +343,7 @@ static void gt9764_remove(struct i2c_client *client)
+@@ -244,11 +364,7 @@ static void gt9764_remove(struct i2c_client *client)
  	struct gt9764 *lens = to_gt9764(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -847,13 +888,17 @@ index 9cb8cca..d24c64b 100755
  }
  
  static int gt9764_suspend(struct device *dev)
-@@ -257,14 +352,15 @@ static int gt9764_suspend(struct device *dev)
+@@ -257,14 +373,19 @@ static int gt9764_suspend(struct device *dev)
  	int ret;
  
  	mutex_lock(lens->ctrls.lock);
 -	ret = lens->power_error ?: pm_runtime_force_suspend(dev);
-+	pm_runtime_barrier(dev);
-+	ret = READ_ONCE(lens->power_error) ?: pm_runtime_force_suspend(dev);
++	ret = pm_runtime_force_suspend(dev);
++	if (!ret && READ_ONCE(lens->power_error)) {
++		ret = gt9764_power_off(dev);
++		if (ret)
++			pm_runtime_force_resume(dev);
++	}
  	mutex_unlock(lens->ctrls.lock);
  	return ret;
  }
@@ -866,10 +911,10 @@ index 9cb8cca..d24c64b 100755
  
  static const struct of_device_id gt9764_of_match[] = {
 diff --git a/drivers/media/i2c/s5kjns.c b/drivers/media/i2c/s5kjns.c
-index 4af91db..af033e7 100755
+index 4af91db..9b0be8d 100755
 --- a/drivers/media/i2c/s5kjns.c
 +++ b/drivers/media/i2c/s5kjns.c
-@@ -5,9 +5,11 @@
+@@ -5,9 +5,12 @@
  #include <linux/delay.h>
  #include <linux/gpio/consumer.h>
  #include <linux/i2c.h>
@@ -878,10 +923,11 @@ index 4af91db..af033e7 100755
  #include <linux/pm_runtime.h>
  #include <linux/regulator/consumer.h>
 +#include <linux/slab.h>
++#include <linux/workqueue.h>
  
  #include <media/v4l2-cci.h>
  #include <media/v4l2-ctrls.h>
-@@ -27,6 +29,7 @@ static const s64 s5kjns_link_freq[] = { 672000000 };
+@@ -27,6 +30,7 @@ static const s64 s5kjns_link_freq[] = { 672000000 };
  static const char * const s5kjns_supply_names[] = { "dovdd", "dvdd", "avdd" };
  
  struct s5kjns {
@@ -889,12 +935,14 @@ index 4af91db..af033e7 100755
  	struct v4l2_subdev sd;
  	struct media_pad pad;
  	struct v4l2_ctrl_handler ctrls;
-@@ -34,11 +37,14 @@ struct s5kjns {
+@@ -34,11 +38,16 @@ struct s5kjns {
  	struct clk *xclk;
  	struct gpio_desc *reset;
  	struct regulator_bulk_data supplies[ARRAY_SIZE(s5kjns_supply_names)];
 -	/* Only references whose ownership is still known are tracked here. */
++	struct delayed_work power_off_work;
  	unsigned long supplies_enabled;
++	unsigned int power_off_retries;
  	bool clock_enabled;
 +	bool reset_asserted;
 +	int reset_error;
@@ -905,7 +953,7 @@ index 4af91db..af033e7 100755
  };
  
  static const char * const s5kjns_test_pattern_menu[] = {
-@@ -54,6 +60,33 @@ static struct s5kjns *to_s5kjns(struct v4l2_subdev *sd)
+@@ -54,6 +63,33 @@ static struct s5kjns *to_s5kjns(struct v4l2_subdev *sd)
  	return container_of(sd, struct s5kjns, sd);
  }
  
@@ -939,7 +987,7 @@ index 4af91db..af033e7 100755
  static const struct cci_reg_sequence s5kjns_reset_regs[] = {
  	{ CCI_REG16(0x6028), 0x4000 },
  	{ CCI_REG16(0x0000), 0x0001 },
-@@ -388,57 +421,113 @@ static const struct cci_reg_sequence s5kjns_4080x3072_regs[] = {
+@@ -388,57 +424,127 @@ static const struct cci_reg_sequence s5kjns_4080x3072_regs[] = {
  	{ CCI_REG16(0x6226), 0x0000 },
  };
  
@@ -1065,18 +1113,32 @@ index 4af91db..af033e7 100755
 +	return reset_ret ?: ret;
 +}
 +
++static void s5kjns_retry_power_off(struct work_struct *work)
++{
++	struct s5kjns *sensor = container_of(to_delayed_work(work), struct s5kjns,
++					    power_off_work);
++
++	pm_runtime_suspend(sensor->sd.dev);
++}
++
 +static int s5kjns_runtime_suspend(struct device *dev)
 +{
 +	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
 +	int ret = s5kjns_power_off(dev);
 +
-+	if (ret)
-+		return sensor->supply_error ? -EIO : -EAGAIN;
-+	return 0;
++	if (sensor->supplies_enabled || sensor->reset_error) {
++		if (sensor->power_off_retries &&
++		    queue_delayed_work(system_freezable_wq, &sensor->power_off_work,
++				       msecs_to_jiffies(100)))
++			sensor->power_off_retries--;
++		return -EAGAIN;
++	}
++	cancel_delayed_work(&sensor->power_off_work);
++	return ret ? -EIO : 0;
  }
  
  static int s5kjns_power_on(struct device *dev)
-@@ -446,11 +535,16 @@ static int s5kjns_power_on(struct device *dev)
+@@ -446,11 +552,16 @@ static int s5kjns_power_on(struct device *dev)
  	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
  	int i, ret;
  
@@ -1097,7 +1159,7 @@ index 4af91db..af033e7 100755
  	fsleep(1000);
  	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
  		ret = regulator_enable(sensor->supplies[i].consumer);
-@@ -460,16 +554,9 @@ static int s5kjns_power_on(struct device *dev)
+@@ -460,16 +571,9 @@ static int s5kjns_power_on(struct device *dev)
  		fsleep(1000);
  	}
  
@@ -1117,7 +1179,7 @@ index 4af91db..af033e7 100755
  
  power_off:
  	/* power_off logs and latches cleanup errors; preserve the first error. */
-@@ -477,6 +564,21 @@ power_off:
+@@ -477,6 +581,23 @@ power_off:
  	return ret;
  }
  
@@ -1126,8 +1188,10 @@ index 4af91db..af033e7 100755
 +	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
 +	int ret = s5kjns_power_on(dev);
 +
-+	if (!ret)
++	if (!ret) {
++		sensor->power_off_retries = 3;
 +		return 0;
++	}
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
 +	if (sensor->supply_error)
 +		return -EIO;
@@ -1139,7 +1203,7 @@ index 4af91db..af033e7 100755
  static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct s5kjns *sensor = container_of(ctrl->handler, struct s5kjns, ctrls);
-@@ -484,6 +586,9 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -484,6 +605,9 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  	u16 reg;
  	int ret = 0, release;
  
@@ -1149,7 +1213,7 @@ index 4af91db..af033e7 100755
  	switch (ctrl->id) {
  	case V4L2_CID_EXPOSURE:
  		reg = 0x0202;
-@@ -498,12 +603,14 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -498,12 +622,14 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  		return 0;
  	}
  
@@ -1167,7 +1231,7 @@ index 4af91db..af033e7 100755
  
  	cci_write(sensor->regmap, CCI_REG16(0x6028), 0x4000, &ret);
  	if (ctrl->id == V4L2_CID_TEST_PATTERN) {
-@@ -560,11 +667,8 @@ static int s5kjns_init_controls(struct s5kjns *sensor)
+@@ -560,11 +686,8 @@ static int s5kjns_init_controls(struct s5kjns *sensor)
  				     ARRAY_SIZE(s5kjns_test_pattern_menu) - 1,
  				     0, 0, s5kjns_test_pattern_menu);
  	v4l2_ctrl_new_fwnode_properties(hdl, &s5kjns_ctrl_ops, &props);
@@ -1181,7 +1245,7 @@ index 4af91db..af033e7 100755
  	sensor->sd.ctrl_handler = hdl;
  	return 0;
  }
-@@ -658,20 +762,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -658,20 +781,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  	int ret = 0, power_ret;
  
  	state = v4l2_subdev_lock_and_get_active_state(sd);
@@ -1206,7 +1270,7 @@ index 4af91db..af033e7 100755
  		power_ret = pm_runtime_put_sync(sd->dev);
  		if (power_ret < 0) {
  			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
-@@ -685,10 +787,16 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -685,10 +806,16 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  	ret = pm_runtime_resume_and_get(sd->dev);
  	if (ret < 0)
  		goto unlock;
@@ -1224,7 +1288,7 @@ index 4af91db..af033e7 100755
  	fsleep(13000);
  	cci_multi_reg_write(sensor->regmap, s5kjns_init_regs,
  			    ARRAY_SIZE(s5kjns_init_regs), &ret);
-@@ -698,16 +806,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -698,16 +825,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  		ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
  	cci_write(sensor->regmap, CCI_REG16(0x6028), 0x4000, &ret);
  	cci_write(sensor->regmap, CCI_REG16(0x0100), 0x0100, &ret);
@@ -1253,7 +1317,7 @@ index 4af91db..af033e7 100755
  unlock:
  	v4l2_subdev_unlock_state(state);
  	return ret;
-@@ -732,6 +842,8 @@ static const struct v4l2_subdev_ops s5kjns_ops = {
+@@ -732,6 +861,8 @@ static const struct v4l2_subdev_ops s5kjns_ops = {
  
  static const struct v4l2_subdev_internal_ops s5kjns_internal_ops = {
  	.init_state = s5kjns_init_state,
@@ -1262,7 +1326,7 @@ index 4af91db..af033e7 100755
  };
  
  static int s5kjns_check_endpoint(struct device *dev)
-@@ -762,6 +874,26 @@ free:
+@@ -762,6 +893,27 @@ free:
  	return ret;
  }
  
@@ -1274,6 +1338,7 @@ index 4af91db..af033e7 100755
 +	mutex_lock(sensor->ctrls.lock);
 +	sensor->detached = true;
 +	pm_runtime_disable(dev);
++	disable_delayed_work_sync(&sensor->power_off_work);
 +	if (sensor->streaming) {
 +		pm_runtime_put_noidle(dev);
 +		sensor->streaming = false;
@@ -1289,7 +1354,7 @@ index 4af91db..af033e7 100755
  static int s5kjns_probe(struct i2c_client *client)
  {
  	struct device *dev = &client->dev;
-@@ -772,9 +904,13 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -772,9 +924,14 @@ static int s5kjns_probe(struct i2c_client *client)
  	ret = s5kjns_check_endpoint(dev);
  	if (ret)
  		return dev_err_probe(dev, ret, "Unsupported CSI-2 endpoint\n");
@@ -1297,6 +1362,7 @@ index 4af91db..af033e7 100755
 +	sensor = kzalloc_obj(*sensor);
  	if (!sensor)
  		return -ENOMEM;
++	INIT_DELAYED_WORK(&sensor->power_off_work, s5kjns_retry_power_off);
 +	kref_init(&sensor->ref);
 +	ret = devm_add_action_or_reset(dev, s5kjns_put, sensor);
 +	if (ret)
@@ -1304,7 +1370,7 @@ index 4af91db..af033e7 100755
  	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
  	if (IS_ERR(sensor->regmap))
  		return dev_err_probe(dev, PTR_ERR(sensor->regmap), "Failed to create regmap\n");
-@@ -799,10 +935,15 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -799,10 +956,15 @@ static int s5kjns_probe(struct i2c_client *client)
  	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
  
  	ret = s5kjns_power_on(dev);
@@ -1321,7 +1387,7 @@ index 4af91db..af033e7 100755
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
  	if (power_ret)
-@@ -815,29 +956,19 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -815,29 +977,19 @@ static int s5kjns_probe(struct i2c_client *client)
  		return ret;
  	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
  	if (ret)
@@ -1355,7 +1421,7 @@ index 4af91db..af033e7 100755
  	return ret;
  }
  
-@@ -847,13 +978,7 @@ static void s5kjns_remove(struct i2c_client *client)
+@@ -847,13 +999,7 @@ static void s5kjns_remove(struct i2c_client *client)
  	struct s5kjns *sensor = to_s5kjns(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -1370,19 +1436,20 @@ index 4af91db..af033e7 100755
  }
  
  static int s5kjns_suspend(struct device *dev)
-@@ -866,17 +991,19 @@ static int s5kjns_suspend(struct device *dev)
+@@ -866,17 +1012,21 @@ static int s5kjns_suspend(struct device *dev)
  	state = v4l2_subdev_lock_and_get_active_state(sd);
  	if (sensor->streaming)
  		ret = -EBUSY;
 -	else if (sensor->power_error)
 -		ret = sensor->power_error;
 -	else
--		ret = pm_runtime_force_suspend(dev);
 +	else {
-+		pm_runtime_barrier(dev);
-+		ret = READ_ONCE(sensor->power_error);
-+		if (!ret)
-+			ret = pm_runtime_force_suspend(dev);
+ 		ret = pm_runtime_force_suspend(dev);
++		if (!ret && READ_ONCE(sensor->power_error)) {
++			ret = s5kjns_power_off(dev);
++			if (ret)
++				pm_runtime_force_resume(dev);
++		}
 +	}
  	v4l2_subdev_unlock_state(state);
  	return ret;

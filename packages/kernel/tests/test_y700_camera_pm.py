@@ -425,12 +425,10 @@ int main(void)
 	hw_enable_error = -ETIMEDOUT;
 	off_status = 0;
 	assert(gdsc_enable(&s.pd) == -ETIMEDOUT);
-	assert(s.icc_votes == 3 && calls == 2 && error_count == 1);
-	assert(!s.icc_retry_work.pending);
-	hw_enable_error = 0;
+	assert(s.icc_votes == 3 && calls == 2 && error_count == 1 && s.icc_retry_work.pending);
 	off_status = 1;
-	assert(!gdsc_disable(&s.pd));
-	assert(s.icc_votes == 0);
+	run_pending_retry(&s);
+	assert(s.icc_votes == 0 && hw_calls == 1 && !s.icc_retry_work.pending);
 	puts("PASS failed HW enable retains votes until a later confirmed OFF");
 
 	s = fresh(2);
@@ -446,6 +444,21 @@ int main(void)
 	s.icc_retry_work.work.run(&s.icc_retry_work.work);
 	assert(s.icc_votes == 3 && calls == before);
 	puts("PASS an ON read keeps votes, including across re-enable and dequeued work");
+
+	s = fresh(2);
+	assert(!gdsc_icc_get(&dev, &s));
+	assert(!gdsc_enable(&s.pd));
+	off_status = -EIO;
+	assert(!gdsc_disable(&s.pd) && s.icc_retry_work.pending);
+	hw_enable_error = -ETIMEDOUT;
+	assert(gdsc_enable(&s.pd) == -ETIMEDOUT && s.icc_retry_work.pending);
+	off_status = 0;
+	run_pending_retry(&s);
+	assert(s.icc_votes == 3 && s.icc_retry_work.pending);
+	off_status = 1;
+	run_pending_retry(&s);
+	assert(!s.icc_votes && !s.icc_retry_work.pending && hw_calls == 3);
+	puts("PASS failed HW re-enable preserves pending OFF recovery");
 
 	s = fresh(2);
 	assert(!gdsc_icc_get(&dev, &s));
@@ -1562,12 +1575,14 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             "static void gt9764_devnode_put(",
             "static int gt9764_set_position(",
             "static int gt9764_power_off(",
+            "static void gt9764_retry_power_off(",
             "static int gt9764_runtime_suspend(",
             "static int gt9764_power_on(",
             "static int gt9764_runtime_resume(",
             "static int gt9764_open(",
             "static int gt9764_close(",
             "static void gt9764_stop_pm(",
+            "static int gt9764_suspend(",
         )
     else:
         defines = (
@@ -1575,6 +1590,8 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             f"#define SENSOR_IS_REAR {int(name == 's5kjns')}\n"
             f"#define SENSOR_RESUME {name}_runtime_resume\n"
             f"#define SENSOR_SUSPEND {name}_runtime_suspend\n"
+            f"#define SENSOR_POWER_OFF_WORK {name}_retry_power_off\n"
+            f"#define SENSOR_SYSTEM_SUSPEND {name}_suspend\n"
             f"#define SENSOR_STREAM {name}_s_stream\n"
         )
         supply_start = source.index(f"static const char * const {name}_supply_names[]")
@@ -1586,10 +1603,12 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             f"static int {name}_restore_reset(",
             f"static int {name}_disable_supplies(",
             f"static int {name}_power_off(",
+            f"static void {name}_retry_power_off(",
             f"static int {name}_runtime_suspend(",
             f"static int {name}_power_on(",
             f"static int {name}_runtime_resume(",
             f"static int {name}_s_stream(",
+            f"static int {name}_suspend(",
         )
     functions = "\n".join((
         supplies,

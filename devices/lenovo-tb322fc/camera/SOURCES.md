@@ -19,8 +19,8 @@ error handling can be reviewed independently.
 | 0250 | Shared-build integration: select the provider-owned ICC paths only on Elden; preserve CAMCC probe and the optional ICC binding contract on other SM8750 boards. |
 | 0251 | Local review fixes for WL2868C control-supply sequencing and verified output writes. |
 | 0252 | Local regulator API for reporting consumer reference release, checking a shared output after a retained disable failure, and preserving unrecoverable faults across consumer rebind. |
-| 0253 | Local Y700 fixes for runtime PM retries, sensor reset and sub-device detach. Runtime PM can retry a retained reference before permitting further I/O. |
-| 0254 | Local bounded retry for inconclusive power-off status and ICC drops, with a provider PM hold during deferred work. |
+| 0253 | Local Y700 fixes for runtime PM retries, sensor reset and sub-device detach. Bounded idle retries can release retained references even when another supply has a fatal error. |
+| 0254 | Local bounded retry for inconclusive power-off status and ICC drops, including after failed re-enable, with a provider PM hold during deferred work. |
 
 Pinned sources:
 

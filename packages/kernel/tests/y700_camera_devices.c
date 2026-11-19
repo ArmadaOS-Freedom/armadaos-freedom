@@ -55,6 +55,13 @@ struct clk {};
 struct gpio_desc {};
 struct regmap {};
 struct cci_reg_sequence { unsigned int reg; };
+struct work_struct { void (*run)(struct work_struct *work); };
+struct delayed_work { struct work_struct work; bool pending, disabled; };
+
+#define to_delayed_work(item) container_of(item, struct delayed_work, work)
+#define INIT_DELAYED_WORK(item, callback) ((item)->work.run = (callback))
+#define msecs_to_jiffies(delay) (delay)
+#define system_freezable_wq NULL
 
 static struct device dev;
 static struct i2c_client client;
@@ -72,7 +79,7 @@ static int (*runtime_suspend)(struct device *);
 static bool active, disabled, reset_level, clock_on, rear;
 static unsigned int elapsed, reset_released, cci_ready, cci_calls, bus_writes;
 static unsigned int clock_started, clock_enabled_at, fail_bus_write, fail_asserts, freed_ctrls;
-static struct regulator *enable_failure, *disable_failure;
+static struct regulator *enable_failure, *disable_failure, *retained_failure;
 static bool fail_after_release;
 
 static void fsleep(unsigned int delay) { elapsed += delay; }
@@ -130,7 +137,7 @@ static void regulator_unlock_dependent(struct regulator_dev *rdev,
 static int _regulator_disable(struct regulator *regulator)
 {
 	assert(regulator->enable_count == 1);
-	if (regulator == disable_failure && !fail_after_release)
+	if (regulator == retained_failure || (regulator == disable_failure && !fail_after_release))
 		return -EIO;
 	regulator->enable_count--;
 	return regulator == disable_failure ? -EAGAIN : 0;
@@ -193,13 +200,18 @@ static int pm_runtime_resume_and_get(struct device *pdev)
 }
 
 static void pm_runtime_put_noidle(struct device *pdev) { assert(usage-- > 0); }
-static int pm_runtime_put_sync(struct device *pdev)
+
+static int pm_runtime_suspend(struct device *pdev)
 {
 	int ret;
-	assert(!disabled);
-	pm_runtime_put_noidle(pdev);
+	if (disabled)
+		return -EACCES;
+	if (pm_status_error)
+		return -EINVAL;
 	if (usage)
-		return 0;
+		return -EAGAIN;
+	if (!active)
+		return 1;
 	ret = runtime_suspend(pdev);
 	if (ret && ret != -EBUSY && ret != -EAGAIN)
 		pm_status_error = ret;
@@ -207,11 +219,63 @@ static int pm_runtime_put_sync(struct device *pdev)
 	return ret;
 }
 
+static int pm_runtime_put_sync(struct device *pdev)
+{
+	assert(!disabled);
+	pm_runtime_put_noidle(pdev);
+	return usage ? 0 : pm_runtime_suspend(pdev);
+}
+
 static void pm_runtime_disable(struct device *pdev) { disabled = true; }
 static void pm_runtime_set_suspended(struct device *pdev)
 {
 	assert(disabled);
 	active = false;
+}
+
+static int pm_runtime_force_suspend(struct device *pdev)
+{
+	int ret;
+
+	assert(!disabled && !usage);
+	disabled = true;
+	if (!active)
+		return 0;
+	ret = runtime_suspend(pdev);
+	disabled = ret == 0;
+	active = ret != 0;
+	return ret;
+}
+
+static int pm_runtime_force_resume(struct device *pdev)
+{
+	assert(disabled && !active && !usage);
+	disabled = false;
+	return 0;
+}
+
+static bool queue_delayed_work(void *queue, struct delayed_work *work, unsigned int delay)
+{
+	assert(delay == 100 && work->work.run);
+	if (work->disabled || work->pending)
+		return false;
+	work->pending = true;
+	return true;
+}
+
+static void cancel_delayed_work(struct delayed_work *work) { work->pending = false; }
+
+static void disable_delayed_work_sync(struct delayed_work *work)
+{
+	work->disabled = true;
+	cancel_delayed_work(work);
+}
+
+static void run_power_off_work(struct delayed_work *work)
+{
+	assert(work->pending && !work->disabled);
+	work->pending = false;
+	work->work.run(&work->work);
 }
 
 static int i2c_smbus_write_byte_data(struct i2c_client *bus, u8 reg, u8 value)
@@ -274,7 +338,7 @@ static void fresh(struct v4l2_subdev *sd, struct regulator_bulk_data *bulk, unsi
 	reset_released = clock_enabled_at = fail_bus_write = fail_asserts = freed_ctrls = 0;
 	active = disabled = clock_on = fail_after_release = false;
 	reset_level = true;
-	enable_failure = disable_failure = NULL;
+	enable_failure = disable_failure = retained_failure = NULL;
 	for (unsigned int index = 0; index < count; index++) {
 		rails[index] = (struct regulator_dev){ .desc = &test_regulator, .status = 1 };
 		supplies[index] = (struct regulator){ .rdev = &rails[index] };
@@ -290,6 +354,7 @@ static struct gt9764 *fresh_lens(void)
 	lens->ref.count = 1;
 	lens->ctrls.lock = &device_lock;
 	lens->focus = &focus;
+	INIT_DELAYED_WORK(&lens->power_off_work, gt9764_retry_power_off);
 	fresh(&lens->sd, lens->supplies, ARRAY_SIZE(lens->supplies));
 	runtime_resume = gt9764_runtime_resume;
 	runtime_suspend = gt9764_runtime_suspend;
@@ -330,11 +395,38 @@ int main(void)
 
 	lens = fresh_lens();
 	assert(!gt9764_open(&lens->sd, NULL));
+	retained_failure = &supplies[1];
+	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
+	assert(lens->power_off_work.pending);
+	retained_failure = NULL;
+	run_power_off_work(&lens->power_off_work);
+	assert(!lens->power_off_work.pending && !lens->supplies_enabled && !lens->power_error && !active);
+	assert(!gt9764_open(&lens->sd, NULL));
+	lens->power_off_work.work.run(&lens->power_off_work.work);
+	assert(active && usage == 1 && lens->supplies_enabled == (BIT(0) | BIT(1)));
+	assert(!gt9764_close(&lens->sd, NULL));
+	gt9764_put(lens);
+	puts("PASS idle work clears a retained lens vote and cannot suspend an open lens");
+
+	lens = fresh_lens();
+	assert(!gt9764_open(&lens->sd, NULL));
+	disable_failure = &supplies[1];
+	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
+	disable_failure = NULL;
+	assert(!gt9764_suspend(&dev) && disabled && !active && !lens->power_error);
+	assert(!lens->power_off_work.pending);
+	assert(!pm_runtime_force_resume(&dev));
+	gt9764_put(lens);
+	puts("PASS system suspend retries a retained lens vote before entering sleep");
+
+	lens = fresh_lens();
+	assert(!gt9764_open(&lens->sd, NULL));
 	disable_failure = &supplies[1];
 	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
 	disable_failure = NULL;
 	gt9764_stop_pm(lens);
 	assert(!lens->supplies_enabled && !supplies[1].enable_count && !rails[1].disable_failures);
+	assert(lens->power_off_work.disabled && !lens->power_off_work.pending);
 	gt9764_put(lens);
 	puts("PASS detach retries a disable that retained the consumer reference");
 
@@ -351,6 +443,21 @@ int main(void)
 	gt9764_stop_pm(lens);
 	gt9764_put(lens);
 	puts("PASS post-release fault rejects an active PM get without a double disable");
+
+	lens = fresh_lens();
+	assert(!gt9764_open(&lens->sd, NULL));
+	disable_failure = &supplies[1];
+	fail_after_release = true;
+	retained_failure = &supplies[0];
+	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
+	assert(lens->supply_error && lens->supplies_enabled == BIT(0) && !pm_status_error);
+	retained_failure = NULL;
+	run_power_off_work(&lens->power_off_work);
+	assert(!lens->supplies_enabled && !lens->power_off_work.pending && pm_status_error == -EIO);
+	assert(gt9764_open(&lens->sd, NULL) == -EINVAL);
+	gt9764_stop_pm(lens);
+	gt9764_put(lens);
+	puts("PASS a fatal lens error still permits cleanup of another retained vote");
 
 	lens = fresh_lens();
 	gt9764_devnode_get(&lens->sd);
@@ -373,6 +480,7 @@ static void fresh_sensor(struct SENSOR *sensor)
 {
 	*sensor = (struct SENSOR){ .xclk = &clock, .reset = &reset, .regmap = &map };
 	sensor->ctrls.lock = &device_lock;
+	INIT_DELAYED_WORK(&sensor->power_off_work, SENSOR_POWER_OFF_WORK);
 	fresh(&sensor->sd, sensor->supplies, ARRAY_SIZE(sensor->supplies));
 	runtime_resume = SENSOR_RESUME;
 	runtime_suspend = SENSOR_SUSPEND;
@@ -434,6 +542,31 @@ int main(void)
 	puts("PASS a post-release fault blocks reuse without a double disable");
 
 	fresh_sensor(&sensor);
+	assert(!pm_runtime_resume_and_get(&dev));
+	retained_failure = &supplies[2];
+	assert(pm_runtime_put_sync(&dev) == -EAGAIN && active && !usage);
+	for (unsigned int attempt = 0; attempt < 3; attempt++)
+		run_power_off_work(&sensor.power_off_work);
+	assert(!sensor.power_off_work.pending && sensor.supplies_enabled == BIT(2));
+	assert(!pm_status_error && !cci_calls);
+	retained_failure = NULL;
+	assert(!pm_runtime_suspend(&dev) && !sensor.supplies_enabled);
+	puts("PASS persistent runtime suspend faults have a bounded retry budget");
+
+	fresh_sensor(&sensor);
+	assert(!pm_runtime_resume_and_get(&dev));
+	disable_failure = &supplies[2];
+	fail_after_release = true;
+	retained_failure = &supplies[1];
+	assert(pm_runtime_put_sync(&dev) == -EAGAIN && !pm_status_error);
+	assert(sensor.supplies_enabled == BIT(1) && sensor.supply_error);
+	retained_failure = NULL;
+	run_power_off_work(&sensor.power_off_work);
+	assert(!sensor.supplies_enabled && pm_status_error == -EIO);
+	assert(SENSOR_STREAM(&sensor.sd, 1) == -EINVAL && !cci_calls);
+	puts("PASS a fatal sensor error still permits cleanup of another retained vote");
+
+	fresh_sensor(&sensor);
 	enable_failure = &supplies[1];
 	disable_failure = &supplies[0];
 	assert(SENSOR_STREAM(&sensor.sd, 1) == -EAGAIN && !usage && !active);
@@ -442,6 +575,16 @@ int main(void)
 	assert(!SENSOR_STREAM(&sensor.sd, 1) && !SENSOR_STREAM(&sensor.sd, 0));
 	assert(!sensor.supplies_enabled && !usage);
 	puts("PASS partial resume rollback retries the retained disable before any new enable");
+
+	fresh_sensor(&sensor);
+	enable_failure = &supplies[1];
+	retained_failure = &supplies[0];
+	assert(SENSOR_STREAM(&sensor.sd, 1) == -EAGAIN && !usage && !active);
+	assert(SENSOR_SYSTEM_SUSPEND(&dev) == -EIO && !disabled);
+	retained_failure = NULL;
+	assert(!SENSOR_SYSTEM_SUSPEND(&dev) && disabled && !sensor.supplies_enabled);
+	assert(!pm_runtime_force_resume(&dev));
+	puts("PASS system suspend checks residual votes even from a failed runtime resume");
 	return 0;
 }
 #endif

@@ -1245,11 +1245,11 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0253-media-fix-y700-camera-power-and-subdev-lifetime.patch`
   source: armada
   upstream: local
-  notes: Allows runtime PM to retry recoverable power failures, reapplies reset sequencing before stream retry, balances PM and supply references on detach, and preserves subdevice storage until the last node user releases it. Removes the media interface and its links under the media graph mutex.
+  notes: Schedules bounded runtime-suspend retries for retained supplies and reset failures. Balances PM and supply references on detach, reapplies reset sequencing before stream retry, and preserves subdevice storage until the last node user releases it. Removes the media interface and its links under the media graph mutex.
 - `patches/0254-clk-qcom-retry-idle-gdsc-interconnect-votes.patch`
   source: armada
   upstream: local
-  notes: Rechecks an inconclusive OFF status after successful power-off and retries ICC vote drops with bounded delayed work. Holds the provider runtime PM reference in the worker, releases votes after confirming OFF, and drains work before provider teardown.
+  notes: Rechecks an inconclusive OFF status after successful power-off or failed power-on. Holds the provider runtime PM reference in the retry worker, releases votes after confirming OFF, and drains work before provider teardown.
 - `dts/sm8750-lenovo-elden-camera-bus.patch`
   source: armada
   upstream: local
