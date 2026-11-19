@@ -82,8 +82,8 @@ jobs:
             if [ "${remote_sha}" = "${commit_sha}" ]; then
               echo "::notice::分支 ${branch} 已存在且与候选一致，补建 PR。"
             else
-              changed="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${branch}" --jq '.files[].filename')"
-              if [ "${changed}" != "packages/steam-bootstrap/BASE.env"$'\n'"packages/steam-bootstrap/manifests/${VERSION}" ]; then
+              changed="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${branch}" --jq '.files[].filename' | sort)"
+              if [ "${changed}" != "packages/steam-bootstrap/BASE.env" ] && [ "${changed}" != "packages/steam-bootstrap/BASE.env"$'\n'"packages/steam-bootstrap/manifests/${VERSION}" ]; then
                 echo "::error::分支 ${branch} 已存在且与候选不符（只允许改 BASE.env 与 manifests/${VERSION}），请人工处理。"
                 exit 1
               fi
