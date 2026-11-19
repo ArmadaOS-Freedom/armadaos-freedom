@@ -217,3 +217,44 @@ artifact from `44477168804` is based on source `585f39ec`, not this audio
 candidate. Neither artifact is suitable for deploying PR head `cfb500dc`.
 The device remains unchanged on `7.2.6-y700-camera2`; the new audio kernel has
 not been installed or booted, and Qualcomm A/B slots have not been modified.
+
+## 2026-11-20 rebased candidate kernel build
+
+The PR head is `8f65e1289b76df5671ca4643ad3ba52da2b25aa0` on top of upstream
+`1197723`. The first ad-hoc compile attempt produced a generic defconfig with
+MSM and Qualcomm AudioReach disabled; it was stopped before being treated as a
+candidate. The existing patched source tree was retained, and the final build
+regenerated configuration with the repository's `arm64 defconfig` plus
+`packages/kernel/config/armada-kernel.config.overrides`. The resulting config
+has `CONFIG_DRM_MSM=y`, `CONFIG_SND_SOC_QCOM=m`,
+`CONFIG_SND_SOC_QDSP6=m`, `CONFIG_SND_SOC_QDSP6_APM=m`, and
+`CONFIG_SND_SOC_AW88461=m`; its SHA-256 is
+`a639aa4e036cae271e51127d734d4e012292ebdb7a69646d5a6599a5e72a243a`.
+
+Using that configuration, `packages/kernel/scripts/build-kernel.sh` completed
+with 321 kernel patches applied and no patch failures. Kernel host checks
+passed, including DPU rotation (135 cases), DPU performance (25 cases), SSPP
+format (38 cases), camera power-management checks and 79 AudioReach lifecycle
+checks against the candidate C functions. The full AArch64 `Image`, DTBs, all
+1,602 in-tree modules, and the existing AW882xx and ALS bridge modules built
+and staged successfully. The build ID is
+`198a09bae6b13f4e0859fd713590c433a2d88b9e`; the Image SHA-256 is
+`661f392d8f28ec838a22d1f2c2c53ba5d2c62835f1a7968cd34ba09ea5b9b306`.
+
+The compressed kernel package is
+`D:\AIWORK\y700-audio-candidate-20261120\armada-kernel-7.2.6.tar.zst`,
+SHA-256 `968dd27b34abb992e8aba6b67b4a21e473654661a3641f28331398f28d4709d2`.
+It contains `sm8750-lenovo-elden.dtb` (model `Lenovo Legion Y700 Gen4`,
+compatible `lenovo,elden`) and the built `snd-q6apm.ko`, `q6apm-dai.ko`, and
+`q6apm-lpass-dais.ko` modules. This is a generic kernel tarball, not the
+model-specific signed EDL package or signed update descriptor. It is suitable
+for build review but is not a direct flash/install payload. The tablet remains
+on `7.2.6-y700-camera2`; this candidate has not been installed or booted, and
+Qualcomm A/B firmware slots remain unchanged.
+
+At the time of this record, PR #159 still had no submitted human review and
+its container-image workflow `44588358207` was still building packages. The
+unit, kernel host-source, and other completed checks passed. The existing
+generic disk artifact is still from the earlier baseline and is not this audio
+candidate. The build log is retained at
+`D:\AIWORK\y700-audio-kernel-build-20261120-final.log`.
