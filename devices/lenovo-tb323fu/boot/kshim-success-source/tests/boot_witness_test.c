@@ -873,8 +873,98 @@ static void test_export_source(void)
     assert(fdt_getprop(buf, node, "armada,boot-lock", &len) == NULL);
 }
 
+static void test_bootconfig_key_and_node_limits(void)
+{
+    char params[4096];
+    char key[264];
+    int source = -1;
+    size_t off;
+    int i;
+
+    /* Baseline: the valid slot line parses on its own. */
+    assert(bc_slot("bootconfig", "androidboot.slot_suffix=_a\n", &BC_OK,
+                   &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* 255-char unrelated flat key followed by the real slot. */
+    memset(key, 'k', sizeof(key));
+    key[0] = 'x';
+    key[255] = '\0';
+    memset(params, 0, sizeof(params));
+    off = 0;
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "%s", key);
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "=v\n");
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.slot_suffix=_a\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* 256-char unrelated flat key is one over the limit: whole op rejected
+     * even though the real slot line is still present. */
+    memset(key, 'k', sizeof(key));
+    key[0] = 'x';
+    key[256] = '\0';
+    memset(params, 0, sizeof(params));
+    off = 0;
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "%s", key);
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "=v\n");
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.slot_suffix=_a\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == -1);
+
+    /* 15 components along one path within the limit (plus leaf = 16). */
+    memset(params, 0, sizeof(params));
+    off = 0;
+    for (i = 0; i < 15; i++)
+        off += (size_t)snprintf(params + off, sizeof(params) - off, "c%d.",
+                                i);
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "leaf=v\n");
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.slot_suffix=_a\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* 16 components (plus leaf = 17) is one over the limit: whole op rejected
+     * with the valid slot line present. */
+    memset(params, 0, sizeof(params));
+    off = 0;
+    for (i = 0; i < 16; i++)
+        off += (size_t)snprintf(params + off, sizeof(params) - off, "c%d.",
+                                i);
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "leaf=v\n");
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.slot_suffix=_a\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == -1);
+
+    /* Exactly 1024 nodes: 509 flat k%d=v nodes, plus slot and hw.board
+     * sharing one androidboot component, is within the node budget. */
+    memset(params, 0, sizeof(params));
+    off = 0;
+    for (i = 0; i < 509; i++)
+        off += (size_t)snprintf(params + off, sizeof(params) - off, "k%d=v\n",
+                                i);
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.slot_suffix=_a\n");
+    off += (size_t)snprintf(params + off, sizeof(params) - off,
+                            "androidboot.hw.board=x\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == 0);
+    assert(source == KSHIM_BOOT_EVIDENCE_BOOTCONFIG);
+
+    /* The extra=v subtree adds 2 nodes, pushing it over 1024: whole op
+     * rejected. */
+    off += (size_t)snprintf(params + off, sizeof(params) - off, "extra=v\n");
+    assert(off < sizeof(params));
+    assert(bc_slot("bootconfig", params, &BC_OK, &source) == -1);
+}
+
 int main(void)
 {
+    test_bootconfig_key_and_node_limits();
     test_read_valid_positions_and_whitespace();
     test_read_missing_and_structural_errors();
     test_read_oversize_bootargs();

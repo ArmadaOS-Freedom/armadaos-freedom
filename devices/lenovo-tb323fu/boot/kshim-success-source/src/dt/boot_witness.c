@@ -16,8 +16,12 @@
 #define BOOT_WITNESS_INITRD_MAX (UINT64_C(1) << 30)
 /* Longest normalized "key=value" token examined for a witness key. */
 #define BOOT_WITNESS_TOKEN_MAX 128U
-/* Upper bound on distinct accepted assignment lines tracked per source. */
-#define BOOT_WITNESS_XBC_NODE_MAX 1024
+/* Bounds for the strict flat grammar: key length, dot-separated
+ * components per key, and total trie nodes (components + one value per
+ * accepted assignment). */
+#define BOOT_WITNESS_KEY_MAX_CHARS 255U
+#define BOOT_WITNESS_KEY_MAX_COMPONENTS 16U
+#define BOOT_WITNESS_XBC_NODE_MAX 1024U
 /* Compact view of one accepted assignment line: byte offsets into text. */
 struct boot_witness_bc_view {
     uint16_t key_off;
@@ -486,20 +490,58 @@ static int boot_witness_bc_printable(char c)
     return (u >= 0x20u && u <= 0x7eu) || boot_witness_is_space(c);
 }
 
-/* Reject leading, trailing, or consecutive '.' in a bare flat key. */
+/* Reject leading, trailing, or consecutive '.' in a bare flat key, and
+ * enforce bootconfig XBC_KEYLEN_MAX (including NUL) and XBC_DEPTH_MAX. */
 static int boot_witness_bc_key_ok(const char *key, size_t key_len)
 {
     size_t i;
+    size_t comps = 1;
 
-    if (key_len == 0 || key[0] == '.' || key[key_len - 1] == '.') {
+    if (key_len == 0 || key_len > BOOT_WITNESS_KEY_MAX_CHARS || key[0] == '.' ||
+        key[key_len - 1] == '.') {
         return 0;
     }
     for (i = 1; i < key_len; i++) {
-        if (key[i] == '.' && key[i - 1] == '.') {
-            return 0;
+        if (key[i] == '.') {
+            if (key[i - 1] == '.') {
+                return 0;
+            }
+            comps++;
+            if (comps > BOOT_WITNESS_KEY_MAX_COMPONENTS) {
+                return 0;
+            }
         }
     }
     return 1;
+}
+
+/* Longest common whole-component prefix of two keys, in component count.
+ * A component is delimited by '.' or the end of a key. */
+static size_t boot_witness_bc_common_comps(const char *a, size_t alen,
+                                           const char *b, size_t blen)
+{
+    size_t i = 0;
+    size_t j = 0;
+    size_t n = 0;
+
+    while (i < alen && j < blen) {
+        size_t ae = i;
+        size_t be = j;
+
+        while (ae < alen && a[ae] != '.') {
+            ae++;
+        }
+        while (be < blen && b[be] != '.') {
+            be++;
+        }
+        if (ae - i != be - j || memcmp(a + i, b + j, ae - i) != 0) {
+            break;
+        }
+        n++;
+        i = ae + 1;
+        j = be + 1;
+    }
+    return n;
 }
 
 /*
@@ -600,7 +642,8 @@ static int boot_witness_bc_line(const char *text, size_t len,
  * so no evidence is used. An exact duplicate ordinary assignment of any key
  * likewise rejects the source before any evidence is emitted. A second pass
  * dispatches only the recorded lines matching keys. Storage is a fixed
- * stack array bounded by XBC_NODE_MAX; overflow is an explicit rejection.
+ * stack array bounded by XBC_NODE_MAX views; a total trie node count over
+ * BOOT_WITNESS_XBC_NODE_MAX is an explicit rejection.
  */
 static void boot_witness_for_each_bootconfig(const char *text, size_t len,
                                              const char *const *keys,
@@ -609,6 +652,7 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
 {
     struct boot_witness_bc_view views[BOOT_WITNESS_XBC_NODE_MAX];
     size_t count = 0;
+    size_t nodes = 0;
     size_t pos = 0;
     size_t i;
     size_t k;
@@ -650,15 +694,30 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
      * for keys this reader ignores. Exact comparison; the views avoid
      * re-parsing prior lines. */
     for (i = 0; i < count; i++) {
-        size_t j;
+        size_t j, comps = 1, shared = 0, klen = views[i].key_len;
+        const char *kp = text + views[i].key_off;
 
-        for (j = i + 1; j < count; j++) {
-            if (views[i].key_len == views[j].key_len &&
-                memcmp(text + views[i].key_off, text + views[j].key_off,
-                       views[i].key_len) == 0) {
+        for (j = 0; j < klen; j++)
+            if (kp[j] == '.')
+                comps++;
+
+        for (j = 0; j < i; j++) {
+            size_t s;
+
+            if (views[j].key_len == klen &&
+                memcmp(text + views[j].key_off, kp, klen) == 0) {
                 fn(ctx, keys[0], strlen(keys[0]));
                 return;
             }
+            s = boot_witness_bc_common_comps(text + views[j].key_off,
+                                             views[j].key_len, kp, klen);
+            if (s > shared)
+                shared = s;
+        }
+        nodes += comps - shared + 1;
+        if (nodes > BOOT_WITNESS_XBC_NODE_MAX) {
+            fn(ctx, keys[0], strlen(keys[0]));
+            return;
         }
     }
 
