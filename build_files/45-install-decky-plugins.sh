@@ -30,15 +30,22 @@ decky_release_json="${decky_tmp_dir}/release.json"
 decky_loader_tmp="${decky_tmp_dir}/PluginLoader-arm64"
 decky_service_tmp="${decky_tmp_dir}/plugin_loader.service"
 
+decky_pinned_tag="$(tr -d '\r\n' < /ctx/build_files/decky-preview-version)"
+if [[ ! "${decky_pinned_tag}" =~ ^v[A-Za-z0-9._+-]+$ ]]; then
+    echo "Invalid pinned Decky tag: ${decky_pinned_tag}" >&2
+    exit 1
+fi
+
 if [[ -e /run/secrets/decky_releases ]]; then
     cp /run/secrets/decky_releases "${decky_releases_json}"
 else
     curl --retry 12 --retry-delay 10 --proto '=https' --proto-redir '=https' -fsSL \
         -o "${decky_releases_json}" \
-        'https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
+        "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/tags/${decky_pinned_tag}"
+    jq '[(.)]' "${decky_releases_json}" >"${decky_releases_json}.wrapped"
+    mv "${decky_releases_json}.wrapped" "${decky_releases_json}"
 fi
 
-decky_pinned_tag="$(tr -d '\r\n' < /ctx/build_files/decky-preview-version)"
 PYTHONPATH=/usr/lib/armada python3 - "${decky_releases_json}" "${decky_release_json}" "${decky_pinned_tag}" <<'PY'
 from dataclasses import asdict
 import json

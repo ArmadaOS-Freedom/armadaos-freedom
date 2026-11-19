@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Refresh the pinned Decky Loader ARM64 preview tag from GitHub releases JSON.
 
-Reads the current pin, selects the newest eligible preview release, compares it
-against the currently pinned release, and rewrites the pin only when the new
-release advances (newer published_at, or equal date with larger release id).
-Prints the resulting tag on stdout only when the pin advances; otherwise the
-script is a strict no-op that prints nothing.
+Reads the current pin, selects the newest eligible preview release from the
+release list, compares it against the pinned release fetched directly by tag,
+and rewrites the pin only when the new release advances (newer published_at, or
+equal date with larger release id). Prints the resulting tag on stdout only when
+the pin advances; otherwise the script is a strict no-op that prints nothing.
 """
 
 from __future__ import annotations
@@ -43,12 +43,22 @@ def _compare(a: DeckyRelease, b: DeckyRelease) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("releases_json", type=Path, help="GitHub releases JSON list")
+    parser.add_argument("pinned_json", type=Path, help="GitHub pinned release JSON object")
     args = parser.parse_args()
 
     try:
         data = json.loads(args.releases_json.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"error: cannot read releases JSON: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        pinned_doc = json.loads(args.pinned_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read pinned release JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(pinned_doc, dict):
+        print("error: pinned release JSON must be an object", file=sys.stderr)
         return 1
 
     try:
@@ -59,7 +69,7 @@ def main() -> int:
 
     try:
         latest = select_preview(data, prerelease_only=True)
-        current = select_preview(data, prerelease_only=True, pinned_tag=pin)
+        current = select_preview([pinned_doc], prerelease_only=True, pinned_tag=pin)
     except DeckyReleaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

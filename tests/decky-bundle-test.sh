@@ -15,6 +15,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 LIST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
+TAG_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/tags/v3.3.1-pre1'
 LATEST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest'
 TARGET_TAG='v3.3.1-pre1'
 
@@ -62,16 +63,20 @@ emit() {
 }
 
 case "$url" in
-    "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100")
-        emit "$FIXTURE_DIR/releases.json"
-        exit 0
+    "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/tags/$(<"$FIXTURE_DIR/tag.txt")")
+        if [[ -f "$FIXTURE_DIR/release.json" ]]; then
+            emit "$FIXTURE_DIR/release.json"
+            exit 0
+        fi
+        echo "curl stub: release tag not found" >&2
+        exit 22
         ;;
     "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest")
-        echo "curl stub: refusing releases/latest; preview policy requires the release list" >&2
+        echo "curl stub: refusing releases/latest; preview policy requires the exact pinned tag" >&2
         exit 22
         ;;
     https://api.github.com/repos/SteamDeckHomebrew/decky-loader/*)
-        echo "curl stub: refusing non-contract release-list URL $url" >&2
+        echo "curl stub: refusing non-contract release URL $url" >&2
         exit 22
         ;;
 esac
@@ -252,6 +257,11 @@ else:
 
 with open(os.path.join(out, "releases.json"), "w") as handle:
     json.dump(releases, handle, indent=2)
+
+target = next((item for item in releases if item.get("tag_name") == tag), None)
+if target is not None:
+    with open(os.path.join(out, "release.json"), "w") as handle:
+        json.dump(target, handle, indent=2)
 with open(os.path.join(out, "arm64.bin"), "wb") as handle:
     handle.write(served_arm)
 with open(os.path.join(out, "x86.bin"), "wb") as handle:
@@ -286,12 +296,15 @@ assert_exists() { [[ -e "$1" ]] || case_fail "missing $1"; }
 assert_absent() { [[ ! -e "$1" ]] || case_fail "unexpected $1"; }
 
 # Every case must prove the preview-channel policy was exercised: the exact
-# release list with per_page=100 was requested and releases/latest never was.
+# pinned tag was requested from the by-tag endpoint and releases/latest never was.
 assert_preview_release_list() {
-    grep -qxF "$LIST_URL" "$CURL_LOG" ||
-        case_fail "did not request the release list"
+    grep -qxF "$TAG_URL" "$CURL_LOG" ||
+        case_fail "did not request the pinned release by tag"
     if grep -qF "$LATEST_URL" "$CURL_LOG"; then
-        case_fail "requested releases/latest instead of the release list"
+        case_fail "requested releases/latest instead of the pinned release tag"
+    fi
+    if grep -qxF "$LIST_URL" "$CURL_LOG"; then
+        case_fail "requested the release list instead of the pinned release tag"
     fi
 }
 
@@ -523,6 +536,9 @@ refusal_case() {
             prefetch-empty | prefetch-malformed)
                 if grep -qE '/releases/download/|/PluginLoader(-arm64)?$|plugin_loader-(release|prerelease)[.]service' "$CURL_LOG"; then
                     case_fail "attempted downloads after an invalid prefetched release list"
+                fi
+                if grep -qxF "$TAG_URL" "$CURL_LOG"; then
+                    case_fail "used the release API despite an invalid prefetched release list"
                 fi
                 ;;
         esac
