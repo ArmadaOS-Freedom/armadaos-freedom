@@ -1,0 +1,122 @@
+---
+name: Update Steam bootstrap
+
+on:
+  schedule:
+    - cron: "23 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-steam-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check upstream manifest
+        id: check
+        run: |
+          set -euo pipefail
+          curl --retry 5 -fLsS -o "${RUNNER_TEMP}/manifest" \
+            https://client-update.steamstatic.com/steam_client_steamdeck_stable_linuxarm64
+          version="$(cd packages/steam-bootstrap && python3 refresh.py "${RUNNER_TEMP}/manifest")"
+          if [ -n "${version}" ]; then
+            echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Test
+        if: steps.check.outputs.version != ''
+        run: python3 packages/steam-bootstrap/test.py
+
+      - name: Publish
+        if: steps.check.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.STEAM_BOOTSTRAP_UPDATE_TOKEN }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::STEAM_BOOTSTRAP_UPDATE_TOKEN 未配置，跳过发布。需要仓库级 fine-grained PAT，授予 Contents/Issues/Pull requests 写权限。"
+            exit 0
+          fi
+          command -v gh >/dev/null || { echo "::error::gh not available"; exit 1; }
+
+          branch="automation/steam-bootstrap-${VERSION}"
+          title="更新 Steam bootstrap 到 ${VERSION}"
+          gh auth setup-git
+
+          same_pr="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=all \
+            -f base=main \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${branch}" \
+            --jq 'map(select(.head.repo.full_name == .base.repo.full_name)) | .[0].number // empty')"
+          if [ -n "${same_pr}" ]; then
+            echo "::notice::同版本 PR #${same_pr} 已存在，跳过发布。"
+            exit 0
+          fi
+
+          git config user.name "steam-bootstrap-bot"
+          git config user.email "steam-bootstrap-bot@users.noreply.github.com"
+          git add packages/steam-bootstrap/BASE.env "packages/steam-bootstrap/manifests/${VERSION}"
+          git commit -m "chore(steam-bootstrap): ${VERSION}"
+
+          commit_sha="$(git rev-parse HEAD)"
+
+          if ! remote_sha="$(git ls-remote --heads origin "${branch}" | cut -f1)"; then
+            echo "::error::无法查询分支 ${branch}。"
+            exit 1
+          fi
+
+          if [ -n "${remote_sha}" ]; then
+            if [ "${remote_sha}" = "${commit_sha}" ]; then
+              echo "::notice::分支 ${branch} 已存在且与候选一致，补建 PR。"
+            else
+              changed="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${branch}" --jq '.files[].filename' | sort)"
+              if [ "${changed}" != "packages/steam-bootstrap/BASE.env" ] && [ "${changed}" != "packages/steam-bootstrap/BASE.env"$'\n'"packages/steam-bootstrap/manifests/${VERSION}" ]; then
+                echo "::error::分支 ${branch} 已存在且与候选不符（只允许改 BASE.env 与 manifests/${VERSION}），请人工处理。"
+                exit 1
+              fi
+              git fetch --no-tags --depth=1 origin "refs/heads/${branch}"
+              env_ok=1
+              manifest_ok=1
+              git show "FETCH_HEAD:packages/steam-bootstrap/BASE.env" | cmp - packages/steam-bootstrap/BASE.env || env_ok=0
+              git show "FETCH_HEAD:packages/steam-bootstrap/manifests/${VERSION}" | cmp - "packages/steam-bootstrap/manifests/${VERSION}" || manifest_ok=0
+              if [ "${env_ok}" -ne 1 ] || [ "${manifest_ok}" -ne 1 ]; then
+                echo "::error::分支 ${branch} 已存在但文件字节与候选不一致，请人工处理。"
+                exit 1
+              fi
+              echo "::notice::分支 ${branch} 已存在且文件字节一致，补建 PR。"
+            fi
+            no_push=1
+          else
+            no_push=0
+          fi
+
+          if [ "${no_push}" -eq 0 ]; then
+            git push origin "HEAD:refs/heads/${branch}"
+          fi
+
+          issue_number="$(gh issue list --state open --json number,title --jq '.[] | select(.title == "Steam bootstrap '"${VERSION}"'") | .number')"
+          if [ -z "${issue_number}" ]; then
+            issue_url="$(gh issue create \
+              --title "Steam bootstrap ${VERSION}" \
+              --body "Steam stable manifest 已更新到 ${VERSION}。这一 issue 由自动流程创建，用于跟踪对应 PR。")"
+            issue_number="$(basename "${issue_url}")"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "${branch}" \
+            --title "${title}" \
+            --body "$(printf '## 什么问题\n\nSteam stable manifest 已更新到 %s，BASE.env 仍固定在旧版本。\n\n## 解决方式\n\n运行 refresh.py 校验新 manifest 与包哈希，更新 BASE.env 并加入 manifests/%s。\n\nFixes #%s\n\nAI 辅助：Codex\n' "${VERSION}" "${VERSION}" "${issue_number}")"
