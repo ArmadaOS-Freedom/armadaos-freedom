@@ -1,0 +1,59 @@
+Subject: [PATCH] leds: qcom-flash: fix V4L2 flash release lifecycle
+
+Bound the reverse release loop before indexing the V4L2 flash array. The
+old condition read one element past the created entries and also skipped
+the first V4L2 flash object. Release every successfully created object
+once and unwind after the final torch-clamp write fails.
+
+diff --git a/drivers/leds/flash/leds-qcom-flash.c b/drivers/leds/flash/leds-qcom-flash.c
+--- a/drivers/leds/flash/leds-qcom-flash.c
++++ b/drivers/leds/flash/leds-qcom-flash.c
+@@ -712,6 +712,19 @@
+ }
+ #endif
+ 
++static void qcom_flash_release_v4l2(struct qcom_flash_data *flash_data)
++{
++	while (flash_data->leds_count > 0) {
++		struct v4l2_flash *v4l2_flash;
++
++		flash_data->leds_count--;
++		v4l2_flash = flash_data->v4l2_flash[flash_data->leds_count];
++		if (v4l2_flash)
++			v4l2_flash_release(v4l2_flash);
++		flash_data->v4l2_flash[flash_data->leds_count] = NULL;
++	}
++}
++
+ static int qcom_flash_register_led_device(struct device *dev,
+ 		struct fwnode_handle *node, struct qcom_flash_led *led)
+ {
+@@ -951,10 +964,14 @@
+ 		flash_data->leds_count++;
+ 	}
+ 
+-	return regmap_field_write(flash_data->r_fields[REG_TORCH_CLAMP], flash_data->torch_clamp);
++	rc = regmap_field_write(flash_data->r_fields[REG_TORCH_CLAMP],
++				flash_data->torch_clamp);
++	if (rc < 0)
++		goto release;
++	return 0;
++
+ release:
+-	while (flash_data->v4l2_flash[flash_data->leds_count] && flash_data->leds_count)
+-		v4l2_flash_release(flash_data->v4l2_flash[flash_data->leds_count--]);
++	qcom_flash_release_v4l2(flash_data);
+ 	return rc;
+ }
+ 
+@@ -962,9 +979,7 @@
+ {
+ 	struct qcom_flash_data *flash_data = platform_get_drvdata(pdev);
+ 
+-	while (flash_data->v4l2_flash[flash_data->leds_count] && flash_data->leds_count)
+-		v4l2_flash_release(flash_data->v4l2_flash[flash_data->leds_count--]);
+-
++	qcom_flash_release_v4l2(flash_data);
+ 	mutex_destroy(&flash_data->lock);
+ }
+ 
