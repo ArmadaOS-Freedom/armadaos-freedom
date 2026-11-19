@@ -2,8 +2,9 @@ Subject: [PATCH] media: fix Y700 camera power and sub-device lifetime
 
 Keep opt-in V4L2 device nodes and controls alive through the final close,
 serialize node I/O with unregister, and remove the media interface and
-its links under the graph mutex. Balance lens and sensor PM references
-on detach. Reapply reset sequencing if a stream retry needs it.
+its links under the graph mutex. Managed nodes keep ordinary controls
+without enabling events. Balance lens and sensor PM references on
+detach. Reapply reset sequencing if a stream retry needs it.
 
 Report retained supplies or a failed reset as a retryable suspend error.
 Bound delayed runtime suspend requests and drain them on detach. Treat
@@ -1588,7 +1589,7 @@ diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l
 index 67e3073..dbef95c 100755
 --- a/drivers/media/v4l2-core/v4l2-device.c
 +++ b/drivers/media/v4l2-core/v4l2-device.c
-@@ -127,6 +127,15 @@ int __v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
+@@ -127,6 +127,17 @@ int __v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
  	sd->owner_v4l2_dev = v4l2_dev->dev && v4l2_dev->dev->driver &&
  		module == v4l2_dev->dev->driver->owner;
  
@@ -1598,13 +1599,15 @@ index 67e3073..dbef95c 100755
 +	     sd->internal_ops->release || v4l2_dev->ctrl_handler ||
 +	     v4l2_device_supports_requests(v4l2_dev) ||
 +	     (sd->flags & V4L2_SUBDEV_FL_HAS_EVENTS) ||
++	     v4l2_subdev_has_op(sd, core, subscribe_event) ||
++	     v4l2_subdev_has_op(sd, core, unsubscribe_event) ||
 +	     (module && sd->owner_v4l2_dev)))
 +		return -EINVAL;
 +
  	if (!sd->owner_v4l2_dev && !try_module_get(module))
  		return -ENODEV;
  
-@@ -166,12 +175,19 @@ error_unregister:
+@@ -166,12 +177,19 @@ error_unregister:
  #endif
  error_module:
  	if (!sd->owner_v4l2_dev)
@@ -1625,7 +1628,7 @@ index 67e3073..dbef95c 100755
  static void v4l2_subdev_release(struct v4l2_subdev *sd)
  {
  	struct module *owner = !sd->owner_v4l2_dev ? sd->owner : NULL;
-@@ -188,9 +204,22 @@ static void v4l2_device_release_subdev_node(struct video_device *vdev)
+@@ -188,9 +206,22 @@ static void v4l2_device_release_subdev_node(struct video_device *vdev)
  	kfree(vdev);
  }
  
@@ -1648,7 +1651,7 @@ index 67e3073..dbef95c 100755
  	struct video_device *vdev;
  	struct v4l2_subdev *sd;
  	int err;
-@@ -205,10 +234,34 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+@@ -205,10 +236,34 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
  		if (sd->devnode)
  			continue;
  
@@ -1687,7 +1690,7 @@ index 67e3073..dbef95c 100755
  		}
  
  		video_set_drvdata(vdev, sd);
-@@ -216,7 +269,6 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+@@ -216,7 +271,6 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
  		vdev->dev_parent = sd->dev;
  		vdev->v4l2_dev = v4l2_dev;
  		vdev->fops = &v4l2_subdev_fops;
@@ -1695,7 +1698,7 @@ index 67e3073..dbef95c 100755
  		vdev->ctrl_handler = sd->ctrl_handler;
  		if (read_only)
  			set_bit(V4L2_FL_SUBDEV_RO_DEVNODE, &vdev->flags);
-@@ -225,7 +277,10 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+@@ -225,7 +279,10 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
  					      sd->owner);
  		if (err < 0) {
  			sd->devnode = NULL;
@@ -1707,7 +1710,7 @@ index 67e3073..dbef95c 100755
  			goto clean_up;
  		}
  #if defined(CONFIG_MEDIA_CONTROLLER)
-@@ -233,9 +288,13 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+@@ -233,9 +290,13 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
  		sd->entity.info.dev.minor = vdev->minor;
  
  		/* Interface is created by __video_register_device() */
@@ -1722,7 +1725,7 @@ index 67e3073..dbef95c 100755
  			link = media_create_intf_link(&sd->entity,
  						      &vdev->intf_devnode->intf,
  						      MEDIA_LNK_FL_ENABLED |
-@@ -252,7 +311,7 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+@@ -252,7 +313,7 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
  clean_up:
  	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
  		if (!sd->devnode)
@@ -1731,7 +1734,7 @@ index 67e3073..dbef95c 100755
  		video_unregister_device(sd->devnode);
  	}
  
-@@ -263,17 +322,21 @@ EXPORT_SYMBOL_GPL(__v4l2_device_register_subdev_nodes);
+@@ -263,17 +324,21 @@ EXPORT_SYMBOL_GPL(__v4l2_device_register_subdev_nodes);
  void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
  {
  	struct v4l2_device *v4l2_dev;
@@ -1753,7 +1756,7 @@ index 67e3073..dbef95c 100755
  	if (sd->internal_ops && sd->internal_ops->unregistered)
  		sd->internal_ops->unregistered(sd);
  	sd->v4l2_dev = NULL;
-@@ -287,7 +350,9 @@ void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
+@@ -287,7 +352,9 @@ void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
  		media_device_unregister_entity(&sd->entity);
  	}
  #endif
@@ -1816,6 +1819,16 @@ index e9f81b9..915a7bb 100755
  }
  #endif
  
+@@ -1701,7 +1723,8 @@ int __v4l2_subdev_init_finalize(struct v4l2_subdev *sd, const char *name,
+ 		}
+ 	}
+ 
+-	if (sd->ctrl_handler)
++	if (sd->ctrl_handler &&
++	    !(sd->internal_ops && sd->internal_ops->devnode_get))
+ 		sd->flags |= V4L2_SUBDEV_FL_HAS_EVENTS;
+ 
+ 	state = __v4l2_subdev_state_alloc(sd, name, key);
 diff --git a/include/media/v4l2-dev.h b/include/media/v4l2-dev.h
 index 2e0f6d2..7cfab47 100755
 --- a/include/media/v4l2-dev.h

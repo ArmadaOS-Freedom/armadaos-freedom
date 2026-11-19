@@ -2,9 +2,10 @@
 """Host lifecycle checks for the TB322FC/SM8750 camera dependencies.
 
 The generated harnesses compile real functions from the patched kernel tree.
-They cover GDSC interconnect votes, partial genpd registration, QCOM flash
-release, CSID startup and camera I2C device lifecycle. Hardware, interrupts
-and firmware commits are outside the scope of the stubs.
+They cover V4L2 node registration and teardown, GDSC interconnect votes,
+partial genpd registration, QCOM flash release, CSID startup and camera I2C
+device lifecycle. Hardware, interrupts and firmware commits are outside
+the scope of the stubs.
 """
 
 from __future__ import annotations
@@ -1554,6 +1555,137 @@ int main(void)
 """
 
 
+NODE_REGISTRATION_PREFIX = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <errno.h>
+
+#define V4L2_SUBDEV_FL_HAS_DEVNODE (1U << 2)
+#define V4L2_SUBDEV_FL_HAS_EVENTS (1U << 3)
+#define V4L2_SUBDEV_FL_STREAMS (1U << 4)
+#define v4l2_subdev_has_op(sd, group, member) \
+	((sd)->ops->group && (sd)->ops->group->member)
+#define dev_err(...) ((void)0)
+#define IS_ERR(state) false
+#define PTR_ERR(state) (-ENOMEM)
+#define spin_lock(lock) ((void)(lock))
+#define spin_unlock(lock) ((void)(lock))
+#define list_add_tail(entry, head) ((void)(entry), (void)(head))
+
+struct module { int unused; };
+struct device_driver { struct module *owner; };
+struct device { struct device_driver *driver; };
+struct lock_class_key { int unused; };
+struct v4l2_ctrl_handler { int unused; };
+struct v4l2_subdev_state { int unused; };
+struct v4l2_subdev_core_ops { bool subscribe_event, unsubscribe_event; };
+struct v4l2_subdev_video_ops { bool s_stream; };
+struct v4l2_subdev_pad_ops { bool enable_streams, disable_streams; };
+struct v4l2_subdev_ops {
+	const struct v4l2_subdev_core_ops *core;
+	const struct v4l2_subdev_video_ops *video;
+	const struct v4l2_subdev_pad_ops *pad;
+};
+struct v4l2_subdev;
+struct v4l2_subdev_internal_ops {
+	void (*devnode_get)(struct v4l2_subdev *sd);
+	void (*devnode_put)(struct v4l2_subdev *sd);
+	void (*release)(struct v4l2_subdev *sd);
+	int (*registered)(struct v4l2_subdev *sd);
+};
+struct v4l2_device {
+	struct device *dev;
+	struct v4l2_ctrl_handler *ctrl_handler;
+	int lock, subdevs;
+};
+struct v4l2_subdev {
+	const struct v4l2_subdev_ops *ops;
+	const struct v4l2_subdev_internal_ops *internal_ops;
+	struct v4l2_ctrl_handler *ctrl_handler;
+	struct v4l2_subdev_state *active_state;
+	struct v4l2_device *v4l2_dev;
+	struct device *dev;
+	struct module *owner;
+	const char *name;
+	unsigned int flags;
+	bool owner_v4l2_dev;
+	int list;
+};
+
+static struct v4l2_subdev_state active_state;
+static struct v4l2_subdev_state *__v4l2_subdev_state_alloc(
+	struct v4l2_subdev *sd, const char *name, struct lock_class_key *key)
+{
+	return &active_state;
+}
+
+static bool v4l2_device_supports_requests(struct v4l2_device *bridge) { return false; }
+static bool try_module_get(struct module *owner) { return true; }
+static void module_put(struct module *owner) { }
+static void devnode_ref(struct v4l2_subdev *sd) { }
+static int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *bridge,
+	struct v4l2_ctrl_handler *subdev, void *filter, bool from_other_dev)
+{
+	return 0;
+}
+"""
+
+
+NODE_REGISTRATION_TESTS = r"""
+int main(void)
+{
+	struct v4l2_device bridge = {0};
+	struct v4l2_ctrl_handler controls = {0};
+	struct v4l2_subdev_internal_ops managed_ops = {
+		.devnode_get = devnode_ref,
+		.devnode_put = devnode_ref,
+	};
+	struct v4l2_subdev_core_ops event_ops = { .subscribe_event = true };
+	struct v4l2_subdev_ops event_subdev_ops = { .core = &event_ops };
+	const struct v4l2_subdev_ops sensor_ops = {0};
+	struct v4l2_subdev sensor = {
+		.ops = &sensor_ops,
+		.name = "camera sensor",
+		.ctrl_handler = &controls,
+		.flags = V4L2_SUBDEV_FL_HAS_DEVNODE,
+	};
+	struct v4l2_subdev managed = sensor;
+	struct v4l2_subdev events = sensor;
+
+	assert(!__v4l2_subdev_init_finalize(&sensor, sensor.name, NULL));
+	assert(sensor.flags & V4L2_SUBDEV_FL_HAS_EVENTS);
+	assert(!__v4l2_device_register_subdev(&bridge, &sensor, NULL));
+	puts("PASS ordinary subdevices still get control events during finalization");
+
+	managed.internal_ops = &managed_ops;
+	assert(!__v4l2_subdev_init_finalize(&managed, managed.name, NULL));
+	assert(!__v4l2_device_register_subdev(&bridge, &managed, NULL));
+	assert(managed.flags == V4L2_SUBDEV_FL_HAS_DEVNODE);
+	assert(managed.ctrl_handler == &controls && managed.active_state == &active_state);
+	puts("PASS a finalized managed sensor registers with its controls and no events");
+
+	events.internal_ops = &managed_ops;
+	events.flags |= V4L2_SUBDEV_FL_HAS_EVENTS;
+	assert(!__v4l2_subdev_init_finalize(&events, events.name, NULL));
+	assert(__v4l2_device_register_subdev(&bridge, &events, NULL) == -EINVAL);
+	assert(!events.v4l2_dev);
+	puts("PASS a managed subdevice that explicitly enables events is rejected");
+
+	events.flags &= ~V4L2_SUBDEV_FL_HAS_EVENTS;
+	events.ops = &event_subdev_ops;
+	assert(__v4l2_device_register_subdev(&bridge, &events, NULL) == -EINVAL);
+	event_ops.subscribe_event = false;
+	event_ops.unsubscribe_event = true;
+	assert(__v4l2_device_register_subdev(&bridge, &events, NULL) == -EINVAL);
+	assert(!events.v4l2_dev);
+	puts("PASS a managed subdevice with custom event callbacks is rejected");
+	return 0;
+}
+"""
+
+
 def extract_flash_probe_tail(source: str) -> str:
     """Run the production probe after V4L2 LED registration has succeeded."""
     probe = extract_function(source, "static int qcom_flash_led_probe(")
@@ -1659,8 +1791,11 @@ def main(argv: list[str] | None = None) -> int:
     pmic_path = tree / "drivers/regulator/wl2868c-regulator.c"
     media_entity_path = tree / "drivers/media/mc/mc-entity.c"
     video_dev_path = tree / "drivers/media/v4l2-core/v4l2-dev.c"
+    v4l2_device_path = tree / "drivers/media/v4l2-core/v4l2-device.c"
+    v4l2_subdev_path = tree / "drivers/media/v4l2-core/v4l2-subdev.c"
     for path in (gdsc_path, flash_path, csid_path, camcc_path,
                  regulator_core, pmic_path, media_entity_path, video_dev_path,
+                 v4l2_device_path, v4l2_subdev_path,
                  *camera_paths.values()):
         if not path.is_file():
             parser.error(f"missing kernel source: {path}")
@@ -1674,6 +1809,8 @@ def main(argv: list[str] | None = None) -> int:
     camcc_source = camcc_bytes.decode("utf-8")
     media_entity_bytes = media_entity_path.read_bytes()
     video_dev_bytes = video_dev_path.read_bytes()
+    v4l2_device_bytes = v4l2_device_path.read_bytes()
+    v4l2_subdev_bytes = v4l2_subdev_path.read_bytes()
 
     icc_functions = "\n\n".join(
         extract_function(gdsc_source, signature)
@@ -1706,6 +1843,16 @@ def main(argv: list[str] | None = None) -> int:
     camera_bytes = {name: path.read_bytes() for name, path in camera_paths.items()}
 
     results = [
+        run_harness(
+            work, "v4l2-managed-node-registration", "\n".join((
+                NODE_REGISTRATION_PREFIX,
+                extract_function(v4l2_device_bytes.decode("utf-8"),
+                                 "\nint __v4l2_device_register_subdev("),
+                extract_function(v4l2_subdev_bytes.decode("utf-8"),
+                                 "\nint __v4l2_subdev_init_finalize("),
+                NODE_REGISTRATION_TESTS,
+            )),
+        ),
         run_harness(
             work, "v4l2-managed-node-unregister", "\n".join((
                 NODE_PREFIX,
@@ -1776,6 +1923,8 @@ def main(argv: list[str] | None = None) -> int:
             "wl2868c": {"path": str(pmic_path), "sha256": sha256(pmic_bytes)},
             "media_entity": {"path": str(media_entity_path), "sha256": sha256(media_entity_bytes)},
             "video_dev": {"path": str(video_dev_path), "sha256": sha256(video_dev_bytes)},
+            "v4l2_device": {"path": str(v4l2_device_path), "sha256": sha256(v4l2_device_bytes)},
+            "v4l2_subdev": {"path": str(v4l2_subdev_path), "sha256": sha256(v4l2_subdev_bytes)},
             **{name: {"path": str(camera_paths[name]), "sha256": sha256(data)}
                for name, data in camera_bytes.items()},
         },

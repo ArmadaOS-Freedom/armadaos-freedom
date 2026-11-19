@@ -89,3 +89,4 @@ test or a measured standby-power improvement.
 Stop capture and close the capture nodes before changing driver bindings.
 Active CAMSS capture pipelines retain their media pads until stream teardown.
 The sub-device node lifetime checks cover open sensor and lens nodes.
+These managed nodes expose V4L2 controls without event subscriptions.
