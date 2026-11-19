@@ -7,6 +7,8 @@ import struct
 from pathlib import Path
 
 WITNESS_PATH = Path('/sys/firmware/devicetree/base/chosen/armada,boot-witness')
+# kShim evidence sources: 1 firmware bootargs, 2 firmware initrd bootconfig.
+WITNESS_SOURCES = (1, 2)
 CMDLINE_PATH = Path('/proc/cmdline')
 
 WITNESS_BYTES = 16
@@ -51,7 +53,7 @@ def _decode_witness(witness):
     if not isinstance(witness, (bytes, bytearray)) or len(witness) != WITNESS_BYTES:
         raise BootContextError('boot witness must be exactly 16 raw bytes')
     fields = struct.unpack('>4I', bytes(witness))
-    if fields[0] != 1 or fields[1] != 1 or fields[3] != 0:
+    if fields[0] != 1 or fields[1] not in WITNESS_SOURCES or fields[3] != 0:
         raise BootContextError('boot witness header fields are invalid')
     if fields[2] not in (0, 1):
         raise BootContextError('boot witness slot is invalid')
