@@ -44,6 +44,19 @@ ArmadaOS Freedom 为 Y700 五代提供 kShimC 多系统启动、Steam 游戏模�
 - **启动器设置：** 机型选择和默认启动项仅在本次启动内生效，持久化暂缓。
 - **手柄扩展功能：** 全部背键、IMU、震动、多模式和插拔／休眠后的 RGB 恢复尚未完整验证。
 
+## 睡眠唤醒诊断
+
+在 Y700 五代 Linux 桌面上，从仓库根目录启动一次唤醒计时。当前睡眠模式须为 `s2idle`，运行用户需要有电源键输入设备的读取权限。
+
+```sh
+script=$(realpath devices/lenovo-tb323fu/diagnostics/y700_wake_latency.py)
+systemd-run --user --collect --unit=y700-wake-latency /usr/bin/python3 "$script"
+```
+
+运行 `journalctl --user -u y700-wake-latency --no-pager -n 20`，看到 `Ready.` 后，在 Steam 电源菜单选择「睡眠」。设备进入睡眠后，短按电源键唤醒。唤醒约 15 秒后可读取 `~/.local/state/armada-wake-latency/latest.json`。
+
+报告记录系统恢复后的首次采样，以及读取到的电源键事件、DRM 面板启用和背光开启。报告给出的屏幕时间是内核接口首次满足亮屏条件的采样时间，实际屏幕亮起的时刻需要外部测量。读取内核日志需要额外权限，日志不可读时仍会保留已采集的计时信息。
+
 ## 内核与启动
 
 五代与[四代](../lenovo-tb322fc/README.md)共用 [`packages/kernel/`](../../packages/kernel/) 中的 Linux 7.2.6 基础内核和 Freedom 补丁集，五代使用 Baldur 设备树、对应驱动补丁与功放模块。旧 7.3 板级源码保留为移植来源，当前构建入口是统一内核目录。
