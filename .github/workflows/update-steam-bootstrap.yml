@@ -56,7 +56,11 @@ jobs:
           title="更新 Steam bootstrap 到 ${VERSION}"
           gh auth setup-git
 
-          same_pr="$(gh pr list --state all --head "${branch}" --json number --jq '.[0].number // empty')"
+          same_pr="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=all \
+            -f base=main \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${branch}" \
+            --jq 'map(select(.head.repo.full_name == .base.repo.full_name)) | .[0].number // empty')"
           if [ -n "${same_pr}" ]; then
             echo "::notice::同版本 PR #${same_pr} 已存在，跳过发布。"
             exit 0
