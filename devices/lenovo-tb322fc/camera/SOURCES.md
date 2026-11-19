@@ -1,6 +1,6 @@
 # Camera port provenance and review boundaries
 
-Patches 0240–0250 are part of Armada's shared Linux 7.2.6 series. This is a
+Patches 0240–0254 are part of Armada's shared Linux 7.2.6 series. This is a
 downstream bring-up port, with separate patches so hardware support and
 error handling can be reviewed independently.
 
@@ -17,6 +17,10 @@ error handling can be reviewed independently.
 | 0248 | Limited adaptation of Qianhui Xu's WL2868C v11 output control, with teardown reset diagnostics. Preserve the current Gen4 parent-supply contract. |
 | 0249 | Local camera2 dependency fix: reverse and bound the V4L2 flash release loop, release every created subdevice once, and unwind after the final torch-clamp write fails or the driver is removed. |
 | 0250 | Shared-build integration: select the provider-owned ICC paths only on Elden; preserve CAMCC probe and the optional ICC binding contract on other SM8750 boards. |
+| 0251 | Local review fixes for WL2868C control-supply sequencing and verified output writes. |
+| 0252 | Local regulator API for reporting consumer reference release and preserving unresolved disable faults across consumer rebind. |
+| 0253 | Local Y700 fixes for runtime PM retries, sensor reset and sub-device detach. |
+| 0254 | Local bounded retry for ICC drops after the power domain is confirmed off. |
 
 Pinned sources:
 
@@ -30,7 +34,8 @@ Pinned sources:
   PHY ABI are not a substitute for SM8750's implementation.
 - [Gen4 reference and posted WL2868C v11](https://github.com/xiaquwan1001/lenovo-legion-y700-gen4-tb322fc-elden-linux/tree/f2763c98e36868caea52f4d9dbcbf935c19af307/patches/upstream/wl2868c-v11-20261113).
   The SYS_EN/SEQ semantics are traced to this source and its reference to
-  WL2868C Rev 1.4 p.35. The original datasheet was not independently obtained.
+  WL2868C Rev 1.4 p.35. The [manufacturer's Rev 1.4 datasheet](https://omnivision-group.com/files/product/files/WL2868C-V1.4.pdf)
+  also describes VSYS and VIN7 as alternative sources for the control logic.
 - [Android SM8750 camera source](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/tree/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3/vendor/qcom/opensource/camera-kernel).
   The local TB322FC_259 camera.ko's 103-entry 2.4.0 PHY table matches all
   four fields in that source. The third field is a delay, including five
@@ -40,14 +45,12 @@ Pinned sources:
 
 Completed host fault suites extract real implementation C functions into
 stubbed APIs. They cover CAMSS partial-start cleanup, sensor/lens power
-errors, WL channel concurrency, ICC transactions and registration unwind.
-They do not simulate electrical sequencing, interrupts or RPMh firmware.
-The camera2 configuration enables the V4L2 flash class required by the
-S5KJNS async graph dependency. Its fault suite exercises one- and two-LED
-normal unwind, second-LED registration failure and final torch-clamp write
-failure against the patched release helper. These are host-side lifecycle
-tests, not hardware camera or flash validation. Full kernel/module/DT and
-schema validation must precede device testing.
+errors, V4L2 node withdrawal, WL2868C shared output state, ICC transactions
+and registration unwind. The flash checks exercise registered LED cleanup
+and inject a failed final torch-clamp write into the probe tail. The camera2
+configuration enables the V4L2 flash class required by the S5KJNS async graph.
+Electrical sequencing, live driver concurrency, interrupts and RPMh firmware
+behavior still require device testing after the kernel, modules and DTB build.
 
 Before any upstream Linux submission, replace imported placeholder binding
 maintainer contacts with consenting maintainers and rebase the legacy

@@ -11,15 +11,14 @@ integration remain unvalidated. See [the device test record](DEVICE-TEST-2026111
 
 The ordinary kernel build and `sm8750-lenovo-elden.dtb` select this support;
 no overlay variable or alternate DTB is required. Install a complete matching
-kernel, modules and DTB together. The hardware validation below used the
+kernel, modules and DTB together. The hardware validation used the
 earlier opt-in `7.2.6-y700-camera2` build and `sm8750-lenovo-elden-camera1.dtb`.
-The ten tested driver patches are promoted unchanged; patch 0250 limits
-the provider-owned ICC contract to Elden so other SM8750 boards retain
-their existing CAMCC behavior. The normal Elden board DTB now
-receives the same CAMCC/CAMSS interconnect properties through its existing
-adaptation patch. The DPU fixed 270-degree configuration is retained.
-The accelerometer is temporarily
-unavailable; it is not used to decide camera or display orientation.
+Patch 0250 limits the provider-owned ICC contract to Elden. The normal Elden
+DTB carries the CAMCC/CAMSS interconnect properties through its adaptation
+patch. Patches 0251–0254 add follow-up fixes for regulator writes, camera
+power management, V4L2 node lifetime and ICC recovery. Those follow-ups
+still need tablet testing. The accelerometer is temporarily unavailable
+and does not determine camera or display orientation.
 
 The port is based on camera-only deltas from
 `h0cheung/tb322fc-linux-kernel@bf96c3d4048973298ede78487177c6f1b4f6bc0f`,
@@ -69,9 +68,9 @@ RAW capture has been tested; hardware flash and the hardware ISP have not.
 WL2868C parent VIN supplies remain unresolved; no parent rail is invented.
 Sensor power-down failures must be reported and must block unsafe reuse.
 The PMIC output mask is serialized and SYS_EN is cleared after its last
-channel shuts down. Sequencer takeover follows the cited v11 driver;
-the underlying datasheet and this tablet's register state still need
-independent confirmation. Failed provider probe with a physical domain
+channel shuts down. Sequencer takeover follows the v11 driver and the
+WL2868C Rev 1.4 datasheet. The tablet's supply wiring and register state
+still need hardware confirmation. Failed provider probe with a physical domain
 still on is a candidate rejection. RPMh commit errors are not propagated
 by the existing ICC set callback, so device logs are part of acceptance.
 Do not load these camera modules into an existing kernel with a different
@@ -86,3 +85,7 @@ driver binding and idle ICC/clock/rail release; five RAW frames per sensor;
 repeated start/stop; display-off capture; RTC s2idle and DDR residency.
 Record each stage separately. Successful compilation is not a hardware
 test or a measured standby-power improvement.
+
+Stop capture and close the capture nodes before changing driver bindings.
+Active CAMSS capture pipelines retain their media pads until stream teardown.
+The sub-device node lifetime checks cover open sensor and lens nodes.

@@ -362,3 +362,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0248-regulator-wl2868c-control-output-lifecycle.patch
 0249-leds-qcom-flash-fix-v4l2-release.patch
 0250-clk-qcom-limit-camera-icc-to-elden.patch
+0251-regulator-wl2868c-harden-control-and-output-writes.patch
+0252-regulator-report-consumer-disable-status.patch
+0253-media-fix-y700-camera-power-and-subdev-lifetime.patch
+0254-clk-qcom-retry-idle-gdsc-interconnect-votes.patch

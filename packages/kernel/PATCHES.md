@@ -1219,7 +1219,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0248-regulator-wl2868c-control-output-lifecycle.patch`
   source: https://github.com/xiaquwan1001/lenovo-legion-y700-gen4-tb322fc-elden-linux/tree/f2763c98e36868caea52f4d9dbcbf935c19af307/patches/upstream/wl2868c-v11-20261113
   upstream: local (adapted from Qianhui Xu's v11)
-  notes: Serializes the full output mask, clears SEQ, seeds physical state, and clears SYS_EN after the last output. The cited datasheet and parent VIN contract still need independent confirmation.
+  notes: Serializes the full output mask, clears SEQ, seeds physical state, and clears SYS_EN after the last output. Elden's parent VIN wiring still needs hardware confirmation.
 - `patches/0249-leds-qcom-flash-fix-v4l2-release.patch`
   source: armada
   upstream: local
@@ -1229,6 +1229,22 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: The tested provider-owned ICC contract is selected only for lenovo,elden before CAMCC registration. Other SM8750 boards keep zero optional paths and their existing probe behavior. The binding allows existing no-ICC nodes and requires both properties together when present. This is a shared-build integration fix beyond the original camera2 checkpoint.
+- `patches/0251-regulator-wl2868c-harden-control-and-output-writes.patch`
+  source: armada, [WL2868C Rev 1.4](https://omnivision-group.com/files/product/files/WL2868C-V1.4.pdf)
+  upstream: local
+  notes: Enables a described VSYS or VIN7 control supply before reset release. Serializes status with the enable mask, verifies ambiguous writes and retries within the provider callback.
+- `patches/0252-regulator-report-consumer-disable-status.patch`
+  source: armada
+  upstream: local
+  notes: Reports whether a failing disable consumed the caller's enable reference. If the consumer detaches with an unresolved disable error, subsequent enables are rejected until the regulator is reinitialized.
+- `patches/0253-media-fix-y700-camera-power-and-subdev-lifetime.patch`
+  source: armada
+  upstream: local
+  notes: Enables runtime resume retry after clean rollback, reapplies reset sequencing before stream retry, balances PM and supply references on detach, and preserves subdevice storage until the last node user releases it. Removes the media interface and its links under the media graph mutex.
+- `patches/0254-clk-qcom-retry-idle-gdsc-interconnect-votes.patch`
+  source: armada
+  upstream: local
+  notes: Retries failed ICC vote drops after confirmed physical power-off, with a bounded delay independent of genpd callbacks. Cancels pending work on power-on and drains it before provider teardown.
 - `dts/sm8750-lenovo-elden-camera-bus.patch`
   source: armada
   upstream: local
