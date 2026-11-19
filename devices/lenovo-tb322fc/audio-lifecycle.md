@@ -37,16 +37,18 @@ produced UNMAP timeouts and contaminated that comparison. These observations
 justify a complete candidate and normal-boot regression; they do not prove
 all audio failures resolved.
 
-The complete candidate is being built as `7.2.6-y700-audio1` from the exact
-tested camera2 plus reflected-fetch rotation source, with all matching modules
-and a migrated initramfs. The original camera2 deployment remains the fallback.
-The PR patch series is based on upstream `d4c3b13`; its clean source application
-and host checks are verified separately from the device build.
+The complete `7.2.6-y700-audio1` candidate was built from the tested camera2
+plus reflected-fetch rotation source, with matching modules and a migrated
+initramfs. The original camera2 deployment remains the fallback. That build
+used the source baseline available before upstream PR #134 landed. The PR
+branch is now rebased onto upstream `1197723` (PR #134); the full kernel build
+has not been repeated against this rebased source.
 
-The standard series applied 306 patches without fuzz or skipped hunks. After
-replacing the initial count-only STOP candidate, all three AudioReach source
-hashes match the device build tree. Existing rotation/performance/SSPP and
-other applicable host checks pass. The new `test_q6apm_lifecycle.py` compiles
+The standard series applied 306 patches without fuzz or skipped hunks at the
+time of the candidate build. After replacing the initial count-only STOP
+candidate, all three AudioReach source hashes matched that device build tree.
+Existing rotation/performance/SSPP and other applicable host checks passed.
+The new `test_q6apm_lifecycle.py` compiles
 the actual extracted C functions with host stubs: 79 candidate checks, or 94
 with baseline negative controls. Its deterministic threaded test holds STOP
 until a START attempt is observed, then checks that START reaches the DSP.
@@ -90,6 +92,13 @@ kernel C functions, including the constructed concurrent START/STOP window.
 The same 94 checks passed under ASan/UBSan in the independent review. These
 checks and the complete build do not substitute for running the new kernel on
 the tablet.
+
+After rebasing onto upstream `1197723`, the lifecycle test was reproduced
+against the archived Linux 7.2.6 source with patches 0750 and 0751 applied;
+all 94 candidate and baseline checks passed. Patch 0752 also applied cleanly
+to the archived `q6apm-dai.c`. All three patches passed Linux 7.2.6
+`checkpatch.pl --strict` with zero errors or warnings. The full kernel build
+and the target runtime checks remain pending for the rebased source.
 
 Still required on the tablet: capture prepare/free/close, start/drop/close,
 reconfiguration and reprepare, playback/idle, filter add/remove with
