@@ -1,0 +1,122 @@
+name: Update Decky Preview Pin
+
+on:
+  schedule:
+    - cron: "41 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-decky-preview
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONPATH: system_files/usr/lib/armada
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check
+        id: check
+        run: |
+          set -euo pipefail
+          releases="${RUNNER_TEMP}/decky-releases.json"
+          curl --retry 5 -fLsS \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100' \
+            -o "${releases}"
+          tag="$(python3 .github/scripts/refresh-decky-preview.py "${releases}")"
+          if [ -n "${tag}" ]; then
+            echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Test
+        if: steps.check.outputs.tag != ''
+        run: python3 tests/test_decky_release.py
+
+      - name: Publish
+        if: steps.check.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.DECKY_PREVIEW_UPDATE_TOKEN || secrets.STEAM_BOOTSTRAP_UPDATE_TOKEN }}
+          NEW_TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::DECKY_PREVIEW_UPDATE_TOKEN/STEAM_BOOTSTRAP_UPDATE_TOKEN 未配置，跳过发布。需要仓库级 fine-grained PAT，授予 Contents/Issues/Pull requests 写权限。"
+            exit 0
+          fi
+          command -v gh >/dev/null || { echo "::error::gh not available"; exit 1; }
+
+          branch="automation/decky-preview-${NEW_TAG}"
+          title="更新 Decky Loader ARM64 preview 到 ${NEW_TAG}"
+          pin_path="build_files/decky-preview-version"
+          gh auth setup-git
+
+          same_pr="$(gh pr list --state all --head "${branch}" --json number --jq '.[0].number // empty')"
+          if [ -n "${same_pr}" ]; then
+            echo "::notice::同版本 PR #${same_pr} 已存在，跳过发布。"
+            exit 0
+          fi
+
+          git config user.name "decky-preview-bot"
+          git config user.email "decky-preview-bot@users.noreply.github.com"
+          git add "${pin_path}"
+          git commit -m "chore(decky): pin preview to ${NEW_TAG}"
+
+          commit_sha="$(git rev-parse HEAD)"
+
+          if ! remote_sha="$(git ls-remote --heads origin "${branch}" | cut -f1)"; then
+            echo "::error::无法查询分支 ${branch}。"
+            exit 1
+          fi
+
+          if [ -n "${remote_sha}" ]; then
+            if [ "${remote_sha}" = "${commit_sha}" ]; then
+              echo "::notice::分支 ${branch} 已存在且与候选一致，补建 PR。"
+            else
+              changed="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${branch}" --jq '.files[].filename')"
+              if [ "${changed}" != "${pin_path}" ]; then
+                echo "::error::分支 ${branch} 已存在且与候选不符（只允许改 ${pin_path}），请人工处理。"
+                exit 1
+              fi
+              git fetch --no-tags --depth=1 origin "refs/heads/${branch}"
+              pin_ok=1
+              git show "FETCH_HEAD:${pin_path}" | cmp - "${pin_path}" || pin_ok=0
+              if [ "${pin_ok}" -ne 1 ]; then
+                echo "::error::分支 ${branch} 已存在但 pin 文件字节与候选不一致，请人工处理。"
+                exit 1
+              fi
+              echo "::notice::分支 ${branch} 已存在且 pin 字节一致，补建 PR。"
+            fi
+            no_push=1
+          else
+            no_push=0
+          fi
+
+          if [ "${no_push}" -eq 0 ]; then
+            git push origin "HEAD:refs/heads/${branch}"
+          fi
+
+          issue_number=$(gh issue list --state open --json number,title --limit 100 | jq -r --arg title "Decky Loader ARM64 preview $NEW_TAG" '[.[] | select(.title == $title)][0].number // ""')
+          if [ -z "${issue_number}" ]; then
+            issue_url="$(gh issue create \
+              --title "Decky Loader ARM64 preview ${NEW_TAG}" \
+              --body "Decky Loader ARM64 preview 已更新到 ${NEW_TAG}。这一 issue 由自动流程创建，用于跟踪对应 PR。")"
+            issue_number="$(basename "${issue_url}")"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "${branch}" \
+            --title "${title}" \
+            --body "$(printf '## 什么问题\n\nDecky Loader ARM64 preview 已更新到 %s，%s 仍固定在旧 tag。\n\n## 解决方式\n\n更新 %s 中的 pin。\n\nFixes #%s\n\nAI 辅助：Codex\n' "${NEW_TAG}" "${pin_path}" "${pin_path}" "${issue_number}")"

@@ -85,7 +85,12 @@ def _validate_url(url: Any, tag: str) -> str:
     return url
 
 
-def select_preview(releases: Any) -> DeckyRelease:
+def select_preview(
+    releases: Any,
+    *,
+    prerelease_only: bool = False,
+    pinned_tag: str | None = None,
+) -> DeckyRelease:
     if not isinstance(releases, list):
         raise DeckyReleaseError("Releases payload must be a list")
 
@@ -94,17 +99,23 @@ def select_preview(releases: Any) -> DeckyRelease:
         if not isinstance(item, dict):
             raise DeckyReleaseError("Release entry must be an object")
         draft = _require_bool(item.get("draft"), "draft")
-        _require_bool(item.get("prerelease"), "prerelease")
+        is_prerelease = _require_bool(item.get("prerelease"), "prerelease")
         # Official loader branch 1 (preview) accepts v* tags from both
         # branches, so a stable promotion is included alongside prereleases.
         tag_name = item.get("tag_name")
         if draft or not isinstance(tag_name, str) or not tag_name.startswith("v"):
+            continue
+        if pinned_tag is not None and tag_name != pinned_tag:
+            continue
+        if prerelease_only and not is_prerelease:
             continue
         rel_id = _require_pos_int(item.get("id"), "release id")
         dt = _parse_iso8601(item.get("published_at"))
         candidates.append((dt, rel_id, item))
 
     if not candidates:
+        if pinned_tag is not None:
+            raise DeckyReleaseError(f"No pinned release found for tag {pinned_tag}")
         raise DeckyReleaseError("No preview releases found")
 
     _, rel_id, latest = max(candidates, key=lambda c: (c[0], c[1]))

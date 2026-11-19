@@ -38,7 +38,8 @@ else
         'https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
 fi
 
-PYTHONPATH=/usr/lib/armada python3 - "${decky_releases_json}" "${decky_release_json}" <<'PY'
+decky_pinned_tag="$(tr -d '\r\n' < /ctx/build_files/decky-preview-version)"
+PYTHONPATH=/usr/lib/armada python3 - "${decky_releases_json}" "${decky_release_json}" "${decky_pinned_tag}" <<'PY'
 from dataclasses import asdict
 import json
 import sys
@@ -46,7 +47,9 @@ import sys
 from updates.decky_release import select_preview
 
 with open(sys.argv[1], encoding="utf-8") as handle:
-    release = select_preview(json.load(handle))
+    release = select_preview(
+        json.load(handle), prerelease_only=True, pinned_tag=sys.argv[3]
+    )
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(asdict(release), handle)
     handle.write("\n")
