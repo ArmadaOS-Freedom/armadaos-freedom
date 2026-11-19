@@ -637,6 +637,19 @@ static void test_bootconfig_slot_rejections(void)
     struct bc_opts o;
     int source = -1;
 
+    assert(bc_slot("bootconfig", "x..other=qcom\nandroidboot.slot_suffix=_a\n", &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig", "other=a\001z\nandroidboot.slot_suffix=_a\n", &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig", "other=\"a\001z\"\nandroidboot.slot_suffix=_a\n", &BC_OK, &source) == -1);
+    assert(bc_slot("bootconfig",
+                   "ignored=1\nignored=2\nandroidboot.slot_suffix=_a\n",
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("console=tty0 \"--\" bootconfig", TB710FU_PARAMS,
+                   &BC_OK, &source) == -1);
+    assert(bc_slot("androidboot.verifiedbootstate=green bootconfig",
+                   TB710FU_PARAMS, &BC_OK, &source) == -1);
+    assert(bc_lock("androidboot.slot_suffix=_a bootconfig", TB710FU_PARAMS,
+                   &source) == 0);
+
     /* The kernel switch is required. */
     assert(bc_slot("console=tty0", TB710FU_PARAMS, &BC_OK, &source) == -1);
     assert(source == 0);

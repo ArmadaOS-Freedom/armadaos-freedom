@@ -18,9 +18,9 @@
  * Returns 0 for slot _a, 1 for slot _b, or -1 when the evidence is
  * absent, malformed, or conflicting (including duplicate keys).
  *
- * When bootargs carries no androidboot.slot_suffix token at all but does
- * carry the exact "bootconfig" switch among the kernel parameters before any
- * "--", the AOSP bootconfig trailer at the end
+ * When bootargs carries no androidboot.slot_suffix or boot-lock key at all
+ * but does carry the exact "bootconfig" switch among the kernel parameters
+ * before any "--", the AOSP bootconfig trailer at the end
  * of the firmware initrd (/chosen linux,initrd-start..end, inside a declared
  * memory range, with a valid size and checksum) is read instead with the same
  * duplicate, bare-key and value rules. Bootargs evidence, valid or not, is
@@ -35,7 +35,8 @@ int kshim_boot_slot_read(const void *firmware_fdt);
 /*
  * Read boot-lock state from original firmware DT /chosen/bootargs, or from
  * the firmware bootconfig under the same rule as kshim_boot_slot_read_source()
- * when bootargs carries none of the three keys below.
+ * when bootargs carries no androidboot.slot_suffix token and none of the
+ * three lock keys below.
  * androidboot.verifiedbootstate is required: green/yellow mean locked and
  * orange means unlocked. vbmeta.device_state and flash.locked may only
  * corroborate it. Returns 0 for unknown, 1 for locked, or 2 for unlocked.

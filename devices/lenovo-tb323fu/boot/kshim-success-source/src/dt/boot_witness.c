@@ -16,6 +16,15 @@
 #define BOOT_WITNESS_INITRD_MAX (UINT64_C(1) << 30)
 /* Longest normalized "key=value" token examined for a witness key. */
 #define BOOT_WITNESS_TOKEN_MAX 128U
+/* Upper bound on distinct accepted assignment lines tracked per source. */
+#define BOOT_WITNESS_XBC_NODE_MAX 1024
+/* Compact view of one accepted assignment line: byte offsets into text. */
+struct boot_witness_bc_view {
+    uint16_t key_off;
+    uint16_t key_len;
+    uint16_t val_off;
+    uint16_t val_len;
+};
 
 /* ASCII whitespace per boot requirements; no locale, no heap. */
 static int boot_witness_is_space(char c)
@@ -469,6 +478,30 @@ static int boot_witness_bc_key_char(char c)
            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
 }
 
+/* Printable ASCII plus the six accepted whitespace bytes (no locale). */
+static int boot_witness_bc_printable(char c)
+{
+    unsigned char u = (unsigned char)c;
+
+    return (u >= 0x20u && u <= 0x7eu) || boot_witness_is_space(c);
+}
+
+/* Reject leading, trailing, or consecutive '.' in a bare flat key. */
+static int boot_witness_bc_key_ok(const char *key, size_t key_len)
+{
+    size_t i;
+
+    if (key_len == 0 || key[0] == '.' || key[key_len - 1] == '.') {
+        return 0;
+    }
+    for (i = 1; i < key_len; i++) {
+        if (key[i] == '.' && key[i - 1] == '.') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /*
  * Parse one bootconfig line under the strict flat grammar:
  *   blank | '#' comment | KEY ws* '=' ws* VALUE ws* ['#' comment]
@@ -495,7 +528,7 @@ static int boot_witness_bc_line(const char *text, size_t len,
     while (j < len && boot_witness_bc_key_char(text[j])) {
         j++;
     }
-    if (j == i) {
+    if (j == i || !boot_witness_bc_key_ok(text + i, j - i)) {
         return -1;
     }
     *key = text + i;
@@ -517,9 +550,15 @@ static int boot_witness_bc_line(const char *text, size_t len,
 
     if (text[j] == '"' || text[j] == '\'') {
         const char *close = memchr(text + j + 1, text[j], len - (j + 1));
+        const char *p;
 
         if (!close) {
             return -1;
+        }
+        for (p = text + j + 1; p < close; p++) {
+            if (!boot_witness_bc_printable(*p)) {
+                return -1;
+            }
         }
         *val = text + j + 1;
         *val_len = (size_t)(close - *val);
@@ -538,7 +577,7 @@ static int boot_witness_bc_line(const char *text, size_t len,
         char c = text[j];
 
         if (c == ',' || c == ';' || c == '{' || c == '}' || c == '"' ||
-            c == '\'') {
+            c == '\'' || !boot_witness_bc_printable(c)) {
             return -1;
         }
         j++;
@@ -552,61 +591,100 @@ static int boot_witness_bc_line(const char *text, size_t len,
 
 /*
  * Feed bootconfig assignments of keys as normalized "key=value" tokens.
- * Android bootconfig is a flat list of single assignments, one per line. The
- * whole bootconfig is first checked against the strict grammar above; any
- * line outside it (arrays, ';', braces, other operators, empty values,
- * embedded quotes, ...) could change which key a later line belongs to, so
- * the source is then unsupported and the first key is passed on bare so no
- * evidence is used.
+ * Android bootconfig is a flat list of single assignments, one per line. A
+ * first pass validates the whole bootconfig against the strict grammar
+ * above and records accepted assignment lines as bounded offset views; any
+ * line outside the grammar (arrays, ';', braces, other operators, empty
+ * values, embedded quotes, ...) could change which key a later line belongs
+ * to, so the source is then unsupported and the first key is passed on bare
+ * so no evidence is used. An exact duplicate ordinary assignment of any key
+ * likewise rejects the source before any evidence is emitted. A second pass
+ * dispatches only the recorded lines matching keys. Storage is a fixed
+ * stack array bounded by XBC_NODE_MAX; overflow is an explicit rejection.
  */
 static void boot_witness_for_each_bootconfig(const char *text, size_t len,
                                              const char *const *keys,
                                              boot_witness_token_fn fn,
                                              void *ctx)
 {
-    const char *key;
-    const char *val;
-    size_t key_len;
-    size_t val_len;
-    size_t pos;
-    int pass;
+    struct boot_witness_bc_view views[BOOT_WITNESS_XBC_NODE_MAX];
+    size_t count = 0;
+    size_t pos = 0;
+    size_t i;
+    size_t k;
 
-    for (pass = 0; pass < 2; pass++) {
-        pos = 0;
-        while (pos < len) {
-            size_t line_end = pos;
-            int rc;
-            size_t k;
+    /* First validation pass: bounded record of accepted assignment views. */
+    while (pos < len) {
+        size_t line_end = pos;
+        const char *key;
+        const char *val;
+        size_t key_len;
+        size_t val_len;
+        int rc;
 
-            while (line_end < len && text[line_end] != '\n') {
-                line_end++;
-            }
-            rc = boot_witness_bc_line(text + pos, line_end - pos, &key,
-                                      &key_len, &val, &val_len);
-            if (rc < 0) {
+        while (line_end < len && text[line_end] != '\n') {
+            line_end++;
+        }
+        rc = boot_witness_bc_line(text + pos, line_end - pos, &key,
+                                  &key_len, &val, &val_len);
+        if (rc < 0) {
+            fn(ctx, keys[0], strlen(keys[0]));
+            return;
+        }
+        if (rc > 0) {
+            if (count >= BOOT_WITNESS_XBC_NODE_MAX) {
+                /* Explicit capacity rejection; no evidence used. */
                 fn(ctx, keys[0], strlen(keys[0]));
                 return;
             }
-            if (rc > 0 && pass == 1) {
-                for (k = 0; keys[k] != NULL; k++) {
-                    char token[BOOT_WITNESS_TOKEN_MAX];
+            views[count].key_off = (uint16_t)(key - text);
+            views[count].key_len = (uint16_t)key_len;
+            views[count].val_off = (uint16_t)(val - text);
+            views[count].val_len = (uint16_t)val_len;
+            count++;
+        }
+        pos = line_end + 1;
+    }
 
-                    if (strlen(keys[k]) != key_len ||
-                        memcmp(keys[k], key, key_len) != 0) {
-                        continue;
-                    }
-                    if (key_len + 1 + val_len > sizeof(token)) {
-                        fn(ctx, keys[k], key_len);
-                        break;
-                    }
-                    memcpy(token, key, key_len);
-                    token[key_len] = '=';
-                    memcpy(token + key_len + 1, val, val_len);
-                    fn(ctx, token, key_len + 1 + val_len);
-                    break;
-                }
+    /* Duplicate ordinary assignment of any key rejects the source, even
+     * for keys this reader ignores. Exact comparison; the views avoid
+     * re-parsing prior lines. */
+    for (i = 0; i < count; i++) {
+        size_t j;
+
+        for (j = i + 1; j < count; j++) {
+            if (views[i].key_len == views[j].key_len &&
+                memcmp(text + views[i].key_off, text + views[j].key_off,
+                       views[i].key_len) == 0) {
+                fn(ctx, keys[0], strlen(keys[0]));
+                return;
             }
-            pos = line_end + 1;
+        }
+    }
+
+    /* Second dispatch pass: only recorded views for wanted keys. */
+    for (i = 0; i < count; i++) {
+        const char *key = text + views[i].key_off;
+        size_t key_len = views[i].key_len;
+        const char *val = text + views[i].val_off;
+        size_t val_len = views[i].val_len;
+
+        for (k = 0; keys[k] != NULL; k++) {
+            char token[BOOT_WITNESS_TOKEN_MAX];
+
+            if (strlen(keys[k]) != key_len ||
+                memcmp(keys[k], key, key_len) != 0) {
+                continue;
+            }
+            if (key_len + 1 + val_len > sizeof(token)) {
+                fn(ctx, keys[k], key_len);
+                break;
+            }
+            memcpy(token, key, key_len);
+            token[key_len] = '=';
+            memcpy(token + key_len + 1, val, val_len);
+            fn(ctx, token, key_len + 1 + val_len);
+            break;
         }
     }
 }
@@ -616,7 +694,9 @@ static void boot_witness_for_each_bootconfig(const char *text, size_t len,
  * among the kernel parameters before a standalone "--". Words are split like
  * the kernel's next_arg(): whitespace inside double quotes does not end a
  * word, so a quoted "a -- b" or "x bootconfig" is part of another argument.
- * The slot/lock token rules above are deliberately left unchanged.
+ * A standalone double-quoted "--" is stripped to the same word as bare "--"
+ * and ends the switch region. bootconfig is never accepted embedded inside a
+ * quoted value. The slot/lock token rules above are deliberately unchanged.
  */
 static int boot_witness_bootconfig_enabled(const char *args, size_t len)
 {
@@ -625,6 +705,7 @@ static int boot_witness_bootconfig_enabled(const char *args, size_t len)
 
     while (i < len) {
         size_t start;
+        size_t end;
         int quoted = 0;
 
         while (i < len && boot_witness_is_space(args[i])) {
@@ -640,20 +721,59 @@ static int boot_witness_bootconfig_enabled(const char *args, size_t len)
             }
             i++;
         }
-        if (i - start == 2 && memcmp(args + start, "--", 2) == 0) {
+        end = i;
+        if (end - start == 4 && args[start] == '"' && args[start + 1] == '-' &&
+            args[start + 2] == '-' && args[start + 3] == '"') {
+            break; /* double-quoted standalone -- ends the switch region */
+        }
+        if (end - start == 2 && memcmp(args + start, "--", 2) == 0) {
             break; /* parse_args() stops here; the rest belongs to init */
         }
-        if (i - start == 10 && memcmp(args + start, "bootconfig", 10) == 0) {
+        if (end - start == 10 && memcmp(args + start, "bootconfig", 10) == 0) {
             enabled = 1;
         }
     }
     return enabled;
 }
 
+/*
+ * Presence collector for the four keys that select a witness from bootargs
+ * instead of bootconfig. Any occurrence, valid or invalid, counts: the readers
+ * decide independently whether the values are usable, but the bootconfig path
+ * must be blocked whenever a relevant key appears at all.
+ */
+struct boot_witness_presence_acc {
+    int seen;
+};
+
+static void boot_witness_presence_token(void *ctx, const char *token,
+                                        size_t len)
+{
+    static const char *const keys[] = {
+        "androidboot.slot_suffix",
+        "androidboot.verifiedbootstate",
+        "androidboot.vbmeta.device_state",
+        "androidboot.flash.locked",
+        NULL,
+    };
+    struct boot_witness_presence_acc *acc = ctx;
+    const char *val = NULL;
+    size_t val_len = 0;
+    int i;
+
+    for (i = 0; keys[i]; i++) {
+        if (boot_witness_match(token, len, keys[i], &val, &val_len) != 0) {
+            acc->seen = 1;
+            return;
+        }
+    }
+}
+
 int kshim_boot_slot_read_source(const void *firmware_fdt, int *source)
 {
     static const char *const keys[] = { "androidboot.slot_suffix", NULL };
     struct boot_witness_slot_acc acc = { 0, 0, -1 };
+    struct boot_witness_presence_acc present = { 0 };
     const char *args;
     const char *text;
     size_t content_len = 0;
@@ -679,6 +799,13 @@ int kshim_boot_slot_read_source(const void *firmware_fdt, int *source)
             *source = KSHIM_BOOT_EVIDENCE_BOOTARGS;
         }
         return acc.slot;
+    }
+
+    /* Any relevant bootargs key, even unusable, blocks bootconfig. */
+    boot_witness_for_each_token(args, content_len,
+                                boot_witness_presence_token, &present);
+    if (present.seen) {
+        return -1;
     }
 
     if (!boot_witness_bootconfig_enabled(args, content_len)) {
@@ -713,6 +840,7 @@ int kshim_boot_lock_read_source(const void *firmware_fdt, int *source)
         NULL,
     };
     struct boot_witness_lock_acc acc = { 0, 0, 0, 0, 0 };
+    struct boot_witness_presence_acc present = { 0 };
     const char *args;
     const char *text;
     size_t content_len = 0;
@@ -736,6 +864,13 @@ int kshim_boot_lock_read_source(const void *firmware_fdt, int *source)
             *source = KSHIM_BOOT_EVIDENCE_BOOTARGS;
         }
         return state;
+    }
+
+    /* Any relevant bootargs key, even unusable, blocks bootconfig. */
+    boot_witness_for_each_token(args, content_len,
+                                boot_witness_presence_token, &present);
+    if (present.seen) {
+        return 0;
     }
 
     if (!boot_witness_bootconfig_enabled(args, content_len)) {
