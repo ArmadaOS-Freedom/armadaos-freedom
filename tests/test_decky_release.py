@@ -146,6 +146,29 @@ class TestSelectPreview(unittest.TestCase):
         with self.assertRaises(DeckyReleaseError):
             self.select(releases)
 
+    def test_require_arm64_skips_newest_missing_and_returns_older_published(self):
+        releases = [
+            rel(1, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+            rel(2, "v3.4.0-pre1", "2024-07-01T00:00:00Z", prerelease=True,
+                assets=[{"id": 1, "name": "other", "size": 1}]),
+        ]
+        r = select_preview(releases, prerelease_only=True, require_arm64=True)
+        self.assertEqual((r.release_id, r.tag), (1, "v3.3.1-pre1"))
+
+    def test_require_arm64_matching_candidate_with_bad_metadata_fails(self):
+        releases = [
+            rel(1, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+            rel(2, "v3.4.0-pre1", "2024-07-01T00:00:00Z", prerelease=True,
+                assets=[asset("v3.4.0-pre1", digest=None)]),
+        ]
+        with self.assertRaisesRegex(DeckyReleaseError, "digest"):
+            select_preview(releases, prerelease_only=True, require_arm64=True)
+
+    def test_require_arm64_keeps_nonlist_assets_failing_later(self):
+        releases = [rel(1, "v1", "2024-01-01T00:00:00Z", assets="x")]
+        with self.assertRaises(DeckyReleaseError):
+            select_preview(releases, require_arm64=True)
+
     def test_duplicate_asset_fails(self):
         releases = [rel(1, "v1", "2024-01-01T00:00:00Z", assets=[asset("v1"), asset("v1")])]
         with self.assertRaises(DeckyReleaseError):

@@ -68,7 +68,7 @@ def main() -> int:
         return 1
 
     try:
-        latest = select_preview(data, prerelease_only=True)
+        latest = select_preview(data, prerelease_only=True, require_arm64=True)
         current = select_preview([pinned_doc], prerelease_only=True, pinned_tag=pin)
     except DeckyReleaseError as exc:
         print(f"error: {exc}", file=sys.stderr)

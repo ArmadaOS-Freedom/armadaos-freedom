@@ -90,6 +90,7 @@ def select_preview(
     *,
     prerelease_only: bool = False,
     pinned_tag: str | None = None,
+    require_arm64: bool = False,
 ) -> DeckyRelease:
     if not isinstance(releases, list):
         raise DeckyReleaseError("Releases payload must be a list")
@@ -109,6 +110,12 @@ def select_preview(
             continue
         if prerelease_only and not is_prerelease:
             continue
+        if require_arm64:
+            assets = item.get("assets")
+            if isinstance(assets, list) and not any(
+                isinstance(a, dict) and a.get("name") == ASSET_NAME for a in assets
+            ):
+                continue
         rel_id = _require_pos_int(item.get("id"), "release id")
         dt = _parse_iso8601(item.get("published_at"))
         candidates.append((dt, rel_id, item))
