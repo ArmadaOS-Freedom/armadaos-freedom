@@ -3,15 +3,15 @@ Subject: [PATCH] media: fix Y700 camera power and sub-device lifetime
 Keep V4L2 node references independent of driver binding. For the opt-in
 nodes, serialize open and I/O with unregister, disconnect the bridge and
 keep sub-device callbacks, state and controls alive through the last close.
-Remove the media interface and its links under the graph mutex so topology
-queries cannot observe an interface being freed.
-Balance lens file and sensor stream PM references during detach.
+Remove the media interface and links under the media graph mutex. Balance
+lens file and sensor stream PM references during detach.
 
-Require PM for the sensors. Allow another runtime resume after confirmed
-rollback, and check the power fault with a PM reference held. Reapply the
-sensor reset exit sequence before sending mode registers if another PM
-reference prevented a power cycle. Retry cleanup at detach only for the
-regulator references still held by the driver.
+Require PM for the sensors and replay the reset exit sequence before I/O
+if a retained PM reference prevented a power cycle. Report recoverable
+power-off failures to runtime PM as -EAGAIN and preserve the original
+error. Reject I/O until a later idle or resume has cleared the fault. A
+post-release supply error remains fatal because another disable cannot
+repair it. Detach retries only references still held.
 
 diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
 index d1e1eb9..3df5a84 100755
@@ -36,7 +36,7 @@ index d1e1eb9..3df5a84 100755
  	select V4L2_FWNODE
  	help
 diff --git a/drivers/media/i2c/gc08a8.c b/drivers/media/i2c/gc08a8.c
-index 87a651b..bae7ecd 100755
+index 87a651b..4630bfa 100755
 --- a/drivers/media/i2c/gc08a8.c
 +++ b/drivers/media/i2c/gc08a8.c
 @@ -5,9 +5,11 @@
@@ -109,7 +109,7 @@ index 87a651b..bae7ecd 100755
  static const struct cci_reg_sequence gc08a8_init_regs[] = {
  	{ CCI_REG8(0x031c), 0x60 },
  	{ CCI_REG8(0x0337), 0x03 },
-@@ -489,57 +522,82 @@ static const struct cci_reg_sequence gc08a8_3264x2448_regs[] = {
+@@ -489,57 +522,92 @@ static const struct cci_reg_sequence gc08a8_3264x2448_regs[] = {
  	{ CCI_REG8(0x0102), 0x09 },
  };
  
@@ -212,14 +212,33 @@ index 87a651b..bae7ecd 100755
 +	ret = gc08a8_disable_supplies(sensor);
 +	WRITE_ONCE(sensor->power_error, reset_ret ?: ret);
 +	return reset_ret ?: ret;
++}
++
++static int gc08a8_runtime_suspend(struct device *dev)
++{
++	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
++	int ret = gc08a8_power_off(dev);
++
++	if (ret)
++		return sensor->supply_error ? -EIO : -EAGAIN;
++	return 0;
  }
  
  static int gc08a8_power_on(struct device *dev)
-@@ -549,9 +607,9 @@ static int gc08a8_power_on(struct device *dev)
+@@ -547,11 +615,16 @@ static int gc08a8_power_on(struct device *dev)
+ 	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
+ 	int i, ret;
  
- 	if (sensor->power_error)
- 		return sensor->power_error;
+-	if (sensor->power_error)
+-		return sensor->power_error;
 -	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (sensor->power_error) {
++		if (sensor->supply_error)
++			return sensor->power_error;
++		ret = gc08a8_power_off(dev);
++		if (ret)
++			return ret;
++	}
 +	ret = gc08a8_set_reset(sensor, true);
  	if (ret)
 -		return ret;
@@ -227,7 +246,7 @@ index 87a651b..bae7ecd 100755
  	fsleep(1000);
  	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
  		ret = regulator_enable(sensor->supplies[i].consumer);
-@@ -566,7 +624,7 @@ static int gc08a8_power_on(struct device *dev)
+@@ -566,7 +639,7 @@ static int gc08a8_power_on(struct device *dev)
  		goto power_off;
  	sensor->clock_enabled = true;
  	fsleep(10000);
@@ -236,7 +255,7 @@ index 87a651b..bae7ecd 100755
  	if (ret)
  		goto power_off;
  	fsleep(3000);
-@@ -578,6 +636,21 @@ power_off:
+@@ -578,6 +651,21 @@ power_off:
  	return ret;
  }
  
@@ -248,9 +267,9 @@ index 87a651b..bae7ecd 100755
 +	if (!ret)
 +		return 0;
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
-+	if (sensor->power_error)
++	if (sensor->supply_error)
 +		return -EIO;
-+	if (ret == -ENOTRECOVERABLE)
++	if (ret == -ENOTRECOVERABLE && !sensor->power_error)
 +		return ret;
 +	return -EAGAIN;
 +}
@@ -258,7 +277,7 @@ index 87a651b..bae7ecd 100755
  static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct gc08a8 *sensor = container_of(ctrl->handler, struct gc08a8, ctrls);
-@@ -585,6 +658,9 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -585,6 +673,9 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  	u16 reg;
  	int ret = 0, release;
  
@@ -268,7 +287,7 @@ index 87a651b..bae7ecd 100755
  	switch (ctrl->id) {
  	case V4L2_CID_EXPOSURE:
  		reg = 0x0202;
-@@ -596,12 +672,14 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -596,12 +687,14 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
  		return 0;
  	}
  
@@ -286,7 +305,7 @@ index 87a651b..bae7ecd 100755
  
  	cci_write(sensor->regmap, CCI_REG8(0x0104), 1, &ret);
  	cci_write(sensor->regmap, CCI_REG8(reg), ctrl->val >> 8, &ret);
-@@ -648,11 +726,8 @@ static int gc08a8_init_controls(struct gc08a8 *sensor)
+@@ -648,11 +741,8 @@ static int gc08a8_init_controls(struct gc08a8 *sensor)
  	v4l2_ctrl_new_std(hdl, &gc08a8_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
  			  1024, 16384, 1, 1024);
  	v4l2_ctrl_new_fwnode_properties(hdl, &gc08a8_ctrl_ops, &props);
@@ -300,7 +319,7 @@ index 87a651b..bae7ecd 100755
  	sensor->sd.ctrl_handler = hdl;
  	return 0;
  }
-@@ -741,20 +816,18 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -741,20 +831,18 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  	int ret = 0, power_ret;
  
  	state = v4l2_subdev_lock_and_get_active_state(sd);
@@ -325,7 +344,7 @@ index 87a651b..bae7ecd 100755
  		power_ret = pm_runtime_put_sync(sd->dev);
  		if (power_ret < 0) {
  			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
-@@ -768,6 +841,12 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -768,6 +856,12 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  	ret = pm_runtime_resume_and_get(sd->dev);
  	if (ret < 0)
  		goto unlock;
@@ -338,7 +357,7 @@ index 87a651b..bae7ecd 100755
  	cci_multi_reg_write(sensor->regmap, gc08a8_init_regs,
  			    ARRAY_SIZE(gc08a8_init_regs), &ret);
  	cci_multi_reg_write(sensor->regmap, gc08a8_3264x2448_regs,
-@@ -776,14 +855,17 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -776,14 +870,17 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
  		ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
  	cci_write(sensor->regmap, CCI_REG8(0x0100), 1, &ret);
  	if (ret) {
@@ -363,7 +382,7 @@ index 87a651b..bae7ecd 100755
  unlock:
  	v4l2_subdev_unlock_state(state);
  	return ret;
-@@ -808,6 +890,8 @@ static const struct v4l2_subdev_ops gc08a8_ops = {
+@@ -808,6 +905,8 @@ static const struct v4l2_subdev_ops gc08a8_ops = {
  
  static const struct v4l2_subdev_internal_ops gc08a8_internal_ops = {
  	.init_state = gc08a8_init_state,
@@ -372,7 +391,7 @@ index 87a651b..bae7ecd 100755
  };
  
  static int gc08a8_check_endpoint(struct device *dev)
-@@ -838,6 +922,26 @@ free:
+@@ -838,6 +937,26 @@ free:
  	return ret;
  }
  
@@ -399,7 +418,7 @@ index 87a651b..bae7ecd 100755
  static int gc08a8_probe(struct i2c_client *client)
  {
  	struct device *dev = &client->dev;
-@@ -848,9 +952,13 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -848,9 +967,13 @@ static int gc08a8_probe(struct i2c_client *client)
  	ret = gc08a8_check_endpoint(dev);
  	if (ret)
  		return dev_err_probe(dev, ret, "Unsupported CSI-2 endpoint\n");
@@ -414,7 +433,7 @@ index 87a651b..bae7ecd 100755
  	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
  	if (IS_ERR(sensor->regmap))
  		return dev_err_probe(dev, PTR_ERR(sensor->regmap), "Failed to create regmap\n");
-@@ -875,10 +983,15 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -875,10 +998,15 @@ static int gc08a8_probe(struct i2c_client *client)
  	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
  
  	ret = gc08a8_power_on(dev);
@@ -431,7 +450,7 @@ index 87a651b..bae7ecd 100755
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
  	if (power_ret)
-@@ -891,29 +1004,19 @@ static int gc08a8_probe(struct i2c_client *client)
+@@ -891,29 +1019,19 @@ static int gc08a8_probe(struct i2c_client *client)
  		return ret;
  	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
  	if (ret)
@@ -465,7 +484,7 @@ index 87a651b..bae7ecd 100755
  	return ret;
  }
  
-@@ -923,13 +1026,7 @@ static void gc08a8_remove(struct i2c_client *client)
+@@ -923,13 +1041,7 @@ static void gc08a8_remove(struct i2c_client *client)
  	struct gc08a8 *sensor = to_gc08a8(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -480,7 +499,7 @@ index 87a651b..bae7ecd 100755
  }
  
  static int gc08a8_suspend(struct device *dev)
-@@ -942,17 +1039,19 @@ static int gc08a8_suspend(struct device *dev)
+@@ -942,17 +1054,19 @@ static int gc08a8_suspend(struct device *dev)
  	state = v4l2_subdev_lock_and_get_active_state(sd);
  	if (sensor->streaming)
  		ret = -EBUSY;
@@ -501,12 +520,12 @@ index 87a651b..bae7ecd 100755
  static const struct dev_pm_ops gc08a8_pm_ops = {
  	SYSTEM_SLEEP_PM_OPS(gc08a8_suspend, pm_runtime_force_resume)
 -	RUNTIME_PM_OPS(gc08a8_power_off, gc08a8_power_on, NULL)
-+	RUNTIME_PM_OPS(gc08a8_power_off, gc08a8_runtime_resume, NULL)
++	RUNTIME_PM_OPS(gc08a8_runtime_suspend, gc08a8_runtime_resume, NULL)
  };
  
  static const struct of_device_id gc08a8_of_match[] = {
 diff --git a/drivers/media/i2c/gt9764.c b/drivers/media/i2c/gt9764.c
-index 9cb8cca..ede47e0 100755
+index 9cb8cca..d24c64b 100755
 --- a/drivers/media/i2c/gt9764.c
 +++ b/drivers/media/i2c/gt9764.c
 @@ -3,10 +3,12 @@
@@ -573,7 +592,7 @@ index 9cb8cca..ede47e0 100755
  static int gt9764_set_position(struct gt9764 *lens, u16 position)
  {
  	struct i2c_client *client = v4l2_get_subdevdata(&lens->sd);
-@@ -51,24 +82,30 @@ static int gt9764_set_position(struct gt9764 *lens, u16 position)
+@@ -51,24 +82,40 @@ static int gt9764_set_position(struct gt9764 *lens, u16 position)
  static int gt9764_power_off(struct device *dev)
  {
  	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
@@ -612,19 +631,39 @@ index 9cb8cca..ede47e0 100755
 -	return lens->power_error;
 +	WRITE_ONCE(lens->power_error, error);
 +	return error;
++}
++
++static int gt9764_runtime_suspend(struct device *dev)
++{
++	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
++	int ret = gt9764_power_off(dev);
++
++	if (ret)
++		return lens->supply_error ? -EIO : -EAGAIN;
++	return 0;
  }
  
  static int gt9764_power_on(struct device *dev)
-@@ -86,7 +123,7 @@ static int gt9764_power_on(struct device *dev)
+@@ -86,10 +133,15 @@ static int gt9764_power_on(struct device *dev)
  		{ GT9764_AAC_TIMING, lens->aac_timing },
  	};
  	unsigned int i;
 -	int ret;
 +	int position, ret;
  
- 	if (lens->power_error)
- 		return lens->power_error;
-@@ -108,9 +145,10 @@ static int gt9764_power_on(struct device *dev)
+-	if (lens->power_error)
+-		return lens->power_error;
++	if (lens->power_error) {
++		if (lens->supply_error)
++			return lens->power_error;
++		ret = gt9764_power_off(dev);
++		if (ret)
++			return ret;
++	}
+ 	ret = regulator_enable(lens->supplies[0].consumer);
+ 	if (ret)
+ 		return ret;
+@@ -108,9 +160,10 @@ static int gt9764_power_on(struct device *dev)
  	}
  
  	fsleep(lens->settling_time);
@@ -637,7 +676,7 @@ index 9cb8cca..ede47e0 100755
  	if (!ret)
  		return 0;
  
-@@ -120,6 +158,21 @@ power_off:
+@@ -120,6 +173,21 @@ power_off:
  	return ret;
  }
  
@@ -649,9 +688,9 @@ index 9cb8cca..ede47e0 100755
 +	if (!ret)
 +		return 0;
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
-+	if (lens->power_error)
++	if (lens->supply_error)
 +		return -EIO;
-+	if (ret == -ENOTRECOVERABLE)
++	if (ret == -ENOTRECOVERABLE && !lens->power_error)
 +		return ret;
 +	return -EAGAIN;
 +}
@@ -659,7 +698,7 @@ index 9cb8cca..ede47e0 100755
  static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct gt9764 *lens = container_of(ctrl->handler, struct gt9764, ctrls);
-@@ -127,13 +180,13 @@ static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -127,13 +195,13 @@ static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
  
  	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
  		return -EINVAL;
@@ -676,7 +715,7 @@ index 9cb8cca..ede47e0 100755
  	pm_runtime_put(lens->sd.dev);
  	return ret;
  }
-@@ -148,7 +201,18 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -148,7 +216,18 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  	int ret;
  
  	mutex_lock(lens->ctrls.lock);
@@ -696,7 +735,7 @@ index 9cb8cca..ede47e0 100755
  	mutex_unlock(lens->ctrls.lock);
  	return ret;
  }
-@@ -156,10 +220,13 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -156,10 +235,13 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  {
  	struct gt9764 *lens = to_gt9764(sd);
@@ -712,7 +751,7 @@ index 9cb8cca..ede47e0 100755
  	mutex_unlock(lens->ctrls.lock);
  	return ret < 0 ? ret : 0;
  }
-@@ -167,19 +234,45 @@ static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+@@ -167,19 +249,45 @@ static int gt9764_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
  static const struct v4l2_subdev_internal_ops gt9764_internal_ops = {
  	.open = gt9764_open,
  	.close = gt9764_close,
@@ -759,7 +798,7 @@ index 9cb8cca..ede47e0 100755
  
  	ret = device_property_read_u32(dev, "giantec,aac-mode", &lens->aac_mode);
  	if (ret)
-@@ -212,29 +305,20 @@ static int gt9764_probe(struct i2c_client *client)
+@@ -212,29 +320,20 @@ static int gt9764_probe(struct i2c_client *client)
  					GT9764_POSITION_MAX, 1, GT9764_POSITION_INIT);
  	ret = lens->ctrls.error;
  	if (ret)
@@ -795,7 +834,7 @@ index 9cb8cca..ede47e0 100755
  	return ret;
  }
  
-@@ -244,11 +328,7 @@ static void gt9764_remove(struct i2c_client *client)
+@@ -244,11 +343,7 @@ static void gt9764_remove(struct i2c_client *client)
  	struct gt9764 *lens = to_gt9764(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -808,7 +847,7 @@ index 9cb8cca..ede47e0 100755
  }
  
  static int gt9764_suspend(struct device *dev)
-@@ -257,14 +337,15 @@ static int gt9764_suspend(struct device *dev)
+@@ -257,14 +352,15 @@ static int gt9764_suspend(struct device *dev)
  	int ret;
  
  	mutex_lock(lens->ctrls.lock);
@@ -822,12 +861,12 @@ index 9cb8cca..ede47e0 100755
  static const struct dev_pm_ops gt9764_pm_ops = {
  	SYSTEM_SLEEP_PM_OPS(gt9764_suspend, pm_runtime_force_resume)
 -	RUNTIME_PM_OPS(gt9764_power_off, gt9764_power_on, NULL)
-+	RUNTIME_PM_OPS(gt9764_power_off, gt9764_runtime_resume, NULL)
++	RUNTIME_PM_OPS(gt9764_runtime_suspend, gt9764_runtime_resume, NULL)
  };
  
  static const struct of_device_id gt9764_of_match[] = {
 diff --git a/drivers/media/i2c/s5kjns.c b/drivers/media/i2c/s5kjns.c
-index 4af91db..c699230 100755
+index 4af91db..af033e7 100755
 --- a/drivers/media/i2c/s5kjns.c
 +++ b/drivers/media/i2c/s5kjns.c
 @@ -5,9 +5,11 @@
@@ -900,7 +939,7 @@ index 4af91db..c699230 100755
  static const struct cci_reg_sequence s5kjns_reset_regs[] = {
  	{ CCI_REG16(0x6028), 0x4000 },
  	{ CCI_REG16(0x0000), 0x0001 },
-@@ -388,57 +421,103 @@ static const struct cci_reg_sequence s5kjns_4080x3072_regs[] = {
+@@ -388,57 +421,113 @@ static const struct cci_reg_sequence s5kjns_4080x3072_regs[] = {
  	{ CCI_REG16(0x6226), 0x0000 },
  };
  
@@ -950,12 +989,12 @@ index 4af91db..c699230 100755
 +		clk_disable_unprepare(sensor->xclk);
 +		sensor->clock_enabled = false;
 +		fsleep(10000);
- 	}
++	}
 +	if (sensor->reset_error || !sensor->reset_asserted) {
 +		ret = s5kjns_set_reset(sensor, true);
 +		if (ret)
 +			return ret;
-+	}
+ 	}
 +
 +	fsleep(1000);
 +	ret = s5kjns_exit_reset(sensor);
@@ -1024,14 +1063,33 @@ index 4af91db..c699230 100755
 +	ret = s5kjns_disable_supplies(sensor);
 +	WRITE_ONCE(sensor->power_error, reset_ret ?: ret);
 +	return reset_ret ?: ret;
++}
++
++static int s5kjns_runtime_suspend(struct device *dev)
++{
++	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
++	int ret = s5kjns_power_off(dev);
++
++	if (ret)
++		return sensor->supply_error ? -EIO : -EAGAIN;
++	return 0;
  }
  
  static int s5kjns_power_on(struct device *dev)
-@@ -448,9 +527,9 @@ static int s5kjns_power_on(struct device *dev)
+@@ -446,11 +535,16 @@ static int s5kjns_power_on(struct device *dev)
+ 	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
+ 	int i, ret;
  
- 	if (sensor->power_error)
- 		return sensor->power_error;
+-	if (sensor->power_error)
+-		return sensor->power_error;
 -	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (sensor->power_error) {
++		if (sensor->supply_error)
++			return sensor->power_error;
++		ret = s5kjns_power_off(dev);
++		if (ret)
++			return ret;
++	}
 +	ret = s5kjns_set_reset(sensor, true);
  	if (ret)
 -		return ret;
@@ -1039,7 +1097,7 @@ index 4af91db..c699230 100755
  	fsleep(1000);
  	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
  		ret = regulator_enable(sensor->supplies[i].consumer);
-@@ -460,16 +539,9 @@ static int s5kjns_power_on(struct device *dev)
+@@ -460,16 +554,9 @@ static int s5kjns_power_on(struct device *dev)
  		fsleep(1000);
  	}
  
@@ -1059,7 +1117,7 @@ index 4af91db..c699230 100755
  
  power_off:
  	/* power_off logs and latches cleanup errors; preserve the first error. */
-@@ -477,6 +549,21 @@ power_off:
+@@ -477,6 +564,21 @@ power_off:
  	return ret;
  }
  
@@ -1071,9 +1129,9 @@ index 4af91db..c699230 100755
 +	if (!ret)
 +		return 0;
 +	dev_err_ratelimited(dev, "Power-up failed: %d\n", ret);
-+	if (sensor->power_error)
++	if (sensor->supply_error)
 +		return -EIO;
-+	if (ret == -ENOTRECOVERABLE)
++	if (ret == -ENOTRECOVERABLE && !sensor->power_error)
 +		return ret;
 +	return -EAGAIN;
 +}
@@ -1081,7 +1139,7 @@ index 4af91db..c699230 100755
  static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  {
  	struct s5kjns *sensor = container_of(ctrl->handler, struct s5kjns, ctrls);
-@@ -484,6 +571,9 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -484,6 +586,9 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  	u16 reg;
  	int ret = 0, release;
  
@@ -1091,7 +1149,7 @@ index 4af91db..c699230 100755
  	switch (ctrl->id) {
  	case V4L2_CID_EXPOSURE:
  		reg = 0x0202;
-@@ -498,12 +588,14 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+@@ -498,12 +603,14 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
  		return 0;
  	}
  
@@ -1109,7 +1167,7 @@ index 4af91db..c699230 100755
  
  	cci_write(sensor->regmap, CCI_REG16(0x6028), 0x4000, &ret);
  	if (ctrl->id == V4L2_CID_TEST_PATTERN) {
-@@ -560,11 +652,8 @@ static int s5kjns_init_controls(struct s5kjns *sensor)
+@@ -560,11 +667,8 @@ static int s5kjns_init_controls(struct s5kjns *sensor)
  				     ARRAY_SIZE(s5kjns_test_pattern_menu) - 1,
  				     0, 0, s5kjns_test_pattern_menu);
  	v4l2_ctrl_new_fwnode_properties(hdl, &s5kjns_ctrl_ops, &props);
@@ -1123,7 +1181,7 @@ index 4af91db..c699230 100755
  	sensor->sd.ctrl_handler = hdl;
  	return 0;
  }
-@@ -658,20 +747,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -658,20 +762,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  	int ret = 0, power_ret;
  
  	state = v4l2_subdev_lock_and_get_active_state(sd);
@@ -1148,7 +1206,7 @@ index 4af91db..c699230 100755
  		power_ret = pm_runtime_put_sync(sd->dev);
  		if (power_ret < 0) {
  			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
-@@ -685,10 +772,16 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -685,10 +787,16 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  	ret = pm_runtime_resume_and_get(sd->dev);
  	if (ret < 0)
  		goto unlock;
@@ -1166,7 +1224,7 @@ index 4af91db..c699230 100755
  	fsleep(13000);
  	cci_multi_reg_write(sensor->regmap, s5kjns_init_regs,
  			    ARRAY_SIZE(s5kjns_init_regs), &ret);
-@@ -698,16 +791,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+@@ -698,16 +806,18 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
  		ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
  	cci_write(sensor->regmap, CCI_REG16(0x6028), 0x4000, &ret);
  	cci_write(sensor->regmap, CCI_REG16(0x0100), 0x0100, &ret);
@@ -1195,7 +1253,7 @@ index 4af91db..c699230 100755
  unlock:
  	v4l2_subdev_unlock_state(state);
  	return ret;
-@@ -732,6 +827,8 @@ static const struct v4l2_subdev_ops s5kjns_ops = {
+@@ -732,6 +842,8 @@ static const struct v4l2_subdev_ops s5kjns_ops = {
  
  static const struct v4l2_subdev_internal_ops s5kjns_internal_ops = {
  	.init_state = s5kjns_init_state,
@@ -1204,7 +1262,7 @@ index 4af91db..c699230 100755
  };
  
  static int s5kjns_check_endpoint(struct device *dev)
-@@ -762,6 +859,26 @@ free:
+@@ -762,6 +874,26 @@ free:
  	return ret;
  }
  
@@ -1231,7 +1289,7 @@ index 4af91db..c699230 100755
  static int s5kjns_probe(struct i2c_client *client)
  {
  	struct device *dev = &client->dev;
-@@ -772,9 +889,13 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -772,9 +904,13 @@ static int s5kjns_probe(struct i2c_client *client)
  	ret = s5kjns_check_endpoint(dev);
  	if (ret)
  		return dev_err_probe(dev, ret, "Unsupported CSI-2 endpoint\n");
@@ -1246,7 +1304,7 @@ index 4af91db..c699230 100755
  	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
  	if (IS_ERR(sensor->regmap))
  		return dev_err_probe(dev, PTR_ERR(sensor->regmap), "Failed to create regmap\n");
-@@ -799,10 +920,15 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -799,10 +935,15 @@ static int s5kjns_probe(struct i2c_client *client)
  	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
  
  	ret = s5kjns_power_on(dev);
@@ -1263,7 +1321,7 @@ index 4af91db..c699230 100755
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
  	if (power_ret)
-@@ -815,29 +941,19 @@ static int s5kjns_probe(struct i2c_client *client)
+@@ -815,29 +956,19 @@ static int s5kjns_probe(struct i2c_client *client)
  		return ret;
  	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
  	if (ret)
@@ -1297,7 +1355,7 @@ index 4af91db..c699230 100755
  	return ret;
  }
  
-@@ -847,13 +963,7 @@ static void s5kjns_remove(struct i2c_client *client)
+@@ -847,13 +978,7 @@ static void s5kjns_remove(struct i2c_client *client)
  	struct s5kjns *sensor = to_s5kjns(sd);
  
  	v4l2_async_unregister_subdev(sd);
@@ -1312,7 +1370,7 @@ index 4af91db..c699230 100755
  }
  
  static int s5kjns_suspend(struct device *dev)
-@@ -866,17 +976,19 @@ static int s5kjns_suspend(struct device *dev)
+@@ -866,17 +991,19 @@ static int s5kjns_suspend(struct device *dev)
  	state = v4l2_subdev_lock_and_get_active_state(sd);
  	if (sensor->streaming)
  		ret = -EBUSY;
@@ -1333,7 +1391,7 @@ index 4af91db..c699230 100755
  static const struct dev_pm_ops s5kjns_pm_ops = {
  	SYSTEM_SLEEP_PM_OPS(s5kjns_suspend, pm_runtime_force_resume)
 -	RUNTIME_PM_OPS(s5kjns_power_off, s5kjns_power_on, NULL)
-+	RUNTIME_PM_OPS(s5kjns_power_off, s5kjns_runtime_resume, NULL)
++	RUNTIME_PM_OPS(s5kjns_runtime_suspend, s5kjns_runtime_resume, NULL)
  };
  
  static const struct of_device_id s5kjns_of_match[] = {

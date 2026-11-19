@@ -25,7 +25,15 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 
-struct regulator_dev { unsigned int disable_failures; };
+struct regulator_dev;
+struct regulator_ops { int (*is_enabled)(struct regulator_dev *rdev); };
+struct regulator_desc { const struct regulator_ops *ops; };
+struct regulator_dev {
+	const struct regulator_desc *desc;
+	bool ena_pin, disable_state_lost;
+	unsigned int disable_failures;
+	int status;
+};
 struct regulator {
 	struct regulator_dev *rdev;
 	unsigned int enable_count;
@@ -63,7 +71,7 @@ static int (*runtime_resume)(struct device *);
 static int (*runtime_suspend)(struct device *);
 static bool active, disabled, reset_level, clock_on, rear;
 static unsigned int elapsed, reset_released, cci_ready, cci_calls, bus_writes;
-static unsigned int clock_started, fail_bus_write, fail_asserts, freed_ctrls;
+static unsigned int clock_started, clock_enabled_at, fail_bus_write, fail_asserts, freed_ctrls;
 static struct regulator *enable_failure, *disable_failure;
 static bool fail_after_release;
 
@@ -100,8 +108,14 @@ static void v4l2_ctrl_handler_free(struct v4l2_ctrl_handler *handler)
 	freed_ctrls++;
 }
 
+static int regulator_check_disable_fault(struct regulator *regulator);
+
 static int regulator_enable(struct regulator *regulator)
 {
+	int ret = regulator_check_disable_fault(regulator);
+
+	if (ret)
+		return ret;
 	if (regulator == enable_failure)
 		return -EIO;
 	regulator->enable_count++;
@@ -122,6 +136,11 @@ static int _regulator_disable(struct regulator *regulator)
 	return regulator == disable_failure ? -EAGAIN : 0;
 }
 
+static int _regulator_is_enabled(struct regulator_dev *rdev) { return rdev->status; }
+
+static const struct regulator_ops test_regulator_ops = { .is_enabled = _regulator_is_enabled };
+static const struct regulator_desc test_regulator = { .ops = &test_regulator_ops };
+
 static int gpiod_set_value_cansleep(struct gpio_desc *gpio, int asserted)
 {
 	if (asserted && fail_asserts) {
@@ -132,7 +151,7 @@ static int gpiod_set_value_cansleep(struct gpio_desc *gpio, int asserted)
 	if (!asserted) {
 		assert(clock_on != rear);
 		reset_released = elapsed;
-		cci_ready = elapsed + (rear ? 16000 : 3000);
+		cci_ready = elapsed + 3000;
 	}
 	return 0;
 }
@@ -143,6 +162,7 @@ static int clk_prepare_enable(struct clk *clk)
 	if (rear)
 		assert(elapsed >= reset_released + 1000);
 	clock_on = true;
+	clock_enabled_at = elapsed;
 	clock_started++;
 	return 0;
 }
@@ -222,6 +242,8 @@ static int cci_write(struct regmap *regmap, unsigned int reg, int value, int *er
 	if (error && *error)
 		return *error;
 	assert(clock_on && !reset_level && elapsed >= cci_ready);
+	if (rear)
+		assert(elapsed >= clock_enabled_at + 15000);
 	assert(supplies[0].enable_count && supplies[1].enable_count && supplies[2].enable_count);
 	if (++cci_calls == fail_bus_write) {
 		if (error)
@@ -249,12 +271,12 @@ static void fresh(struct v4l2_subdev *sd, struct regulator_bulk_data *bulk, unsi
 	dev.drvdata = sd;
 	sd->dev = &dev;
 	usage = pm_status_error = elapsed = cci_ready = cci_calls = bus_writes = clock_started = 0;
-	reset_released = fail_bus_write = fail_asserts = freed_ctrls = 0;
+	reset_released = clock_enabled_at = fail_bus_write = fail_asserts = freed_ctrls = 0;
 	active = disabled = clock_on = fail_after_release = false;
 	reset_level = true;
 	enable_failure = disable_failure = NULL;
 	for (unsigned int index = 0; index < count; index++) {
-		rails[index] = (struct regulator_dev){0};
+		rails[index] = (struct regulator_dev){ .desc = &test_regulator, .status = 1 };
 		supplies[index] = (struct regulator){ .rdev = &rails[index] };
 		bulk[index] = (struct regulator_bulk_data){ "test", &supplies[index] };
 	}
@@ -270,7 +292,7 @@ static struct gt9764 *fresh_lens(void)
 	lens->focus = &focus;
 	fresh(&lens->sd, lens->supplies, ARRAY_SIZE(lens->supplies));
 	runtime_resume = gt9764_runtime_resume;
-	runtime_suspend = gt9764_power_off;
+	runtime_suspend = gt9764_runtime_suspend;
 	return lens;
 }
 
@@ -288,8 +310,28 @@ int main(void)
 	lens = fresh_lens();
 	assert(!gt9764_open(&lens->sd, NULL));
 	disable_failure = &supplies[1];
-	assert(gt9764_close(&lens->sd, NULL) == -EIO);
+	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
+	assert(lens->power_error == -EIO && !pm_status_error);
 	assert(lens->supplies_enabled == BIT(1) && rails[1].disable_failures == 1);
+	struct regulator peer = { .rdev = &rails[1] };
+	assert(regulator_enable(&supplies[1]) == -ENOTRECOVERABLE);
+	assert(!regulator_enable(&peer) && peer.enable_count == 1);
+	assert(!regulator_disable_with_status(&peer, &(bool){false}));
+	rails[1].status = 0;
+	assert(regulator_check_disable_fault(&peer) == -EAGAIN);
+	rails[1].status = -EIO;
+	assert(regulator_check_disable_fault(&peer) == -EIO);
+	disable_failure = NULL;
+	assert(gt9764_open(&lens->sd, NULL) == -EIO && !usage);
+	assert(!lens->supplies_enabled && !rails[1].disable_failures && !lens->power_error);
+	assert(!gt9764_open(&lens->sd, NULL) && !gt9764_close(&lens->sd, NULL));
+	gt9764_put(lens);
+	puts("PASS retained lens disable permits a confirmed-on peer and recovers without detach");
+
+	lens = fresh_lens();
+	assert(!gt9764_open(&lens->sd, NULL));
+	disable_failure = &supplies[1];
+	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
 	disable_failure = NULL;
 	gt9764_stop_pm(lens);
 	assert(!lens->supplies_enabled && !supplies[1].enable_count && !rails[1].disable_failures);
@@ -300,10 +342,12 @@ int main(void)
 	assert(!gt9764_open(&lens->sd, NULL));
 	disable_failure = &supplies[1];
 	fail_after_release = true;
-	assert(gt9764_close(&lens->sd, NULL) == -EAGAIN);
+	assert(gt9764_close(&lens->sd, NULL) == -EIO);
 	assert(!lens->supplies_enabled && !supplies[1].enable_count && !usage);
-	assert(gt9764_open(&lens->sd, NULL) == -EAGAIN);
+	assert(gt9764_open(&lens->sd, NULL) == -EINVAL);
 	assert(!usage && !lens->open_count && rails[1].disable_failures == 1);
+	peer.rdev = &rails[1];
+	assert(regulator_check_disable_fault(&peer) == -ENOTRECOVERABLE);
 	gt9764_stop_pm(lens);
 	gt9764_put(lens);
 	puts("PASS post-release fault rejects an active PM get without a double disable");
@@ -331,7 +375,7 @@ static void fresh_sensor(struct SENSOR *sensor)
 	sensor->ctrls.lock = &device_lock;
 	fresh(&sensor->sd, sensor->supplies, ARRAY_SIZE(sensor->supplies));
 	runtime_resume = SENSOR_RESUME;
-	runtime_suspend = SENSOR_OFF;
+	runtime_suspend = SENSOR_SUSPEND;
 	rear = SENSOR_IS_REAR;
 }
 
@@ -372,11 +416,32 @@ int main(void)
 	fresh_sensor(&sensor);
 	assert(!pm_runtime_resume_and_get(&dev));
 	disable_failure = &supplies[2];
-	fail_after_release = true;
 	assert(pm_runtime_put_sync(&dev) == -EAGAIN && active && !usage);
-	assert(SENSOR_STREAM(&sensor.sd, 1) == -EAGAIN && !usage && !cci_calls);
+	assert(sensor.power_error == -EIO && !pm_status_error);
+	disable_failure = NULL;
+	assert(SENSOR_STREAM(&sensor.sd, 1) == -EIO && !usage && !cci_calls);
+	assert(!sensor.supplies_enabled && !sensor.power_error && !active);
+	assert(!SENSOR_STREAM(&sensor.sd, 1) && !SENSOR_STREAM(&sensor.sd, 0));
+	puts("PASS a retained disable retries without unsafe sensor I/O or a latched PM error");
+
+	fresh_sensor(&sensor);
+	assert(!pm_runtime_resume_and_get(&dev));
+	disable_failure = &supplies[2];
+	fail_after_release = true;
+	assert(pm_runtime_put_sync(&dev) == -EIO && active && !usage);
+	assert(SENSOR_STREAM(&sensor.sd, 1) == -EINVAL && !usage && !cci_calls);
 	assert(!sensor.streaming && !sensor.supplies_enabled);
-	puts("PASS a PM get racing failed suspend cannot reach sensor I/O");
+	puts("PASS a post-release fault blocks reuse without a double disable");
+
+	fresh_sensor(&sensor);
+	enable_failure = &supplies[1];
+	disable_failure = &supplies[0];
+	assert(SENSOR_STREAM(&sensor.sd, 1) == -EAGAIN && !usage && !active);
+	assert(sensor.supplies_enabled == BIT(0) && !pm_status_error);
+	enable_failure = disable_failure = NULL;
+	assert(!SENSOR_STREAM(&sensor.sd, 1) && !SENSOR_STREAM(&sensor.sd, 0));
+	assert(!sensor.supplies_enabled && !usage);
+	puts("PASS partial resume rollback retries the retained disable before any new enable");
 	return 0;
 }
 #endif

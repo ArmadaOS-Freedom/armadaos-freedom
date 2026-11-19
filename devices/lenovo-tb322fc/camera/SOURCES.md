@@ -18,9 +18,9 @@ error handling can be reviewed independently.
 | 0249 | Local camera2 dependency fix: reverse and bound the V4L2 flash release loop, release every created subdevice once, and unwind after the final torch-clamp write fails or the driver is removed. |
 | 0250 | Shared-build integration: select the provider-owned ICC paths only on Elden; preserve CAMCC probe and the optional ICC binding contract on other SM8750 boards. |
 | 0251 | Local review fixes for WL2868C control-supply sequencing and verified output writes. |
-| 0252 | Local regulator API for reporting consumer reference release and preserving unresolved disable faults across consumer rebind. |
-| 0253 | Local Y700 fixes for runtime PM retries, sensor reset and sub-device detach. |
-| 0254 | Local bounded retry for ICC drops after the power domain is confirmed off. |
+| 0252 | Local regulator API for reporting consumer reference release, checking a shared output after a retained disable failure, and preserving unrecoverable faults across consumer rebind. |
+| 0253 | Local Y700 fixes for runtime PM retries, sensor reset and sub-device detach. Runtime PM can retry a retained reference before permitting further I/O. |
+| 0254 | Local bounded retry for inconclusive power-off status and ICC drops, with a provider PM hold during deferred work. |
 
 Pinned sources:
 

@@ -109,13 +109,16 @@ int main(void)
 
 	assert(!wl2868c_init_outputs(&chip) && !chip.enabled);
 	assert(!wl2868c_enable(&ldo1) && regmap.value == (WL2868C_SYS_ENABLE | BIT(0)));
+	unsigned int reads_before = reads;
 	accept_timeout = writes + 1;
 	assert(!wl2868c_enable(&ldo7) && regmap.value == both);
+	assert(writes == accept_timeout && reads == reads_before + 1);
 	assert(chip.enabled == (BIT(0) | BIT(6)) && wl2868c_is_enabled(&ldo7) == 1);
 	puts("PASS accepted timeout is reconciled without adopting firmware presets");
 
 	fail_write = writes + 1;
 	assert(!wl2868c_disable(&ldo1) && writes == fail_write + 1);
+	assert(regmap.value == (WL2868C_SYS_ENABLE | BIT(6)) && chip.enabled == BIT(6));
 	assert(wl2868c_is_enabled(&ldo7) == 1);
 	assert(!wl2868c_disable(&ldo7) && !regmap.value && !chip.enabled);
 	puts("PASS transient disable error retries without dropping another output");

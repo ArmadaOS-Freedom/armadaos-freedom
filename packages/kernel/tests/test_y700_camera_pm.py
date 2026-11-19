@@ -174,6 +174,7 @@ struct gdsc {
 	struct delayed_work icc_retry_work;
 	unsigned int icc_retries;
 	bool icc_off;
+	bool icc_recheck_off;
 };
 enum gdsc_status { GDSC_OFF, GDSC_ON };
 
@@ -425,6 +426,7 @@ int main(void)
 	off_status = 0;
 	assert(gdsc_enable(&s.pd) == -ETIMEDOUT);
 	assert(s.icc_votes == 3 && calls == 2 && error_count == 1);
+	assert(!s.icc_retry_work.pending);
 	hw_enable_error = 0;
 	off_status = 1;
 	assert(!gdsc_disable(&s.pd));
@@ -436,14 +438,43 @@ int main(void)
 	assert(!gdsc_icc_enable(&s));
 	off_status = 0;
 	assert(!gdsc_disable(&s.pd) && s.icc_votes == 3 && warning_count == 1);
-	assert(!s.icc_retry_work.pending);
+	assert(s.icc_retry_work.pending);
+	run_pending_retry(&s);
+	assert(s.icc_votes == 3 && s.icc_retry_work.pending);
+	assert(!gdsc_enable(&s.pd) && !s.icc_retry_work.pending);
+	before = calls;
+	s.icc_retry_work.work.run(&s.icc_retry_work.work);
+	assert(s.icc_votes == 3 && calls == before);
+	puts("PASS an ON read keeps votes, including across re-enable and dequeued work");
+
 	s = fresh(2);
 	assert(!gdsc_icc_get(&dev, &s));
 	assert(!gdsc_icc_enable(&s));
 	off_status = -EIO;
 	assert(!gdsc_disable(&s.pd) && s.icc_votes == 3 && warning_count == 1);
-	assert(!s.icc_retry_work.pending);
-	puts("PASS unconfirmed hardware OFF cannot drop or schedule ICC votes");
+	rpm_error = -EIO;
+	run_pending_retry(&s);
+	assert(s.icc_votes == 3 && s.icc_retry_work.pending && !rpm_puts);
+	rpm_error = 0;
+	run_pending_retry(&s);
+	assert(s.icc_votes == 3 && s.icc_retry_work.pending && rpm_puts == 1);
+	off_status = 1;
+	run_pending_retry(&s);
+	assert(s.icc_votes == 0 && !s.icc_retry_work.pending && hw_calls == 1);
+	assert(rpm_gets == 3 && rpm_puts == 2);
+	puts("PASS later OFF releases retained votes without a new camera transition");
+
+	s = fresh(2);
+	assert(!gdsc_icc_get(&dev, &s));
+	assert(!gdsc_icc_enable(&s));
+	off_status = -EIO;
+	assert(!gdsc_disable(&s.pd));
+	for (int attempt = 0; attempt < 3; attempt++)
+		run_pending_retry(&s);
+	assert(s.icc_votes == 3 && !s.icc_retry_work.pending && rpm_gets == rpm_puts);
+	gdsc_icc_release(&s);
+	assert(s.icc_retry_work.disabled && warning_count == 2);
+	puts("PASS persistent unreadable status bounds the retry and retains both votes");
 
 	s = fresh(2);
 	assert(!gdsc_icc_get(&dev, &s));
@@ -1531,6 +1562,7 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             "static void gt9764_devnode_put(",
             "static int gt9764_set_position(",
             "static int gt9764_power_off(",
+            "static int gt9764_runtime_suspend(",
             "static int gt9764_power_on(",
             "static int gt9764_runtime_resume(",
             "static int gt9764_open(",
@@ -1542,7 +1574,7 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             f"#define SENSOR {name}\n"
             f"#define SENSOR_IS_REAR {int(name == 's5kjns')}\n"
             f"#define SENSOR_RESUME {name}_runtime_resume\n"
-            f"#define SENSOR_OFF {name}_power_off\n"
+            f"#define SENSOR_SUSPEND {name}_runtime_suspend\n"
             f"#define SENSOR_STREAM {name}_s_stream\n"
         )
         supply_start = source.index(f"static const char * const {name}_supply_names[]")
@@ -1554,6 +1586,7 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
             f"static int {name}_restore_reset(",
             f"static int {name}_disable_supplies(",
             f"static int {name}_power_off(",
+            f"static int {name}_runtime_suspend(",
             f"static int {name}_power_on(",
             f"static int {name}_runtime_resume(",
             f"static int {name}_s_stream(",
@@ -1561,6 +1594,7 @@ def camera_device_harness(name: str, source: str, regulator_core: str) -> str:
     functions = "\n".join((
         supplies,
         extract_function(source, f"\nstruct {name} {{") + ";",
+        extract_function(regulator_core, "\nstatic int regulator_check_disable_fault("),
         extract_function(regulator_core, "\nint regulator_disable_with_status("),
         *(extract_function(source, signature) for signature in signatures),
     ))
@@ -1619,6 +1653,8 @@ def main(argv: list[str] | None = None) -> int:
     csid_source = csid_bytes.decode("utf-8")
     camcc_bytes = camcc_path.read_bytes()
     camcc_source = camcc_bytes.decode("utf-8")
+    media_entity_bytes = media_entity_path.read_bytes()
+    video_dev_bytes = video_dev_path.read_bytes()
 
     icc_functions = "\n\n".join(
         extract_function(gdsc_source, signature)
@@ -1627,6 +1663,7 @@ def main(argv: list[str] | None = None) -> int:
             "static void gdsc_icc_queue_retry(",
             "static void gdsc_icc_retry(",
             "static void gdsc_icc_mark_off(",
+            "static void gdsc_icc_defer_off(",
             "static int gdsc_icc_enable(",
             "static void gdsc_icc_release(",
             "static int gdsc_icc_get(",
@@ -1653,9 +1690,9 @@ def main(argv: list[str] | None = None) -> int:
         run_harness(
             work, "v4l2-managed-node-unregister", "\n".join((
                 NODE_PREFIX,
-                extract_function(media_entity_path.read_text(encoding="utf-8"),
+                extract_function(media_entity_bytes.decode("utf-8"),
                                  "\nvoid media_devnode_remove("),
-                extract_function(video_dev_path.read_text(encoding="utf-8"),
+                extract_function(video_dev_bytes.decode("utf-8"),
                                  "\nvoid video_unregister_device("),
                 NODE_TESTS,
             )),
@@ -1718,8 +1755,8 @@ def main(argv: list[str] | None = None) -> int:
                 "sha256": sha256(regulator_core_bytes),
             },
             "wl2868c": {"path": str(pmic_path), "sha256": sha256(pmic_bytes)},
-            **{key: {"path": str(path), "sha256": sha256(path.read_bytes())}
-               for key, path in (("media_entity", media_entity_path), ("video_dev", video_dev_path))},
+            "media_entity": {"path": str(media_entity_path), "sha256": sha256(media_entity_bytes)},
+            "video_dev": {"path": str(video_dev_path), "sha256": sha256(video_dev_bytes)},
             **{name: {"path": str(camera_paths[name]), "sha256": sha256(data)}
                for name, data in camera_bytes.items()},
         },
