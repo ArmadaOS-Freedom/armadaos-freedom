@@ -58,11 +58,13 @@ assert_eq "transform shell options" "$-" "$before"
 (( ${#cmdline} <= ARMADA_CMDLINE_MAX )) ||
     fail "transform: ${#cmdline}B exceeds ${ARMADA_CMDLINE_MAX}B"
 
-# --- supported-dtbs: shipped Gen4 board input --------------------------------
-# The updater resolves the board DTB through this shipped list, so the Gen4
-# board must be listed exactly once. This is boot input data, not a lint pass.
+# --- supported-dtbs: shipped Lenovo board inputs -----------------------------
+# The updater resolves the board DTB through this shipped list, so the Gen4 and
+# Gen5 boards must be listed exactly once. This is boot input data, not a lint pass.
 elden_entries="$(grep -cxF 'sm8750-lenovo-elden' "$ARMADA_LIB/supported-dtbs" || true)"
 assert_eq "supported-dtbs Gen4 entry count" "$elden_entries" "1"
+baldur_entries="$(grep -cxF 'kaanapali-lenovo-baldur-display' "$ARMADA_LIB/supported-dtbs" || true)"
+assert_eq "supported-dtbs Gen5 entry count" "$baldur_entries" "1"
 
 # --- armada-bootimg-update: snapshot + DTB list resolution -------------------
 

@@ -152,6 +152,8 @@ jobs:
 
       - name: Prepare disk image upload
         id: disk
+        env:
+          PUBLISH_R2: ${{ inputs.publish_r2 }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -165,15 +167,110 @@ jobs:
           # Use the basename so sha256sum -c works beside the downloaded image.
           (cd output && sha256sum "${filename}" > "${filename}.sha256")
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "filename=${filename}" >> "${GITHUB_OUTPUT}"
+          if [ "${PUBLISH_R2}" = true ]; then
+            echo "chunk_count=0" >> "${GITHUB_OUTPUT}"
+          else
+            chunk_count="$(.github/scripts/split-disk-image.sh "${image}" 996147200 8)"
+            echo "chunk_count=${chunk_count}" >> "${GITHUB_OUTPUT}"
+          fi
 
-      - name: Upload disk image to GitHub artifacts
+      - name: Upload disk image part 1 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 1 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-1
+          path: output/armada-*.img.gz.part-01
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 2 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 2 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-2
+          path: output/armada-*.img.gz.part-02
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 3 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 3 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-3
+          path: output/armada-*.img.gz.part-03
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 4 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 4 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-4
+          path: output/armada-*.img.gz.part-04
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 5 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 5 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-5
+          path: output/armada-*.img.gz.part-05
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 6 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 6 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-6
+          path: output/armada-*.img.gz.part-06
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 7 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 7 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-7
+          path: output/armada-*.img.gz.part-07
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image part 8 to GitHub artifacts
+        if: ${{ !inputs.publish_r2 && fromJSON(steps.disk.outputs.chunk_count) >= 8 }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armada-disk-image-part-8
+          path: output/armada-*.img.gz.part-08
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload disk image checksum and manifest to GitHub artifacts
         if: ${{ !inputs.publish_r2 }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: armada-disk-image
+          name: armada-disk-image-checksum
           path: |
-            output/armada-*.img.gz
             output/armada-*.img.gz.sha256
+            output/armada-*.img.gz.parts.manifest
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
