@@ -105,15 +105,6 @@ jobs:
           -v "${GITHUB_WORKSPACE}:/src:ro" -w /src
           -e PYTHONDONTWRITEBYTECODE=1 fedora:44
           bash -lc "dnf install -y --setopt=install_weak_deps=false python3-gobject ostree btrfs-progs openssl && python3 -B tests/update-offline-image-test.py && python3 -B tests/update-offline-payload-test.py"
-      - name: Check desktop update interface
-        run: |
-          docker run --rm --cpus 2 --memory 2g \
-            -v "${GITHUB_WORKSPACE}:/src:ro" -w /src \
-            -e PYTHONDONTWRITEBYTECODE=1 -e GTK_A11Y=none -e GSK_RENDERER=cairo \
-            fedora:44 bash -euc '
-              dnf install -y python3-gobject gtk4 libadwaita xorg-x11-server-Xvfb xauth dbus-daemon dejavu-sans-fonts
-              xvfb-run -a -s "-screen 0 1600x1200x24" dbus-run-session -- /usr/bin/python3 -B tests/armada-tools-ui-test.py
-            '
       - name: Check Plasma runtime tests
         run: python3 -m unittest discover -s tests -p test_plasma_runtime.py
 

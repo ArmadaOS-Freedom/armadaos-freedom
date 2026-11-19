@@ -349,6 +349,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0229-drm-msm-dpu-program-source-split-order.patch
 0230-drm-msm-dpu-elden-candidate-performance.patch
 0232-drm-msm-dpu-elden-final-atomic-bandwidth.patch
+0234-drm-msm-dpu-qseed-v11-reflected-fetch.patch
 
 # SM8750 Elden camera dependencies must bind before NoC sync_state can run.
 0240-media-camss-unwind-power-and-stream-failures.patch

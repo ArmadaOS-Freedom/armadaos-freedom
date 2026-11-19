@@ -1184,6 +1184,11 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Moves Elden's aggregate bandwidth check after every CRTC/plane helper has prepared its candidate resources. Locks untouched CRTC states through the transaction acquire context and propagates -EDEADLK for normal retries. Real C host checks cover multi-CRTC callback order, stale-state rejection, pending disables, the exact bandwidth boundary and lock retry.
+- `patches/0234-drm-msm-dpu-qseed-v11-reflected-fetch.patch`
+  source: armada
+  upstream: local
+  notes: Mirrors QSEED's left/right fetch fields under final horizontal reflection and top/bottom fetch fields under final vertical reflection. The physical source extent, QSEED phase, preload and total dimensions, ROI, UBWC and source-split order are unchanged. The no-reflection right 270-degree path remains identical.
+  validation: 135 host C cases execute the production QSEED setup, geometry check and PE packing functions across no reflection, X-only, Y-only and combined reflection, including captured left-90 split-pipe geometry and signed extension cases. The unpatched negative control fails 190 assertions. TB322FC device checks confirm the expected KMS and active SSPP orientation bits in all four directions, with zero sampled UBWC errors; left-90 fullscreen gears also passed a 30-second technical check. See devices/lenovo-tb322fc/rotation.md for the tested build, physical-validation limits and separate session-restart issues.
 - `patches/0240-media-camss-unwind-power-and-stream-failures.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/commit/dc7d14dc64c8d4f86220b30cd126b17d805c8474
   upstream: not submitted (downstream port)
