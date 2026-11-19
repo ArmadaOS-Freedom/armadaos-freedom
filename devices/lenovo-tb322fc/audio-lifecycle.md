@@ -87,6 +87,13 @@ about 908 MiB under `/boot/ostree`. The prior unregistered candidate directory
 not authorize deleting deployments or residual files, changing pins or boot
 entries, remounting `/boot`, or installing the candidate.
 
+At 23:34 +08:00, the same read-only checks succeeded through the USB network
+SSH endpoint (`172.16.42.1`, password authentication). It confirmed the same
+kernel release, zero-free read-only boot filesystem, nine pinned deployments,
+masked boot-image sync service, and unregistered `dea2bdb1…` residual. Both
+Wi-Fi and USB network paths are available; the USB path is preferred for the
+next device checks.
+
 Host lifecycle regression passes 94 checks against the candidate and baseline
 kernel C functions, including the constructed concurrent START/STOP window.
 The same 94 checks passed under ASan/UBSan in the independent review. These
