@@ -220,8 +220,9 @@ not been installed or booted, and Qualcomm A/B slots have not been modified.
 
 ## 2026-11-20 rebased candidate kernel build
 
-The PR head is `8f65e1289b76df5671ca4643ad3ba52da2b25aa0` on top of upstream
-`1197723`. The first ad-hoc compile attempt produced a generic defconfig with
+The kernel candidate is based on PR commit `8f65e1289b76df5671ca4643ad3ba52da2b25aa0`
+on top of upstream `1197723`. The build record was committed separately as
+`1f74771a47c120c663836a3551494ad08882691c`. The first ad-hoc compile attempt produced a generic defconfig with
 MSM and Qualcomm AudioReach disabled; it was stopped before being treated as a
 candidate. The existing patched source tree was retained, and the final build
 regenerated configuration with the repository's `arm64 defconfig` plus
@@ -252,9 +253,13 @@ for build review but is not a direct flash/install payload. The tablet remains
 on `7.2.6-y700-camera2`; this candidate has not been installed or booted, and
 Qualcomm A/B firmware slots remain unchanged.
 
-At the time of this record, PR #159 still had no submitted human review and
-its container-image workflow `44588358207` was still building packages. The
-unit, kernel host-source, and other completed checks passed. The existing
-generic disk artifact is still from the earlier baseline and is not this audio
-candidate. The build log is retained at
+At the time of this record, PR #159 remained a draft with no submitted human
+review. For head `1f74771a47c120c663836a3551494ad08882691c`, linked issue,
+patch catalogue, unit tests, shell tests, kernel host-source checks,
+root/disposable-container tests, kShimC, package resolution and the PR's
+integration checks all passed. PR run `44596999099` had resolved every package
+and was still executing its ARM container-image job; no new image or disk
+artifact was available yet. Any eventual PR disk artifact is a generic disk
+image, not the signed model-specific EDL package. The earlier disk artifact is
+from the pre-audio baseline. The build log is retained at
 `D:\AIWORK\y700-audio-kernel-build-20261120-final.log`.
