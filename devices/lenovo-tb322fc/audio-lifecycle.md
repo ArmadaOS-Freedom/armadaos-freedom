@@ -135,3 +135,59 @@ callbacks after graph/port destruction. Retaining the STOP count is not a
 promise that an unresponsive DSP can safely recover through close/reopen. Avoid fault
 injection or repeated card unbind/module replacement as the main target
 validation. Use a normal reboot to establish a clean test state.
+
+## 2026-11-20 new baseline and boot inventory
+
+The PR source is rebased on upstream `1197723` (including PR #134). PR
+workflow run `44562085116` completed successfully for head `069f304`; package,
+container, disk-image, kernel host, unit, shell, root/container and kShimC
+checks all passed. The disk artifact is `armada-disk-pr159`, downloaded as
+`armada-20261119.6663d23.img.gz` and verified against its sidecar SHA-256
+`d87c3bf8bd4f264f0e8564128333d77824bef29a719537191d5b931e62df9806`.
+
+USB SSH inventory on 2026-11-20 resolved the boot menu entries to OSTree
+deployment checksums. Initially `/boot` was `/dev/sda17`, mounted read-only,
+with zero available bytes (908 MiB used of 974 MiB). `loader.0` and `loader.1`
+were OSTree bootconfig generations, not Qualcomm firmware A/B slots. Do not
+edit their entry files directly or touch firmware slots.
+
+Retain the running deployment `2f63f785395f380f7e0a944cf1de5c1c5bd99a65fd6d222c5538cb32aa1d33f9`
+(rotation90 candidate), pending deployment
+`5311c3ca1bbece2fc682b044f0e1a34594a1c1dbaa1658e58bbb4f08ba5fa370`, and
+rollback deployment
+`8fb3dbb55fa6e46804f90b9982be58088f023f0179877b53359f98ab2e43f254`.
+The six old pinned history deployments were removed through `ostree admin
+undeploy`, checking the live deployment order and special current/pending/
+rollback markers as indexes shifted: `e3d797599ce1c4d2655fea6ebb74a543d594bad0debc04f1f9576f4e9d50dd66`,
+`cb58f54cfee21446a33df42ad2d29c6850ad26d2ab1f252f5b7521ace26e5bd5`,
+`d7e1bfb9b9231e868d333fe58c8f5f45f71afced70f36d57485761acf421cc5e`,
+`3fad6cae26fad1ce2f16c232d4e0a7328f597556770a4c192f2f9516a6ca0628`,
+`b8cd23fb24915e69652e2a5646add08c77949abc816c66d2a81f2f74a6227202`, and
+`b93133ab3041360bdc937f14e506518c1f92c480402339b130e4286aed806e0e`.
+The pending image is the signed Armada `testing` deployment with image version
+`20261111.7943625`; it remains pending and has not been selected as the audio
+PR candidate.
+
+After cleanup, only the running, pending and rollback deployments remain. The
+active bootconfig is `loader.1`, with exactly three entries for those checksums;
+OSTree retired the inactive `loader.0` generation. After cleanup `/boot` had
+556 MiB available (351 MiB used of 974 MiB); it was then remounted read-only.
+OSTree cleanup also removed
+the unregistered pre-PR-#134 `7.2.6-y700-audio1` residual kernel directory;
+it was not manually deleted. Qualcomm A/B firmware slots were not touched.
+
+The CI artifact is a generic compressed raw disk image (about 28.49 GiB
+expanded) with an MBR-compatible partition layout. It is not the signed,
+model-specific split EDL package and it is not the signed descriptor/payload
+format consumed by `armada-offline-update`; it must not be written directly to
+UFS or imported as an OTA payload. The existing TB322FC EDL workflow requires a
+separately produced model package and installer preflight, including recovery
+and A/B-slot checks.
+
+The rebased PR candidate has therefore not been deployed or booted. The device
+remains on `7.2.6-y700-camera2` with `/boot` read-only and 556 MiB available,
+and the current, pending and rollback deployments intact. The next authorized
+step is to produce or obtain a TB322FC EDL package from the signed image source,
+run the installer's non-writing preflight, and only then perform a controlled
+EDL deployment with a verified recovery path. No Qualcomm A/B firmware slot was
+modified during this work.
