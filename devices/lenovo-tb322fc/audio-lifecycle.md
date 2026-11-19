@@ -94,6 +94,21 @@ masked boot-image sync service, and unregistered `dea2bdb1…` residual. Both
 Wi-Fi and USB network paths are available; the USB path is preferred for the
 next device checks.
 
+At 23:42 +08:00, read-only audio inventory over USB showed the user PipeWire,
+PipeWire Pulse and WirePlumber services active, with the Lenovo-Y700-Gen4 ALSA
+playback and capture endpoints present. PipeWire exposed the built-in speaker
+sink at volume 0.34 and the built-in microphone source. Steam and gamescope
+were running. This is baseline `camera2` service visibility only; no stream
+restart, capture cycle, candidate-kernel test or audible test was performed.
+
+The draft PR's GitHub checks passed for linked issue, package resolution,
+automatic unit tests, patch catalogue, shell tests, kernel host source checks
+and kShimC. The unrelated root/disposable-container job failed only at
+`tests/installer-source-test.py::test_seed_selects_explicit_commit_over_newer_import`:
+the fixture's ref listing had no `/v2_3A_latest` entry (`StopIteration`). The
+test file is unchanged by this PR. The container-image build was still running
+at the last status check.
+
 Host lifecycle regression passes 94 checks against the candidate and baseline
 kernel C functions, including the constructed concurrent START/STOP window.
 The same 94 checks passed under ASan/UBSan in the independent review. These
