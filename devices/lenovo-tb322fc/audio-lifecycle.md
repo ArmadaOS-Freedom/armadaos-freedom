@@ -101,13 +101,14 @@ sink at volume 0.34 and the built-in microphone source. Steam and gamescope
 were running. This is baseline `camera2` service visibility only; no stream
 restart, capture cycle, candidate-kernel test or audible test was performed.
 
-The draft PR's GitHub checks passed for linked issue, package resolution,
-automatic unit tests, patch catalogue, shell tests, kernel host source checks
-and kShimC. The unrelated root/disposable-container job failed only at
-`tests/installer-source-test.py::test_seed_selects_explicit_commit_over_newer_import`:
-the fixture's ref listing had no `/v2_3A_latest` entry (`StopIteration`). The
-test file is unchanged by this PR. The container-image build was still running
-at the last status check.
+The draft PR's latest GitHub run passed linked issue, package resolution,
+automatic unit tests, patch catalogue, shell tests, kernel host source checks,
+root/disposable-container tests and kShimC. An earlier run failed an unrelated
+installer fixture lookup for `/v2_3A_latest`; the test passed on the next run
+and is unchanged by this PR. The latest container workflow had applied all 321
+kernel patches and passed the kernel host source checks, including the audio
+lifecycle regression. Its overall image/package job was still running; a full
+kernel compile against the rebased source has not yet been confirmed.
 
 Host lifecycle regression passes 94 checks against the candidate and baseline
 kernel C functions, including the constructed concurrent START/STOP window.
