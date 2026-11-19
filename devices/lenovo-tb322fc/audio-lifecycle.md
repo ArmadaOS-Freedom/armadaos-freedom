@@ -53,11 +53,50 @@ until a START attempt is observed, then checks that START reaches the DSP.
 These tests are part of the normal kernel host-check entry point. They do not
 exercise the real DSP, kernel scheduler or hardware error recovery.
 
-Validation is still in progress. Required target checks are capture
-prepare/free/close, start/drop/close, reconfiguration and reprepare,
-playback/idle, filter add/remove with WirePlumber restart, Steam restart and
-suspend/resume. Inspect command completion, status and kernel logs in addition
-to application return codes, visible nodes and active services.
+## Validation status
+
+The complete `7.2.6-y700-audio1` Image, DTBs, in-tree modules and two existing
+out-of-tree modules were built and reconciled against the camera2 baseline.
+The build contains 1,602 modules and has build ID
+`bced30a50bfdc68f295e3d2d9ce24a5feaa27b8f`. The migrated initramfs passed its
+independent content, module and dependency checks (SHA-256
+`2ba0ffba26945c06e867597a2c7c45106b37226a44329d2025756d2ec9888abd`). The
+overlay and isolated OSTree rehearsal also passed their payload, startup,
+deployment-retention, BLS and bootlink checks.
+
+The actual tablet remains on `7.2.6-y700-camera2`; the audio1 kernel has not
+been installed or booted. The last read-only capacity snapshot reported
+69,210,112 bytes of root-available space on `/boot`, zero bytes available to
+an unprivileged user, while the complete candidate plus the 32 MiB safety
+margin requires 155,377,664 bytes. A previous installer attempt stopped before
+boot-partition writes when the OSTree boot copy ran out of space. No old OSTree
+deployment, rollback entry, BLS entry or A/B boot slot was intentionally
+removed or rewritten by that attempt.
+
+On 2026-11-19 at 23:14 +08:00, read-only SSH verification over Wi-Fi
+(`192.168.31.147`) confirmed the tablet was still running
+`7.2.6-y700-camera2`. `/boot` was mounted read-only and had zero available
+bytes (951,492,608 used of 1,020,702,720); the root overlay also reported zero
+available bytes. The pending deployment was still pinned, as were the running
+deployment, rollback and six other retained deployments. Boot storage used
+about 908 MiB under `/boot/ostree`. The prior unregistered candidate directory
+`dea2bdb1…` and its origin file were still present; they were not modified.
+`armada-bootimg-sync.service` remained masked and inactive. This snapshot does
+not authorize deleting deployments or residual files, changing pins or boot
+entries, remounting `/boot`, or installing the candidate.
+
+Host lifecycle regression passes 94 checks against the candidate and baseline
+kernel C functions, including the constructed concurrent START/STOP window.
+The same 94 checks passed under ASan/UBSan in the independent review. These
+checks and the complete build do not substitute for running the new kernel on
+the tablet.
+
+Still required on the tablet: capture prepare/free/close, start/drop/close,
+reconfiguration and reprepare, playback/idle, filter add/remove with
+WirePlumber restart, Steam restart and suspend/resume. Inspect command
+completion, kernel logs, visible nodes and active services as well as
+userspace return codes. Keep amplifier gain unchanged at 950/950 and do not
+use card unbind/module hot swaps or ADSP stop/start as the validation method.
 
 These patches do not repair final-close cleanup after a failed STOP or late
 callbacks after graph/port destruction. Retaining the STOP count is not a

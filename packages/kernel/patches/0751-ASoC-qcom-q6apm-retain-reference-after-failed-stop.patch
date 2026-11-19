@@ -19,10 +19,11 @@ Signed-off-by: 181981772 <181981772@qq.com>
 ---
 --- a/sound/soc/qcom/qdsp6/q6apm.h
 +++ b/sound/soc/qcom/qdsp6/q6apm.h
-@@ -86,6 +86,7 @@
+@@ -86,6 +86,8 @@
  	struct audioreach_graph_info *info;
  	uint32_t id;
  	int state;
++	/* Serialize graph START and STOP. */
 +	struct mutex start_stop_lock;
  	int start_count;
  	/* Cached Graph data */
