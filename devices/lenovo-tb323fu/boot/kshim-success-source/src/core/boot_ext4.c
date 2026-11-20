@@ -613,9 +613,17 @@ int kshim_ext4_read_file(const struct kshim_blockdev *dev,
             if (l_lo == 0 || l_lo > 60)
                 return KSHIM_STORAGE_FORMAT;
 
-            uint32_t b_lo = (uint32_t)inode[28] | ((uint32_t)inode[29] << 8) |
-                            ((uint32_t)inode[30] << 16) | ((uint32_t)inode[31] << 24);
-            if (b_lo != 0)
+            uint64_t blocks = (uint64_t)le32(inode + 28);
+            uint64_t acl = (uint64_t)le32(inode + 104);
+            if (v.descriptor_size == 64) {
+                blocks |= (uint64_t)le16(inode + 116) << 32;
+                acl |= (uint64_t)le16(inode + 118) << 32;
+            }
+            if (acl != 0 && acl >= v.blocks)
+                return KSHIM_STORAGE_FORMAT;
+            uint64_t expected = (acl == 0) ? 0 :
+                                ((fl & 0x00040000u) ? 1 : 8);
+            if (blocks != expected)
                 return KSHIM_STORAGE_FORMAT;
 
             /* build new path: target + remaining components */
