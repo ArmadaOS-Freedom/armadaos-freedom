@@ -19,6 +19,7 @@ from pathlib import Path
 
 Q6APM_C_REL = Path("sound/soc/qcom/qdsp6/q6apm.c")
 Q6APM_H_REL = Path("sound/soc/qcom/qdsp6/q6apm.h")
+Q6APM_DAI_NAME = "q6apm-dai.c"
 
 
 def extract_function(source: str, signature: str) -> tuple[str, int]:
@@ -80,7 +81,7 @@ def extract_case(function: str, case_label: str, next_case: str) -> str:
 
 
 def classify_sources(
-    candidate_text: str, candidate_header: str, baseline_text: str | None
+    candidate_text: str, candidate_header: str, dai_text: str, baseline_text: str | None
 ) -> dict[str, tuple[str, int]]:
     signatures = {
         "candidate_start": (
@@ -91,9 +92,13 @@ def classify_sources(
             candidate_text,
             "int q6apm_graph_stop(struct q6apm_graph *graph)",
         ),
-        "candidate_send_stop": (
+        "candidate_send_tracked": (
             candidate_text,
-            "static int q6apm_send_graph_stop(struct q6apm *apm, struct gpr_pkt *pkt)",
+            "static int q6apm_send_tracked_cmd(struct q6apm *apm, struct gpr_pkt *pkt)",
+        ),
+        "candidate_trigger": (
+            dai_text,
+            "static int q6apm_dai_trigger(struct snd_soc_component *component,",
         ),
         "candidate_unmap": (
             candidate_text,
@@ -174,46 +179,6 @@ def classify_sources(
     if "--ar_graph->start_count" in candidate_stop:
         raise ValueError("candidate STOP still decrements before command")
 
-    candidate_unmap = extracted["candidate_unmap"][0]
-    require_once(
-        candidate_unmap,
-        "u32 token = graph_id | "
-        "(is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0);",
-        "candidate request token",
-    )
-    require_once(
-        candidate_unmap,
-        "APM_CMD_SHARED_MEM_UNMAP_REGIONS, token);",
-        "candidate request token use",
-    )
-
-    candidate_callback = extracted["candidate_callback"][0]
-    candidate_unmap_case = extract_case(
-        candidate_callback,
-        "case APM_CMD_SHARED_MEM_UNMAP_REGIONS:",
-        "case APM_CMD_RSP_SHARED_MEM_MAP_REGIONS:",
-    )
-    require_once(
-        candidate_unmap_case,
-        "apm->result.opcode = result->opcode;",
-        "candidate callback result opcode",
-    )
-    require_once(
-        candidate_unmap_case,
-        "apm->result.status = result->status;",
-        "candidate callback result status",
-    )
-    require_once(
-        candidate_unmap_case,
-        "graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;",
-        "candidate callback graph-id mask",
-    )
-    require_once(
-        candidate_unmap_case,
-        "} else if (result->status) {",
-        "candidate callback error guard",
-    )
-
     if baseline_text is not None:
         baseline_start = extracted["baseline_start"][0]
         if "start_stop_lock" in baseline_start:
@@ -270,6 +235,18 @@ typedef uint32_t u32;
 #define __free(x)
 #define GPR_HDR_SIZE 24U
 #define HZ 1000
+#define READ_ONCE(value) (value)
+#define WRITE_ONCE(target, value) ((target) = (value))
+#define lockdep_assert_held(lock) assert(pthread_mutex_trylock(lock) == EBUSY)
+
+static u32 cmpxchg(u32 *value, u32 expected, u32 replacement)
+{
+	u32 old = *value;
+
+	if (old == expected)
+		*value = replacement;
+	return old;
+}
 
 #define APM_CMD_SHARED_MEM_UNMAP_REGIONS      0x0100100dU
 #define APM_CMD_SHARED_MEM_MAP_REGIONS        0x0100100cU
@@ -342,11 +319,11 @@ struct q6apm {
 	struct device *dev;
 	gpr_device_t *gdev;
 	pthread_mutex_t lock;
-	pthread_mutex_t stop_reply_lock;
-	struct completion stop_done;
-	u32 stop_token;
-	u32 stop_status;
-	bool stop_pending;
+	pthread_mutex_t reply_lock;
+	struct completion reply_done;
+	u32 reply_token;
+	u32 reply_opcode;
+	u32 reply_status;
 	struct gpr_ibasic_rsp_result_t result;
 	wait_queue_head_t wait;
 	uint32_t state;
@@ -373,14 +350,36 @@ struct q6apm_graph {
 	struct audioreach_graph *ar_graph;
 };
 
+enum {
+	SNDRV_PCM_TRIGGER_START, SNDRV_PCM_TRIGGER_RESUME,
+	SNDRV_PCM_TRIGGER_PAUSE_RELEASE, SNDRV_PCM_TRIGGER_STOP,
+	SNDRV_PCM_TRIGGER_SUSPEND, SNDRV_PCM_TRIGGER_PAUSE_PUSH,
+};
+enum { SNDRV_PCM_STREAM_PLAYBACK, SNDRV_PCM_STREAM_CAPTURE };
+enum { Q6APM_STREAM_IDLE, Q6APM_STREAM_RUNNING, Q6APM_STREAM_STOPPED };
+
+struct q6apm_dai_rtd {
+	bool prepare_failed;
+	int state;
+	unsigned int queue_ptr;
+	unsigned int last_pos_index;
+};
+
+struct snd_pcm_runtime {
+	void *private_data;
+};
+
+struct snd_pcm_substream {
+	struct snd_pcm_runtime *runtime;
+	int stream;
+};
+
+struct snd_soc_component;
+
 static struct gpr_pkt alloc_packet;
-static size_t alloc_size;
 static uint32_t alloc_opcode;
 static uint32_t alloc_token;
 static bool alloc_fail;
-static int send_calls;
-static uint32_t sent_opcode;
-static int send_result;
 static int stop_results[16];
 static int start_results[16];
 static int stop_calls;
@@ -394,7 +393,6 @@ static bool start_attempted;
 static bool wait_for_start_attempt;
 static pthread_t start_thread_id;
 static unsigned int error_logs;
-static unsigned int wake_calls;
 
 static void mutex_lock(pthread_mutex_t *mutex)
 {
@@ -476,21 +474,20 @@ static struct gpr_pkt *audioreach_alloc_apm_cmd_pkt(size_t size,
 						    uint32_t opcode,
 						    uint32_t token)
 {
-	alloc_size = size;
+	assert(size <= sizeof(alloc_packet.data) - GPR_HDR_SIZE);
 	alloc_opcode = opcode;
 	alloc_token = token;
+	alloc_packet.hdr = (struct gpr_hdr) { .opcode = opcode, .token = token };
 	return alloc_fail ? NULL : &alloc_packet;
 }
 
+#ifdef HAVE_BASELINE
 static int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
 			       uint32_t opcode)
 {
-	(void)apm;
-	(void)pkt;
-	send_calls++;
-	sent_opcode = opcode;
-	return send_result;
+	return 0;
 }
+#endif
 
 static void dev_err(struct device *dev, const char *fmt, ...)
 {
@@ -502,7 +499,6 @@ static void dev_err(struct device *dev, const char *fmt, ...)
 static void wake_up(wait_queue_head_t *wait)
 {
 	wait->wakes++;
-	wake_calls++;
 }
 
 static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph,
@@ -581,21 +577,9 @@ static void reset_request(struct q6apm *apm,
 	info->pos_buf_mem_map_handle = 0x22;
 	apm->graph_info_idr.info = info;
 	alloc_fail = false;
-	send_calls = 0;
-	sent_opcode = 0;
-	send_result = 0;
-	alloc_size = 0;
 	alloc_opcode = 0;
 	alloc_token = UINT32_MAX;
-}
-
-static void reset_callback(struct q6apm *apm,
-			   struct audioreach_graph_info *info,
-			   unsigned int graph_id)
-{
-	reset_request(apm, info, graph_id);
 	error_logs = 0;
-	wake_calls = 0;
 }
 
 static void run_callback(int (*callback)(const struct gpr_resp_pkt *, void *, int),
@@ -781,115 +765,30 @@ static void check_concurrent_start_during_stop(void)
 	destroy_graph(&shared);
 }
 
-static void check_request_tokens(void)
+#ifdef HAVE_BASELINE
+static void check_baseline_unmap(void)
 {
 	struct q6apm apm;
 	struct audioreach_graph_info info;
-	struct device parent = {
-		.drv = &apm,
-	};
-	struct device dev = {
-		.parent = &parent,
-	};
+	gpr_device_t gdev = {};
+	struct device dev = { .parent = &gdev.dev };
 
+	/* Negative controls: baseline reports the outer opcode and clears a
+	 * normal mapping even when the DSP command failed. Its sender also
+	 * leaves off the bit distinguishing position-buffer UNMAP.
+	 */
 	reset_request(&apm, &info, 120);
-	CHECK(candidate_unmap_memory(&dev, 120, false) == 0);
+	gdev.dev.drv = &apm;
+	CHECK(baseline_unmap_memory(&dev, 120, true) == 0);
 	CHECK(alloc_opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
 	CHECK(alloc_token == 120);
-	CHECK(send_calls == 1);
-	CHECK(sent_opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-
-	reset_request(&apm, &info, 120);
-	CHECK(candidate_unmap_memory(&dev, 120, true) == 0);
-	CHECK(alloc_token ==
-	      (120U | APM_MMAP_TOKEN_MAP_TYPE_POS_BUF));
-	CHECK(send_calls == 1);
-
-	reset_request(&apm, &info, 0);
-	CHECK(candidate_unmap_memory(&dev, 0, false) == 0);
-	CHECK(alloc_token == 0);
-	CHECK(send_calls == 1);
-
-	reset_request(&apm, &info, 120);
-	info.pos_buf_mem_map_handle = 0;
-	CHECK(candidate_unmap_memory(&dev, 120, true) == 0);
-	CHECK(alloc_token ==
-	      (120U | APM_MMAP_TOKEN_MAP_TYPE_POS_BUF));
-	CHECK(send_calls == 0);
-
-#ifdef HAVE_BASELINE
-	/* Negative control: baseline drops the position-buffer type bit. */
-	reset_request(&apm, &info, 120);
-	CHECK(baseline_unmap_memory(&dev, 120, true) == 0);
-	CHECK(alloc_token == 120);
-	CHECK((alloc_token & APM_MMAP_TOKEN_MAP_TYPE_POS_BUF) == 0);
-#endif
-}
-
-static void check_callbacks(void)
-{
-	struct q6apm apm;
-	struct audioreach_graph_info info;
-	gpr_device_t gdev;
-
-	reset_callback(&apm, &info, 120);
-	run_callback(candidate_apm_callback, &apm, &gdev, 120,
-		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
-	CHECK(apm.result.opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-	CHECK(apm.result.status == 0);
-	CHECK(info.mem_map_handle == 0);
-	CHECK(info.pos_buf_mem_map_handle == 0x22);
-	CHECK(apm.graph_info_idr.last_lookup == 120);
-	CHECK(error_logs == 0);
-	CHECK(wake_calls == 1);
-
-	reset_callback(&apm, &info, 120);
-	run_callback(candidate_apm_callback, &apm, &gdev,
-		     120U | APM_MMAP_TOKEN_MAP_TYPE_POS_BUF,
-		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
-	CHECK(apm.result.opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-	CHECK(info.mem_map_handle == 0x11);
-	CHECK(info.pos_buf_mem_map_handle == 0);
-	CHECK(apm.graph_info_idr.last_lookup == 120);
-	CHECK(error_logs == 0);
-
-	reset_callback(&apm, &info, 120);
-	run_callback(candidate_apm_callback, &apm, &gdev, 120,
-		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 9);
-	CHECK(apm.result.opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-	CHECK(apm.result.status == 9);
-	CHECK(info.mem_map_handle == 0x11);
-	CHECK(info.pos_buf_mem_map_handle == 0x22);
-	CHECK(error_logs == 1);
-	CHECK(wake_calls == 1);
-
-	reset_callback(&apm, &info, 120);
-	run_callback(candidate_apm_callback, &apm, &gdev, 121,
-		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
-	CHECK(apm.result.opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-	CHECK(info.mem_map_handle == 0x11);
-	CHECK(info.pos_buf_mem_map_handle == 0x22);
-	CHECK(error_logs == 1);
-
-	reset_callback(&apm, &info, 0);
-	run_callback(candidate_apm_callback, &apm, &gdev, 0,
-		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
-	CHECK(apm.result.opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS);
-	CHECK(info.mem_map_handle == 0);
-	CHECK(info.pos_buf_mem_map_handle == 0x22);
-
-#ifdef HAVE_BASELINE
-	/* Negative controls: baseline reports the outer opcode and clears a
-	 * normal mapping even when the DSP command failed.
-	 */
-	reset_callback(&apm, &info, 120);
 	run_callback(baseline_apm_callback, &apm, &gdev, 120,
 		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 9);
 	CHECK(apm.result.opcode == GPR_BASIC_RSP_RESULT);
 	CHECK(apm.result.status == 0);
 	CHECK(info.mem_map_handle == 0);
 
-	reset_callback(&apm, &info, 120);
+	reset_request(&apm, &info, 120);
 	run_callback(baseline_apm_callback, &apm, &gdev,
 		     120U | APM_MMAP_TOKEN_MAP_TYPE_POS_BUF,
 		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
@@ -897,32 +796,78 @@ static void check_callbacks(void)
 	      (120U | APM_MMAP_TOKEN_MAP_TYPE_POS_BUF));
 	CHECK(info.mem_map_handle == 0x11);
 	CHECK(info.pos_buf_mem_map_handle == 0x22);
-#endif
 }
+#endif
 
-static u32 stale_stop_token;
-static bool send_stop_reply;
-static u32 stop_reply_status;
+static struct {
+	u32 opcode;
+	u32 stale_token;
+	u32 token;
+	u32 handle;
+	u32 status;
+	u32 *replace_handle;
+	int send_error;
+	unsigned int sends;
+	bool wrong_opcode;
+	bool respond;
+} transaction;
 
 static int gpr_send_pkt(gpr_device_t *gdev, const struct gpr_pkt *pkt)
 {
 	struct q6apm *apm = gdev->dev.drv;
+	u32 opcode = pkt->hdr.opcode;
+	u32 token = pkt->hdr.token;
 
 	CHECK(pkt->hdr.src_port == gdev->svc_id);
-	CHECK(pkt->hdr.opcode == APM_CMD_GRAPH_STOP);
-	CHECK(pkt->hdr.token != 0);
-	CHECK(apm->stop_pending);
-	if (stale_stop_token) {
-		CHECK(stale_stop_token != pkt->hdr.token);
-		run_callback(candidate_apm_callback, apm, gdev, stale_stop_token,
-			     APM_CMD_GRAPH_STOP, 0);
-		CHECK(apm->stop_pending);
-		CHECK(apm->stop_done.done == 0);
+	CHECK(opcode == transaction.opcode);
+	CHECK(token != 0);
+	CHECK(apm->reply_opcode == opcode);
+	transaction.token = token;
+	transaction.sends++;
+	if (opcode == APM_CMD_SHARED_MEM_UNMAP_REGIONS) {
+		const struct apm_cmd_shared_mem_unmap_regions *cmd =
+			(const void *)pkt + GPR_HDR_SIZE;
+
+		CHECK(cmd->mem_map_handle == transaction.handle);
 	}
-	if (send_stop_reply)
-		run_callback(candidate_apm_callback, apm, gdev, pkt->hdr.token,
-			     APM_CMD_GRAPH_STOP, stop_reply_status);
+	if (transaction.send_error)
+		return transaction.send_error;
+	if (transaction.wrong_opcode) {
+		u32 other = opcode == APM_CMD_GRAPH_STOP ?
+			APM_CMD_SHARED_MEM_UNMAP_REGIONS : APM_CMD_GRAPH_STOP;
+
+		run_callback(candidate_apm_callback, apm, gdev, token, other, 0);
+		CHECK(apm->reply_done.done == 0);
+	}
+	if (transaction.stale_token) {
+		CHECK(transaction.stale_token != token);
+		run_callback(candidate_apm_callback, apm, gdev, transaction.stale_token,
+			     opcode, 0);
+		CHECK(apm->reply_done.done == 0);
+	}
+	if (transaction.respond) {
+		if (transaction.replace_handle)
+			*transaction.replace_handle = 0x33;
+		run_callback(candidate_apm_callback, apm, gdev, token,
+			     opcode, transaction.status);
+		CHECK(apm->reply_done.done == 1);
+		CHECK(apm->reply_status == transaction.status);
+		/* A duplicate success must not replace the accepted DSP status. */
+		run_callback(candidate_apm_callback, apm, gdev, token, opcode, 0);
+		CHECK(apm->reply_done.done == 1);
+		CHECK(apm->reply_status == transaction.status);
+	}
 	return sizeof(pkt->hdr);
+}
+
+static int send_stop(struct q6apm *apm, struct gpr_pkt *pkt)
+{
+	int ret;
+
+	mutex_lock(&apm->lock);
+	ret = q6apm_send_tracked_cmd(apm, pkt);
+	mutex_unlock(&apm->lock);
+	return ret;
 }
 
 static void check_stop_replies(void)
@@ -932,35 +877,126 @@ static void check_stop_replies(void)
 		.gdev = &gdev,
 		.dev = &gdev.dev,
 		.lock = PTHREAD_MUTEX_INITIALIZER,
-		.stop_reply_lock = PTHREAD_MUTEX_INITIALIZER,
+		.reply_lock = PTHREAD_MUTEX_INITIALIZER,
 	};
 	struct gpr_pkt pkt = { .hdr.opcode = APM_CMD_GRAPH_STOP };
 
 	gdev.dev.drv = &apm;
-	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -ETIMEDOUT);
-	CHECK(!apm.stop_pending);
-	stale_stop_token = pkt.hdr.token;
-	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -ETIMEDOUT);
-	CHECK(!apm.stop_pending);
+	transaction.opcode = APM_CMD_GRAPH_STOP;
+	CHECK(send_stop(&apm, &pkt) == -ETIMEDOUT);
+	CHECK(apm.reply_opcode == 0);
+	transaction.stale_token = pkt.hdr.token;
+	transaction.wrong_opcode = true;
+	CHECK(send_stop(&apm, &pkt) == -ETIMEDOUT);
+	CHECK(apm.reply_opcode == 0);
+	transaction.respond = true;
+	transaction.status = 9;
+	CHECK(send_stop(&apm, &pkt) == -EINVAL);
+	transaction.status = 0;
+	CHECK(send_stop(&apm, &pkt) == 0);
 	CHECK(apm.wait.wakes == 0);
-	send_stop_reply = true;
-	stop_reply_status = 9;
-	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -EINVAL);
-	stop_reply_status = 0;
-	CHECK(q6apm_send_graph_stop(&apm, &pkt) == 0);
-	CHECK(!apm.stop_pending);
-	CHECK(pthread_mutex_destroy(&apm.stop_reply_lock) == 0);
+	CHECK(apm.reply_opcode == 0);
+	CHECK(pthread_mutex_destroy(&apm.reply_lock) == 0);
 	CHECK(pthread_mutex_destroy(&apm.lock) == 0);
+}
+
+static void check_unmap_replies(void)
+{
+	gpr_device_t gdev = { .svc_id = 1 };
+	struct device dev = { .parent = &gdev.dev };
+	struct audioreach_graph_info info;
+	struct q6apm apm;
+	u32 first_token;
+
+	reset_request(&apm, &info, 0);
+	CHECK(pthread_mutex_init(&apm.lock, NULL) == 0);
+	CHECK(pthread_mutex_init(&apm.reply_lock, NULL) == 0);
+	apm.gdev = &gdev;
+	apm.dev = &gdev.dev;
+	gdev.dev.drv = &apm;
+	memset(&transaction, 0, sizeof(transaction));
+	transaction.opcode = APM_CMD_SHARED_MEM_UNMAP_REGIONS;
+	transaction.handle = 0x11;
+	CHECK(candidate_unmap_memory(&dev, 0, false) == -ETIMEDOUT);
+	CHECK(apm.reply_opcode == 0);
+	first_token = transaction.token;
+	run_callback(candidate_apm_callback, &apm, &gdev, first_token,
+		     APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
+	CHECK(info.mem_map_handle == 0x11);
+	CHECK(apm.reply_done.done == 0);
+
+	/* A delayed data-buffer reply cannot finish the position UNMAP. */
+	transaction.stale_token = first_token;
+	transaction.handle = 0x22;
+	transaction.wrong_opcode = true;
+	CHECK(candidate_unmap_memory(&dev, 0, true) == -ETIMEDOUT);
+	CHECK(info.mem_map_handle == 0x11);
+	CHECK(info.pos_buf_mem_map_handle == 0x22);
+
+	/* Repeating the exact same data UNMAP gets a different token too. */
+	transaction.handle = 0x11;
+	transaction.respond = true;
+	transaction.status = 9;
+	CHECK(candidate_unmap_memory(&dev, 0, false) == -EINVAL);
+	CHECK(info.mem_map_handle == 0x11);
+	CHECK(info.pos_buf_mem_map_handle == 0x22);
+
+	transaction.status = 0;
+	transaction.replace_handle = &info.mem_map_handle;
+	CHECK(candidate_unmap_memory(&dev, 0, false) == 0);
+	CHECK(info.mem_map_handle == 0x33);
+	transaction.replace_handle = NULL;
+	transaction.handle = 0x33;
+	CHECK(candidate_unmap_memory(&dev, 0, false) == 0);
+	CHECK(info.mem_map_handle == 0);
+	CHECK(info.pos_buf_mem_map_handle == 0x22);
+
+	transaction.handle = 0x22;
+	transaction.send_error = -EIO;
+	CHECK(candidate_unmap_memory(&dev, 0, true) == -EIO);
+	CHECK(apm.reply_opcode == 0);
+	CHECK(info.pos_buf_mem_map_handle == 0x22);
+	transaction.send_error = 0;
+	CHECK(candidate_unmap_memory(&dev, 0, true) == 0);
+	CHECK(info.pos_buf_mem_map_handle == 0);
+	CHECK(apm.wait.wakes == 0);
+	CHECK(transaction.sends == 7);
+	CHECK(candidate_unmap_memory(&dev, 0, true) == 0);
+	CHECK(candidate_unmap_memory(&dev, 1, false) == -ENODEV);
+	CHECK(transaction.sends == 7);
+	CHECK(pthread_mutex_destroy(&apm.reply_lock) == 0);
+	CHECK(pthread_mutex_destroy(&apm.lock) == 0);
+}
+
+static void check_failed_pcm_prepare(void)
+{
+	struct q6apm_dai_rtd prtd = { .state = Q6APM_STREAM_RUNNING };
+	struct snd_pcm_runtime runtime = { .private_data = &prtd };
+	struct snd_pcm_substream substream = { .runtime = &runtime };
+	const int commands[] = { SNDRV_PCM_TRIGGER_START, SNDRV_PCM_TRIGGER_RESUME,
+				 SNDRV_PCM_TRIGGER_PAUSE_RELEASE };
+
+	for (int stream = SNDRV_PCM_STREAM_PLAYBACK; stream <= SNDRV_PCM_STREAM_CAPTURE;
+	     stream++) {
+		substream.stream = stream;
+		for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+			prtd.prepare_failed = true;
+			CHECK(q6apm_dai_trigger(NULL, &substream, commands[i]) == -EPIPE);
+			prtd.prepare_failed = false;
+			CHECK(q6apm_dai_trigger(NULL, &substream, commands[i]) == 0);
+		}
+	}
 }
 
 int main(void)
 {
 	check_start_stop_sequences();
 	check_concurrent_start_during_stop();
-	check_request_tokens();
-	check_callbacks();
 	check_stop_replies();
+	check_unmap_replies();
+	check_failed_pcm_prepare();
 #ifdef HAVE_BASELINE
+	check_baseline_unmap();
 	printf("PASS: %u checks against extracted candidate and baseline C\n",
 	       checks);
 #else
@@ -974,10 +1010,12 @@ int main(void)
 def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     candidate_start, _ = extracted["candidate_start"]
     candidate_stop, _ = extracted["candidate_stop"]
-    candidate_send_stop, _ = extracted["candidate_send_stop"]
+    candidate_send_tracked, _ = extracted["candidate_send_tracked"]
+    candidate_trigger, _ = extracted["candidate_trigger"]
     candidate_unmap, _ = extracted["candidate_unmap"]
     candidate_callback, _ = extracted["candidate_callback"]
     parts = [
+        "#define HAVE_BASELINE 1" if "baseline_start" in extracted else "",
         PREAMBLE,
         "#define q6apm_graph_start candidate_graph_start",
         candidate_start,
@@ -985,7 +1023,8 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         "#define q6apm_graph_stop candidate_graph_stop",
         candidate_stop,
         "#undef q6apm_graph_stop",
-        candidate_send_stop,
+        candidate_send_tracked,
+        candidate_trigger,
         "#define __q6apm_unmap_memory_fixed_region candidate_unmap_memory",
         candidate_unmap,
         "#undef __q6apm_unmap_memory_fixed_region",
@@ -1000,7 +1039,6 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         baseline_callback, _ = extracted["baseline_callback"]
         parts.extend(
             [
-                "#define HAVE_BASELINE 1",
             "#define q6apm_graph_start baseline_graph_start",
             baseline_start,
             "#undef q6apm_graph_start",
@@ -1056,6 +1094,7 @@ def main() -> int:
 
     candidate = resolve_q6apm_c(args.kernel_source_tree, "candidate")
     candidate_header = candidate.with_name(Q6APM_H_REL.name)
+    candidate_dai = candidate.with_name(Q6APM_DAI_NAME)
     if not candidate_header.is_file():
         raise SystemExit(f"candidate header not found at {candidate_header}")
     baseline = (
@@ -1063,9 +1102,10 @@ def main() -> int:
     )
     candidate_text = candidate.read_text(encoding="utf-8")
     candidate_header_text = candidate_header.read_text(encoding="utf-8")
+    dai_text = candidate_dai.read_text(encoding="utf-8")
     baseline_text = baseline.read_text(encoding="utf-8") if baseline else None
     extracted = classify_sources(
-        candidate_text, candidate_header_text, baseline_text
+        candidate_text, candidate_header_text, dai_text, baseline_text
     )
     harness = build_harness(extracted)
 
@@ -1109,6 +1149,7 @@ def main() -> int:
         "candidate_sha256": digest(candidate),
         "candidate_header": str(candidate_header),
         "candidate_header_sha256": digest(candidate_header),
+        "candidate_dai_sha256": digest(candidate_dai),
         "baseline_negative_controls": baseline is not None,
         "extracted": {
             name: {

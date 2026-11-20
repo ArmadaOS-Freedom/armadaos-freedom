@@ -3,34 +3,41 @@
 ## 2026-11-21 combined change
 
 PR #159 carries two patches. `0750` stops the capture frontend in `hw_free`
-before DPCM tears down the backend, serializes shared graph references, and
-completes typed memory UNMAP replies. Each GRAPH_STOP now uses its own GPR
-transaction token, so a late reply cannot complete the next STOP. Playback
-and LPASS reprepare return a failed STOP before restarting the graph;
-capture START is rejected after a failed prepare until prepare succeeds.
+before DPCM tears down the backend and serializes shared graph references.
+STOP and UNMAP use per-request GPR tokens and a synchronized completion so
+a late reply does not complete another request. The UNMAP caller clears
+only the requested handle after a matching success. Playback and LPASS
+reprepare return a failed STOP before restarting the graph. Neither PCM
+direction accepts START until prepare succeeds again.
 DPCM still performs best-effort cleanup after a persistent `hw_free` error.
 
 `0751` runs the SoundWire and LPASS RX, WSA, TX and VA runtime PM callbacks
 in late suspend and early resume on `lenovo,elden`. This puts clock gating
 after the normal ASoC suspend phase, and clock restore before graph rebuild.
 The main SoundWire IRQ is drained before gating the interface clock in
-system sleep, and reenabled after the clock is available. Ordinary runtime
-suspend does not wait for the IRQ thread, which can itself request runtime
-PM through a SoundWire peripheral. The patch header records its sources.
+system sleep. On wake, the driver reenables it after the clock is available
+or restores the runtime-suspended IRQ policy if resume is deferred. In the
+latter case the IRQ thread enables the interface clock before register
+access. Ordinary runtime suspend does not wait for the IRQ thread, which
+can itself request runtime PM through a SoundWire peripheral. The patch
+header records its sources.
 
 The combined Linux 7.2.6 tree passed the kernel host checks with the Infinity
-overlay. The lifecycle fixture passed 130 checks with baseline controls,
-including late STOP, DSP error, and matching response cases. The affected
-ARM64 objects compiled and ten audio modules linked locally using the
-existing kernel's symbol table and BTF base. This was a module build check.
+overlay. The lifecycle fixture passed 206 checks with baseline controls,
+including late and duplicate STOP/UNMAP replies, DSP errors, and start after
+failed PCM prepare. A separate host fixture checked five SoundWire IRQ
+transitions, including deferred resume. The affected ARM64 modules linked
+locally against the existing kernel's symbols and BTF; the four DSP modules
+and the SoundWire controller module were rebuilt after review.
 
 The previous `92fa202c` audio1 r4 candidate booted locally on TB322FC, separate
 from the CI disk image. Each of its three capture teardown cases stopped FE2
 before BE120 shutdown, with 72 successful synchronous DSP commands. It also
 reopened both PCM paths after a 45-second USB-connected `s2idle`. The new
 revision still needs a boot test, firmware token confirmation, wake playback
-and capture, and battery-only standby measurement. A persistent DSP timeout,
-other Qualcomm devices and acoustic output remain outside the device results.
+and capture, and battery-only standby measurement. A timeout can still leave
+the DSP graph or mapping state unknown. Port callback and graph object
+lifetime issues in the base driver are outside this change.
 
 ## Earlier AudioReach work and validation
 

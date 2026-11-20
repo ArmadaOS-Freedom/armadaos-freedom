@@ -13,10 +13,12 @@ SoundWire controllers against their LPASS providers.
 
 Drain and disable the controller IRQ before gating hclk for system
 sleep. Do not wait for it in ordinary runtime suspend: the IRQ thread
-can itself request runtime PM through a peripheral. Restore the main
-IRQ only once hclk is available, retaining the original wake IRQ
-handling on successful resume. Return an hclk enable error without
-touching either IRQ.
+can itself request runtime PM through a peripheral. When system resume
+restores the controller, reenable its IRQ after enabling hclk. When
+runtime PM defers that resume, restore the original runtime-suspended
+IRQ policy, where the IRQ thread votes for hclk before accessing the
+controller. Check that vote and leave both IRQs alone if the clock
+cannot be enabled in runtime resume.
 
 Adapt Oleg Keri's SoundWire IRQ ordering fix and the Armada system PM
 changes carried by Noahcdls in Erhai. The original system PM work is
@@ -32,7 +34,7 @@ Link: https://github.com/armada-os/armada/commit/98e87a10155988d4577d8e3397035bd
 Signed-off-by: 181981772 <181981772@qq.com>
 ---
 diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
-index d34aff9..4b0b946 100644
+index d34aff9..c87a064 100644
 --- a/drivers/soundwire/qcom.c
 +++ b/drivers/soundwire/qcom.c
 @@ -205,6 +205,8 @@ struct qcom_swrm_ctrl {
@@ -44,7 +46,24 @@ index d34aff9..4b0b946 100644
  	int num_din_ports;
  	int num_dout_ports;
  	int nports;
-@@ -1729,23 +1731,44 @@ static void qcom_swrm_remove(struct platform_device *pdev)
+@@ -720,9 +722,14 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+ 	struct qcom_swrm_ctrl *ctrl = dev_id;
+ 	u32 value, intr_sts, intr_sts_masked, slave_status;
+ 	u32 i;
+-	int devnum;
++	int devnum, err;
+ 	int ret = IRQ_HANDLED;
+-	clk_prepare_enable(ctrl->hclk);
++
++	err = clk_prepare_enable(ctrl->hclk);
++	if (err) {
++		dev_err_ratelimited(ctrl->dev, "failed to enable iface clock: %d\n", err);
++		return IRQ_NONE;
++	}
+ 
+ 	ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_STATUS],
+ 		       &intr_sts);
+@@ -1729,23 +1736,44 @@ static void qcom_swrm_remove(struct platform_device *pdev)
  	clk_disable_unprepare(ctrl->hclk);
  }
  
@@ -91,7 +110,7 @@ index d34aff9..4b0b946 100644
  		qcom_swrm_init(ctrl);
  
  		usleep_range(100, 105);
-@@ -1786,6 +1809,7 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+@@ -1786,6 +1814,7 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
  		if (!swrm_wait_for_frame_gen_enabled(ctrl))
  			dev_err(ctrl->dev, "link failed to connect\n");
  
@@ -99,7 +118,7 @@ index d34aff9..4b0b946 100644
  		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
  		if (ret < 0)
  			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
-@@ -1823,6 +1847,9 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -1823,6 +1852,9 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
  		}
  	}
  
@@ -109,7 +128,7 @@ index d34aff9..4b0b946 100644
  	clk_disable_unprepare(ctrl->hclk);
  
  	usleep_range(300, 305);
-@@ -1835,7 +1862,35 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -1835,7 +1867,43 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
  	return 0;
  }
  
@@ -134,10 +153,18 @@ index d34aff9..4b0b946 100644
 +
 +static int swrm_elden_resume(struct device *dev)
 +{
++	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
++	int ret;
++
 +	if (!of_machine_is_compatible("lenovo,elden"))
 +		return 0;
 +
-+	return pm_runtime_force_resume(dev);
++	ret = pm_runtime_force_resume(dev);
++	/* A deferred runtime resume leaves the IRQ thread to vote for hclk. */
++	if (!ret)
++		swrm_enable_sleep_irq(ctrl);
++
++	return ret;
 +}
 +
  static const struct dev_pm_ops swrm_dev_pm_ops = {

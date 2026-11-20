@@ -8,14 +8,16 @@ capture frontend during component hw_free and serialize the transition
 with read requeue. Keep fragment ownership in close and reprepare.
 
 Serialize shared graph START and STOP and keep the last reference on
-failure. Use a distinct GPR transaction token for each STOP so a delayed
-response cannot complete the next request. Abort PCM playback and LPASS
-reprepare when STOP fails. Reject capture START after failed reprepare
-until another prepare succeeds.
+failure. Abort PCM playback and LPASS reprepare when STOP fails. Reject
+PCM START in either direction after failed reprepare until another
+prepare succeeds, and do not queue playback buffers in the meantime.
 
-Complete UNMAP with the original command and DSP status, carrying the
-ordinary or position-buffer type in the request. Clear only the handle
-the DSP successfully unmapped.
+Match STOP and UNMAP basic responses by opcode and transaction token.
+Publish the DSP status through a completion, independent of the legacy
+opcode-only wait queue. For UNMAP, keep the graph and mapping selection
+in the initiating thread. Clear only the requested handle after a
+matching successful response, so a late reply cannot finish a later
+UNMAP or clear its mapping.
 
 DPCM still performs best-effort cleanup after a persistent hw_free
 failure. This change does not make a timed-out DSP graph's state known
@@ -24,7 +26,7 @@ or change the lifetime of callbacks after final port teardown.
 Signed-off-by: 181981772 <181981772@qq.com>
 ---
 diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
-index 82a5f78..a91e89a 100644
+index 82a5f78..19c134e 100644
 --- a/sound/soc/qcom/qdsp6/q6apm-dai.c
 +++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
 @@ -81,6 +81,9 @@ struct q6apm_dai_rtd {
@@ -32,7 +34,7 @@ index 82a5f78..a91e89a 100644
  	spinlock_t lock;
  	bool notify_on_drain;
 +	bool graph_stopped;
-+	bool capture_prepare_failed;
++	bool prepare_failed;
 +	struct mutex capture_lock;	/* serializes capture read and STOP */
  };
  
@@ -141,7 +143,18 @@ index 82a5f78..a91e89a 100644
  static int q6apm_dai_prepare(struct snd_soc_component *component,
  			     struct snd_pcm_substream *substream)
  {
-@@ -249,11 +315,27 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+@@ -234,6 +300,10 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 	struct q6apm_dai_data *pdata;
+ 	int ret;
+ 
++	/* ALSA can leave a previously prepared PCM in PREPARED on error. */
++	if (prtd)
++		WRITE_ONCE(prtd->prepare_failed, true);
++
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata)
+ 		return -EINVAL;
+@@ -249,11 +319,25 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
  	cfg.bit_width = prtd->bits_per_sample;
  	cfg.fmt = SND_AUDIOCODEC_PCM;
  	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
@@ -149,8 +162,6 @@ index 82a5f78..a91e89a 100644
 -		/* clear the previous setup if any  */
 -		q6apm_graph_stop(prtd->graph);
 +	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-+		/* ALSA can leave a previously prepared PCM in PREPARED on error. */
-+		WRITE_ONCE(prtd->capture_prepare_failed, true);
 +		ret = q6apm_dai_stop_capture(prtd);
 +		if (ret) {
 +			dev_err(dev, "Failed to stop previous capture graph %d\n", ret);
@@ -173,7 +184,7 @@ index 82a5f78..a91e89a 100644
  	}
  
  	prtd->queue_ptr = 0;
-@@ -311,6 +393,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+@@ -311,6 +395,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
  		dev_err(dev, "Failed to Start Graph %d\n", ret);
  		return ret;
  	}
@@ -181,33 +192,33 @@ index 82a5f78..a91e89a 100644
  	if (!q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
  		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
  			int i;
-@@ -321,7 +404,9 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+@@ -321,7 +406,8 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
  	}
  
  	/* Now that graph as been prepared and started update the internal state accordingly */
 -	prtd->state = Q6APM_STREAM_RUNNING;
 +	WRITE_ONCE(prtd->state, Q6APM_STREAM_RUNNING);
-+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-+		WRITE_ONCE(prtd->capture_prepare_failed, false);
++	WRITE_ONCE(prtd->prepare_failed, false);
  
  	return 0;
  }
-@@ -333,7 +418,8 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
+@@ -332,8 +418,9 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
  	int i, ret = 0, avail_periods;
  
- 	/* SYNC_PTR can get here before prepare has allocated fragments */
+-	/* SYNC_PTR can get here before prepare has allocated fragments */
 -	if (!prtd->graph || prtd->state == Q6APM_STREAM_IDLE)
-+	if (!prtd->graph ||
++	/* SYNC_PTR can run before prepare or after a failed reprepare. */
++	if (READ_ONCE(prtd->prepare_failed) || !prtd->graph ||
 +	    READ_ONCE(prtd->state) == Q6APM_STREAM_IDLE)
  		return 0;
  
  	if (q6apm_is_graph_in_push_pull_mode(prtd->graph))
-@@ -365,10 +451,13 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+@@ -365,10 +452,12 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
  	case SNDRV_PCM_TRIGGER_START:
  	case SNDRV_PCM_TRIGGER_RESUME:
  	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
-+		    READ_ONCE(prtd->capture_prepare_failed))
++		if (READ_ONCE(prtd->prepare_failed))
 +			ret = -EPIPE;
  		break;
  	case SNDRV_PCM_TRIGGER_STOP:
@@ -251,46 +262,46 @@ index 11da559..717c8d4 100644
  	dai_data->is_prepared[dai->id] = false;
  
 diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
-index 8af5514..cc2f040 100644
+index 8af5514..c3f0376 100644
 --- a/sound/soc/qcom/qdsp6/q6apm.c
 +++ b/sound/soc/qcom/qdsp6/q6apm.c
 @@ -40,6 +40,43 @@ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
  					NULL, &apm->wait, pkt, rsp_opcode);
  }
  
-+static int q6apm_send_graph_stop(struct q6apm *apm, struct gpr_pkt *pkt)
++static int q6apm_send_tracked_cmd(struct q6apm *apm, struct gpr_pkt *pkt)
 +{
 +	gpr_device_t *gdev = apm->gdev;
++	u32 opcode = pkt->hdr.opcode;
 +	int ret;
 +
-+	/* Share the APM command mutex, but not its opcode-only result slot. */
-+	mutex_lock(&apm->lock);
-+	spin_lock(&apm->stop_reply_lock);
-+	if (!++apm->stop_token)
-+		apm->stop_token++;
-+	pkt->hdr.token = apm->stop_token;
-+	reinit_completion(&apm->stop_done);
-+	apm->stop_pending = true;
-+	spin_unlock(&apm->stop_reply_lock);
++	/* Use the APM command mutex without its opcode-only result slot. */
++	lockdep_assert_held(&apm->lock);
++	spin_lock(&apm->reply_lock);
++	if (!++apm->reply_token)
++		apm->reply_token++;
++	pkt->hdr.token = apm->reply_token;
++	reinit_completion(&apm->reply_done);
++	apm->reply_opcode = opcode;
++	spin_unlock(&apm->reply_lock);
 +
 +	pkt->hdr.src_port = gdev->svc_id;
 +	ret = gpr_send_pkt(gdev, pkt);
 +	if (ret >= 0) {
-+		if (!wait_for_completion_timeout(&apm->stop_done, 5 * HZ)) {
-+			dev_err(apm->dev, "GRAPH_STOP timed out\n");
++		if (!wait_for_completion_timeout(&apm->reply_done, 5 * HZ)) {
++			dev_err(apm->dev, "Command %#x timed out\n", opcode);
 +			ret = -ETIMEDOUT;
-+		} else if (apm->stop_status) {
-+			dev_err(apm->dev, "GRAPH_STOP failed: %#x\n", apm->stop_status);
++		} else if (apm->reply_status) {
++			dev_err(apm->dev, "Command %#x failed: %#x\n", opcode, apm->reply_status);
 +			ret = -EINVAL;
 +		} else {
 +			ret = 0;
 +		}
 +	}
 +
-+	spin_lock(&apm->stop_reply_lock);
-+	apm->stop_pending = false;
-+	spin_unlock(&apm->stop_reply_lock);
-+	mutex_unlock(&apm->lock);
++	spin_lock(&apm->reply_lock);
++	apm->reply_opcode = 0;
++	spin_unlock(&apm->reply_lock);
 +
 +	return ret;
 +}
@@ -306,31 +317,81 @@ index 8af5514..cc2f040 100644
  	graph->apm = apm;
  	graph->info = info;
  	graph->id = graph_id;
-@@ -127,6 +165,9 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
+@@ -127,6 +165,15 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
  	list_for_each_entry(sg, &info->sg_list, node)
  		mgmt_cmd->sub_graph_id_list[i++] = sg->sub_graph_id;
  
-+	if (opcode == APM_CMD_GRAPH_STOP)
-+		return q6apm_send_graph_stop(apm, pkt);
++	if (opcode == APM_CMD_GRAPH_STOP) {
++		int ret;
++
++		mutex_lock(&apm->lock);
++		ret = q6apm_send_tracked_cmd(apm, pkt);
++		mutex_unlock(&apm->lock);
++		return ret;
++	}
 +
  	return q6apm_send_cmd_sync(apm, pkt, 0);
  }
  
-@@ -335,8 +376,11 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
+@@ -334,31 +381,40 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
+ 	struct apm_cmd_shared_mem_unmap_regions *cmd;
  	struct q6apm *apm = dev_get_drvdata(dev->parent);
  	struct audioreach_graph_info *info;
- 	uint32_t mem_map_handle;
+-	uint32_t mem_map_handle;
 -	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
 -						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id);
-+	u32 token = graph_id | (is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0);
+-	if (IS_ERR(pkt))
+-		return PTR_ERR(pkt);
 +	struct gpr_pkt *pkt __free(kfree) = NULL;
-+
-+	pkt = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
-+					   APM_CMD_SHARED_MEM_UNMAP_REGIONS, token);
- 	if (IS_ERR(pkt))
- 		return PTR_ERR(pkt);
++	u32 mem_map_handle, *handle;
++	int ret;
  
-@@ -827,31 +871,49 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
++	/* Keep graph info and the selected mapping alive across the wait. */
++	mutex_lock(&apm->lock);
+ 	info = idr_find(&apm->graph_info_idr, graph_id);
+-	if (!info)
+-		return -ENODEV;
+-
+-	if (is_pos_buf) {
+-		if (!info->pos_buf_mem_map_handle)
+-			return 0;
+-		mem_map_handle = info->pos_buf_mem_map_handle;
+-	} else {
++	if (!info) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	handle = is_pos_buf ? &info->pos_buf_mem_map_handle : &info->mem_map_handle;
++	mem_map_handle = READ_ONCE(*handle);
++	if (!mem_map_handle) {
++		ret = 0;
++		goto unlock;
++	}
+ 
+-		if (!info->mem_map_handle)
+-			return 0;
+-		mem_map_handle = info->mem_map_handle;
++	pkt = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd), APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
++	if (IS_ERR(pkt)) {
++		ret = PTR_ERR(pkt);
++		goto unlock;
+ 	}
+ 
+ 	cmd = (void *)pkt + GPR_HDR_SIZE;
+ 	cmd->mem_map_handle = mem_map_handle;
+ 
+-	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_SHARED_MEM_UNMAP_REGIONS);
++	ret = q6apm_send_tracked_cmd(apm, pkt);
++	if (!ret)
++		cmpxchg(handle, mem_map_handle, 0);
++
++unlock:
++	mutex_unlock(&apm->lock);
++	return ret;
+ }
+ 
+ int q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int graph_id)
+@@ -827,31 +883,49 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
  int q6apm_graph_start(struct q6apm_graph *graph)
  {
  	struct audioreach_graph *ar_graph = graph->ar_graph;
@@ -370,8 +431,7 @@ index 8af5514..cc2f040 100644
 +		ret = 0;
 +		goto unlock;
 +	}
- 
--	return audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
++
 +	if (ar_graph->start_count > 1) {
 +		ar_graph->start_count--;
 +		ret = 0;
@@ -381,23 +441,24 @@ index 8af5514..cc2f040 100644
 +	ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
 +	if (!ret)
 +		ar_graph->start_count--;
-+
+ 
+-	return audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
 +unlock:
 +	mutex_unlock(&ar_graph->start_stop_lock);
 +	return ret;
  }
  EXPORT_SYMBOL_GPL(q6apm_graph_stop);
  
-@@ -897,6 +959,8 @@ static int apm_probe(gpr_device_t *gdev)
+@@ -897,6 +971,8 @@ static int apm_probe(gpr_device_t *gdev)
  	apm->dev = dev;
  	apm->gdev = gdev;
  	init_waitqueue_head(&apm->wait);
-+	spin_lock_init(&apm->stop_reply_lock);
-+	init_completion(&apm->stop_done);
++	spin_lock_init(&apm->reply_lock);
++	init_completion(&apm->reply_done);
  
  	INIT_LIST_HEAD(&apm->widget_list);
  	idr_init(&apm->graph_idr);
-@@ -967,7 +1031,6 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+@@ -967,7 +1043,6 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
  		case APM_CMD_GRAPH_PREPARE:
  		case APM_CMD_GRAPH_CLOSE:
  		case APM_CMD_GRAPH_FLUSH:
@@ -405,49 +466,37 @@ index 8af5514..cc2f040 100644
  		case APM_CMD_SET_CFG:
  			apm->result.opcode = result->opcode;
  			apm->result.status = result->status;
-@@ -976,17 +1039,33 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+@@ -976,19 +1051,16 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
  					result->opcode);
  			wake_up(&apm->wait);
  			break;
 +		case APM_CMD_GRAPH_STOP:
-+			spin_lock(&apm->stop_reply_lock);
-+			if (apm->stop_pending && hdr->token == apm->stop_token) {
-+				apm->stop_pending = false;
-+				apm->stop_status = result->status;
-+				complete(&apm->stop_done);
-+			}
-+			spin_unlock(&apm->stop_reply_lock);
-+			break;
  		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
 -			apm->result.opcode = hdr->opcode;
 -			apm->result.status = 0;
 -			rsp = data->payload;
-+			apm->result.opcode = result->opcode;
-+			apm->result.status = result->status;
- 
+-
 -			info = idr_find(&apm->graph_info_idr, hdr->token);
 -			if (info)
 -				info->mem_map_handle = 0;
 -			else
-+			graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;
-+			is_pos_buf = hdr->token & APM_MMAP_TOKEN_MAP_TYPE_POS_BUF;
-+			info = idr_find(&apm->graph_info_idr, graph_id);
-+			if (!info) {
-+				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
-+					result->opcode);
-+			} else if (result->status) {
- 				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
- 					result->opcode);
-+			} else if (is_pos_buf) {
-+				info->pos_buf_mem_map_handle = 0;
-+			} else {
-+				info->mem_map_handle = 0;
+-				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
+-					result->opcode);
+-
+-			wake_up(&apm->wait);
++			spin_lock(&apm->reply_lock);
++			if (apm->reply_opcode == result->opcode &&
++			    hdr->token == apm->reply_token) {
++				apm->reply_opcode = 0;
++				apm->reply_status = result->status;
++				complete(&apm->reply_done);
 +			}
- 
- 			wake_up(&apm->wait);
++			spin_unlock(&apm->reply_lock);
+ 			break;
+ 		default:
  			break;
 diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
-index 9092359..3be54bf 100644
+index 9092359..bd91b25 100644
 --- a/sound/soc/qcom/qdsp6/q6apm.h
 +++ b/sound/soc/qcom/qdsp6/q6apm.h
 @@ -3,6 +3,8 @@
@@ -463,12 +512,12 @@ index 9092359..3be54bf 100644
  	/* For Graph OPEN/START/STOP/CLOSE operations */
  	wait_queue_head_t wait;
  	struct gpr_ibasic_rsp_result_t result;
-+	/* Match GRAPH_STOP replies to one request, even after a timeout. */
-+	spinlock_t stop_reply_lock;
-+	struct completion stop_done;
-+	u32 stop_token;
-+	u32 stop_status;
-+	bool stop_pending;
++	/* Match STOP and UNMAP replies to one request, even after a timeout. */
++	spinlock_t reply_lock;
++	struct completion reply_done;
++	u32 reply_token;
++	u32 reply_opcode;
++	u32 reply_status;
  
  	struct mutex cmd_lock;
  	struct mutex lock;

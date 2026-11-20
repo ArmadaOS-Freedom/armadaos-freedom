@@ -1338,7 +1338,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0750-ASoC-qcom-harden-audioreach-teardown.patch`
   source: armada
   upstream: local
-  notes: Stop the capture frontend during hw_free, match GRAPH_STOP replies by transaction token, serialize shared graph references, and complete typed UNMAP correctly. Shared AudioReach code; persistent DSP failure still uses best-effort DPCM cleanup.
+  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Reject PCM starts after a failed reprepare. Shared AudioReach code; persistent DSP failure still uses best-effort DPCM cleanup.
 - `patches/0751-ASoC-qcom-quiesce-elden-audio-in-system-sleep.patch`
   source: https://github.com/yzddmr6/linux-sm8750-erhai/tree/da4b783e34bd05d7451a6f904fbf567af1215f99 (adapted Erhai SoundWire and LPASS changes; Armada Elden TX/VA extension)
   upstream: local
