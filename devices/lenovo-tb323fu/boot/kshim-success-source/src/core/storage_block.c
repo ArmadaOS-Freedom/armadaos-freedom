@@ -78,11 +78,11 @@ uint32_t kshim_crc32(const void *data, size_t size)
 {
     return ~crc_update(UINT32_MAX, data, size);
 }
-static int backup_name(const uint8_t *entry)
+static int entry_name_is(const uint8_t *entry, const uint8_t *name,
+                         size_t name_len)
 {
-    static const uint8_t name[] = "ARMADA_BACKUP";
     for (size_t i = 0; i < 36; ++i) {
-        uint8_t want = i < sizeof(name) - 1 ? name[i] : 0;
+        uint8_t want = i < name_len ? name[i] : 0;
         if (entry[56 + 2 * i] != want || entry[57 + 2 * i]) return 0;
     }
     return 1;
@@ -93,12 +93,13 @@ static void canonical_uuid(uint8_t *dst, const uint8_t *src)
     dst[4] = src[5]; dst[5] = src[4]; dst[6] = src[7]; dst[7] = src[6];
     for (unsigned i = 8; i < 16; ++i) dst[i] = src[i];
 }
-int kshim_gpt_find_backup(const struct kshim_blockdev *d,
+static int find_partition(const struct kshim_blockdev *d,
+                          const uint8_t *name, size_t name_len,
                           struct kshim_partition *out,
                           void *scratch, size_t scratch_bytes)
 {
     uint8_t *block = scratch;
-    if (!device_valid(d) || !out || !block ||
+    if (!device_valid(d) || !out || !block || !name ||
         scratch_bytes < KSHIM_STORAGE_SCRATCH_BYTES) return KSHIM_STORAGE_ARG;
     if (d->block_count < 6) return KSHIM_STORAGE_RANGE;
     int rc = kshim_block_read(d, 1, 1, block);
@@ -151,7 +152,7 @@ int kshim_gpt_find_backup(const struct kshim_blockdev *d,
             put64(ranges + 16 * used, start);
             put64(ranges + 16 * used + 8, end);
             ++used;
-            if (backup_name(e)) {
+            if (entry_name_is(e, name, name_len)) {
                 if (++matches > 1) return KSHIM_STORAGE_CONFLICT;
                 found.first_lba = start; found.last_lba = end;
                 canonical_uuid(found.uuid, e + 16);
@@ -162,4 +163,18 @@ int kshim_gpt_find_backup(const struct kshim_blockdev *d,
     if (!matches) return KSHIM_STORAGE_NOT_FOUND;
     *out = found;
     return KSHIM_STORAGE_OK;
+}
+int kshim_gpt_find_backup(const struct kshim_blockdev *d,
+                          struct kshim_partition *out,
+                          void *scratch, size_t scratch_bytes)
+{
+    static const uint8_t name[] = "ARMADA_BACKUP";
+    return find_partition(d, name, sizeof(name) - 1, out, scratch, scratch_bytes);
+}
+int kshim_gpt_find_linux_boot(const struct kshim_blockdev *d,
+                              struct kshim_partition *out,
+                              void *scratch, size_t scratch_bytes)
+{
+    static const uint8_t name[] = "ARMADA_BOOT";
+    return find_partition(d, name, sizeof(name) - 1, out, scratch, scratch_bytes);
 }

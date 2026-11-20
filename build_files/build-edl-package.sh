@@ -555,7 +555,25 @@ elif ((${#install_only_models[@]} > 0)); then
 else
     note "producing the install-only raw EDL package for ${selected_models[*]} (no selected model has the dual-slot upgrade backend)"
 fi
+disk_signer_mounts=()
+if [[ "${ARMADA_BOOT_FILES:-}" == "1" ]] && ((upgrade_enabled)); then
+    if [[ -z "${COSIGN_PRIVATE_KEY:-}" || -z "${COSIGN_PASSWORD:-}" ]]; then
+        echo "ARMADA_BOOT_FILES=1 with upgrade_eligible_models requires COSIGN_PRIVATE_KEY and COSIGN_PASSWORD" >&2
+        exit 1
+    fi
+    cosign_path="$(command -v cosign || true)"
+    if [[ -z "$cosign_path" || ! -x "$cosign_path" || ! -f "$cosign_path" ]]; then
+        echo "ARMADA_BOOT_FILES=1 requires an executable cosign on PATH" >&2
+        exit 1
+    fi
+    cosign_path="$(realpath "$cosign_path")"
+    disk_signer_mounts+=(-v "${cosign_path}:/run/armada-cosign:ro")
+    disk_signer_mounts+=(-e COSIGN_PRIVATE_KEY -e COSIGN_PASSWORD)
+    producer_args+=(--disk-boot-cosign /run/armada-cosign)
+fi
+
 run_container "$TASK_PREFIX-producer-$run_id" \
+    "${disk_signer_mounts[@]}" \
     --cpus 4 \
     --memory 6g \
     --network none \
@@ -624,6 +642,9 @@ descriptor_args=(
 )
 if ((upgrade_enabled)); then
     descriptor_args+=(--offline-upgrade)
+    if ((${#disk_signer_mounts[@]})); then
+        descriptor_args+=(--minimum-installer-version 0.9.19 --minimum-updater-version 0.8.2)
+    fi
 else
     for model_id in "${install_only_models[@]}"; do
         descriptor_args+=(--install-model "$model_id")

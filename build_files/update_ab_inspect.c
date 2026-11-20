@@ -321,15 +321,17 @@ int armada_update_ab_inspect_fds(const int fds[6],
  * plus the partition GUID in canonical RFC 4122 byte order. Reuses the
  * validated six-LUN GPT parser via kshim_ab_find_partition; never writes.
  * Outputs are left unchanged on any error. */
-__attribute__((visibility("default")))
-int armada_update_ab_partition_fds(const int fds[6],
-                                   const uint32_t block_sizes[6],
-                                   const uint64_t block_counts[6],
-                                   const uint8_t boot_ids[6],
-                                   uint32_t enabled_boot_id,
-                                   const char *label,
-                                   uint64_t result[3],
-                                   uint8_t uuid[16])
+enum ab_locator_mode { AB_LOCATOR_LEGACY, AB_LOCATOR_GPT };
+
+static int partition_fds_common(const int fds[6],
+                                const uint32_t block_sizes[6],
+                                const uint64_t block_counts[6],
+                                const uint8_t boot_ids[6],
+                                uint32_t enabled_boot_id,
+                                const char *label,
+                                uint64_t result[3],
+                                uint8_t uuid[16],
+                                enum ab_locator_mode mode)
 {
     struct update_ab_fd_ctx fd_ctx[KSHIM_AB_LUNS] = {{0}};
     struct update_ab_media_ctx media_ctx = {0, -1};
@@ -348,7 +350,9 @@ int armada_update_ab_partition_fds(const int fds[6],
     if (rc != KSHIM_STORAGE_OK)
         return rc;
 
-    rc = kshim_ab_find_partition(&media, label, &lun, &part);
+    rc = (mode == AB_LOCATOR_GPT)
+        ? kshim_ab_find_partition_gpt(&media, label, &lun, &part)
+        : kshim_ab_find_partition(&media, label, &lun, &part);
     if (rc != KSHIM_STORAGE_OK)
         return rc;
     if (part.last_lba < part.first_lba ||
@@ -360,6 +364,38 @@ int armada_update_ab_partition_fds(const int fds[6],
     result[2] = part.last_lba - part.first_lba + 1;
     memcpy(uuid, part.uuid, 16);
     return KSHIM_STORAGE_OK;
+}
+
+__attribute__((visibility("default")))
+int armada_update_ab_partition_fds(const int fds[6],
+                                   const uint32_t block_sizes[6],
+                                   const uint64_t block_counts[6],
+                                   const uint8_t boot_ids[6],
+                                   uint32_t enabled_boot_id,
+                                   const char *label,
+                                   uint64_t result[3],
+                                   uint8_t uuid[16])
+{
+    return partition_fds_common(fds, block_sizes, block_counts, boot_ids,
+                                enabled_boot_id, label, result, uuid,
+                                AB_LOCATOR_LEGACY);
+}
+
+/* GPT-only variant for Linux disk-boot mode. Same argument shape; no slot
+ * control, misc, Boot LUN, or write operations. Old callers are unaffected. */
+__attribute__((visibility("default")))
+int armada_update_gpt_partition_fds(const int fds[6],
+                                    const uint32_t block_sizes[6],
+                                    const uint64_t block_counts[6],
+                                    const uint8_t boot_ids[6],
+                                    uint32_t enabled_boot_id,
+                                    const char *label,
+                                    uint64_t result[3],
+                                    uint8_t uuid[16])
+{
+    return partition_fds_common(fds, block_sizes, block_counts, boot_ids,
+                                enabled_boot_id, label, result, uuid,
+                                AB_LOCATOR_GPT);
 }
 
 __attribute__((visibility("default")))

@@ -36,4 +36,6 @@ int kshim_config_load(struct kshim_config_store *, struct kshim_config_values *,
  * is never overwritten. sequence is updated only on verified success. */
 int kshim_config_save(struct kshim_config_store *, const struct kshim_config_values *,
                       uint64_t *sequence);
+int kshim_config_log_boot(struct kshim_config_store *s, uint32_t target,
+                          uint32_t phase, int32_t status);
 #endif

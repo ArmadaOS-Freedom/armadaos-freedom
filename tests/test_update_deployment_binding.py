@@ -126,6 +126,22 @@ class SelectorAndFallbackTests(unittest.TestCase):
         self.assertEqual(res.stdout, "")
         self.assertTrue(res.stderr.strip(), "expected non-empty stderr on failure")
 
+    def test_selector_stable_disk_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, old, new = create_sysroot(Path(tmp))
+            armada = root / "ostree" / "armada"
+            armada.mkdir()
+            binding = f"{OLD_COMMIT}.0"
+            link = armada / binding
+            link.symlink_to(os.path.relpath(old, armada))
+            karg = f"/ostree/armada/{binding}"
+            cmdline = f"ostree={karg} armada.deployment={OSNAME}/{binding}"
+            self.assert_selector_ok(root, cmdline, karg)
+            self.assert_selector_fails(root, cmdline.replace(karg, f"/ostree/armada/{NEW_COMMIT}.0"))
+            link.unlink()
+            link.symlink_to(new)
+            self.assert_selector_fails(root, cmdline)
+
     def test_selector_valid_resolutions_and_no_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

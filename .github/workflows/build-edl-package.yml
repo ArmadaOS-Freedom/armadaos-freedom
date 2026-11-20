@@ -199,6 +199,9 @@ jobs:
 
       - name: Build EDL package
         env:
+          ARMADA_BOOT_FILES: "1"
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
           IMAGE: ${{ steps.image.outputs.image }}
           IMAGE_DIGEST: ${{ inputs.image_digest }}
           REVISION: ${{ steps.revision.outputs.revision }}

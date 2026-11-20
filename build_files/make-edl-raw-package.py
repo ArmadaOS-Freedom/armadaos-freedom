@@ -13,6 +13,7 @@ block or filesystem I/O.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import gzip
 import hashlib
@@ -23,6 +24,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import sys
 import uuid
 import zipfile
@@ -914,6 +916,58 @@ def _prepare_dtb_module(source, work):
     return module
 
 
+def _sign_disk_record(record: Path, cosign: str, trusted_key: Path) -> bytes:
+    work = Path(tempfile.mkdtemp(prefix="disk-sign-"))
+    sig_b64 = work / "signature.b64"
+    sig_der = work / "signature.der"
+    try:
+        subprocess.run(
+            [
+                cosign,
+                "sign-blob",
+                "--yes",
+                "--key",
+                "env://COSIGN_PRIVATE_KEY",
+                "--tlog-upload=false",
+                "--output-signature",
+                str(sig_b64),
+                str(record),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        encoded = sig_b64.read_bytes().strip()
+        der = base64.b64decode(encoded, validate=True)
+        if not 8 <= len(der) <= 72:
+            raise ValueError("disk record signature has invalid DER length")
+        sig_der.write_bytes(der)
+        subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-verify",
+                str(trusted_key),
+                "-signature",
+                str(sig_der),
+                str(record),
+            ],
+            cwd=work,
+            capture_output=True,
+            check=True,
+        )
+        return der
+    finally:
+        for path in (sig_b64, sig_der):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            work.rmdir()
+        except OSError:
+            pass
+
 def _build_dtb(module, dtb, bootargs, stage, tag, destination):
     derived, data, _changed, _dts = module.build_dtb(
         {"dtb": str(dtb)},
@@ -1269,6 +1323,7 @@ def _produce(args):
     fs_work = work / "fs"
     fs_work.mkdir()
     recipes = {}
+    armada_boot_capsules = {}
     with filesystem_pair(
         fs_work,
         build["bootBytes"],
@@ -1333,6 +1388,7 @@ def _produce(args):
             target / "boot" / result["initrd"], staging / "common/boot/initramfs.img"
         )
         kshim = _prepare_dtb_module(source, work)
+        disk_dtbs = {}
         for name in models:
             profile = profiles[name]
             model_dir = staging / "models" / name
@@ -1363,6 +1419,95 @@ def _produce(args):
                 runtimes[name]["path"], model_dir / "runtime/runtime.bin"
             )
             recipes[name] = {"normal": normal, "diagnostic": diagnostic}
+            if args.disk_boot_cosign and name in {"TB322FC", "TB323FU"}:
+                runtime_bytes = Path(runtimes[name]["path"]).read_bytes()
+                if b"ARMDSK1" not in runtime_bytes:
+                    raise RuntimeError(
+                        f"runtime for {name} lacks ARMDSK1 disk boot marker"
+                    )
+                static = []
+                for token in normal.split():
+                    key = token.partition("=")[0]
+                    if key not in {
+                        "root",
+                        "boot",
+                        "ostree",
+                        "armada.deployment",
+                    }:
+                        static.append(token)
+                static_args = " ".join(static)
+                disk_dtb = work / f"{name}-armada-boot.dtb"
+                _build_dtb(
+                    kshim,
+                    dtb,
+                    static_args,
+                    "os",
+                    f"{name}-disk",
+                    disk_dtb,
+                )
+                _run(["fdtput", "-t", "s", str(disk_dtb), "/chosen",
+                      "armada,release-commit", result["deployment_checksum"]])
+                disk_dtbs[name] = disk_dtb
+        if disk_dtbs:
+            helper_path = (
+                source
+                / "system_files/usr/lib/armada/updates/boot_disk_binding.py"
+            )
+            spec = importlib.util.spec_from_file_location(
+                "boot_disk_binding", helper_path
+            )
+            binding_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(binding_mod)
+            normal_tokens = parsed["normalBootArgs"].split()
+            ostree_tokens = [
+                t for t in normal_tokens if t.partition("=")[0] == "ostree"
+            ]
+            if len(ostree_tokens) != 1:
+                raise RuntimeError("expected exactly one ostree= boot argument")
+            deployment_tokens = [
+                t
+                for t in normal_tokens
+                if t.partition("=")[0] == "armada.deployment"
+            ]
+            if len(deployment_tokens) != 1:
+                raise RuntimeError(
+                    "expected exactly one armada.deployment= boot argument"
+                )
+            binding = binding_mod.encode_binding(
+                ostree_tokens[0].partition("=")[2],
+                deployment_tokens[0].partition("=")[2],
+            )
+            install_spec = importlib.util.spec_from_file_location(
+                "armada_boot_install", source / "build_files/armada_boot_install.py")
+            disk_installer = importlib.util.module_from_spec(install_spec)
+            install_spec.loader.exec_module(disk_installer)
+            _armada_lib = str(source / "system_files/usr/lib/armada")
+            sys.path.insert(0, _armada_lib)
+            try:
+                from updates.boot_disk_selector import ensure_root_binding
+                ensure_root_binding(target, deployment_tokens[0].partition("=")[2])
+            finally:
+                sys.path.pop(0)
+            disk_installer.stage_install_boot(
+                target / "boot",
+                target / "boot" / result["image"],
+                target / "boot" / result["initrd"],
+                binding,
+                disk_dtbs,
+                source / "build_files/boot-disk-manifest.py",
+                lambda record: _sign_disk_record(
+                    record,
+                    args.disk_boot_cosign,
+                    source
+                    / "system_files/etc/pki/containers/armadaos-freedom.pub",
+                ),
+            )
+            for name in disk_dtbs:
+                seed = target / "boot" / "armada" / "seed" / name
+                armada_boot_capsules[name] = {
+                    filename: base64.b64encode((seed / filename).read_bytes()).decode("ascii")
+                    for filename in ("board.dtb", "manifest.bin", "manifest.sig")
+                }
         _run(["ostree", "fsck", f"--repo={target}/ostree/repo"])
         os.sync()
         stats = os.statvfs(target)
@@ -1470,6 +1615,11 @@ def _produce(args):
                 "normalBootArgs": recipes[name]["normal"],
                 "diagnosticBootArgs": recipes[name]["diagnostic"],
                 "defaultEntry": parsed["defaultEntry"],
+                **(
+                    {"linuxBootSource": "armada-boot-v1"}
+                    if name in disk_dtbs
+                    else {}
+                ),
             },
         }
         _write_json(model_dir / "package.json", manifest)
@@ -1481,6 +1631,7 @@ def _produce(args):
             "bundleId": "armadaos-freedom",
             "version": args.version,
             "offlineUpgrade": bool(args.offline_upgrade),
+            **({"armadaBootCapsules": armada_boot_capsules} if armada_boot_capsules else {}),
             "packages": [
                 {
                     "deviceModel": name,
@@ -1545,6 +1696,7 @@ def main(argv=None):
             "the embedded runtime)."
         ),
     )
+    parser.add_argument("--disk-boot-cosign", default=None)
     parser.add_argument("--boot-uuid", required=True)
     parser.add_argument("--root-uuid", required=True)
     parser.add_argument(

@@ -23,6 +23,30 @@ def is_busy_error(error):
     return BUSY_ERROR in str(error)
 
 
+# updates/client.py — insert before "class UpdateClient:"
+def system_reboot_ready(result):
+    """Return True only for a verified terminal awaiting-reboot result."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("state") != "awaiting_reboot":
+        return False
+    if result.get("requiresReboot") is not True:
+        return False
+    if result.get("bootPolicy") != "dual-boot-no-slot-control":
+        return False
+    if result.get("slotControlState") != "not_issued":
+        return False
+    if result.get("bootSource") == "armada_boot":
+        if result.get("bootWriteState") != "not_started":
+            return False
+        if "fromSlot" not in result or "targetSlot" not in result:
+            return False
+        if result.get("fromSlot") is not None or result.get("targetSlot") is not None:
+            return False
+        return True
+    return result.get("bootWriteState") == "written"
+
+
 class UpdateClient:
     _METHODS = {
         "GetStatus": None,

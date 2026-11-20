@@ -8,6 +8,8 @@ from .deployment_store import (
     _binding_of,
     _candidate_path,
     _gi,
+    _initialize_writable_sysroot,
+    _new_sysroot,
     _parse_binding,
     _require_nonsymlink_dir,
 )
@@ -151,7 +153,19 @@ def read_deployment_options(*, sysroot_path, current_binding, target_binding):
             raise DeploymentOptionsError("current and target commits must differ")
 
         root = _resolve_sysroot(sysroot_path)
-        sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
+        try:
+            sysroot = _new_sysroot(Gio, OSTree, root)
+        except DeploymentError as exc:
+            raise DeploymentOptionsError(str(exc)) from exc
+        try:
+            is_live = Path(root) == Path("/sysroot")
+        except OSError:
+            is_live = False
+        if is_live:
+            try:
+                _initialize_writable_sysroot(sysroot, root)
+            except DeploymentError as exc:
+                raise DeploymentOptionsError(str(exc)) from exc
         ok, acquired = sysroot.try_lock()
         if not (ok and acquired):
             raise DeploymentOptionsError("sysroot busy: try_lock not acquired")

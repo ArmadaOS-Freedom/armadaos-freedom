@@ -423,7 +423,31 @@ static void trial_store_and_format_errors(void){
     assert(kshim_ufs_settings_trial_save(&backend,0,&t1,&written)==KSHIM_STORAGE_FORMAT);
     assert(!backend.host.owned&&kshim_ufs_settings_handoff_safe(&backend)&&written==99&&internal.writes==w0);
 }
+extern int kshim_ufs_settings_read_boot(struct kshim_ufs_settings *, int (*)(const struct kshim_blockdev *, void *), void *);
+static int test_read_boot_cb(const struct kshim_blockdev *bd, void *ctx)
+{
+    uint8_t header[4096];
+    assert(kshim_block_read(bd, 1, 1, header) == 0);
+    assert(memcmp(header, "EFI PART", 8) == 0);
+    assert(bd->write == NULL);
+    assert(bd->flush == NULL);
+    *(int *)ctx = 1;
+    return 0;
+}
+
+static void test_read_boot(void)
+{
+    int called = 0;
+    reset();
+    assert(open_store() == KSHIM_STORAGE_EMPTY);
+    assert(kshim_ufs_settings_read_boot(&backend, test_read_boot_cb, &called) == 0);
+    assert(called == 1);
+    assert(backend.host.owned == 0);
+    assert(internal.writes == 0);
+}
+
 int main(void){
+    test_read_boot();
     ab_success_ownership();
     ab_ownership();
     history_reopen();

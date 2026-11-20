@@ -5,7 +5,9 @@ sysroot without making it default, removing prior deployments, seeding /var/home
 or formatting storage. Caller holds /run/lock/armada-update.lock for the full
 transaction; this module also acquires and releases the OSTree Sysroot try_lock.
 """
+import os
 import re
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -42,6 +44,114 @@ _TEMP_REF_RE = re.compile(re.escape(_TEMP_REF_PREFIX) + r"/[0-9a-f]{32}")
 
 class DeploymentError(Exception):
     pass
+
+
+def _new_sysroot(Gio, OSTree, root):
+    """Create an OSTree.Sysroot for ``root``.
+
+    The live canonical root ``Path('/sysroot')`` uses
+    ``OSTree.Sysroot.new_default()`` (path ``'/'``), which is the form
+    that resolves the actual booted deployment.  Every other root keeps
+    the explicit ``OSTree.Sysroot.new(<path>)`` behavior unchanged.
+    """
+    try:
+        is_live = Path(root) == Path("/sysroot")
+    except OSError:
+        is_live = False
+    if is_live:
+        sysroot = OSTree.Sysroot.new_default()
+        ostree_link = Path("/ostree")
+        root_ostree = Path(root) / "ostree"
+        try:
+            match = os.path.samefile(ostree_link, root_ostree)
+        except OSError as exc:
+            raise DeploymentError(
+                f"cannot stat /ostree vs {root_ostree}: {exc}"
+            ) from exc
+        if not match:
+            raise DeploymentError(
+                f"/ostree is not the same inode as {root_ostree}"
+            )
+        return sysroot
+    return OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
+
+
+def _initialize_writable_sysroot(sysroot, root):
+    """Bring /sysroot writable for a live canonical root, then initialize.
+
+    For a live canonical ``Path('/sysroot')`` only: probe writability of
+    ``root`` and ``root/ostree/repo``; if either is read-only, enter a
+    private mount namespace (``os.unshare(CLONE_NEWNS)``) and make the
+    whole tree rprivate before remounting the offending bind mounts rw.
+    Remounts are bind-only (``-o remount,bind,rw``), scoped to the two
+    known targets, and never fall back to a global or device remount.
+
+    For any other root the existing initializer is used unchanged and no
+    namespace or remount work is performed.
+
+    Raises ``DeploymentError`` if preparation or initialization fails.
+    """
+    try:
+        canonical = Path("/sysroot")
+        try:
+            is_live = Path(root).resolve() == canonical.resolve()
+        except OSError:
+            is_live = False
+
+        targets = ()
+        if is_live:
+            targets = [root, root / "ostree" / "repo"]
+            boot = Path("/boot")
+            if not boot.is_symlink() and boot.is_mount():
+                targets.append(boot)
+            targets = tuple(targets)
+            needs_ns = any(
+                os.statvfs(str(t)).f_flag & os.ST_RDONLY for t in targets
+            )
+            if needs_ns:
+                try:
+                    os.unshare(os.CLONE_NEWNS)
+                except (OSError, AttributeError) as exc:
+                    raise DeploymentError(
+                        f"sysroot unshare(CLONE_NEWNS) failed: {exc}"
+                    ) from exc
+                subprocess.run(
+                    ["/usr/bin/mount", "-n", "--make-rprivate", "/"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                for t in targets:
+                    if os.statvfs(str(t)).f_flag & os.ST_RDONLY:
+                        subprocess.run(
+                            [
+                                "/usr/bin/mount",
+                                "-n",
+                                "-o",
+                                "remount,bind,rw",
+                                str(t),
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if os.statvfs(str(t)).f_flag & os.ST_RDONLY:
+                            raise DeploymentError(
+                                f"sysroot bind remount rw claimed success "
+                                f"but target still ro: {t}"
+                            )
+
+        if not sysroot.initialize_with_mount_namespace(None):
+            raise DeploymentError("sysroot initialize_with_mount_namespace failed")
+    except DeploymentError:
+        raise
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip() or "<empty stderr>"
+        raise DeploymentError(
+            f"sysroot mount command failed ({exc.cmd[0]} ...): {stderr}"
+        ) from exc
+    except (OSError, AttributeError) as exc:
+        raise DeploymentError(f"sysroot prepare failed: {exc}") from exc
 
 
 def _unique_binding(deployments, binding, label):
@@ -277,7 +387,24 @@ def _candidate_path(sysroot, root, dep, osname, commit):
     expected = root.joinpath(*parts)
     actual = Path(raw)
     if actual != expected:
-        raise DeploymentError(f"unexpected deployment path: {raw!r} != {str(expected)!r}")
+        alternative_ok = False
+        try:
+            is_live = Path(root) == Path("/sysroot")
+        except OSError:
+            is_live = False
+        if is_live:
+            ostree_alias = Path("/").joinpath(*parts)
+            if actual == ostree_alias:
+                try:
+                    alternative_ok = (
+                        actual.resolve(strict=True) == expected
+                    )
+                except OSError:
+                    alternative_ok = False
+        if not alternative_ok:
+            raise DeploymentError(
+                f"unexpected deployment path: {raw!r} != {str(expected)!r}"
+            )
     _require_nonsymlink_dir(root, *parts)
     return str(expected)
 
@@ -459,9 +586,8 @@ def ensure_deployment_binding(*, sysroot_path, binding):
     _require_nonsymlink_dir(root, "ostree", "repo")
     _require_nonsymlink_dir(root, "boot")
 
-    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
-    if not sysroot.initialize_with_mount_namespace(None):
-        raise DeploymentError("sysroot initialize_with_mount_namespace failed")
+    sysroot = _new_sysroot(Gio, OSTree, root)
+    _initialize_writable_sysroot(sysroot, root)
     ok, acquired = sysroot.try_lock()
     if not (ok and acquired):
         raise DeploymentError("sysroot busy: try_lock not acquired")
@@ -533,9 +659,8 @@ def append_verified_deployment(*, sysroot_path, current_binding, target_commit, 
     _require_nonsymlink_dir(root, "ostree", "repo")
     _require_nonsymlink_dir(root, "boot")
 
-    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
-    if not sysroot.initialize_with_mount_namespace(None):
-        raise DeploymentError("sysroot initialize_with_mount_namespace failed")
+    sysroot = _new_sysroot(Gio, OSTree, root)
+    _initialize_writable_sysroot(sysroot, root)
     ok, acquired = sysroot.try_lock()
     if not (ok and acquired):
         raise DeploymentError("sysroot busy: try_lock not acquired")
@@ -729,9 +854,8 @@ def promote_confirmed_deployment(*, sysroot_path, current_binding, previous_bind
     _require_nonsymlink_dir(root, "ostree", "repo")
     _require_nonsymlink_dir(root, "boot")
 
-    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
-    if not sysroot.initialize_with_mount_namespace(None):
-        raise DeploymentError("sysroot initialize_with_mount_namespace failed")
+    sysroot = _new_sysroot(Gio, OSTree, root)
+    _initialize_writable_sysroot(sysroot, root)
     ok, acquired = sysroot.try_lock()
     if not (ok and acquired):
         raise DeploymentError("sysroot busy: try_lock not acquired")
