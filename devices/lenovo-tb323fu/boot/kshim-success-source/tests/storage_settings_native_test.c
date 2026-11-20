@@ -226,6 +226,51 @@ static void trial_io(void){
     assert(storage_settings_native_trial_load(NULL,&selected)==KSHIM_STORAGE_ARG);
     assert(storage_settings_native_trial_save(55,NULL,&written)==KSHIM_STORAGE_ARG);
 }
+/* ---- add to tests/storage_settings_native_test.c (NOT RUN) ---- */
+
+static int boot_read_native_calls;
+
+static int native_boot_read_cb(const struct kshim_blockdev *bd, void *ctx)
+{
+    (void)bd;
+    int *n = (int *)ctx;
+    (*n)++;
+    return -77;
+}
+
+int kshim_ufs_settings_read_boot(struct kshim_ufs_settings *b,
+                                 int (*r)(const struct kshim_blockdev *, void *),
+                                 void *ctx)
+{
+    assert(b == last);
+    assert(mmu_on);
+    return r(&b->lun.block, ctx);
+}
+
+static void native_boot_read(void)
+{
+    int rc;
+
+    mmu_on = 0;
+    assert(last != NULL);
+    last->unsafe=0;mmu_on=0;root_table=0x4000;enable_rc=close_rc=0;
+    last->board = DEVICE_BOARD_TB323FU;
+
+    enables = 0;
+    closes = 0;
+    boot_read_native_calls = 0;
+
+    rc = storage_settings_native_read_boot(native_boot_read_cb, &boot_read_native_calls);
+
+    assert(rc == -77);
+    assert(boot_read_native_calls == 1);
+    assert(enables == 1);
+    assert(closes == 1);
+    assert(!mmu_on);
+}
+
+/* main: call native_boot_read(); right after trial_io(); */
+
 int main(void){
     const struct kshim_config_values defaults={0,0,1, 0, 0};
     assert(storage_settings_native_open(DEVICE_BOARD_UNKNOWN,&defaults)==KSHIM_UFS_UNSUPPORTED);
@@ -252,6 +297,7 @@ int main(void){
     serial_ab();
     native_success();
     trial_io();
+    native_boot_read();
     unsigned old=opens;last->unsafe=1;
     assert(!storage_settings_native_handoff_safe());
     assert(storage_settings_native_open(DEVICE_BOARD_TB322FC,&defaults)==KSHIM_UFS_QUARANTINED&&opens==old);

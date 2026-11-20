@@ -426,6 +426,19 @@ static void clean_range(uint64_t base, uint64_t size)
 #endif
 }
 
+void kshim_mmu_clean_payload(uint64_t base, uint64_t size)
+{
+#if defined(__aarch64__)
+    if (size == 0U)
+        return;
+    clean_range(base, size);
+    __asm__ volatile("dsb sy" ::: "memory");
+#else
+    (void)base;
+    (void)size;
+#endif
+}
+
 static void disable_at_el(uint64_t exception_level)
 {
 #if defined(__aarch64__)

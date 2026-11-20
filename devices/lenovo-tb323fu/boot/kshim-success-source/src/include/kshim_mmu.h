@@ -70,6 +70,9 @@ uint64_t kshim_mmu_root_table(void);
  * loaded where it was linked (standalone/QEMU). */
 uint64_t kshim_mmu_image_base(void);
 int kshim_mmu_prepare_handoff(void);
+/* Flush a loaded-payload range through the existing ARM64 clean_range so
+ * it is visible to the kernel after the MMU is disabled. No-op elsewhere. */
+void kshim_mmu_clean_payload(uint64_t base, uint64_t size);
 void kshim_mmu_cpu_off_prepare(void);
 
 /* Compatibility entry used by the existing main path. */

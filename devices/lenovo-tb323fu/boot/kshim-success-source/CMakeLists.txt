@@ -270,6 +270,89 @@ add_custom_command(
 
 add_custom_target(preprocess_linker_script ALL DEPENDS ${PROCESSED_LINKER_SCRIPT})
 add_executable(${OUTPUT_NAME}.elf ${SRC_FILES})
+
+# ---------------------------------------------------------------------------
+# Optional isolated disk-boot build (KSHIM_DISK_BOOT).
+# Enabled ONLY when BOTH are provided as explicit paths:
+#   - KSHIM_DISK_BOOT_BEARSSL    (PATH  to BearSSL source tree)
+#   - KSHIM_DISK_BOOT_KEY_HEADER (FILE  trusted uncompressed P-256 pubkey header,
+#                                       prepared by caller, format:
+#                                       static const uint8_t armada_disk_boot_key[65])
+# If exactly one is set -> FATAL_ERROR. If neither -> block is a no-op.
+# Caller must prepare the key header BEFORE invoking CMake configure.
+# ---------------------------------------------------------------------------
+if(DEFINED KSHIM_DISK_BOOT_BEARSSL OR DEFINED KSHIM_DISK_BOOT_KEY_HEADER)
+    if(NOT (DEFINED KSHIM_DISK_BOOT_BEARSSL AND DEFINED KSHIM_DISK_BOOT_KEY_HEADER))
+        message(FATAL_ERROR
+            "KSHIM_DISK_BOOT requires BOTH KSHIM_DISK_BOOT_BEARSSL (path) and "
+            "KSHIM_DISK_BOOT_KEY_HEADER (file) to be set; only one was provided.")
+    endif()
+    if(NOT IS_DIRECTORY "${KSHIM_DISK_BOOT_BEARSSL}")
+        message(FATAL_ERROR "KSHIM_DISK_BOOT_BEARSSL is not a directory: ${KSHIM_DISK_BOOT_BEARSSL}")
+    endif()
+    if(NOT EXISTS "${KSHIM_DISK_BOOT_KEY_HEADER}")
+        message(FATAL_ERROR "KSHIM_DISK_BOOT_KEY_HEADER does not exist: ${KSHIM_DISK_BOOT_KEY_HEADER}")
+    endif()
+
+    get_filename_component(_kshim_bearssl_dir "${KSHIM_DISK_BOOT_BEARSSL}" ABSOLUTE)
+    get_filename_component(_kshim_key_header   "${KSHIM_DISK_BOOT_KEY_HEADER}" ABSOLUTE)
+
+    # Copy validated key header into the binary dir under a unique fixed name.
+    set(_kshim_key_generated_dir "${CMAKE_BINARY_DIR}/armada_disk_boot_key")
+    configure_file("${_kshim_key_header}"
+                   "${_kshim_key_generated_dir}/armada_disk_boot_key.h"
+                   COPYONLY)
+
+    # Exact crypto sources from BearSSL (no globbing — list is curated).
+    set(_kshim_disk_boot_crypto_srcs
+        "${_kshim_bearssl_dir}/src/ec/ec_p256_m31.c"
+        "${_kshim_bearssl_dir}/src/ec/ec_secp256r1.c"
+        "${_kshim_bearssl_dir}/src/ec/ec_secp384r1.c"
+        "${_kshim_bearssl_dir}/src/ec/ec_secp521r1.c"
+        "${_kshim_bearssl_dir}/src/ec/ecdsa_i31_vrfy_asn1.c"
+        "${_kshim_bearssl_dir}/src/ec/ecdsa_i31_vrfy_raw.c"
+        "${_kshim_bearssl_dir}/src/ec/ecdsa_i31_bits.c"
+        "${_kshim_bearssl_dir}/src/ec/ecdsa_atr.c"
+        "${_kshim_bearssl_dir}/src/hash/sha2small.c"
+        "${_kshim_bearssl_dir}/src/codec/dec32be.c"
+        "${_kshim_bearssl_dir}/src/codec/enc32be.c"
+        "${_kshim_bearssl_dir}/src/codec/ccopy.c"
+        "${_kshim_bearssl_dir}/src/int/i32_div32.c"
+    )
+    file(GLOB _kshim_i31_srcs "${_kshim_bearssl_dir}/src/int/i31_*.c")
+    list(SORT _kshim_i31_srcs)
+    list(APPEND _kshim_disk_boot_crypto_srcs ${_kshim_i31_srcs})
+
+    # Exact runtime modules (existing files, boot_disk_* + boot_ext4).
+    set(_kshim_disk_boot_runtime_srcs
+        "${CMAKE_SOURCE_DIR}/src/core/boot_disk_entry.c"
+        "${CMAKE_SOURCE_DIR}/src/core/boot_disk_binding.c"
+        "${CMAKE_SOURCE_DIR}/src/core/boot_disk_load.c"
+        "${CMAKE_SOURCE_DIR}/src/core/boot_disk_manifest.c"
+        "${CMAKE_SOURCE_DIR}/src/core/boot_ext4.c"
+        "${CMAKE_SOURCE_DIR}/src/dt/boot_disk_memory.c"
+        "${CMAKE_SOURCE_DIR}/src/dt/boot_disk_kernel.c"
+        "${CMAKE_SOURCE_DIR}/src/arch/arm64/boot_disk_native.c"
+        "${CMAKE_SOURCE_DIR}/src/arch/arm64/boot_disk_stage.c"
+    )
+    foreach(_f IN LISTS _kshim_disk_boot_crypto_srcs _kshim_disk_boot_runtime_srcs)
+        if(NOT EXISTS "${_f}")
+            message(FATAL_ERROR "KSHIM_DISK_BOOT source missing: ${_f}")
+        endif()
+    endforeach()
+
+    target_sources(${OUTPUT_NAME}.elf PRIVATE
+        ${_kshim_disk_boot_runtime_srcs}
+        ${_kshim_disk_boot_crypto_srcs}
+    )
+    target_compile_definitions(${OUTPUT_NAME}.elf PRIVATE KSHIM_DISK_BOOT=1)
+    target_include_directories(${OUTPUT_NAME}.elf PRIVATE
+        "${_kshim_bearssl_dir}/inc"
+        "${_kshim_bearssl_dir}/src"
+        "${_kshim_key_generated_dir}"
+    )
+    # NOTE: product activation of this target is deferred to the next patch.
+endif()
 # Expose the build version to C as a quoted string literal (e.g. "0.0.1"), not
 # a bare preprocessing token. VERSION is only an environment variable fed into
 # Kconfig, so it never reaches the C compiler as a definition on its own.
