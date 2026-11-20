@@ -1,0 +1,233 @@
+From: 181981772 <181981772@qq.com>
+Subject: [PATCH] ASoC: qcom: quiesce Elden SoundWire and LPASS in system sleep
+
+On Y700 Gen4, WCD9395 uses the SoundWire RX and TX links. The TX link
+depends on the LPASS TX macro, which in turn takes fsgen from VA.
+Runtime-active devices can keep these clocks on during s2idle.
+
+On lenovo,elden, use late suspend and early resume to run SoundWire and
+LPASS RX, WSA, TX and VA runtime PM around system sleep. This leaves
+the links available during normal ASoC suspend and restores access
+before normal ASoC resume. The existing clock dependencies order the
+SoundWire controllers against their LPASS providers.
+
+Drain and disable the controller IRQ before gating hclk for system
+sleep. Do not wait for it in ordinary runtime suspend: the IRQ thread
+can itself request runtime PM through a peripheral. Restore the main
+IRQ only once hclk is available, retaining the original wake IRQ
+handling on successful resume. Return an hclk enable error without
+touching either IRQ.
+
+Adapt Oleg Keri's SoundWire IRQ ordering fix and the Armada system PM
+changes carried by Noahcdls in Erhai. The original system PM work is
+credited to Armada; the TX/VA Elden adaptation comes from the local
+Erhai candidate. Keep the system sleep policy specific to Elden.
+
+Link: https://lkml.iu.edu/2610.1/02715.html
+Link: https://github.com/yzddmr6/linux-sm8750-erhai/commit/da3087ebc5b1cc35da4e8e43ef9df3c5f91e70d1
+Link: https://github.com/yzddmr6/linux-sm8750-erhai/commit/f507f71d1fd392ef23a8dc07a000ae87ec60ea67
+Link: https://github.com/yzddmr6/linux-sm8750-erhai/commit/7e6c7b0a93b3cfe491ddb25b53e71a3eb660ae64
+Link: https://github.com/armada-os/armada/commit/98e87a10155988d4577d8e3397035bd698727196
+
+Signed-off-by: 181981772 <181981772@qq.com>
+---
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index d34aff9..4b0b946 100644
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -205,6 +205,8 @@ struct qcom_swrm_ctrl {
+ 	int irq;
+ 	unsigned int version;
+ 	int wake_irq;
++	bool system_suspending;
++	bool sleep_irq_disabled;
+ 	int num_din_ports;
+ 	int num_dout_ports;
+ 	int nports;
+@@ -1729,23 +1731,44 @@ static void qcom_swrm_remove(struct platform_device *pdev)
+ 	clk_disable_unprepare(ctrl->hclk);
+ }
+ 
++static void swrm_disable_sleep_irq(struct qcom_swrm_ctrl *ctrl)
++{
++	if (!ctrl->sleep_irq_disabled) {
++		disable_irq(ctrl->irq);
++		ctrl->sleep_irq_disabled = true;
++	}
++}
++
++static void swrm_enable_sleep_irq(struct qcom_swrm_ctrl *ctrl)
++{
++	if (ctrl->sleep_irq_disabled) {
++		enable_irq(ctrl->irq);
++		ctrl->sleep_irq_disabled = false;
++	}
++}
++
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	ret = clk_prepare_enable(ctrl->hclk);
++	if (ret) {
++		dev_err(dev, "failed to enable iface clock: %d\n", ret);
++		return ret;
++	}
++
+ 	if (ctrl->wake_irq > 0) {
+ 		if (!irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
+ 			disable_irq_nosync(ctrl->wake_irq);
+ 	}
+ 
+-	clk_prepare_enable(ctrl->hclk);
+-
+ 	if (ctrl->clock_stop_not_supported) {
+ 		reinit_completion(&ctrl->enumeration);
+ 		ctrl->reg_write(ctrl, SWRM_COMP_SW_RESET, 0x01);
+ 		usleep_range(100, 105);
+ 
++		swrm_enable_sleep_irq(ctrl);
+ 		qcom_swrm_init(ctrl);
+ 
+ 		usleep_range(100, 105);
+@@ -1786,6 +1809,7 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ 		if (!swrm_wait_for_frame_gen_enabled(ctrl))
+ 			dev_err(ctrl->dev, "link failed to connect\n");
+ 
++		swrm_enable_sleep_irq(ctrl);
+ 		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
+ 		if (ret < 0)
+ 			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
+@@ -1823,6 +1847,9 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ 		}
+ 	}
+ 
++	/* The IRQ thread can request runtime PM through a SoundWire slave. */
++	if (ctrl->system_suspending)
++		swrm_disable_sleep_irq(ctrl);
+ 	clk_disable_unprepare(ctrl->hclk);
+ 
+ 	usleep_range(300, 305);
+@@ -1835,7 +1862,35 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++static int swrm_elden_suspend(struct device *dev)
++{
++	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
++	int ret;
++
++	if (!of_machine_is_compatible("lenovo,elden"))
++		return 0;
++
++	/* Late suspend quiesces the slave before we wait for the IRQ thread. */
++	if (pm_runtime_status_suspended(dev))
++		swrm_disable_sleep_irq(ctrl);
++
++	ctrl->system_suspending = true;
++	ret = pm_runtime_force_suspend(dev);
++	ctrl->system_suspending = false;
++
++	return ret;
++}
++
++static int swrm_elden_resume(struct device *dev)
++{
++	if (!of_machine_is_compatible("lenovo,elden"))
++		return 0;
++
++	return pm_runtime_force_resume(dev);
++}
++
+ static const struct dev_pm_ops swrm_dev_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(swrm_elden_suspend, swrm_elden_resume)
+ 	SET_RUNTIME_PM_OPS(swrm_runtime_suspend, swrm_runtime_resume, NULL)
+ };
+ 
+diff --git a/sound/soc/codecs/lpass-macro-common.h b/sound/soc/codecs/lpass-macro-common.h
+index 10ad682..6e5fcb7 100644
+--- a/sound/soc/codecs/lpass-macro-common.h
++++ b/sound/soc/codecs/lpass-macro-common.h
+@@ -6,6 +6,9 @@
+ #ifndef __LPASS_MACRO_COMMON_H__
+ #define __LPASS_MACRO_COMMON_H__
+ 
++#include <linux/of.h>
++#include <linux/pm_runtime.h>
++
+ /* NPL clock is expected */
+ #define LPASS_MACRO_FLAG_HAS_NPL_CLOCK		BIT(0)
+ /* The soundwire block should be internally reset at probe */
+@@ -42,6 +45,23 @@ void lpass_macro_pds_exit(struct lpass_macro *pds);
+ void lpass_macro_set_codec_version(enum lpass_codec_version version);
+ enum lpass_codec_version lpass_macro_get_codec_version(void);
+ 
++/* Gate the clock chain after the card releases its AudioReach graphs. */
++static inline int lpass_macro_elden_suspend(struct device *dev)
++{
++	if (!of_machine_is_compatible("lenovo,elden"))
++		return 0;
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static inline int lpass_macro_elden_resume(struct device *dev)
++{
++	if (!of_machine_is_compatible("lenovo,elden"))
++		return 0;
++
++	return pm_runtime_force_resume(dev);
++}
++
+ static inline void lpass_macro_pds_exit_action(void *pds)
+ {
+ 	lpass_macro_pds_exit(pds);
+diff --git a/sound/soc/codecs/lpass-rx-macro.c b/sound/soc/codecs/lpass-rx-macro.c
+index e9e557e..8f4e226 100644
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -4068,6 +4068,7 @@ err_npl:
+ }
+ 
+ static const struct dev_pm_ops rx_macro_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(lpass_macro_elden_suspend, lpass_macro_elden_resume)
+ 	RUNTIME_PM_OPS(rx_macro_runtime_suspend, rx_macro_runtime_resume, NULL)
+ };
+ 
+diff --git a/sound/soc/codecs/lpass-tx-macro.c b/sound/soc/codecs/lpass-tx-macro.c
+index 8629451..8717503 100644
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2475,6 +2475,7 @@ err_npl:
+ }
+ 
+ static const struct dev_pm_ops tx_macro_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(lpass_macro_elden_suspend, lpass_macro_elden_resume)
+ 	RUNTIME_PM_OPS(tx_macro_runtime_suspend, tx_macro_runtime_resume, NULL)
+ };
+ 
+diff --git a/sound/soc/codecs/lpass-va-macro.c b/sound/soc/codecs/lpass-va-macro.c
+index 58a5798..f5f4599 100644
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1756,6 +1756,7 @@ static int va_macro_runtime_resume(struct device *dev)
+ 
+ 
+ static const struct dev_pm_ops va_macro_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(lpass_macro_elden_suspend, lpass_macro_elden_resume)
+ 	RUNTIME_PM_OPS(va_macro_runtime_suspend, va_macro_runtime_resume, NULL)
+ };
+ 
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index af521e0..6fdd7f9 100644
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2899,6 +2899,7 @@ err_npl:
+ }
+ 
+ static const struct dev_pm_ops wsa_macro_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(lpass_macro_elden_suspend, lpass_macro_elden_resume)
+ 	RUNTIME_PM_OPS(wsa_macro_runtime_suspend, wsa_macro_runtime_resume, NULL)
+ };
+ 

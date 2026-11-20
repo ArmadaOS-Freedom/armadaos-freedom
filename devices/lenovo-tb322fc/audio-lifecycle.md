@@ -1,4 +1,38 @@
-# AudioReach capture lifecycle candidate
+# Y700 Gen4 audio teardown and system sleep
+
+## 2026-11-21 combined change
+
+PR #159 carries two patches. `0750` stops the capture frontend in `hw_free`
+before DPCM tears down the backend, serializes shared graph references, and
+completes typed memory UNMAP replies. Each GRAPH_STOP now uses its own GPR
+transaction token, so a late reply cannot complete the next STOP. Playback
+and LPASS reprepare return a failed STOP before restarting the graph;
+capture START is rejected after a failed prepare until prepare succeeds.
+DPCM still performs best-effort cleanup after a persistent `hw_free` error.
+
+`0751` runs the SoundWire and LPASS RX, WSA, TX and VA runtime PM callbacks
+in late suspend and early resume on `lenovo,elden`. This puts clock gating
+after the normal ASoC suspend phase, and clock restore before graph rebuild.
+The main SoundWire IRQ is drained before gating the interface clock in
+system sleep, and reenabled after the clock is available. Ordinary runtime
+suspend does not wait for the IRQ thread, which can itself request runtime
+PM through a SoundWire peripheral. The patch header records its sources.
+
+The combined Linux 7.2.6 tree passed the kernel host checks with the Infinity
+overlay. The lifecycle fixture passed 130 checks with baseline controls,
+including late STOP, DSP error, and matching response cases. The affected
+ARM64 objects compiled and ten audio modules linked locally using the
+existing kernel's symbol table and BTF base. This was a module build check.
+
+The previous `92fa202c` audio1 r4 candidate booted locally on TB322FC, separate
+from the CI disk image. Each of its three capture teardown cases stopped FE2
+before BE120 shutdown, with 72 successful synchronous DSP commands. It also
+reopened both PCM paths after a 45-second USB-connected `s2idle`. The new
+revision still needs a boot test, firmware token confirmation, wake playback
+and capture, and battery-only standby measurement. A persistent DSP timeout,
+other Qualcomm devices and acoustic output remain outside the device results.
+
+## Earlier AudioReach work and validation
 
 This change addresses three driver state/response defects found while testing
 speaker processing on TB322FC. It does not change amplifier gain, firmware,

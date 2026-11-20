@@ -91,6 +91,10 @@ def classify_sources(
             candidate_text,
             "int q6apm_graph_stop(struct q6apm_graph *graph)",
         ),
+        "candidate_send_stop": (
+            candidate_text,
+            "static int q6apm_send_graph_stop(struct q6apm *apm, struct gpr_pkt *pkt)",
+        ),
         "candidate_unmap": (
             candidate_text,
             "static int __q6apm_unmap_memory_fixed_region(struct device *dev, "
@@ -264,20 +268,21 @@ typedef uint32_t u32;
 
 #define BIT(n) (1UL << (n))
 #define __free(x)
-#define GPR_HDR_SIZE 16U
+#define GPR_HDR_SIZE 24U
+#define HZ 1000
 
 #define APM_CMD_SHARED_MEM_UNMAP_REGIONS      0x0100100dU
 #define APM_CMD_SHARED_MEM_MAP_REGIONS        0x0100100cU
-#define APM_CMD_GRAPH_START                   0x01001010U
-#define APM_CMD_GRAPH_OPEN                    0x01001011U
-#define APM_CMD_GRAPH_PREPARE                 0x01001012U
-#define APM_CMD_GRAPH_CLOSE                   0x01001013U
-#define APM_CMD_GRAPH_FLUSH                   0x01001014U
-#define APM_CMD_GRAPH_STOP                    0x01001015U
-#define APM_CMD_SET_CFG                       0x01001016U
-#define APM_CMD_RSP_GET_SPF_STATE             0x02001001U
+#define APM_CMD_GRAPH_START                   0x01001002U
+#define APM_CMD_GRAPH_OPEN                    0x01001000U
+#define APM_CMD_GRAPH_PREPARE                 0x01001001U
+#define APM_CMD_GRAPH_CLOSE                   0x01001004U
+#define APM_CMD_GRAPH_FLUSH                   0x01001005U
+#define APM_CMD_GRAPH_STOP                    0x01001003U
+#define APM_CMD_SET_CFG                       0x01001006U
+#define APM_CMD_RSP_GET_SPF_STATE             0x02001007U
 #define GPR_BASIC_RSP_RESULT                  0x02001005U
-#define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS     0x02001006U
+#define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS     0x02001001U
 
 #define APM_MMAP_TOKEN_GID_MASK 0xffffU
 #define APM_MMAP_TOKEN_MAP_TYPE_POS_BUF BIT(16)
@@ -289,6 +294,7 @@ struct device {
 
 typedef struct {
 	struct device dev;
+	u32 svc_id;
 } gpr_device_t;
 
 struct wait_queue_head {
@@ -304,6 +310,11 @@ struct gpr_ibasic_rsp_result_t {
 struct gpr_hdr {
 	uint32_t token;
 	uint32_t opcode;
+	uint32_t src_port;
+};
+
+struct completion {
+	unsigned int done;
 };
 
 struct gpr_resp_pkt {
@@ -328,6 +339,14 @@ struct fake_idr {
 };
 
 struct q6apm {
+	struct device *dev;
+	gpr_device_t *gdev;
+	pthread_mutex_t lock;
+	pthread_mutex_t stop_reply_lock;
+	struct completion stop_done;
+	u32 stop_token;
+	u32 stop_status;
+	bool stop_pending;
 	struct gpr_ibasic_rsp_result_t result;
 	wait_queue_head_t wait;
 	uint32_t state;
@@ -335,7 +354,10 @@ struct q6apm {
 };
 
 struct gpr_pkt {
-	unsigned char data[96] __attribute__((aligned(8)));
+	union {
+		struct gpr_hdr hdr;
+		unsigned char data[96] __attribute__((aligned(8)));
+	};
 };
 
 struct apm_cmd_shared_mem_unmap_regions {
@@ -390,6 +412,34 @@ static void mutex_unlock(pthread_mutex_t *mutex)
 {
 	assert(pthread_mutex_unlock(mutex) == 0);
 }
+
+static void spin_lock(pthread_mutex_t *mutex)
+{
+	assert(pthread_mutex_lock(mutex) == 0);
+}
+
+static void spin_unlock(pthread_mutex_t *mutex)
+{
+	assert(pthread_mutex_unlock(mutex) == 0);
+}
+
+static void reinit_completion(struct completion *completion)
+{
+	completion->done = 0;
+}
+
+static void complete(struct completion *completion)
+{
+	completion->done++;
+}
+
+static int wait_for_completion_timeout(struct completion *completion, int timeout)
+{
+	assert(timeout > 0);
+	return completion->done ? completion->done-- : 0;
+}
+
+static int gpr_send_pkt(gpr_device_t *gdev, const struct gpr_pkt *pkt);
 
 static void *dev_get_drvdata(struct device *dev)
 {
@@ -698,6 +748,7 @@ static void check_concurrent_start_during_stop(void)
 	struct lifecycle_thread_arg start_arg = {.graph = &graph};
 	pthread_t stop_thread;
 	pthread_t start_thread;
+	struct timespec deadline;
 	int starts[1] = {0};
 	int stops[1] = {0};
 
@@ -708,8 +759,11 @@ static void check_concurrent_start_during_stop(void)
 
 	CHECK(pthread_create(&stop_thread, NULL, run_stop_thread, &stop_arg) == 0);
 	CHECK(pthread_mutex_lock(&control_lock) == 0);
+	CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+	deadline.tv_sec += 2;
 	while (!stop_entered)
-		CHECK(pthread_cond_wait(&stop_entered_cond, &control_lock) == 0);
+		CHECK(pthread_cond_timedwait(&stop_entered_cond, &control_lock,
+					     &deadline) == 0);
 	CHECK(pthread_mutex_unlock(&control_lock) == 0);
 
 	/* STOP is still waiting for its DSP response.  START must wait for the
@@ -846,12 +900,66 @@ static void check_callbacks(void)
 #endif
 }
 
+static u32 stale_stop_token;
+static bool send_stop_reply;
+static u32 stop_reply_status;
+
+static int gpr_send_pkt(gpr_device_t *gdev, const struct gpr_pkt *pkt)
+{
+	struct q6apm *apm = gdev->dev.drv;
+
+	CHECK(pkt->hdr.src_port == gdev->svc_id);
+	CHECK(pkt->hdr.opcode == APM_CMD_GRAPH_STOP);
+	CHECK(pkt->hdr.token != 0);
+	CHECK(apm->stop_pending);
+	if (stale_stop_token) {
+		CHECK(stale_stop_token != pkt->hdr.token);
+		run_callback(candidate_apm_callback, apm, gdev, stale_stop_token,
+			     APM_CMD_GRAPH_STOP, 0);
+		CHECK(apm->stop_pending);
+		CHECK(apm->stop_done.done == 0);
+	}
+	if (send_stop_reply)
+		run_callback(candidate_apm_callback, apm, gdev, pkt->hdr.token,
+			     APM_CMD_GRAPH_STOP, stop_reply_status);
+	return sizeof(pkt->hdr);
+}
+
+static void check_stop_replies(void)
+{
+	gpr_device_t gdev = { .svc_id = 1 };
+	struct q6apm apm = {
+		.gdev = &gdev,
+		.dev = &gdev.dev,
+		.lock = PTHREAD_MUTEX_INITIALIZER,
+		.stop_reply_lock = PTHREAD_MUTEX_INITIALIZER,
+	};
+	struct gpr_pkt pkt = { .hdr.opcode = APM_CMD_GRAPH_STOP };
+
+	gdev.dev.drv = &apm;
+	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -ETIMEDOUT);
+	CHECK(!apm.stop_pending);
+	stale_stop_token = pkt.hdr.token;
+	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -ETIMEDOUT);
+	CHECK(!apm.stop_pending);
+	CHECK(apm.wait.wakes == 0);
+	send_stop_reply = true;
+	stop_reply_status = 9;
+	CHECK(q6apm_send_graph_stop(&apm, &pkt) == -EINVAL);
+	stop_reply_status = 0;
+	CHECK(q6apm_send_graph_stop(&apm, &pkt) == 0);
+	CHECK(!apm.stop_pending);
+	CHECK(pthread_mutex_destroy(&apm.stop_reply_lock) == 0);
+	CHECK(pthread_mutex_destroy(&apm.lock) == 0);
+}
+
 int main(void)
 {
 	check_start_stop_sequences();
 	check_concurrent_start_during_stop();
 	check_request_tokens();
 	check_callbacks();
+	check_stop_replies();
 #ifdef HAVE_BASELINE
 	printf("PASS: %u checks against extracted candidate and baseline C\n",
 	       checks);
@@ -866,6 +974,7 @@ int main(void)
 def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     candidate_start, _ = extracted["candidate_start"]
     candidate_stop, _ = extracted["candidate_stop"]
+    candidate_send_stop, _ = extracted["candidate_send_stop"]
     candidate_unmap, _ = extracted["candidate_unmap"]
     candidate_callback, _ = extracted["candidate_callback"]
     parts = [
@@ -876,6 +985,7 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         "#define q6apm_graph_stop candidate_graph_stop",
         candidate_stop,
         "#undef q6apm_graph_stop",
+        candidate_send_stop,
         "#define __q6apm_unmap_memory_fixed_region candidate_unmap_memory",
         candidate_unmap,
         "#undef __q6apm_unmap_memory_fixed_region",
@@ -959,9 +1069,10 @@ def main() -> int:
     )
     harness = build_harness(extracted)
 
-    args.work.mkdir(parents=True, exist_ok=True)
-    source = args.work / "source_regression.c"
-    binary = args.work / "source_regression"
+    work = args.work.resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    source = work / "source_regression.c"
+    binary = work / "source_regression"
     source.write_text(harness, encoding="utf-8")
     compile_cmd = [
         args.cc,
@@ -983,7 +1094,11 @@ def main() -> int:
         sys.stderr.write(compiled.stderr)
         sys.stderr.write(f"\nGenerated harness: {source}\n")
         return compiled.returncode
-    tested = subprocess.run([str(binary)], text=True, capture_output=True)
+    try:
+        tested = subprocess.run([str(binary)], text=True, capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"AudioReach lifecycle harness timed out: {binary}\n")
+        return 1
     sys.stdout.write(tested.stdout)
     sys.stderr.write(tested.stderr)
     if tested.returncode:
