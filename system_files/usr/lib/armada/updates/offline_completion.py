@@ -127,6 +127,13 @@ def document_identity(prepared, plan, plan_sha256=None):
         return None
     if 'fromSlot' not in plan or 'targetSlot' not in plan:
         return None
+    armada_boot = (plan.get('armadaBootSwitch') is not None or
+                   plan.get('bootSource') == 'armada_boot')
+    if armada_boot:
+        if (plan.get('fromSlot') is not None or
+                plan.get('targetSlot') is not None or
+                not isinstance(plan.get('armadaBootSwitch'), dict)):
+            return None
     source = {
         'transactionId': prepared.get('transactionId'),
         'planSha256': prepared.get('planSha256'),
@@ -135,8 +142,7 @@ def document_identity(prepared, plan, plan_sha256=None):
         'fromSlot': plan.get('fromSlot'),
         'targetSlot': plan.get('targetSlot'),
     }
-    if (plan.get('fromSlot') is None and plan.get('targetSlot') is None and
-            isinstance(plan.get('armadaBootSwitch'), dict)):
+    if armada_boot:
         source['bootSource'] = 'armada_boot'
     identity = _identity(source)
     if identity is None or plan.get('transactionId') != identity['transactionId']:

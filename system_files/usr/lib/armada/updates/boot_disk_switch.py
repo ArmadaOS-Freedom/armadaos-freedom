@@ -267,6 +267,20 @@ def prepare(root, initial, target, package, *, trusted_key):
 def plan_rollback(root, initial, target, *, trusted_key):
     boot, expected = _active(root, initial, trusted_key)
     boot_disk_selector.ensure_root_binding(root, target)
+    record = _read_pending(boot, completed=True)
+    if record is not None:
+        if (record["target"] != expected
+                or record["newDeployment"] != initial["deployment"]
+                or record["currentDeployment"] != target
+                or record["model"] != initial["model"]):
+            raise BootDiskSwitchError("completed switch record does not match rollback")
+        retained = record["expected"]
+        _verified_generation(boot, retained, initial["model"], target, trusted_key)
+        return {
+            "expected": expected, "target": retained,
+            "currentDeployment": initial["deployment"], "newDeployment": target,
+            "model": initial["model"],
+        }
     candidates = []
     for entry in (boot / "armada").iterdir():
         if entry.name == expected or not _GEN_DIR_RE.fullmatch(entry.name) or entry.is_symlink():

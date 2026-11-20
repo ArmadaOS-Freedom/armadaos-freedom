@@ -129,8 +129,7 @@ def _apply_outcome(stdout, returncode, base, work_dir):
             if ("fromSlot" not in report or "targetSlot" not in report):
                 return uncertain(
                     "The system apply worker omitted armada boot slot evidence")
-            if (report["fromSlot"], report["targetSlot"]) not in (
-                    (None, None), ("a", "b"), ("b", "a")):
+            if (report["fromSlot"], report["targetSlot"]) != (None, None):
                 return uncertain(
                     "The system apply worker reported an unexpected "
                     "armada boot slot transition")
@@ -305,7 +304,7 @@ def _valid_trial_receipt(trial, model):
                     or "fromSlot" not in receipt or "targetSlot" not in receipt):
                 return False
             pair = (trial["fromSlot"], trial["targetSlot"])
-            if pair not in ((None, None), ("a", "b"), ("b", "a")):
+            if pair != (None, None):
                 return False
             plan_path = work_dir / "plan.json"
             raw_plan = _read_regular(plan_path, MAX_CONFIG_BYTES)
