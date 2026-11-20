@@ -54,6 +54,7 @@ _MODEL_BOARD: Mapping[str, int] = {
 }
 
 _HEX64_RE = re.compile(rb"[0-9a-f]{64}")
+_GEN_RE = re.compile(r"gen-[0-9a-f]{32}")
 
 _MAX_U32_SIGNED = 2**31 - 1
 
@@ -279,6 +280,30 @@ def stage_generation(
     dtb = capsule["board.dtb"]
     if len(dtb) != d_size or hashlib.sha256(dtb).hexdigest() != d_sha:
         raise ValueError("boot capsule DTB does not match its authenticated manifest")
+
+    for existing_name in sorted(
+        p.name for p in armada.iterdir()
+        if _GEN_RE.fullmatch(p.name) and not p.is_symlink() and p.is_dir()
+    ):
+        existing = armada / existing_name
+        try:
+            existing_model = existing / model
+            if existing_model.is_symlink() or not existing_model.is_dir():
+                continue
+            existing_binding = _io.read_bounded(
+                existing / "binding.bin", BINDING_LEN)
+            if existing_binding != binding:
+                continue
+            existing_manifest = _io.read_bounded(
+                existing_model / "manifest.bin", MANIFEST_LEN)
+            if existing_manifest != mf_raw:
+                continue
+            verify_generation(existing, model, trusted_key=trusted_key)
+        except (OSError, ValueError, signature.SignatureError):
+            continue
+        _check_file(Path(kernel), k_size, k_sha)
+        _check_file(Path(initramfs), i_size, i_sha)
+        return existing_name
 
     name = "gen-%s" % (uuid.uuid4().hex,)
     gen = armada / name
