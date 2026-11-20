@@ -27,6 +27,7 @@ SOURCE_ROOT = Path(
 )
 WLSOURCE = SOURCE_ROOT / "src/wlserver.cpp"
 RULE = ROOT / "system_files/usr/lib/udev/rules.d/99-armada-tb323fu-virtual-touch.rules"
+PEN_RULE = ROOT / "system_files/usr/lib/udev/rules.d/99-armada-tb710fu-pen-touch.rules"
 
 PRELUDE = r"""
 #include <cstddef>
@@ -218,8 +219,14 @@ void wlserver_touchup( int touch_id, uint32_t )
 
 MAIN = r"""
 // What libinput applies from LIBINPUT_CALIBRATION_MATRIX="0 1 0 -1 0 1".
+// The TB323FU panel touch carries the landscape-right desktop matrix; the
+// TB710FU pen-as-touch device lives on a natively landscape panel and has none.
+static bool g_baseCalibration = true;
+
 static void apply_base_right_calibration( double *x, double *y )
 {
+    if ( !g_baseCalibration )
+        return;
     double nx = *y;
     double ny = 1.0 - *x;
     *x = nx;
@@ -244,6 +251,7 @@ static void scenario( const std::string &name )
     g_udevBus = udev_device{};
     g_udevRoot = udev_device{};
 
+    g_baseCalibration = true;
     g_udevEvent.subsystem = "input";
     g_udevEvent.parent = &g_udevRoot;
     g_udevRoot.subsystem = "platform";
@@ -262,6 +270,23 @@ static void scenario( const std::string &name )
         ;
     else if ( name == "virtual-tagged" )
         g_udevEvent.pszCalibration = "right";
+    else if ( name == "virtual-normal" )
+    {
+        g_udevEvent.pszCalibration = "normal";
+        g_baseCalibration = false;
+    }
+    else if ( name == "no-connector-normal" )
+    {
+        g_udevEvent.pszCalibration = "normal";
+        g_baseCalibration = false;
+        g_backend.bHasInternal = false;
+        g_backend.bHasExternal = false;
+    }
+    else if ( name == "virtual-unknown-tag" )
+    {
+        g_udevEvent.pszCalibration = "left";
+        g_baseCalibration = false;
+    }
     else if ( name == "no-connector-tagged" )
     {
         g_udevEvent.pszCalibration = "right";
@@ -619,6 +644,83 @@ class TouchOrientationNativeTest(unittest.TestCase):
             'ATTRS{id/bustype}!="001c"',
         ):
             self.assertIn(fragment, text, text)
+
+    # ---- TB710FU: the pen replayed as touch on a natively landscape panel ----
+
+    def test_normal_tagged_virtual_associates_internal_without_undo(self):
+        output = self.run_fixture(
+            "scenario", "virtual-normal",
+            "orientation", "0",
+            "down", "0.25", "0.5", "1",
+            "state",
+        )
+        self.assertEqual(self.state(output), ("internal", False), output)
+        self.assertEqual(self.connector(output, "down"), "internal", output)
+        self.assert_point(self.coordinates(output, "down"), (0.25, 0.5), output)
+
+    def test_normal_tagged_virtual_follows_every_orientation(self):
+        # Without the association the override would rotate the picture but
+        # leave the pen's touch at the native coordinates.
+        for orientation in (0, 90, 180, 270):
+            for raw in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.13, 0.87), (0.5, 0.5)):
+                with self.subTest(orientation=orientation, raw=raw):
+                    output = self.run_fixture(
+                        "scenario", "virtual-normal",
+                        "orientation", str(orientation),
+                        "down", str(raw[0]), str(raw[1]), "1",
+                        "motion", str(raw[0]), str(raw[1]), "1",
+                        "apply",
+                    )
+                    self.assert_point(self.coordinates(output, "down"), raw, output)
+                    self.assert_point(self.coordinates(output, "motion"), raw, output)
+                    self.assert_point(
+                        self.coordinates(output, "applied"), forward(orientation, *raw), output
+                    )
+
+    def test_normal_tag_without_a_connector_leaves_coordinates_alone(self):
+        output = self.run_fixture(
+            "scenario", "no-connector-normal",
+            "orientation", "90",
+            "down", "0.25", "0.5", "1",
+            "state",
+            "apply",
+        )
+        self.assertEqual(self.state(output), ("none", False), output)
+        self.assert_point(self.coordinates(output, "applied"), (0.25, 0.5), output)
+
+    def test_unknown_tag_value_is_left_alone(self):
+        output = self.run_fixture(
+            "scenario", "virtual-unknown-tag",
+            "orientation", "90",
+            "down", "0.25", "0.5", "1",
+            "state",
+            "apply",
+        )
+        self.assertEqual(self.state(output), ("none", False), output)
+        self.assert_point(self.coordinates(output, "applied"), (0.25, 0.5), output)
+
+    def test_pen_rule_tags_only_the_tb710fu_pen_bridge(self):
+        text = PEN_RULE.read_text(encoding="utf-8")
+        tag = 'ENV{GAMESCOPE_TOUCH_CALIBRATION}="normal"'
+        self.assertEqual(text.count(tag), 1, text)
+        line = next(entry for entry in text.splitlines() if tag in entry)
+        self.assertIn(
+            'PROGRAM=="/usr/bin/grep -azFxq lenovo,tb710fu /sys/firmware/devicetree/base/compatible"',
+            line, text,
+        )
+        # The natively landscape panel needs no desktop matrix.
+        self.assertNotIn("LIBINPUT_CALIBRATION_MATRIX", text)
+        for fragment in (
+            'DEVPATH!="/devices/virtual/input/input*/event*"',
+            'ATTRS{name}!="Armada pen touch"',
+            'ATTRS{id/bustype}!="0006"',
+        ):
+            self.assertIn(fragment, text, text)
+
+    def test_pen_rule_name_matches_the_bridge(self):
+        bridge = (ROOT / "system_files/usr/libexec/armada/armada-pen-touch.py").read_text(encoding="utf-8")
+        self.assertIn('VIRTUAL_NAME = "Armada pen touch"', bridge)
+        self.assertIn("BUS_VIRTUAL = 0x06", bridge)
 
 
 if __name__ == "__main__":
