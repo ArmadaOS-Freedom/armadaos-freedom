@@ -280,6 +280,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
         created = False
         boot_write_started = False
         disk = False
+        selector_committed = False
         status = {'schemaVersion': 1, 'component': 'system', 'state': 'failed',
                   'phase': 'preflight', 'requiresReboot': False,
                   'bootPolicy': BOOT_POLICY, 'slotControlState': 'not_issued',
@@ -397,10 +398,15 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     raise ValueError('physical identity changed during ARMADA_BOOT preparation')
                 status['newDeployment'] = target_deployment
                 status['planSha256'] = _io.sha256_hex(_save_json(work, 'plan.json', plan))
-                boot_disk_switch.activate(
-                    root, initial, plan, trusted_key=trusted_key,
-                    receipt={key: status[key] for key in
-                             ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')})
+                try:
+                    boot_disk_switch.activate(
+                        root, initial, plan, trusted_key=trusted_key,
+                        receipt={key: status[key] for key in
+                                 ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')})
+                except boot_disk_switch.BootDiskSwitchUncertainError:
+                    selector_committed = True
+                    raise
+                selector_committed = True
                 status.update(state='awaiting_reboot', phase='awaiting_reboot',
                               requiresReboot=True, bootWriteState='not_started')
                 _save_json(work, 'status.json', status)
@@ -555,6 +561,9 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                 # only local status/report persistence failed.
                 status['state'] = 'recovery_required'
                 status['journalCommitState'] = 'committed'
+            elif selector_committed:
+                status['state'] = 'recovery_required'
+                status['requiresReboot'] = False
             status['error'] = '%s: %s' % (type(exc).__name__, exc)
             persisted = False
             if created:

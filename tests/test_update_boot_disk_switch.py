@@ -235,6 +235,30 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(rollback["newDeployment"], _OLD_BINDING)
         self.assertEqual(rollback["model"], "TB322FC")
 
+    def test_activate_rename_succeeded_but_fsync_failed(self):
+        """If the rename succeeds but post-rename fsync fails, activate returns
+        success after verifying the exact on-disk state."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+
+        original_replace = os.replace
+        def _replace(src, dst, *args, **kwargs):
+            original_replace(src, dst, *args, **kwargs)
+            if os.fspath(dst) == os.fspath(self.boot / "armada" / "boot"):
+                raise OSError(5, "simulated post-rename fsync failure")
+
+        with mock.patch.object(boot_disk_selector.os, "replace", side_effect=_replace):
+            boot_disk_switch.activate(
+                self.root, self.initial, plan,
+                trusted_key=self.trusted_key, receipt=receipt,
+            )
+
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+        pending = self._read_pending()
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["target"], _NEW_GEN)
+        self.assertEqual(pending["expected"], _OLD_GEN)
+
     def test_activate_interrupted_before_rename(self):
         """If activate_generation raises after we write pending, selector stays old
         and ensure_ready clears only that interrupted pending state."""

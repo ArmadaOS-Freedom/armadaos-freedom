@@ -140,3 +140,12 @@ def activate_generation(boot: Union[str, os.PathLike, Path], expected: str, targ
         _io.fsync_dir(armada_dir)
     finally:
         tmp_link.unlink(missing_ok=True)
+
+
+def resync_armada_directory(boot: Union[str, os.PathLike, Path]) -> None:
+    boot_p = Path(boot)
+    if not boot_p.is_absolute():
+        raise ValueError("boot must be absolute")
+    resolved_boot = _canon(boot_p)
+    armada_dir = resolved_boot / "armada"
+    _io.fsync_dir(armada_dir)

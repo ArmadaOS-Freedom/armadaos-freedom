@@ -26,6 +26,10 @@ class BootDiskSwitchError(RuntimeError):
     """An installed disk boot generation could not be verified or switched."""
 
 
+class BootDiskSwitchUncertainError(BootDiskSwitchError):
+    """Selector state is uncertain: the switch may or may not have taken effect."""
+
+
 def _require_binding(binding, label):
     if not isinstance(binding, str) or not _DEPLOYMENT_RE.fullmatch(binding):
         raise BootDiskSwitchError(f"{label} is not a canonical deployment binding")
@@ -316,9 +320,34 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
         _validate_receipt(receipt)
         record["receipt"] = receipt
     _write_switch_durably(boot, _PENDING_NAME, record)
-    boot_disk_selector.activate_generation(boot, expected, target)
+    try:
+        boot_disk_selector.activate_generation(boot, expected, target)
+    except Exception as exc:
+        try:
+            selected = _read_boot_active(boot)[1]
+            pending_now = _read_pending(boot)
+        except Exception as read_exc:
+            raise BootDiskSwitchUncertainError(
+                "ARMADA_BOOT activation uncertain: selector read failed") from read_exc
+        if selected == expected and pending_now == record:
+            raise
+        if selected == target and pending_now == record:
+            try:
+                boot_disk_selector.resync_armada_directory(boot)
+            except Exception as resync_exc:
+                raise BootDiskSwitchUncertainError(
+                    "ARMADA_BOOT activation uncertain: resync failed") from resync_exc
+            try:
+                if _read_boot_active(boot)[1] == target and _read_pending(boot) == record:
+                    return
+            except Exception as read_exc:
+                raise BootDiskSwitchUncertainError(
+                    "ARMADA_BOOT activation uncertain: reread failed") from read_exc
+        raise BootDiskSwitchUncertainError(
+            "ARMADA_BOOT activation uncertain: selector state ambiguous") from exc
     if _read_boot_active(boot)[1] != target or _read_pending(boot) != record:
-        raise BootDiskSwitchError("ARMADA_BOOT activation readback did not match")
+        raise BootDiskSwitchUncertainError(
+            "ARMADA_BOOT activation uncertain: readback did not match")
 
 
 def confirm(root, initial, *, trusted_key):
