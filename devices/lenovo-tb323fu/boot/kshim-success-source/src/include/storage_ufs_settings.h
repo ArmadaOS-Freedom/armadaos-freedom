@@ -55,11 +55,14 @@ struct kshim_blockdev;
 struct kshim_ufs_settings;
 struct kshim_config_store;
 
+/* Requires a readable provisioned ARMADA_BACKUP prerequisite. Release
+ * failures continue to forbid handoff. Matching the provisioned block is
+ * performed here; the trial API does not imply this provisioned prerequisite. */
 int kshim_ufs_settings_read_boot(struct kshim_ufs_settings *b,
                                  int (*reader)(const struct kshim_blockdev *, void *),
                                  void *ctx);
 
-#endif /* STORAGE_UFS_SETTINGS_H */
-
 int kshim_ufs_settings_log_boot(struct kshim_ufs_settings *b, uint32_t target,
                                 uint32_t phase, int32_t status);
+
+#endif /* STORAGE_UFS_SETTINGS_H */

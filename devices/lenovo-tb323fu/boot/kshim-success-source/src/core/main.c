@@ -1074,23 +1074,15 @@ int kshim_main(
         const MANIFEST_ENTRY *entry = view.entries[selected_index];
 #if defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
         {
-            uint32_t log_target = 0;
             if (entry->type == MF_ENTRY_TYPE_DISK_LINUX) {
+                uint32_t log_target = 3u;
                 struct kshim_disk_entry sel_desc;
                 if (kshim_disk_entry_decode(
                         (const void *)(uintptr_t)(linux_base + entry->offset),
-                        (size_t)entry->size, &sel_desc) == 0) {
+                        (size_t)entry->size, &sel_desc) == 0)
                     log_target = sel_desc.diagnostic ? 2u : 1u;
-                } else {
-                    log_target = 3u;
-                }
-            } else if (entry->type == MF_ENTRY_TYPE_LINUX &&
-                       (entry->flags & MF_ENTRY_FLAG_BASE_IMAGE)) {
-                log_target = 0u;
-            } else {
-                log_target = 3u;
+                disk_boot_log(log_target, 1u, 0);
             }
-            disk_boot_log(log_target, 1u, 0);
             if (!storage_settings_native_handoff_safe()) {
                 __asm__ volatile("msr daifset, #0xf" ::: "memory");
                 for (;;) __asm__ volatile("wfe");
