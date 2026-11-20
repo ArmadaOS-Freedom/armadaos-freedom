@@ -112,11 +112,68 @@ static void one_shot_tests(void){
     unsigned writes=internal.writes;
     assert(kshim_settings_take_action(&s,&action)==0 && action==0 && internal.writes==writes);
     assert(kshim_settings_open(&s,&i,NULL,1,&v)==0 && s.values.next_action==0);
-    s.values.next_action=2;
+    /* Unsupported packed action (5) is rejected; no save, no publication. */
+    s.values.next_action=5;
     assert(kshim_settings_take_action(&s,&action)==KSHIM_STORAGE_ARG && action==0 && internal.writes==writes);
+}
+static void v4_take_action_tests(void){
+    static struct kshim_settings_session s;
+    struct kshim_blockdev i=device(&internal);
+    /* One-shot clears action but preserves the no-boot-log flag and history. */
+    struct kshim_config_values v={1,4,1,2, kshim_next_action_pack(KSHIM_ACTION_LINUX, KSHIM_FLAG_NO_BOOT_LOG)};
+    provision(&internal);assert(kshim_settings_open(&s,&i,NULL,1,&(struct kshim_config_values){0})==KSHIM_STORAGE_EMPTY);
+    assert(kshim_settings_save(&s,&v)==0);
+    uint32_t action=99;
+    assert(kshim_settings_take_action(&s,&action)==0 && action==KSHIM_ACTION_LINUX);
+    assert(s.values.next_action==KSHIM_FLAG_NO_BOOT_LOG);
+    assert(s.values.device_choice==1 && s.values.default_target==4 &&
+           s.values.language==1 && s.values.last_target==2);
+    /* Reload from disk matches: durable clear, flag preserved. */
+    assert(kshim_settings_open(&s,&i,NULL,1,&v)==0);
+    assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_NONE);
+    assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+    /* Flag-only: no save, action stays 0, flag stays. */
+    unsigned writes=internal.writes;
+    assert(kshim_settings_take_action(&s,&action)==0 && action==0 && internal.writes==writes);
+    /* Reboot must not dispatch after a failed clear. */
+    s.values.next_action=kshim_next_action_pack(KSHIM_ACTION_EDL, KSHIM_FLAG_NO_BOOT_LOG);
+    internal.fail=1;
+    assert(kshim_settings_take_action(&s,&action)!=0 && action==0);
+    internal.fail=0;
+}
+/* TEMP diagnostic auto-return candidate: action 4 consumed as diagnostic
+ * publishes no action and latches next plain Linux while retaining flag. */
+static void diag_auto_return_tests(void){
+    static struct kshim_settings_session s;
+    struct kshim_blockdev i=device(&internal);
+    struct kshim_config_values v={1,4,1,2, kshim_next_action_pack(KSHIM_ACTION_LINUX_DIAG, KSHIM_FLAG_NO_BOOT_LOG)};
+    provision(&internal);
+    assert(kshim_settings_open(&s,&i,NULL,1,&(struct kshim_config_values){0})==KSHIM_STORAGE_EMPTY);
+    assert(kshim_settings_save(&s,&v)==0);
+    uint32_t action=99;internal.fail=1;
+    assert(kshim_settings_take_action(&s,&action)!=0 && action==0);
+    assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_LINUX_DIAG);
+    assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+    internal.fail=0;
+    assert(kshim_settings_take_action(&s,&action)==0 && action==KSHIM_ACTION_LINUX_DIAG);
+    assert(s.values.device_choice==1 && s.values.default_target==4 &&
+           s.values.language==1 && s.values.last_target==2);
+    assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_LINUX);
+    assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+    assert(kshim_settings_open(&s,&i,NULL,1,&v)==0);
+    assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_LINUX);
+    assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+    assert(s.values.default_target==4 && s.values.language==1 && s.values.device_choice==1);
+    unsigned writes=internal.writes;
+    assert(kshim_settings_take_action(&s,&action)==0 && action==KSHIM_ACTION_LINUX);
+    assert(internal.writes==writes+1);
+    assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_NONE);
+    assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
 }
 int main(void){
     one_shot_tests();
+    v4_take_action_tests();
+    diag_auto_return_tests();
     history_tests();
     static struct kshim_settings_session s;
     struct kshim_blockdev i=device(&internal),t=device(&tf);

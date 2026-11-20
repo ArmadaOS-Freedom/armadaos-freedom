@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
+#if !defined(KSHIM_HOST_TEST)
+#include <config.h>
+#endif
 #include <storage_settings_export.h>
 #include <libfdt.h>
 int storage_settings_export(void *fdt,const struct kshim_ufs_settings *b,
@@ -22,5 +25,15 @@ int storage_settings_export(void *fdt,const struct kshim_ufs_settings *b,
     const fdt32_t history[2]={cpu_to_fdt32(1),cpu_to_fdt32(b->settings.values.last_target)};
     rc=fdt_setprop(fdt,node,"kshim,last-boot-v1",history,sizeof(history));
     if (rc) return rc;
-    return fdt_setprop_u32(fdt,node,"kshim,next-action",b->settings.values.next_action);
+    rc=fdt_setprop_u32(fdt,node,"kshim,next-action",kshim_next_action_value(b->settings.values.next_action));
+    if (rc) return rc;
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS
+    if (b->settings.source==KSHIM_SETTINGS_INTERNAL &&
+        (b->board==1||b->board==2) &&
+        b->settings.medium[0].config.ready) {
+        rc=fdt_setprop_u32(fdt,node,"kshim,launcher-settings-version",4);
+        if (rc) return rc;
+    }
+#endif
+    return 0;
 }

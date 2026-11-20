@@ -269,6 +269,19 @@ typedef enum kshim_menu_text_id {
     /* TB710FU names: appended so every earlier text id keeps its value. */
     KSHIM_TEXT_DEVICE_TB710FU_NAME,
     KSHIM_TEXT_BOARD_TB710FU_NAME,
+    /* Pending next-boot row and boot-log row; appended so every earlier text
+     * id keeps its value. The FMT ids carry exactly one %s each. */
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_FMT,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_NONE,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_ANDROID,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_LINUX,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_DIAG,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_EDL,
+    KSHIM_TEXT_SETTINGS_NEXT_BOOT_DESC,
+    KSHIM_TEXT_SETTINGS_BOOT_LOG_FMT,
+    KSHIM_TEXT_SETTINGS_BOOT_LOG_OPEN,
+    KSHIM_TEXT_SETTINGS_BOOT_LOG_CLOSED,
+    KSHIM_TEXT_SETTINGS_BOOT_LOG_DESC,
     KSHIM_TEXT_COUNT
 } kshim_menu_text_id;
 

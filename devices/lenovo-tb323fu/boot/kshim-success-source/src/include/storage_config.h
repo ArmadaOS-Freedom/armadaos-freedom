@@ -5,12 +5,35 @@
 #define KSHIM_CONFIG_PARTITION_BYTES UINT64_C(2147483648)
 #define KSHIM_CONFIG_REGION_BYTES 65536u
 #define KSHIM_CONFIG_SLOT_BYTES 4096u
+
+/* next_action carries a packed action (bits 0..7) plus flag bits (bit 8+).
+ * Use the helpers below rather than comparing next_action to a bare value. */
+enum kshim_action {
+    KSHIM_ACTION_NONE = 0,
+    KSHIM_ACTION_EDL = 1,
+    KSHIM_ACTION_ANDROID = 2,
+    KSHIM_ACTION_LINUX = 3,
+    KSHIM_ACTION_LINUX_DIAG = 4,
+    KSHIM_ACTION_MAX = KSHIM_ACTION_LINUX_DIAG,
+};
+#define KSHIM_ACTION_MASK 0xffu
+#define KSHIM_FLAG_NO_BOOT_LOG (1u << 8)
+#define KSHIM_FLAGS_KNOWN KSHIM_FLAG_NO_BOOT_LOG
+#define KSHIM_FLAGS_MASK 0xffffff00u
+
+static inline uint32_t kshim_next_action_pack(uint32_t action, uint32_t flags)
+{ return (action & KSHIM_ACTION_MASK) | (flags & KSHIM_FLAGS_MASK); }
+static inline uint32_t kshim_next_action_flags(uint32_t packed)
+{ return packed & KSHIM_FLAGS_MASK; }
+static inline uint32_t kshim_next_action_value(uint32_t packed)
+{ return packed & KSHIM_ACTION_MASK; }
+
 struct kshim_config_values {
     uint32_t device_choice; /* 0..2 */
     uint32_t default_target; /* 0..4; 4 remembers the last system */
     uint32_t language;       /* 0..1 */
     uint32_t last_target;    /* 0 unknown, 1 Android, 2 internal, 3 TF */
-    uint32_t next_action;    /* 0 none, 1 one-shot EDL; consumed before reset */
+    uint32_t next_action;    /* packed: bits 0..7 action, bit 8 no-boot-log flag */
 };
 struct kshim_config_store {
     const struct kshim_blockdev *dev;

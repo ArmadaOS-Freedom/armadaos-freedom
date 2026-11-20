@@ -29,9 +29,18 @@ static void copy(uint8_t *dst, const uint8_t *src, size_t n)
 {
     while (n--) *dst++ = *src++;
 }
+/* Shared validator for the packed next_action. Rejects unknown action
+ * values and unknown flag bits; used by both config and settings layers. */
+static int next_action_valid(uint32_t packed)
+{
+    return (packed & ~(KSHIM_ACTION_MASK | KSHIM_FLAGS_KNOWN)) == 0 &&
+           kshim_next_action_value(packed) <= KSHIM_ACTION_MAX;
+}
 static int values_valid(const struct kshim_config_values *v)
 {
-    return v && v->device_choice <= 2 && v->default_target <= 4 && v->language <= 1 && v->last_target <= 3 && v->next_action <= 1;
+    return v && v->device_choice <= 2 && v->default_target <= 4 &&
+           v->language <= 1 && v->last_target <= 3 &&
+           next_action_valid(v->next_action);
 }
 int kshim_config_open(struct kshim_config_store *store,
                       const struct kshim_blockdev *dev,
@@ -103,13 +112,17 @@ static int record_valid(const struct kshim_config_store *s, const uint8_t *p)
 {
     if (zero(p, 4096)) return 0;
     uint32_t version=get32(p+8);
-    if (!same(p, (const uint8_t *)"KSCFGR1", 8) || (version<1 || version>3) ||
+    if (!same(p, (const uint8_t *)"KSCFGR1", 8) || (version<1 || version>4) ||
         get32(p + 12) != 4096 || !get64(p + 16) ||
         !same(p + 24, s->partition.uuid, 16) || !same(p + 40, s->installation_uuid, 16) ||
         get32(p + 56) > 2 || get32(p + 60) > (version==1 ? 3u : 4u) ||
-        get32(p + 64) > 1 || (version>=2 && get32(p+68)>3) || (version==3 && get32(p+72)>1) ||
-        !zero(p + (version==1 ? 68 : version==2 ? 72 : 76), version==1 ? 4024 : version==2 ? 4020 : 4016) ||
-        kshim_crc32(p, 4092) != get32(p + 4092)) return -1;
+        get32(p + 64) > 1 || (version>=2 && get32(p+68)>3)) return -1;
+    /* v3 caps action <= 1; v4 uses the packed validator. */
+    if (version==3 && get32(p+72)>1) return -1;
+    if (version==4 && !next_action_valid(get32(p+72))) return -1;
+    if (!zero(p + (version==1 ? 68 : version==2 ? 72 : 76),
+              version==1 ? 4024 : version==2 ? 4020 : 4016)) return -1;
+    if (kshim_crc32(p, 4092) != get32(p + 4092)) return -1;
     return 1;
 }
 static int read_slots(struct kshim_config_store *s, int *best, int *target)
@@ -149,7 +162,7 @@ int kshim_config_load(struct kshim_config_store *s, struct kshim_config_values *
     v->default_target = get32(p + 60);
     v->language = get32(p + 64);
     v->last_target = get32(p+8)>=2 ? get32(p+68) : 0;
-    v->next_action = get32(p+8)==3 ? get32(p+72) : 0;
+    v->next_action = get32(p+8)>=3 ? get32(p+72) : 0;
     *sequence = get64(p + 16);
     return KSHIM_STORAGE_OK;
 }
@@ -166,10 +179,13 @@ int kshim_config_save(struct kshim_config_store *s,
         if (next == UINT64_MAX) return KSHIM_STORAGE_OVERFLOW;
         ++next;
     }
+    /* v3 expresses only the bare action (0..1) with zero flags; anything
+     * richer requires v4, which reads flags at offset 72. */
+    uint32_t version = v->next_action <= KSHIM_ACTION_EDL ? 3 : 4;
     uint8_t *record = s->scratch;
     for (size_t i = 0; i < KSHIM_CONFIG_SLOT_BYTES; ++i) record[i] = 0;
     copy(record, (const uint8_t *)"KSCFGR1", 8);
-    put32(record + 8, 3); put32(record + 12, KSHIM_CONFIG_SLOT_BYTES);
+    put32(record + 8, version); put32(record + 12, KSHIM_CONFIG_SLOT_BYTES);
     put64(record + 16, next);
     copy(record + 24, s->partition.uuid, 16);
     copy(record + 40, s->installation_uuid, 16);
@@ -296,6 +312,18 @@ int kshim_config_log_boot(struct kshim_config_store *s, uint32_t target,
             return KSHIM_STORAGE_FORMAT;
         best = -1;
         target_idx = 0;
+    }
+
+    /* Board1: a nominal normal target=1 phase=1 status=0 duplicate that
+     * directly follows a validated diagnostic target=2 phase=4 status=0
+     * record is skipped so the handoff retains that one diagnostic record.
+     * No format or slot-layout change; compare the newest live record. */
+    if (s->board_id == 1 && best >= 0 &&
+        target == 1 && phase == 1 && status == 0) {
+        const uint8_t *live = (best == 0) ? a : b;
+        if (get32(live + 60) == 2 && get32(live + 64) == 4 &&
+            get32(live + 68) == 0)
+            return KSHIM_STORAGE_OK;
     }
 
     uint64_t next;
