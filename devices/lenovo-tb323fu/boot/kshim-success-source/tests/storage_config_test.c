@@ -194,7 +194,7 @@ static void test_last_boot_v2(unsigned bs) {
     assert(kshim_config_save(&store,&v,&sequence)==0 && sequence==9);assert_only_slot_changed(0);
     memset(&v,0,sizeof(v));assert(kshim_config_load(&store,&v,&sequence)==0 && v.last_target==2 && v.default_target==4);
     /* A corrupt/unknown newer record must not mask a compatible older one. */
-    for (unsigned version=4;version<=5;++version) {
+    for (unsigned version=5;version<=6;++version) {
         le32(slot(0)+8,version);seal(slot(0));
         assert(kshim_config_load(&store,&v,&sequence)==0 && sequence==8 && v.last_target==1);
     }
@@ -215,6 +215,7 @@ static void test_one_shot_v3(unsigned bs) {
     assert(kshim_config_save(&store,&v,&seq)==0 && seq==8);
     assert(slot(1)[8]==3 && slot(1)[72]==0);
     assert(kshim_config_load(&store,&v,&seq)==0 && v.next_action==0 && v.default_target==4 && v.language==1);
+    /* Old v3 cap: action 2 is not representable in a v3 record. */
     le32(slot(1)+72,2);seal(slot(1));
     assert(kshim_config_load(&store,&v,&seq)==0 && seq==7 && v.next_action==1);
     le32(slot(1)+72,0);slot(1)[76]=1;seal(slot(1));
@@ -222,8 +223,82 @@ static void test_one_shot_v3(unsigned bs) {
     fixture(bs);make_slot(0,1,0,2,0);assert(open_store()==0);v.next_action=1;
     assert(kshim_config_load(&store,&v,&seq)==0 && v.next_action==0);
 }
+static void test_v4_flags(unsigned bs) {
+    struct kshim_config_values v={0};uint64_t seq=0;
+    /* v4 roundtrip: packed action+flag written and read back intact. */
+    fixture(bs);assert(open_store()==0);
+    v=(struct kshim_config_values){1,2,1,3, kshim_next_action_pack(KSHIM_ACTION_LINUX, KSHIM_FLAG_NO_BOOT_LOG)};
+    assert(kshim_config_save(&store,&v,&seq)==0 && seq==1);
+    assert(slot(0)[8]==4);                                  /* v4 record */
+    assert(kshim_config_load(&store,&v,&seq)==0 && seq==1);
+    assert(kshim_next_action_value(v.next_action)==KSHIM_ACTION_LINUX);
+    assert(kshim_next_action_flags(v.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+
+    /* Flag-only (action 0 + flag) roundtrip; still a v4 record. */
+    fixture(bs);assert(open_store()==0);
+    v=(struct kshim_config_values){0,0,0,0, kshim_next_action_pack(KSHIM_ACTION_NONE, KSHIM_FLAG_NO_BOOT_LOG)};
+    assert(kshim_config_save(&store,&v,&seq)==0);
+    assert(slot(0)[8]==4);
+    assert(kshim_config_load(&store,&v,&seq)==0 && v.next_action==KSHIM_FLAG_NO_BOOT_LOG);
+
+    /* Every supported action packs into a v4 record. */
+    for (uint32_t a=KSHIM_ACTION_NONE;a<=KSHIM_ACTION_MAX;++a) {
+        fixture(bs);assert(open_store()==0);
+        v=(struct kshim_config_values){0,0,0,0, kshim_next_action_pack(a, KSHIM_FLAG_NO_BOOT_LOG)};
+        assert(kshim_config_save(&store,&v,&seq)==0);
+        assert(slot(0)[8]==4);
+        assert(kshim_config_load(&store,&v,&seq)==0);
+        assert(kshim_next_action_value(v.next_action)==a);
+        assert(kshim_next_action_flags(v.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
+    }
+
+    /* Unsupported action 5 and unknown flag bits are rejected before write. */
+    fixture(bs);assert(open_store()==0);
+    v=(struct kshim_config_values){0,0,0,0, kshim_next_action_pack(5, 0)};
+    assert(kshim_config_save(&store,&v,&seq)==KSHIM_STORAGE_ARG && writes==0);
+    v.next_action=KSHIM_FLAG_NO_BOOT_LOG<<1;
+    assert(kshim_config_save(&store,&v,&seq)==KSHIM_STORAGE_ARG && writes==0);
+
+    /* Manually crafted v4 with garbage flag bit is rejected on load. */
+    fixture(bs);make_slot(0,7,0,2,0);
+    le32(slot(0)+8,4);le32(slot(0)+72,0x10000u | KSHIM_ACTION_EDL);seal(slot(0));
+    assert(open_store()==0);
+    assert(kshim_config_load(&store,&v,&seq)==KSHIM_STORAGE_FORMAT);
+
+    /* Readback failure publishes nothing. */
+    fixture(bs);assert(open_store()==0);
+    v=(struct kshim_config_values){0,0,0,0, kshim_next_action_pack(KSHIM_ACTION_EDL, KSHIM_FLAG_NO_BOOT_LOG)};
+    corrupt_readback=1;seq=99;
+    assert(kshim_config_save(&store,&v,&seq)==KSHIM_STORAGE_IO && seq==99);
+    /* No publication: session sequence stayed put; nothing read back as v4. */
+    fixture(bs);make_slot(0,7,0,2,0);assert(open_store()==0);
+    assert(kshim_config_load(&store,&v,&seq)==0 && seq==7 && v.next_action==0);
+}
+/* TEMP Gen4 diagnostic auto-return candidate: after a diagnostic record the
+ * ordinary entry preserves writes count, the handoff appends one log slot. */
+static void test_bootlog_diag_auto_return(unsigned bs) {
+    fixture(bs);
+    le32(descriptor()+8,3);le32(descriptor()+92,28672);
+    le32(descriptor()+96,32768);le32(descriptor()+100,4096);
+    le32(descriptor()+88,1);seal(descriptor());
+    assert(kshim_config_open(&store,&dev,&part,1,scratch,sizeof(scratch))==0);
+    assert(store.descriptor_version==3);
+    unsigned w0=writes;
+    assert(kshim_config_log_boot(&store,2,4,0)==KSHIM_STORAGE_OK);
+    assert(writes==w0+1);
+    unsigned w1=writes;
+    assert(kshim_config_log_boot(&store,1,1,0)==KSHIM_STORAGE_OK);
+    assert(writes==w1);
+    assert(kshim_config_log_boot(&store,1,4,0)==KSHIM_STORAGE_OK);
+    assert(writes==w1+1);
+    /* Both log slots still hold the diagnostic and ordinary entries. */
+    assert(descriptor()[12288+60]==2 && descriptor()[12288+64]==4);
+    assert(descriptor()[20480+60]==1 && descriptor()[20480+64]==4);
+}
 int main(void) {
     test_one_shot_v3(512);test_one_shot_v3(4096);
+    test_bootlog_diag_auto_return(512);test_bootlog_diag_auto_return(4096);
+    test_v4_flags(512);test_v4_flags(4096);
     test_last_boot_v2(512);test_last_boot_v2(4096);
     assert(fixture_crc((const unsigned char *)"123456789",9)==0xcbf43926u);
     test_descriptor(512);test_descriptor(4096);

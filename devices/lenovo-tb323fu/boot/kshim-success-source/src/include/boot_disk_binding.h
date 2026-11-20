@@ -22,6 +22,6 @@ int kshim_disk_binding_decode(const void *data, size_t bytes,
 int kshim_disk_bootargs(char out[2048], const char *signed_args,
                         const struct kshim_disk_entry *entry,
                         const struct kshim_disk_binding *binding,
-                        uint32_t board);
+                        uint32_t board, int auto_return);
 
 #endif /* BOOT_DISK_BINDING_H */

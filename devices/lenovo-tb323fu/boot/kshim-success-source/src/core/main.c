@@ -11,6 +11,7 @@
 #include <boot_metrics.h>
 #include <boot_witness.h>
 #include <kshim_mmu.h>
+#include <storage_config.h>
 #if defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
 #include <armada_disk_boot_key.h>
 #include <boot_disk_stage.h>
@@ -319,7 +320,8 @@ static void print_entry_name(const MANIFEST_ENTRY *entry)
 }
 
 static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t linux_base,
-                             const struct device_info *info, uint32_t *boot_target)
+                             const struct device_info *info, uint32_t next_action,
+                             bool *one_shot, uint32_t *boot_target)
 {
     uint32_t indexes[MANIFEST_MAX_ENTRIES];
     char labels[MANIFEST_MAX_ENTRIES][96];
@@ -403,6 +405,40 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
         if (i == view->manifest->header.default_entry) initial = count;
         ++count;
     }
+    *one_shot=false;
+    if (next_action==KSHIM_ACTION_ANDROID||next_action==KSHIM_ACTION_LINUX||
+        next_action==KSHIM_ACTION_LINUX_DIAG) {
+        size_t match_count=0, match_idx=0;
+        for (size_t k=0;k<count;++k) {
+            bool role_ok=false, board_ok=true;
+            if (next_action==KSHIM_ACTION_ANDROID)
+                role_ok=(roles[k]==KSHIM_MENU_ROLE_ANDROID);
+            else if (next_action==KSHIM_ACTION_LINUX)
+                role_ok=(roles[k]==KSHIM_MENU_ROLE_INTERNAL);
+            else
+                role_ok=(roles[k]==KSHIM_MENU_ROLE_DIAGNOSTIC);
+            if (!role_ok) continue;
+            if (next_action!=KSHIM_ACTION_ANDROID) {
+                /* require actual board known/safe and payload matches */
+                if (!((info->board==DEVICE_BOARD_TB322FC||info->board==DEVICE_BOARD_TB323FU)))
+                    board_ok=false;
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS
+                else if ((int)payload_boards[k]!=(int)info->board)
+                    board_ok=false;
+#else
+                else board_ok=false;   /* no payload_boards array: cannot verify */
+#endif
+            }
+            if (!board_ok) continue;
+            if (match_count==0) match_idx=k;
+            ++match_count;
+        }
+        if (match_count==1) {
+            *one_shot=true;
+            *boot_target=0;
+            return indexes[match_idx];
+        }
+    }
 #if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS
     if (kshim_platform_select_localized_settings(fdt, names, descriptions, roles, info,
             payload_boards, count, initial, view->manifest->header.timeout_ms,
@@ -473,7 +509,9 @@ static int disk_android_initrd_range(const void *fdt, struct dt_range *range)
 
 static void disk_boot_log(uint32_t target, uint32_t phase, int rc)
 {
-    (void)storage_settings_native_log_boot(target, phase, rc);
+    struct kshim_settings_session *session=storage_settings_native_session();
+    if (!(session->values.next_action & KSHIM_FLAG_NO_BOOT_LOG))
+        (void)storage_settings_native_log_boot(target, phase, rc);
     if (!storage_settings_native_handoff_safe()) {
         __asm__ volatile("msr daifset, #0xf" ::: "memory");
         for (;;) __asm__ volatile("wfe");
@@ -550,7 +588,7 @@ static int stage_disk_menu_entry(uint64_t linux_base, uint64_t manifest_address,
 static int set_disk_linux_chosen(void *blob, size_t capacity,
                                  const struct kshim_disk_entry *descriptor,
                                  const struct kshim_disk_boot_image *image,
-                                 uint32_t board)
+                                 uint32_t board, int auto_return)
 {
     int chosen = fdt_path_offset(blob, "/chosen");
     if (chosen < 0)
@@ -571,7 +609,7 @@ static int set_disk_linux_chosen(void *blob, size_t capacity,
 
     char args[2048];
     int rc = kshim_disk_bootargs(args, signed_args, descriptor,
-                                 &image->binding, board);
+                                 &image->binding, board, auto_return);
     if (rc)
         return rc;
 
@@ -593,6 +631,17 @@ static int set_disk_linux_chosen(void *blob, size_t capacity,
                             descriptor->diagnostic ? "maintenance" : "os");
     if (rc)
         return rc;
+
+    if (auto_return) {
+        rc = fdt_setprop(blob, chosen, "armada,diagnostic-auto-return",
+                         NULL, 0);
+        if (rc)
+            return rc;
+    } else {
+        rc = fdt_delprop(blob, chosen, "armada,diagnostic-auto-return");
+        if (rc != -FDT_ERR_NOTFOUND && rc != 0)
+            return rc;
+    }
 
     rc = fdt_setprop_string(blob, chosen, "armada,root-medium", "internal");
     if (rc)
@@ -1024,6 +1073,7 @@ int kshim_main(
             arm64_boot_linux(linux_base, device_tree_address, 4);
         }
 
+        uint32_t consumed_action=KSHIM_ACTION_NONE;
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
         const struct kshim_config_values defaults={0,0,(uint32_t)kshim_menu_get_language(), 0, 0};
         (void)storage_settings_native_open(device_info.board,&defaults);
@@ -1036,33 +1086,62 @@ int kshim_main(
         (void)kshim_qcom_reboot_probe_edl(
             (const void *)(uintptr_t)device_tree_address,&EdlProbe);
 #endif
-        /* Linux requests this through the provisioned settings store. Clear
-         * it durably before entering EDL so a later reset boots normally. */
-        struct kshim_settings_session *session=storage_settings_native_session();
-        uint32_t action=0;
-        EdlRequestSeen=session->values.next_action;
-        EdlRequestStatus=kshim_settings_take_action(session,&action);
-        if (!storage_settings_native_handoff_safe()) {
-            __asm__ volatile("msr daifset, #0xf" ::: "memory");
-            for (;;) __asm__ volatile("wfe");
-        }
-        if (!EdlRequestStatus && action==1) {
-            printf("Entering EDL from Linux request\n");
-            EdlRequestStatus=kshim_qcom_reboot_request(
-                (const void *)(uintptr_t)device_tree_address,KSHIM_QCOM_REBOOT_EDL);
-            if (EdlRequestStatus==KSHIM_QCOM_REBOOT_ROLLBACK_FAILED) {
-                __asm__ volatile("msr daifset, #0xf" ::: "memory");
-                for (;;) __asm__ volatile("wfe");
+#endif
+        {
+            struct kshim_settings_session *session=storage_settings_native_session();
+            uint32_t raw_action=kshim_next_action_value(session->values.next_action);
+            int have_request=raw_action!=KSHIM_ACTION_NONE;
+            if (have_request) {
+                int admissible=0;
+#if CONFIG_KSHIM_QCOM_REBOOT
+                if (raw_action==KSHIM_ACTION_EDL) admissible=1;
+#endif
+                if (raw_action!=KSHIM_ACTION_EDL && session->source==KSHIM_SETTINGS_INTERNAL &&
+                    (device_info.board==DEVICE_BOARD_TB322FC || device_info.board==DEVICE_BOARD_TB323FU))
+                    admissible=1;
+                if (admissible) {
+#if CONFIG_KSHIM_QCOM_REBOOT
+                    if (raw_action==KSHIM_ACTION_EDL) {
+                        EdlRequestSeen=raw_action;
+                        EdlRequestStatus=0;
+                    }
+#endif
+                    uint32_t action=0;
+                    int status=kshim_settings_take_action(session,&action);
+#if CONFIG_KSHIM_QCOM_REBOOT
+                    if (raw_action==KSHIM_ACTION_EDL) EdlRequestStatus=status;
+#endif
+                    if (!storage_settings_native_handoff_safe()) {
+                        __asm__ volatile("msr daifset, #0xf" ::: "memory");
+                        for (;;) __asm__ volatile("wfe");
+                    }
+                    if (!status&&action) {
+#if CONFIG_KSHIM_QCOM_REBOOT
+                        if (action==KSHIM_ACTION_EDL) {
+                            EdlRequestStatus=kshim_qcom_reboot_request(
+                                (const void *)(uintptr_t)device_tree_address,
+                                KSHIM_QCOM_REBOOT_EDL);
+                            if (EdlRequestStatus==KSHIM_QCOM_REBOOT_ROLLBACK_FAILED) {
+                                __asm__ volatile("msr daifset, #0xf" ::: "memory");
+                                for (;;) __asm__ volatile("wfe");
+                            }
+                            if (EdlRequestSeen&&EdlRequestStatus)
+                                printf("EDL request failed: %d\n",EdlRequestStatus);
+                        } else
+#endif
+                        {
+                            consumed_action=action;
+                        }
+                    }
+                }
             }
         }
-        if (EdlRequestSeen && EdlRequestStatus)
-            printf("EDL request failed: %d\n",EdlRequestStatus);
-#endif
         kshim_platform_bind_settings(storage_settings_native_session());
 #endif
         uint32_t boot_target=0;
+        bool one_shot=false;
         uint32_t selected_index = select_image(&view, device_tree_address, linux_base,
-                                               &device_info,&boot_target);
+                                               &device_info, consumed_action, &one_shot, &boot_target);
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
         kshim_platform_bind_settings(NULL);
         if (!storage_settings_native_handoff_safe()) {
@@ -1221,9 +1300,14 @@ int kshim_main(
                          * already validated the entries and source bounds. */
 #if defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
                     if (disk_boot) {
+                        int diag_auto_return =
+                            one_shot &&
+                            consumed_action == KSHIM_ACTION_LINUX_DIAG &&
+                            device_info.board == DEVICE_BOARD_TB322FC;
                         status = set_disk_linux_chosen(
                             blob, sizeof(HandoffDtb), &disk_descriptor,
-                            &disk_image, (uint32_t)device_info.board);
+                            &disk_image, (uint32_t)device_info.board,
+                            diag_auto_return);
                         handoff_stage = "disk_chosen";
                     } else
 #endif
@@ -1706,7 +1790,7 @@ int kshim_main(
 #endif
                 printf("Memory handoff failed; booting base image\n");
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
-                remember_selected_boot(1,0);
+                remember_selected_boot(one_shot ? 0u : 1u,0);
 #endif
                 prepare_boot();
                 arm64_boot_linux(linux_base, device_tree_address, 4);
@@ -1758,12 +1842,30 @@ int kshim_main(
             if (gate_rc != 0) {
                 printf("Update trial gate refused handoff (%d); booting base image\n",
                        gate_rc);
-                remember_selected_boot(1, 0);
+                remember_selected_boot(one_shot ? 0u : 1u, 0);
                 prepare_boot();
                 arm64_boot_linux(linux_base, device_tree_address, 4);
             }
         }
-        remember_selected_boot(boot_target,selected_device_tree);
+        remember_selected_boot(one_shot ? 0u : boot_target,selected_device_tree);
+#endif
+#if defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+        if (disk_boot) {
+            uint32_t log_target = 3u;
+            {
+                struct kshim_disk_entry sel_desc;
+                if (kshim_disk_entry_decode(
+                        (const void *)(uintptr_t)(linux_base + entry->offset),
+                        (size_t)entry->size, &sel_desc) == 0)
+                    log_target = sel_desc.diagnostic ? 2u : 1u;
+            }
+            disk_boot_log(log_target, 4u, 0);
+            kshim_mmu_clean_payload(disk_image.kernel_start, disk_image.kernel_bytes);
+            kshim_mmu_clean_payload(disk_image.initrd_start, disk_image.initrd_bytes);
+            sync_image_cache(disk_image.kernel_start, disk_image.kernel_bytes);
+            prepare_boot();
+            arm64_boot_linux(disk_image.kernel_start, selected_device_tree, 0);
+        }
 #endif
 #if defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
         if (disk_boot) {
