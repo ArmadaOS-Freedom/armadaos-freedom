@@ -259,6 +259,30 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(pending["target"], _NEW_GEN)
         self.assertEqual(pending["expected"], _OLD_GEN)
 
+    def test_activate_final_readback_error_is_uncertain(self):
+        """If the selector was changed but the final readback raises, activate
+        must report BootDiskSwitchUncertainError rather than leaking the error."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+
+        real_read = boot_disk_switch._read_boot_active
+        def _read_active(boot):
+            result = real_read(boot)
+            # The final readback happens after activate_generation succeeds;
+            # the first few calls are prechecks. Raise once selector is new.
+            if result[1] == _NEW_GEN:
+                raise OSError("simulated final readback failure")
+            return result
+
+        with mock.patch.object(
+            boot_disk_switch, "_read_boot_active", side_effect=_read_active,
+        ):
+            with self.assertRaises(boot_disk_switch.BootDiskSwitchUncertainError):
+                boot_disk_switch.activate(
+                    self.root, self.initial, plan,
+                    trusted_key=self.trusted_key, receipt=receipt,
+                )
+
     def test_activate_interrupted_before_rename(self):
         """If activate_generation raises after we write pending, selector stays old
         and ensure_ready clears only that interrupted pending state."""

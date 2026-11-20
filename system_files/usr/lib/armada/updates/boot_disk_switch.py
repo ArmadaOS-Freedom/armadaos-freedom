@@ -345,7 +345,12 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
                     "ARMADA_BOOT activation uncertain: reread failed") from read_exc
         raise BootDiskSwitchUncertainError(
             "ARMADA_BOOT activation uncertain: selector state ambiguous") from exc
-    if _read_boot_active(boot)[1] != target or _read_pending(boot) != record:
+    try:
+        matched = _read_boot_active(boot)[1] == target and _read_pending(boot) == record
+    except (OSError, ValueError, BootDiskSwitchError) as read_exc:
+        raise BootDiskSwitchUncertainError(
+            "ARMADA_BOOT activation uncertain: readback failed") from read_exc
+    if not matched:
         raise BootDiskSwitchUncertainError(
             "ARMADA_BOOT activation uncertain: readback did not match")
 
