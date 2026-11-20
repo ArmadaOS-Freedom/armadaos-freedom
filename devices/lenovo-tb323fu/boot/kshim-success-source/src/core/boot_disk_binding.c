@@ -82,15 +82,61 @@ int kshim_disk_binding_decode(const void *data, size_t bytes,
 #include <stdio.h>
 #include <string.h>
 
-/* Loose check: reject reserved signed_args tokens exactly root / boot /
- * ostree / armada.deployment, either bare or immediately followed by '='.
- * A token is a maximal run of non-space characters within the signed args. */
+/* Scan one quote-aware token at args[*i..len). Whitespace inside double
+ * quotes does not end the token. Returns 0 on success and sets the start and end of
+ * the token (including any surrounding quotes). Returns -1 if a double quote
+ * is left unbalanced. Mirrors the boot_witness scan for Linux quoting. */
+static int kshim_signed_next_token(const char *args, size_t len, size_t *i,
+                                   size_t *start, size_t *end)
+{
+    int quoted = 0;
+
+    while (*i < len && args[*i] == ' ')
+        (*i)++;
+    if (*i >= len) {
+        *start = *i;
+        *end = *i;
+        return 0;
+    }
+    *start = *i;
+    while (*i < len && (quoted || args[*i] != ' ')) {
+        if (args[*i] == '"')
+            quoted = !quoted;
+        (*i)++;
+    }
+    if (quoted)
+        return -1;
+    *end = *i;
+    return 0;
+}
+
+/* Strip one leading double quote and, if the token was quoted and the
+ * remaining text still ends in one, a single trailing double quote. Every
+ * double quote toggles the scan; there are no escape rules. */
+static void kshim_signed_token_unquote(const char **tok, size_t *len)
+{
+    int quoted = 0;
+
+    if (*len > 0 && (*tok)[0] == '"') {
+        (*tok)++;
+        (*len)--;
+        quoted = 1;
+    }
+    if (quoted && *len > 0 && (*tok)[*len - 1] == '"')
+        (*len)--;
+}
+
+/* Reject reserved signed_args tokens exactly root / boot / ostree /
+ * armada.deployment, either bare or immediately followed by '=', after
+ * handling surrounding double quotes. Values quoted inside are preserved. */
 static int kshim_signed_token_reserved(const char *tok, size_t len)
 {
     static const char *const reserved[] = {
         "root", "boot", "ostree", "armada.deployment"
     };
     size_t i;
+
+    kshim_signed_token_unquote(&tok, &len);
 
     for (i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
         size_t rlen = strlen(reserved[i]);
@@ -126,6 +172,7 @@ static int kshim_signed_token_prefix_eq(const char *tok, size_t len,
 
 static int kshim_token_board2_diag_filtered(const char *tok, size_t len)
 {
+    kshim_signed_token_unquote(&tok, &len);
     if (kshim_signed_token_is(tok, len, "quiet"))
         return 1;
     if (kshim_signed_token_prefix_eq(tok, len, "loglevel"))
@@ -193,38 +240,32 @@ int kshim_disk_bootargs(char out[2048], const char *signed_args,
             return -1;
     }
     i = 0;
-    while (i < n && signed_args[i] == ' ')
-        i++;
     while (i < n) {
-        size_t start, len;
-        start = i;
-        while (i < n && signed_args[i] != ' ')
-            i++;
-        len = i - start;
-        if (len > 0 && kshim_signed_token_reserved(signed_args + start, len))
+        size_t start, end, len;
+        const char *tok;
+        if (kshim_signed_next_token(signed_args, n, &i, &start, &end) != 0)
             return -1;
-        if (len > 0 && kshim_signed_token_is(signed_args + start, len, "--"))
+        if (end == start)
+            break;
+        tok = signed_args + start;
+        len = end - start;
+        if (kshim_signed_token_reserved(tok, len))
             return -1;
-        while (i < n && signed_args[i] == ' ')
-            i++;
+        kshim_signed_token_unquote(&tok, &len);
+        if (len > 0 && kshim_signed_token_is(tok, len, "--"))
+            return -1;
     }
 
     /* Copy signed statics, applying board-specific filtering. */
     n = strlen(signed_args);
     i = 0;
-    while (i < n && signed_args[i] == ' ')
-        i++;
     while (i < n) {
-        size_t start, len;
-        start = i;
-        while (i < n && signed_args[i] != ' ')
-            i++;
-        len = i - start;
-        while (i < n && signed_args[i] == ' ')
-            i++;
-
-        if (len == 0)
-            continue;
+        size_t start, end, len;
+        if (kshim_signed_next_token(signed_args, n, &i, &start, &end) != 0)
+            return -1;
+        if (end == start)
+            break;
+        len = end - start;
 
         if (board == 2 && entry->diagnostic && kshim_token_board2_diag_filtered(
                 signed_args + start, len))
