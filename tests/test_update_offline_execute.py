@@ -183,6 +183,125 @@ class OfflineExecuteTest(unittest.TestCase):
         env.spies["trial_save"].assert_not_called()
         self._assert_sources_untouched(env)
 
+    def test_execute_disk_path_uses_boot_disk_switch_not_offline_writer(self):
+        """Contract: with disk=True, execution switches boot via
+        boot_disk_switch.activate, writes status + write-report, and never
+        touches raw offline_boot_writer or _build_record."""
+        with self.fixture._case() as env:
+            _prepared, _initial_bytes, ack = self._ready(env)
+            initial = dict(env.physical, bootSource="armada_boot",
+                           actualSlot=None, inactiveSlot=None)
+            work = env.work
+
+            saved_status = self._json(work, "status.json")
+            saved_status.update(bootSource="armada_boot",
+                                fromSlot=None, targetSlot=None)
+            # Snapshot fixture raw data the test relies on, so the contract
+            # assertions below are self-documenting.
+            self.assertEqual(saved_status["state"], "awaiting_recovery_export")
+            plan_sha = saved_status["planSha256"]
+            self.assertEqual(ack["planSha256"], plan_sha)
+            tx = saved_status["transactionId"]
+            self.assertEqual(ack["transactionId"], tx)
+
+            expected = Path(work)
+            plan = {
+                "sysrootPath": str(expected / "sysroot"),
+                "armadaBootSwitch": {
+                    "fromSlot": saved_status["fromSlot"],
+                    "targetSlot": saved_status["targetSlot"],
+                    "kernel": "armada",
+                    "nextBoot": "armada",
+                },
+            }
+            ctx = {
+                "saved_status": dict(saved_status),
+                "initial": initial,
+                "plan": plan,
+                "disk": True,
+                "tx": tx,
+            }
+
+            activate_calls = []
+            fake_activate = mock.Mock(
+                side_effect=lambda *a, **k: activate_calls.append((a, k)))
+
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    offline_execute, "_preflight", return_value=ctx))
+                stack.enter_context(mock.patch.object(
+                    offline_execute, "boot_disk_switch",
+                    SimpleNamespace(activate=fake_activate)))
+                raw_writer = stack.enter_context(mock.patch.object(
+                    offline_execute.offline_boot_writer,
+                    "write_offline_boots",
+                    side_effect=AssertionError("raw offline_boot_writer used")))
+                build_record = stack.enter_context(mock.patch.object(
+                    offline_execute, "_build_record",
+                    side_effect=AssertionError("_build_record used on disk path")))
+                save_json = stack.enter_context(mock.patch.object(
+                    offline_execute.system_transaction, "_save_json",
+                    wraps=system_transaction._save_json))
+
+                result = offline_execute._execute_offline_update(
+                    work_dir=work, recovery_ack=ack)
+
+            # boot_disk_switch.activate was called exactly once with the plan path.
+            self.assertEqual(fake_activate.call_count, 1)
+            pos, kw = activate_calls[0]
+            self.assertEqual(Path(pos[0]), expected / "sysroot")
+            self.assertEqual(pos[1], initial)
+            self.assertEqual(pos[2], plan["armadaBootSwitch"])
+            self.assertEqual(kw["trusted_key"], offline_execute.signature.DEFAULT_TRUSTED_KEY)
+            self.assertEqual(kw["receipt"], {
+                "transactionId": tx,
+                "planSha256": plan_sha,
+                "fromSlot": saved_status["fromSlot"],
+                "targetSlot": saved_status["targetSlot"],
+            })
+
+            # Raw writer and _build_record were never invoked.
+            raw_writer.assert_not_called()
+            build_record.assert_not_called()
+
+            # _save_json was used to write recovery-ack, status (executing), and
+            # write-report, in that order, plus the final awaiting_reboot status.
+            written = [c.args[1] for c in save_json.call_args_list]
+            self.assertEqual(written, [
+                "recovery-ack.json",
+                "status.json",
+                "write-report.json",
+                "status.json",
+            ])
+
+            # Returned status reflects the awaiting-reboot contract.
+            self.assertEqual(result["state"], "awaiting_reboot")
+            self.assertEqual(result["phase"], "awaiting_reboot")
+            self.assertTrue(result["requiresReboot"])
+            self.assertEqual(result["bootWriteState"], "not_started")
+            self.assertEqual(result["transactionId"], tx)
+            self.assertEqual(result["planSha256"], plan_sha)
+
+            # Persisted artifacts, read back through the real _save_json output.
+            on_disk_status = self._json(work, "status.json")
+            self.assertEqual(on_disk_status["state"], "awaiting_reboot")
+            self.assertTrue(on_disk_status["requiresReboot"])
+            report = self._json(work, "write-report.json")
+            self.assertEqual(report, {
+                "schemaVersion": 1,
+                "phase": "armada_boot_selected",
+                "transactionId": tx,
+                "planSha256": plan_sha,
+                "armadaBootSwitch": plan["armadaBootSwitch"],
+            })
+            on_disk_ack = self._json(work, "recovery-ack.json")
+            self.assertEqual(on_disk_ack, ack)
+
+            # Incidental fixture sanity: no boots were written, no report was
+            # validated, in the raw sense — those are the non-disk path effects.
+            self.assertFalse((work / "boots").exists() and
+                             any((work / "boots").iterdir()))
+
     def test_success_models_slots_record_progress_and_single_execution(self) -> None:
         for model in ("TB322FC", "TB323FU"):
             for actual in ("a", "b"):

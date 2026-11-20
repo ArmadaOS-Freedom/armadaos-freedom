@@ -1,5 +1,7 @@
 """Validation for signed Freedom package and split-media descriptors."""
 
+import base64
+import binascii
 from copy import deepcopy
 from pathlib import Path
 import re
@@ -31,6 +33,7 @@ _TOP_KEYS = frozenset((
     "minimumUpdaterVersion", "supportedModels", "operations", "archive", "parts",
     "files", "modelManifests", "recoveryManifests", "deckySnapshot",
 ))
+_OPTIONAL_TOP_KEYS = frozenset(("armadaBootCapsules",))
 _ARCHIVE_KEYS = frozenset(("fileName", "bytes", "sha256"))
 _FILE_KEYS = frozenset((
     "path", "bytes", "sha256", "expandedBytes", "expandedSha256", "compression", "role",
@@ -177,8 +180,33 @@ def _install_models(value) -> frozenset:
     return frozenset(selected)
 
 
+_CAPSULE_SIZES = {"board.dtb": (1, 256 * 1024), "manifest.bin": (160, 160),
+                  "manifest.sig": (8, 72)}
+
+
+def _armada_boot_capsules(value, supported_models):
+    if not isinstance(value, dict) or not value:
+        raise PackageError("armadaBootCapsules must be a nonempty object")
+    for model, capsule in value.items():
+        if model not in {"TB322FC", "TB323FU"} or model not in supported_models:
+            raise PackageError(f"armadaBootCapsules is not allowed for model {model!r}")
+        if not isinstance(capsule, dict) or capsule.keys() != _CAPSULE_SIZES.keys():
+            raise PackageError(f"invalid boot capsule file list for {model}")
+        for name, (minimum, maximum) in _CAPSULE_SIZES.items():
+            blob = capsule[name]
+            if not isinstance(blob, str) or len(blob) > ((maximum + 2) // 3) * 4:
+                raise PackageError(f"invalid boot capsule length for {model}/{name}")
+            try:
+                content = base64.b64decode(blob, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise PackageError(f"invalid boot capsule base64 for {model}/{name}") from exc
+            if not minimum <= len(content) <= maximum or base64.b64encode(content).decode("ascii") != blob:
+                raise PackageError(f"invalid boot capsule data for {model}/{name}")
+
+
 def _validate(data: dict, install_models=frozenset()) -> None:
-    if not isinstance(data, dict) or set(data) != _TOP_KEYS:
+    if (not isinstance(data, dict) or not _TOP_KEYS <= set(data)
+            or not set(data) <= _TOP_KEYS | _OPTIONAL_TOP_KEYS):
         raise PackageError("package must contain exactly the schema 1 top-level keys")
     if type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1:
         raise PackageError("schemaVersion must be integer 1")
@@ -208,6 +236,8 @@ def _validate(data: dict, install_models=frozenset()) -> None:
         if len(set(values)) != len(values):
             raise PackageError(f"{field} must not contain duplicates")
     supported = set(data["supportedModels"])
+    if "armadaBootCapsules" in data:
+        _armada_boot_capsules(data["armadaBootCapsules"], supported)
     if not extra_models <= supported:
         raise PackageError("install_models must be listed in supportedModels")
     if "offline-upgrade" in data["operations"]:

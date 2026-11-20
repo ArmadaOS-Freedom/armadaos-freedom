@@ -6,6 +6,7 @@ from pathlib import Path
 
 from . import (
     boot_context,
+    boot_disk_switch,
     finalization_receipt,
     recovery_device,
     trial_record,
@@ -36,10 +37,18 @@ def read_trial_status(
 ):
     if not isinstance(context, dict):
         return _unavailable("Boot context is malformed")
-    if (context.get("state") != "available"
-            or context.get("actualSlot") not in ("a", "b")
-            or not isinstance(context.get("deployment"), str)
-            or not context.get("deployment")):
+    if context.get("state") != "available" or not isinstance(context.get("deployment"), str) or (not context.get("deployment")):
+        return _unavailable(context.get("error") or "Boot context is unavailable")
+
+    if context.get("bootSource") == "armada_boot":
+        if context.get("actualSlot") is not None or context.get("inactiveSlot") is not None:
+            return _unavailable("Boot context slot pair must be null for armada_boot")
+        try:
+            return boot_disk_switch.read_trial_status(context)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            return _unavailable(error)
+
+    if context.get("actualSlot") not in ("a", "b"):
         return _unavailable(context.get("error") or "Boot context is unavailable")
 
     actual_slot = context["actualSlot"]

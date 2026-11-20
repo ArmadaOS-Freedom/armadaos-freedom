@@ -30,6 +30,7 @@ from . import (
     UPDATER_VERSION,
     _io,
     boot_candidate,
+    boot_disk_switch,
     boot_materials,
     boot_trust,
     deployment_store,
@@ -95,7 +96,7 @@ def _snapshot_channel(snapshot):
     return channel
 
 
-def _validate_rollback_target(snapshot, expected_checksum, old, journal_record):
+def _validate_rollback_target(snapshot, expected_checksum, old, journal_record, *, disk=False):
     if (not isinstance(expected_checksum, str) or len(expected_checksum) != 64 or
             any(ch not in '0123456789abcdef' for ch in expected_checksum)):
         raise ValueError('rollback checksum must be 64 lowercase hex characters')
@@ -114,11 +115,12 @@ def _validate_rollback_target(snapshot, expected_checksum, old, journal_record):
     target = _binding(target_deployment)
     if target[0] != old[0] or target[1] == old[1]:
         raise ValueError('rollback deployment must be a distinct commit in the active OS')
-    if journal_record is None or journal_record.state != trial_record.CONFIRMED:
-        raise ValueError('previous bound deployment unavailable')
-    journal_old = (journal_record.os_name, journal_record.old_commit.hex(), journal_record.old_serial)
-    if target != journal_old:
-        raise ValueError('previous bound deployment unavailable')
+    if not disk:
+        if journal_record is None or journal_record.state != trial_record.CONFIRMED:
+            raise ValueError('previous bound deployment unavailable')
+        journal_old = (journal_record.os_name, journal_record.old_commit.hex(), journal_record.old_serial)
+        if target != journal_old:
+            raise ValueError('previous bound deployment unavailable')
     version = rollback.get('version')
     return (target_deployment, target,
             version if isinstance(version, str) and version else None)
@@ -277,6 +279,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
         work = Path(work_dir)
         created = False
         boot_write_started = False
+        disk = False
         status = {'schemaVersion': 1, 'component': 'system', 'state': 'failed',
                   'phase': 'preflight', 'requiresReboot': False,
                   'bootPolicy': BOOT_POLICY, 'slotControlState': 'not_issued',
@@ -300,6 +303,10 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             initial = physical_slots.inspect_physical_slots()
             if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
                 raise ValueError('unsupported physical model')
+            disk = initial.get('bootSource') == 'armada_boot'
+            if disk:
+                boot_disk_switch.ensure_ready(root, initial)
+                status['bootSource'] = 'armada_boot'
             snapshot = armada_os.snapshot()
             if (snapshot['repository'] not in armada_os.REPOSITORIES or
                     snapshot['staged'] or snapshot['rollback_queued']):
@@ -308,13 +315,13 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             if mode == 'online' and snapshot_channel != expected_channel:
                 raise ValueError('requested channel differs from configured channel')
             old = _binding(initial['deployment'])
-            journal = _check_recovery(initial, old)
+            journal = None if disk else _check_recovery(initial, old)
             target_deployment = None
             new = None
             target_version = None
             if mode == 'rollback':
                 target_deployment, new, target_version = _validate_rollback_target(
-                    snapshot, expected_checksum, old, journal.record)
+                    snapshot, expected_checksum, old, None if disk else journal.record, disk=disk)
                 # The retained rollback target may predate the per-deployment
                 # armada.deployment token (for example the first installed
                 # deployment).  Persist its own canonical binding under the
@@ -324,7 +331,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     sysroot_path=root, binding=target_deployment)
                 if ensured.get('deployment') != target_deployment:
                     raise ValueError('rollback target binding was not persisted')
-            if journal.record is not None and journal.record.state == trial_record.CONFIRMED:
+            if journal is not None and journal.record is not None and journal.record.state == trial_record.CONFIRMED:
                 boot = trial_confirmation._check_boot_evidence(
                     trial_confirmation.collect_boot_evidence(journal.record), journal.record
                 )
@@ -365,6 +372,42 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                         physical_slots.inspect_physical_slots(), initial):
                     raise ValueError('physical slots changed after download')
 
+            if disk:
+                status['phase'] = 'preparing_armada_boot'
+                _save_json(work, 'status.json', status)
+                if mode == 'online':
+                    package = downloaded['package']
+                    if initial['model'] not in package.get('armadaBootCapsules', {}):
+                        raise ValueError('signed channel package lacks ARMADA_BOOT materials for model')
+                    deployed = deployment_store.append_verified_deployment(
+                        sysroot_path=root, current_binding=initial['deployment'],
+                        target_commit=downloaded['commit'], oci_digest=package['ociDigest'],
+                        source_revision=package['sourceRevision'], version=package['version'],
+                        model=initial['model'], origin_ref=downloaded['originRef'])
+                    target_deployment = deployed['deployment']
+                    plan = boot_disk_switch.prepare(
+                        root, initial, target_deployment, package, trusted_key=trusted_key)
+                    status['targetVersion'] = package['version']
+                else:
+                    _recheck_rollback_snapshot(expected_checksum, new)
+                    plan = boot_disk_switch.plan_rollback(
+                        root, initial, target_deployment, trusted_key=trusted_key)
+                if not physical_slots.same_physical_identity(
+                        physical_slots.inspect_physical_slots(), initial):
+                    raise ValueError('physical identity changed during ARMADA_BOOT preparation')
+                status['newDeployment'] = target_deployment
+                status['planSha256'] = _io.sha256_hex(_save_json(work, 'plan.json', plan))
+                boot_disk_switch.activate(
+                    root, initial, plan, trusted_key=trusted_key,
+                    receipt={key: status[key] for key in
+                             ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')})
+                status.update(state='awaiting_reboot', phase='awaiting_reboot',
+                              requiresReboot=True, bootWriteState='not_started')
+                _save_json(work, 'status.json', status)
+                return status
+
+            if mode == 'online' and initial['model'] in downloaded['package'].get('armadaBootCapsules', {}):
+                raise ValueError('this package requires an existing ARMADA_BOOT installation')
             status['phase'] = 'capturing_boot_trust'
             _save_json(work, 'status.json', status)
             trust = boot_trust.capture_boot_trust(output_dir=work / 'trust',
@@ -521,7 +564,7 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     status['persistenceError'] = '%s: %s' % (type(save_exc).__name__, save_exc)
                 else:
                     persisted = True
-            if created and persisted and not boot_write_started:
+            if created and persisted and not boot_write_started and not disk:
                 # The failed status is durable and the mirrored boot writer was
                 # never entered.  Re-read the journal while the update lock is
                 # still held: only the exact pre-job snapshot with no reference

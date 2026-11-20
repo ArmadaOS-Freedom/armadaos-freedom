@@ -404,25 +404,28 @@ and then declares both `install` and `offline-upgrade` for the all-profile
 package; a package built from an image without that updater fails the build
 instead of being relabeled. The operation list is package-level: every listed
 model can be installed, while an offline-upgrade request is accepted only for
-a selected model with the dual-slot backend. A package whose selected models
+a selected model with Linux update support for its installed boot layout. A package whose selected models
 include a profile outside the shipped contract is built install-only: the
 wrapper never requests offline-upgrade for it, and it passes that configured
 model identifier explicitly so validation accepts the install package while
-still rejecting offline-upgrade and recovery for it. The offline upgrade keeps
-user data and writes both boot slots from the verified payload; the online OCI
-update instead rotates only the non-current slot. A signature alone does not
-make a package upgrade-capable: the descriptor must declare offline-upgrade,
-the requested model must be eligible, and the installed updater must meet
-`minimumUpdaterVersion`.
+still rejecting offline-upgrade and recovery for it.
 
-The unified package ships updater 0.8.1, and its descriptor therefore declares
-`minimumUpdaterVersion` 0.8.1 while `minimumInstallerVersion` stays 0.8.0. A
-fresh installation from this package is the supported baseline: the installed
-system reports 0.8.1, and later unified packages can update the eligible Y700
-models in place while keeping user data. An installation made from an earlier
-0.8.0 package does not reach this baseline through an update: its installed
-validator rejects the mixed package, and this change ships no in-place
-migration path. That baseline is obtained by a fresh installation.
+On TB322FC and TB323FU, the normal and diagnostic Linux entries load the
+kernel, initramfs, and signed board device tree from the 1 GiB ext4
+`ARMADA_BOOT` partition. Each Android boot slot retains its own Android kernel
+and ramdisk, plus the Freedom launcher and Linux entry descriptors. New
+`ARMADA_BOOT` installations use the same signed files for online and offline
+updates. An update switches the selected generation and keeps the previous
+verified generation for rollback. Updates and rollback leave both raw Android
+boot partitions and the Android slot selector alone and preserve user data.
+
+The disk-boot package declares installer 0.9.19 and updater 0.8.2 as its
+minimum versions. A fresh installation creates the layout. On an existing
+internal installation, overwrite can reuse a matching partition layout
+after verifying the recovery backup. This reinstalls Linux and retains
+Android user data and the verified backup. For an offline upgrade, the
+signed descriptor must declare `offline-upgrade` and support the installed
+model and updater version.
 
 Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
 (TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part

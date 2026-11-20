@@ -54,16 +54,18 @@ def _pread(fd, size, offset):
             continue
 
 
-def _load_locator():
+def _load_locator(*, gpt_only=False):
+    symbol = ('armada_update_gpt_partition_fds' if gpt_only
+              else 'armada_update_ab_partition_fds')
     try:
         lib = ctypes.CDLL(str(physical_slots.LIBRARY_PATH))
-        fn = lib.armada_update_ab_partition_fds
+        fn = getattr(lib, symbol)
     except OSError as error:
         raise BootSourcesError(
             f'cannot load {physical_slots.LIBRARY_PATH}: {error}') from error
     except AttributeError as error:
         raise BootSourcesError(
-            f'missing armada_update_ab_partition_fds in {physical_slots.LIBRARY_PATH}') from error
+            f'missing {symbol} in {physical_slots.LIBRARY_PATH}') from error
     fn.restype = ctypes.c_int
     fn.argtypes = [
         ctypes.POINTER(ctypes.c_int),
@@ -228,7 +230,8 @@ def _capture_boot_sources(expected_physical, output_dir, extra_labels, *,
         for lun in luns:
             fds.append(
                 physical_slots._device_fd(found[lun]['path'], found[lun]['rdev']))
-        locator = _load_locator()
+        locator = _load_locator(
+            gpt_only=initial.get('bootSource') == 'armada_boot')
 
         extents = {}
         seen_extents = set()

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 [Unit]
 Description=Armada Linux update trial confirmation
-ConditionPathExists=/sys/firmware/devicetree/base/chosen/armada,update-transaction
+ConditionPathExists=|/sys/firmware/devicetree/base/chosen/armada,update-transaction
+ConditionPathExists=|/sys/firmware/devicetree/base/chosen/armada,boot-source
 After=local-fs.target dbus.service systemd-logind.service
 StartLimitIntervalSec=10min
 StartLimitBurst=10

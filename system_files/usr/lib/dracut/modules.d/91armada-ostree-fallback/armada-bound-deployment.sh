@@ -46,16 +46,6 @@ else
     die "invalid deployment binding"
 fi
 
-if [[ "${karg}" =~ ^/ostree/boot\.([01])/([^/]+)/([^/]+)/([^/]+)$ ]]; then
-    [ "${BASH_REMATCH[2]}" = "${osname}" ] || die "ostree osname does not match binding"
-    bootcsum=${BASH_REMATCH[3]}
-    original_index=${BASH_REMATCH[4]}
-else
-    die "invalid ostree path"
-fi
-[[ "${bootcsum}" =~ ^[0-9a-f]{64}$ ]] || die "invalid boot checksum"
-[[ "${original_index}" =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid boot index"
-
 expected="${root}/ostree/deploy/${osname}/deploy/${commit}.${serial}"
 [ -d "${expected}" ] || die "bound deployment is missing"
 resolved=$(readlink -e -- "${expected}") || die "cannot resolve bound deployment"
@@ -67,6 +57,24 @@ matches() {
     target=$(readlink -e -- "${link}" 2>/dev/null) || return 1
     [ "${target}" = "${expected}" ]
 }
+
+if [[ "${karg}" == /ostree/armada/* ]]; then
+    [ "${osname}" = "default" ] || die "stable ostree pointer requires default osname"
+    [ "${karg}" = "/ostree/armada/${commit}.${serial}" ] || die "stable ostree pointer does not match binding"
+    matches "${root}${karg}" || die "stable ostree pointer does not resolve to bound deployment"
+    printf '%s\n' "${karg}"
+    exit 0
+fi
+
+if [[ "${karg}" =~ ^/ostree/boot\.([01])/([^/]+)/([^/]+)/([^/]+)$ ]]; then
+    [ "${BASH_REMATCH[2]}" = "${osname}" ] || die "ostree osname does not match binding"
+    bootcsum=${BASH_REMATCH[3]}
+    original_index=${BASH_REMATCH[4]}
+else
+    die "invalid ostree path"
+fi
+[[ "${bootcsum}" =~ ^[0-9a-f]{64}$ ]] || die "invalid boot checksum"
+[[ "${original_index}" =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid boot index"
 
 if matches "${root}${karg}"; then
     printf '%s\n' "${karg}"

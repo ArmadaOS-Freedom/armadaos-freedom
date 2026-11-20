@@ -316,6 +316,16 @@ class OfflineJobManager:
                 status.get('newDeployment') != identity['newDeployment']):
             return None
 
+        # armada_boot: exact marker propagation
+        if identity.get('bootSource') == 'armada_boot':
+            if (status.get('bootSource') != 'armada_boot' or
+                    physical.get('bootSource') != 'armada_boot'):
+                return None
+            if 'fromSlot' not in status or 'targetSlot' not in status:
+                return None
+            if 'actualSlot' not in physical or 'inactiveSlot' not in physical:
+                return None
+
         manifest_sha = prepared.get('recoveryManifestSha256')
         package_sha = prepared.get('packageDescriptorSha256')
         if (not _is_sha256(manifest_sha) or

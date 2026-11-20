@@ -139,10 +139,23 @@ def read_device_identity():
     if context.get('deployment') != deployment:
         raise OfflineSessionError(
             'boot context does not describe the booted deployment')
-    actual = context.get('actualSlot')
-    inactive = context.get('inactiveSlot')
-    if actual not in ('a', 'b') or inactive != ('b' if actual == 'a' else 'a'):
-        raise OfflineSessionError('boot context reports invalid slots')
+    boot_source = context.get('bootSource', _LEGACY_BOOT_SOURCE)
+    if boot_source == 'armada_boot':
+        if 'actualSlot' not in context or 'inactiveSlot' not in context:
+            raise OfflineSessionError('boot context reports invalid slots')
+        actual = context['actualSlot']
+        inactive = context['inactiveSlot']
+        if actual is not None or inactive is not None:
+            raise OfflineSessionError('boot context reports invalid slots')
+        native = True
+    elif boot_source == _LEGACY_BOOT_SOURCE:
+        actual = context.get('actualSlot')
+        inactive = context.get('inactiveSlot')
+        if actual not in ('a', 'b') or inactive != ('b' if actual == 'a' else 'a'):
+            raise OfflineSessionError('boot context reports invalid slots')
+        native = False
+    else:
+        raise OfflineSessionError('boot context reports unknown boot source')
     try:
         _dev, part_uuid, board, _rdev = recovery_device.locate_recovery_partition(
             require_edl=False)
@@ -155,13 +168,19 @@ def read_device_identity():
         raise OfflineSessionError('physical offline upgrades support only ' + '/'.join(sorted(_MODELS)))
     if not isinstance(part_uuid, str) or not part_uuid:
         raise OfflineSessionError('recovery partition has no verified PARTUUID')
-    return {
+    result = {
         'model': model,
         'actualSlot': actual,
         'inactiveSlot': inactive,
         'deployment': deployment,
         'recoveryPartUuid': part_uuid,
     }
+    if native:
+        result['bootSource'] = 'armada_boot'
+    return result
+
+
+_LEGACY_BOOT_SOURCE = None  # module-level sentinel for legacy decoder
 
 
 class OfflineSessionStore:
@@ -188,15 +207,28 @@ class OfflineSessionStore:
     def _require_identity(self, physical):
         if not isinstance(physical, dict) or physical.get('model') not in _MODELS:
             raise OfflineSessionError('physical offline upgrades support only ' + '/'.join(sorted(_MODELS)))
-        for field in ('model', 'actualSlot', 'inactiveSlot', 'deployment',
-                      'recoveryPartUuid'):
+        for field in ('model', 'deployment', 'recoveryPartUuid'):
             value = physical.get(field)
             if not isinstance(value, str) or not value:
                 raise OfflineSessionError('device identity has no verified %s' % field)
-        actual = physical['actualSlot']
-        if actual not in ('a', 'b') or physical['inactiveSlot'] != (
-                'b' if actual == 'a' else 'a'):
-            raise OfflineSessionError('device identity reports invalid slots')
+        boot_source = physical.get('bootSource', _LEGACY_BOOT_SOURCE)
+        if boot_source == 'armada_boot':
+            for field in ('actualSlot', 'inactiveSlot'):
+                if field not in physical:
+                    raise OfflineSessionError('device identity has no verified %s' % field)
+                if physical[field] is not None:
+                    raise OfflineSessionError('device identity reports invalid slots')
+        elif boot_source == _LEGACY_BOOT_SOURCE:
+            for field in ('actualSlot', 'inactiveSlot'):
+                value = physical.get(field)
+                if not isinstance(value, str) or not value:
+                    raise OfflineSessionError('device identity has no verified %s' % field)
+            actual = physical['actualSlot']
+            if actual not in ('a', 'b') or physical['inactiveSlot'] != (
+                    'b' if actual == 'a' else 'a'):
+                raise OfflineSessionError('device identity reports invalid slots')
+        else:
+            raise OfflineSessionError('device identity reports unknown boot source')
         return physical
 
     def _info_physical(self):
@@ -217,7 +249,7 @@ class OfflineSessionStore:
 
     def info(self):
         physical = self._info_physical()
-        return {
+        result = {
             'schemaVersion': 1,
             'updaterVersion': self.updater_version,
             'bootPolicy': trial_record.BOOT_POLICY,
@@ -228,6 +260,9 @@ class OfflineSessionStore:
             'recoveryPartUuid': physical['recoveryPartUuid'],
             'channel': self._channel_info(),
         }
+        if physical.get('bootSource') == 'armada_boot':
+            result['bootSource'] = 'armada_boot'
+        return result
 
     def _ensure_base(self):
         if self.base.exists() or self.base.is_symlink():

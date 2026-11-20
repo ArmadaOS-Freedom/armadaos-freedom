@@ -211,6 +211,7 @@ def build_descriptor(archive_path: Path, *, release_id: str,
             if not isinstance(packages, list) or not packages:
                 raise PackageError("bundle.packages must be nonempty")
             models, manifests, overrides = [], {}, {}
+            disk_models = set()
             model_install_artifacts = {}
             common_paths = {role: set() for role in _COMPRESSED | {"kernel", "initramfs"}}
             source_revision = deployment_commit = manifest_digest = None
@@ -275,8 +276,13 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                     overrides[record["path"]] = record
                 if roles != _REQUIRED:
                     raise PackageError(f"{model} must declare exactly the seven required roles")
+                if document.get("bootRecipe", {}).get("linuxBootSource") == "armada-boot-v1":
+                    disk_models.add(model)
                 models.append(model)
                 manifests[model] = manifest_path
+            raw_boot_caps = bundle.get("armadaBootCapsules", {})
+            if not isinstance(raw_boot_caps, dict) or set(raw_boot_caps) != disk_models:
+                raise PackageError("armadaBootCapsules must match the disk boot model recipes")
             if any(len(paths) != 1 for paths in common_paths.values()):
                 raise PackageError("root, boot, kernel, and initramfs must each be shared")
 
@@ -435,6 +441,8 @@ def build_descriptor(archive_path: Path, *, release_id: str,
         "parts": parts, "files": files, "modelManifests": manifests,
         "recoveryManifests": recovery_manifests, "deckySnapshot": None,
     }
+    if raw_boot_caps:
+        descriptor["armadaBootCapsules"] = deepcopy(raw_boot_caps)
     result = validate_package(descriptor, install_models=install_models)
     if raw_recovery_docs:
         for model, (norm_path, doc_bytes) in raw_recovery_docs.items():

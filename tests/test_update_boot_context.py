@@ -335,6 +335,68 @@ class BootContextTests(unittest.TestCase):
             with self.assertRaises(BootContextError):
                 read_boot_context(booted, witness_path, nul_path)
 
+    def test_armada_boot_reads_disk_evidence_without_witness(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source_path = tmp / "boot_source"
+            witness_path = tmp / "witness"
+            cmdline_path = tmp / "cmdline"
+            source_path.write_bytes(b"armada_boot\x00")
+            cmdline_path.write_text(
+                "armada.deployment=default/{hex}.5 ostree=/ostree/armada/{hex}.5".format(
+                    hex=COMMIT_CSUM
+                ),
+                encoding="utf-8",
+            )
+            booted = make_booted(stateroot="default", serial=5)
+
+            result = read_boot_context(
+                booted,
+                witness_path,
+                cmdline_path,
+                boot_source_path=source_path,
+            )
+            self.assertEqual(result["bootSource"], "armada_boot")
+            self.assertIsNone(result["actualSlot"])
+            self.assertIsNone(result["inactiveSlot"])
+            self.assertEqual(result["deployment"], f"default/{COMMIT_CSUM}.5")
+
+            # Missing boot marker (both witness and marker absent)
+            with self.assertRaises(BootContextError):
+                read_boot_context(
+                    booted,
+                    witness_path,
+                    cmdline_path,
+                    boot_source_path=tmp / "missing_marker",
+                )
+
+            # Invalid marker bytes
+            bad_marker = tmp / "bad_marker"
+            bad_marker.write_bytes(b"not_armada_boot\x00")
+            with self.assertRaises(BootContextError):
+                read_boot_context(
+                    booted,
+                    witness_path,
+                    cmdline_path,
+                    boot_source_path=bad_marker,
+                )
+
+            # Wrong deployment binding via differing ostree pointer
+            bad_cmdline = tmp / "bad_cmdline"
+            bad_cmdline.write_text(
+                "armada.deployment=default/{hex}.5 ostree=/ostree/armada/{other}.5".format(
+                    hex=COMMIT_CSUM, other=OTHER_CSUM
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(BootContextError):
+                read_boot_context(
+                    booted,
+                    witness_path,
+                    bad_cmdline,
+                    boot_source_path=source_path,
+                )
+
     def test_read_regular_accumulates_short_reads_and_closes_fd(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

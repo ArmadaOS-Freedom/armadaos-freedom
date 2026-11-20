@@ -91,13 +91,19 @@ def _identity(source, plan_sha256=None):
         'planSha256': _sha(plan_sha256 if plan_sha256 is not None
                            else source.get('planSha256')),
     }
+    disk = (source.get('bootSource') == 'armada_boot' and
+            'fromSlot' in source and source['fromSlot'] is None and
+            'targetSlot' in source and source['targetSlot'] is None)
     if (identity['transactionId'] is None or identity['oldDeployment'] is None or
             identity['newDeployment'] is None or
-            identity['fromSlot'] not in _SLOTS or
-            identity['targetSlot'] not in _SLOTS or
-            identity['fromSlot'] == identity['targetSlot'] or
+            (not disk and (
+                identity['fromSlot'] not in _SLOTS or
+                identity['targetSlot'] not in _SLOTS or
+                identity['fromSlot'] == identity['targetSlot'])) or
             identity['planSha256'] is None):
         return None
+    if disk:
+        identity['bootSource'] = 'armada_boot'
     return identity
 
 
@@ -119,14 +125,20 @@ def document_identity(prepared, plan, plan_sha256=None):
         return None
     if plan_sha256 is not None and plan_sha256 != prepared.get('planSha256'):
         return None
-    identity = _identity({
+    if 'fromSlot' not in plan or 'targetSlot' not in plan:
+        return None
+    source = {
         'transactionId': prepared.get('transactionId'),
         'planSha256': prepared.get('planSha256'),
         'oldDeployment': plan.get('oldDeployment'),
         'newDeployment': plan.get('newDeployment'),
         'fromSlot': plan.get('fromSlot'),
         'targetSlot': plan.get('targetSlot'),
-    })
+    }
+    if (plan.get('fromSlot') is None and plan.get('targetSlot') is None and
+            isinstance(plan.get('armadaBootSwitch'), dict)):
+        source['bootSource'] = 'armada_boot'
+    identity = _identity(source)
     if identity is None or plan.get('transactionId') != identity['transactionId']:
         return None
     return identity
@@ -196,10 +208,15 @@ def _slot_digests(plan, name):
     return digests
 
 
-def _status_evidence(status, identity, model):
+def _status_evidence(status, identity, model, *, disk=False):
     """Return whether the final status proves the dual boot write completed."""
     if not isinstance(status, dict):
         return False
+    if identity.get('bootSource') == 'armada_boot':
+        if (status.get('bootSource') != 'armada_boot' or
+                'fromSlot' not in status or
+                'targetSlot' not in status):
+            return False
     return (
         type(status.get('schemaVersion')) is int and
         status['schemaVersion'] == 1 and
@@ -216,7 +233,8 @@ def _status_evidence(status, identity, model):
         status.get('state') == AWAITING_REBOOT and
         status.get('phase') == AWAITING_REBOOT and
         status.get('requiresReboot') is True and
-        status.get('bootWriteState') == 'written' and
+        status.get('bootWriteState') == ('not_started' if disk else 'written') and
+        (status.get('bootSource') == 'armada_boot') == disk and
         status.get('slotControlState') == 'not_issued' and
         status.get('bootPolicy') == BOOT_POLICY)
 
@@ -296,10 +314,24 @@ def execute_completion(prepared, plan, plan_sha256, status, report, ack,
     old_digests = _slot_digests(plan, 'originalBootSha256')
     if new_digests is None or old_digests is None:
         return None
-    if not _status_evidence(status, identity, plan_model):
+    disk = 'armadaBootSwitch' in plan
+    if not _status_evidence(status, identity, plan_model, disk=disk):
         return None
     if not isinstance(report, dict):
         return None
+    if disk:
+        switch = plan['armadaBootSwitch']
+        if (not isinstance(switch, dict) or old_digests != new_digests or
+                report.get('schemaVersion') != 1 or
+                report.get('phase') != 'armada_boot_selected' or
+                report.get('transactionId') != identity['transactionId'] or
+                report.get('planSha256') != identity['planSha256'] or
+                report.get('armadaBootSwitch') != switch or
+                switch.get('model') != plan_model or
+                switch.get('currentDeployment') != identity['oldDeployment'] or
+                switch.get('newDeployment') != identity['newDeployment']):
+            return None
+        return identity
     if (report.get('phase') != 'dual_boots_written' or
             report.get('model') != plan_model or
             report.get('transactionUuid') != identity['transactionId'] or
@@ -373,7 +405,11 @@ def _classify(receipt, trial, identity):
             trial.get('oldDeployment') != identity['oldDeployment'] or
             trial.get('newDeployment') != identity['newDeployment'] or
             trial.get('fromSlot') != identity['fromSlot'] or
-            trial.get('targetSlot') != identity['targetSlot']):
+            trial.get('targetSlot') != identity['targetSlot'] or
+            (identity.get('bootSource') == 'armada_boot' and (
+                trial.get('bootSource') != 'armada_boot' or
+                'fromSlot' not in trial or
+                'targetSlot' not in trial))):
         return _mismatch(
             identity, 'transaction_mismatch',
             'the live trial journal does not describe this session')

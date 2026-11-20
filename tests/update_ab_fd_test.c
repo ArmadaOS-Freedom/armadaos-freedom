@@ -29,6 +29,17 @@ int armada_update_ab_partition_fds(
     uint8_t uuid[16]
 );
 
+int armada_update_gpt_partition_fds(
+    const int fds[6],
+    const uint32_t sizes[6],
+    const uint64_t counts[6],
+    const uint8_t ids[6],
+    uint32_t enabled,
+    const char *label,
+    uint64_t result[3],
+    uint8_t uuid[16]
+);
+
 enum scenario {
     SC_VALID = 0,
     SC_CORRUPT_PRIMARY_GPT_CRC,
@@ -255,6 +266,23 @@ static void run_case(unsigned bs, unsigned selected, enum scenario sc)
         locator_fails(args_fds, sizes, counts, ids, enabled, long_label);
         locator_fails(args_fds, sizes, counts, ids, enabled, "boot_\xc3\xa9");
         locator_fails(args_fds, sizes, counts, ids, enabled, NULL);
+    }
+
+    uint64_t grc_result[3] = {0xdeadbeefu, 0xfeedfaceu, 0xcafebabeu};
+    uint8_t grc_uuid[16];
+    memset(grc_uuid, 0xa5, sizeof(grc_uuid));
+    if (sc == SC_RECOVERY_MISC_CMD) {
+        assert(armada_update_gpt_partition_fds(args_fds, sizes, counts, ids, enabled,
+                                               "boot_a", grc_result, grc_uuid) == 0);
+        assert(grc_result[0] == 4u && grc_result[1] == 8u && grc_result[2] == 8u);
+        assert(!memcmp(grc_uuid, expected_uuid[0], sizeof(grc_uuid)));
+    } else if (sc == SC_CORRUPT_PRIMARY_GPT_CRC) {
+        assert(armada_update_gpt_partition_fds(args_fds, sizes, counts, ids, enabled,
+                                               "boot_a", grc_result, grc_uuid) != 0);
+        assert(grc_result[0] == 0xdeadbeefu && grc_result[1] == 0xfeedfaceu &&
+               grc_result[2] == 0xcafebabeu);
+        for (unsigned j = 0; j < 16; ++j)
+            assert(grc_uuid[j] == 0xa5u);
     }
 
     assert(!f.writes && !f.lun_writes && !f.flushes);
