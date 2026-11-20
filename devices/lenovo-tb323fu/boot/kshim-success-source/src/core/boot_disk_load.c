@@ -169,6 +169,37 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return KSHIM_STORAGE_CRC;
     }
 
+    /* Reject null/overflow/overlap using the verified byte ranges before any
+     * payload read. Capacities keep their meaning; overlaps are checked
+     * pairwise over the actual verified lengths as uintptr_t. The three paths
+     * are disjoint exact board paths proven by code (distinct board table
+     * entries and fixed kernel/initrd paths), so buffers must be disjoint. */
+    {
+        uintptr_t k = (uintptr_t)buffers->kernel;
+        uintptr_t i = (uintptr_t)buffers->initrd;
+        uintptr_t d = (uintptr_t)buffers->dtb;
+        uintptr_t kb = (uintptr_t)verified.kernel_bytes;
+        uintptr_t ib = (uintptr_t)verified.initrd_bytes;
+        uintptr_t db = (uintptr_t)verified.dtb_bytes;
+
+        if (k == 0 || i == 0 || d == 0) {
+            return KSHIM_STORAGE_CRC;
+        }
+        if (kb > (uintptr_t)-1 - k || ib > (uintptr_t)-1 - i ||
+            db > (uintptr_t)-1 - d) {
+            return KSHIM_STORAGE_CRC;
+        }
+        if (k < i + ib && i < k + kb) {
+            return KSHIM_STORAGE_CRC;
+        }
+        if (k < d + db && d < k + kb) {
+            return KSHIM_STORAGE_CRC;
+        }
+        if (i < d + db && d < i + ib) {
+            return KSHIM_STORAGE_CRC;
+        }
+    }
+
     rc = read_hashed(dev, part, KSHIM_KERNEL_PATH, buffers->kernel,
                      (size_t)verified.kernel_bytes,
                      verified.kernel_sha256, scratch, scratch_bytes);

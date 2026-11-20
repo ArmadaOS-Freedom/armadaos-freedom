@@ -577,6 +577,9 @@ int kshim_ext4_read_file(const struct kshim_blockdev *dev,
         if (k == 0)
             continue;
 
+        if (k == 1 && name[0] == '.')
+            continue;
+
         if (k == 2 && name[0] == '.' && name[1] == '.')
             return KSHIM_STORAGE_ARG; /* '..' introduced by symlink */
 

@@ -203,6 +203,8 @@ int kshim_disk_bootargs(char out[2048], const char *signed_args,
         len = i - start;
         if (len > 0 && kshim_signed_token_reserved(signed_args + start, len))
             return -1;
+        if (len > 0 && kshim_signed_token_is(signed_args + start, len, "--"))
+            return -1;
         while (i < n && signed_args[i] == ' ')
             i++;
     }

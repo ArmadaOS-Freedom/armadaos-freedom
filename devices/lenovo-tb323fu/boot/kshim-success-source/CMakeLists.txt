@@ -287,6 +287,11 @@ if(DEFINED KSHIM_DISK_BOOT_BEARSSL OR DEFINED KSHIM_DISK_BOOT_KEY_HEADER)
             "KSHIM_DISK_BOOT requires BOTH KSHIM_DISK_BOOT_BEARSSL (path) and "
             "KSHIM_DISK_BOOT_KEY_HEADER (file) to be set; only one was provided.")
     endif()
+    if(NOT CONFIG_KSHIM_UFS_NATIVE_IO OR NOT CONFIG_KSHIM_UFS_SETTINGS)
+        message(FATAL_ERROR
+            "KSHIM_DISK_BOOT requires CONFIG_KSHIM_UFS_NATIVE_IO and "
+            "CONFIG_KSHIM_UFS_SETTINGS to be enabled.")
+    endif()
     if(NOT IS_DIRECTORY "${KSHIM_DISK_BOOT_BEARSSL}")
         message(FATAL_ERROR "KSHIM_DISK_BOOT_BEARSSL is not a directory: ${KSHIM_DISK_BOOT_BEARSSL}")
     endif()

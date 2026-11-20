@@ -91,6 +91,16 @@ int kshim_settings_note_boot(struct kshim_settings_session *s,uint32_t target){
     if(!note_rc)s->values.last_target=target;
     return note_rc;
 }
+static unsigned log_calls;
+static struct kshim_ufs_settings *log_last;
+static uint32_t log_target,log_phase;
+static int32_t log_status;
+int kshim_ufs_settings_log_boot(struct kshim_ufs_settings *b,uint32_t target,
+                                uint32_t phase,int32_t status){
+    assert(mmu_on);
+    ++log_calls;log_last=b;log_target=target;log_phase=phase;log_status=status;
+    return 0;
+}
 static void late_history(void){
     last->settings.source=KSHIM_SETTINGS_INTERNAL;last->settings.values.last_target=0;
     mmu_on=0;
@@ -226,7 +236,6 @@ static void trial_io(void){
     assert(storage_settings_native_trial_load(NULL,&selected)==KSHIM_STORAGE_ARG);
     assert(storage_settings_native_trial_save(55,NULL,&written)==KSHIM_STORAGE_ARG);
 }
-/* ---- add to tests/storage_settings_native_test.c (NOT RUN) ---- */
 
 static int boot_read_native_calls;
 
@@ -269,7 +278,28 @@ static void native_boot_read(void)
     assert(!mmu_on);
 }
 
-/* main: call native_boot_read(); right after trial_io(); */
+static void native_log_boot(void)
+{
+    struct kshim_ufs_settings *b = last;
+    unsigned e0, c0;
+
+    assert(b != NULL);
+    last->unsafe = 0; mmu_on = 0;
+    root_table = 0x4000; enable_rc = close_rc = 0;
+    last->board = DEVICE_BOARD_TB323FU;
+    enables = closes = 0;
+    log_calls = 0; log_last = NULL;
+    log_target = log_phase = 0; log_status = 0;
+
+    e0 = enables; c0 = closes;
+
+    assert(storage_settings_native_log_boot(3, 2, -5) == 0);
+    assert(log_calls == 1 && log_last == b);
+    assert(log_target == 3 && log_phase == 2 && log_status == -5);
+    assert(enables == e0 + 1 && closes == c0 + 1);
+    assert(!mmu_on);
+    assert(storage_settings_native_handoff_safe());
+}
 
 int main(void){
     const struct kshim_config_values defaults={0,0,1, 0, 0};
@@ -298,6 +328,7 @@ int main(void){
     native_success();
     trial_io();
     native_boot_read();
+    native_log_boot();
     unsigned old=opens;last->unsafe=1;
     assert(!storage_settings_native_handoff_safe());
     assert(storage_settings_native_open(DEVICE_BOARD_TB322FC,&defaults)==KSHIM_UFS_QUARANTINED&&opens==old);

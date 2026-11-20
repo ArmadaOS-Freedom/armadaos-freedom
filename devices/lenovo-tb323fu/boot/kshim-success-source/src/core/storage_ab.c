@@ -66,7 +66,7 @@ static void release(struct capture *c)
         free(c->table[l].next);
     }
 }
-static int load_table(const struct kshim_blockdev *d,struct table *t)
+static int load_table(const struct kshim_blockdev *d,struct table *t,int strict_labels)
 {
     if((d->block_size!=512 && d->block_size!=4096)||d->block_count<10)return KSHIM_STORAGE_FORMAT;
     for(unsigned j=0;j<2;++j) {
@@ -94,7 +94,7 @@ static int load_table(const struct kshim_blockdev *d,struct table *t)
         for(unsigned i=0;i<count;++i) {
             uint8_t *p=e+i*ENTRY_BYTES;char text[37];if(zero(p,16))continue;
             uint64_t a=r64(p+32),b=r64(p+40);
-            if(zero(p+16,16)||name(p,text)<1||a<first||a>b||b>last)return KSHIM_STORAGE_RANGE;
+            if(zero(p+16,16)||(strict_labels&&name(p,text)<1)||a<first||a>b||b>last)return KSHIM_STORAGE_RANGE;
             for(unsigned k=0;k<i;++k){uint8_t *q=e+k*ENTRY_BYTES;
                 if(!zero(q,16) && a<=r64(q+40) && r64(q+32)<=b)return KSHIM_STORAGE_RANGE;}
         }
@@ -111,7 +111,7 @@ static int load(const struct kshim_ab_media *m,struct capture *c)
 {
     uint8_t scratch[4096];int rc;
     if(!m||!m->get_boot_lun)return KSHIM_STORAGE_ARG;
-    for(unsigned l=0;l<KSHIM_AB_LUNS;++l)if((rc=load_table(&m->lun[l],&c->table[l])))return rc;
+    for(unsigned l=0;l<KSHIM_AB_LUNS;++l)if((rc=load_table(&m->lun[l],&c->table[l],1)))return rc;
     c->boot[0]=find(c,"boot_a",&c->boot_lun[0]);c->boot[1]=find(c,"boot_b",&c->boot_lun[1]);
     c->misc=find(c,"misc",&c->misc_lun);
     if(!c->boot[0]||!c->boot[1]||!c->misc)return KSHIM_STORAGE_CONFLICT;
@@ -201,7 +201,7 @@ static int find_partition_common(const struct kshim_ab_media *m, const char *lab
             goto done;
     } else {
         for (unsigned l = 0; l < KSHIM_AB_LUNS; ++l)
-            if ((rc = load_table(&m->lun[l], &c->table[l])))
+            if ((rc = load_table(&m->lun[l], &c->table[l], 0)))
                 goto done;
     }
 
