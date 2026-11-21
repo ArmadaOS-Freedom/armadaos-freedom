@@ -319,9 +319,33 @@ static void print_entry_name(const MANIFEST_ENTRY *entry)
     }
 }
 
+#if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS && defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+static uint32_t unique_disk_diagnostic_index(const MANIFEST_VIEW *view, uint64_t linux_base,
+                                             const struct device_info *info)
+{
+    uint32_t found = UINT32_MAX;
+    if (!(info->board == DEVICE_BOARD_TB322FC || info->board == DEVICE_BOARD_TB323FU))
+        return found;
+    for (uint32_t i = 0; i + 1 < view->manifest->header.entry_count; ++i) {
+        const MANIFEST_ENTRY *entry = view->entries[i];
+        if (entry->type != MF_ENTRY_TYPE_DISK_LINUX ||
+            !(entry->flags & MF_ENTRY_FLAG_EXECUTABLE)) continue;
+        const void *disk_blob = (const void *)(uintptr_t)(linux_base + entry->offset);
+        struct kshim_disk_entry disk_entry;
+        if (kshim_disk_entry_decode(disk_blob, (size_t)entry->size, &disk_entry) == 0 &&
+            disk_entry.diagnostic) {
+            if (found != UINT32_MAX) return UINT32_MAX;
+            found = i;
+        }
+    }
+    return found;
+}
+#endif
+
 static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t linux_base,
                              const struct device_info *info, uint32_t next_action,
-                             bool *one_shot, uint32_t *boot_target)
+                             bool *one_shot, uint32_t *boot_target,
+                             uint32_t diagnostic_index)
 {
     uint32_t indexes[MANIFEST_MAX_ENTRIES];
     char labels[MANIFEST_MAX_ENTRIES][96];
@@ -406,17 +430,18 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
         ++count;
     }
     *one_shot=false;
-    if (next_action==KSHIM_ACTION_ANDROID||next_action==KSHIM_ACTION_LINUX||
-        next_action==KSHIM_ACTION_LINUX_DIAG) {
+    if (next_action==KSHIM_ACTION_LINUX_DIAG && diagnostic_index!=UINT32_MAX) {
+        *one_shot=true;
+        *boot_target=0;
+        return diagnostic_index;
+    }
+    if (next_action==KSHIM_ACTION_ANDROID||next_action==KSHIM_ACTION_LINUX) {
         size_t match_count=0, match_idx=0;
         for (size_t k=0;k<count;++k) {
             bool role_ok=false, board_ok=true;
-            if (next_action==KSHIM_ACTION_ANDROID)
-                role_ok=(roles[k]==KSHIM_MENU_ROLE_ANDROID);
-            else if (next_action==KSHIM_ACTION_LINUX)
-                role_ok=(roles[k]==KSHIM_MENU_ROLE_INTERNAL);
-            else
-                role_ok=(roles[k]==KSHIM_MENU_ROLE_DIAGNOSTIC);
+            role_ok=(next_action==KSHIM_ACTION_ANDROID) ?
+                (roles[k]==KSHIM_MENU_ROLE_ANDROID) :
+                (roles[k]==KSHIM_MENU_ROLE_INTERNAL);
             if (!role_ok) continue;
             if (next_action!=KSHIM_ACTION_ANDROID) {
                 /* require actual board known/safe and payload matches */
@@ -1074,6 +1099,7 @@ int kshim_main(
         }
 
         uint32_t consumed_action=KSHIM_ACTION_NONE;
+        uint32_t diagnostic_index=UINT32_MAX;
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
         const struct kshim_config_values defaults={0,0,(uint32_t)kshim_menu_get_language(), 0, 0};
         (void)storage_settings_native_open(device_info.board,&defaults);
@@ -1100,6 +1126,10 @@ int kshim_main(
                     (device_info.board==DEVICE_BOARD_TB322FC || device_info.board==DEVICE_BOARD_TB323FU))
                     admissible=1;
                 if (admissible) {
+#if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS && defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+                    if (raw_action==KSHIM_ACTION_LINUX_DIAG)
+                        diagnostic_index=unique_disk_diagnostic_index(&view,linux_base,&device_info);
+#endif
 #if CONFIG_KSHIM_QCOM_REBOOT
                     if (raw_action==KSHIM_ACTION_EDL) {
                         EdlRequestSeen=raw_action;
@@ -1107,7 +1137,7 @@ int kshim_main(
                     }
 #endif
                     uint32_t action=0;
-                    int status=kshim_settings_take_action(session,&action);
+                    int status=kshim_settings_take_action(session,&action,diagnostic_index!=UINT32_MAX);
 #if CONFIG_KSHIM_QCOM_REBOOT
                     if (raw_action==KSHIM_ACTION_EDL) EdlRequestStatus=status;
 #endif
@@ -1141,7 +1171,8 @@ int kshim_main(
         uint32_t boot_target=0;
         bool one_shot=false;
         uint32_t selected_index = select_image(&view, device_tree_address, linux_base,
-                                               &device_info, consumed_action, &one_shot, &boot_target);
+                                               &device_info, consumed_action, &one_shot, &boot_target,
+                                               diagnostic_index);
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
         kshim_platform_bind_settings(NULL);
         if (!storage_settings_native_handoff_safe()) {
