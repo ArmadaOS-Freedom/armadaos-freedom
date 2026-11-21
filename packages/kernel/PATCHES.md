@@ -1339,7 +1339,3 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Reject PCM starts after a failed reprepare. Shared AudioReach code; persistent DSP failure still uses best-effort DPCM cleanup.
-- `patches/0751-ASoC-qcom-quiesce-elden-audio-in-system-sleep.patch`
-  source: https://github.com/yzddmr6/linux-sm8750-erhai/tree/da4b783e34bd05d7451a6f904fbf567af1215f99 (adapted Erhai SoundWire and LPASS changes; Armada Elden TX/VA extension)
-  upstream: local
-  notes: Run SoundWire and LPASS system sleep PM on `lenovo,elden` after the normal ASoC suspend phase, restoring clocks before ASoC resume. Quiesce the main IRQ before gating the interface clock in that device's system sleep path.
