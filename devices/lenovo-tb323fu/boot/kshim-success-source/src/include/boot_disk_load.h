@@ -22,12 +22,13 @@ struct kshim_disk_boot_buffers {
 };
 
 /*
- * 只读地从 part 上固定绝对路径读取并校验 boot 载荷：
- *   /armada/boot/manifest.bin (160 字节)
- *   /armada/boot/manifest.sig (8..72 字节)
- *   /armada/boot/kernel.img   (校验签名 size + SHA-256)
- *   /armada/boot/initramfs.img
- *   /armada/boot/board.dtb
+ * 只读地从 part 上固定绝对路径读取并校验 boot 载荷，<model> 为
+ * TB322FC 或 TB323FU：
+ *   /armada/boot/<model>/manifest.bin (160 字节)
+ *   /armada/boot/<model>/manifest.sig (8..72 字节)
+ *   /armada/boot/kernel.img   (共享；校验签名 size + SHA-256)
+ *   /armada/boot/initramfs.img (共享)
+ *   /armada/boot/<model>/board.dtb
  *
  * 契约：
  *  - 绝不 malloc / free，绝不写设备，仅使用 caller 提供的 scratch。
