@@ -302,6 +302,62 @@ class OfflineExecuteTest(unittest.TestCase):
             self.assertFalse((work / "boots").exists() and
                              any((work / "boots").iterdir()))
 
+    def test_disk_path_boot_disk_switch_failures_set_status_state(self):
+        """Contract: real BootDiskSwitchError yields result state 'failed';
+        real BootDiskSwitchUncertainError marks on-disk status
+        'recovery_required' because the selector may have started."""
+        for exc_type, expected_state in (
+                (offline_execute.boot_disk_switch.BootDiskSwitchError, "failed"),
+                (offline_execute.boot_disk_switch.BootDiskSwitchUncertainError,
+                 "recovery_required")):
+            with self.subTest(exc=exc_type.__name__), self.fixture._case() as env:
+                _prepared, _initial_bytes, ack = self._ready(env)
+                initial = dict(env.physical, bootSource="armada_boot",
+                               actualSlot=None, inactiveSlot=None)
+                work = env.work
+                saved_status = self._json(work, "status.json")
+                saved_status.update(bootSource="armada_boot",
+                                    fromSlot=None, targetSlot=None)
+                tx = saved_status["transactionId"]
+                expected = Path(work)
+                plan = {
+                    "sysrootPath": str(expected / "sysroot"),
+                    "armadaBootSwitch": {
+                        "fromSlot": saved_status["fromSlot"],
+                        "targetSlot": saved_status["targetSlot"],
+                        "kernel": "armada",
+                        "nextBoot": "armada",
+                    },
+                }
+                ctx = {
+                    "saved_status": dict(saved_status),
+                    "initial": initial,
+                    "plan": plan,
+                    "disk": True,
+                    "tx": tx,
+                }
+                fake_activate = mock.Mock(side_effect=exc_type("injected failure"))
+
+                with ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(
+                        offline_execute, "_preflight", return_value=ctx))
+                    stack.enter_context(mock.patch.object(
+                        offline_execute.boot_disk_switch, "activate",
+                        fake_activate))
+                    with self.assertRaises(
+                            system_transaction.SystemTransactionError) as raised:
+                        offline_execute._execute_offline_update(
+                            work_dir=work, recovery_ack=ack)
+
+                self.assertEqual(raised.exception.result["state"], expected_state)
+                self.assertFalse(raised.exception.result["requiresReboot"])
+                self.assertEqual(raised.exception.result["bootWriteState"],
+                                 "not_started")
+                on_disk_status = self._json(work, "status.json")
+                self.assertEqual(on_disk_status["state"], expected_state)
+                self.assertFalse(on_disk_status["requiresReboot"])
+                self.assertEqual(on_disk_status["bootWriteState"], "not_started")
+
     def test_disk_path_write_report_failure_occurs_before_activate(self):
         """Contract: an injected OSError on the pre-activate write-report
         persists failure with bootWriteState=not_started, does not invoke

@@ -430,6 +430,7 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                                  ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
                         reclaim_failed_target=True)
                 except boot_disk_switch.BootDiskSwitchUncertainError:
+                    selector_started = True
                     raise
                 else:
                     selector_started = True
