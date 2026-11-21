@@ -23,6 +23,13 @@ int kshim_ab_inspect(const struct kshim_ab_media *, struct kshim_ab_status *);
  * and duplicate labels. */
 int kshim_ab_find_partition(const struct kshim_ab_media *, const char *label,
                             unsigned *lun, struct kshim_partition *partition);
+/* GPT-only, read-only lookup by ASCII label. Uses the same fully validated
+ * six-LUN GPT parse (CRC, backup agreement, overlaps) but performs no slot
+ * control, misc, or Boot LUN operations. Intended for Linux disk-boot mode
+ * where Android slot metadata is absent. Rejects missing/duplicate labels;
+ * outputs unchanged on error. */
+int kshim_ab_find_partition_gpt(const struct kshim_ab_media *, const char *label,
+                                unsigned *lun, struct kshim_partition *partition);
 int kshim_ab_select(const struct kshim_ab_media *, unsigned target, unsigned expected_current);
 /* Mark the current slot SUCCESS after the caller has independently verified
  * Linux health (booted from the current slot and validated it). Only touches
