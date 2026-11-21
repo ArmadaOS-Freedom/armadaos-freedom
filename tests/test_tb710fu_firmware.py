@@ -77,8 +77,9 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue((BUNDLE / name).is_file() or (SYSTEM_FW / name).is_file(), name)
 
     def test_iris_is_enabled_with_the_shipped_firmware(self):
-        # The board file enables iris with the unit's firmware; the patch must not disable it again.
+        # The board file enables iris with the unit's firmware, and the patch keeps it explicitly enabled.
         text = DTS_PATCH.read_text(encoding="utf-8")
+        self.assertRegex(text, r"\+&iris \{\n\+\tstatus = \"okay\";")
         self.assertNotRegex(text, r"\+&iris \{\n\+\tstatus = \"disabled\";")
         board = DTS.read_text(encoding="utf-8")
         node = re.search(r"&iris \{(.*?)\n\};", board, re.S)
