@@ -36,19 +36,15 @@ static uint32_t dt_parent_index_u32(const void *p)
            ((uint32_t)b[2] << 8) | (uint32_t)b[3];
 }
 
-/* Insert in ascending order; tree order breaks ties, so a handle used twice is
- * still adjacent to itself exactly where the full walk met it twice. */
+/* Append in scan order; equal handles stay in separate entries. Ordering is
+ * established once by dt_parent_index_sort_phandles() before publishing. */
 static bool dt_parent_index_add_phandle(int *count, uint32_t phandle, int node)
 {
     if (!phandle || phandle == UINT32_MAX) return true;
     if (*count >= DT_PARENT_INDEX_MAX) return false;
-    int at = (*count)++;
-    while (at > 0 && dt_phandle_index[at - 1].phandle > phandle) {
-        dt_phandle_index[at] = dt_phandle_index[at - 1];
-        --at;
-    }
-    dt_phandle_index[at].phandle = phandle;
-    dt_phandle_index[at].node = node;
+    dt_phandle_index[*count].phandle = phandle;
+    dt_phandle_index[*count].node = node;
+    ++*count;
     return true;
 }
 
@@ -64,6 +60,49 @@ static bool dt_parent_index_finish(int at, const struct dt_parent_index_props *p
     uint32_t phandle = p->a && p->alen == 4 ? dt_parent_index_u32(p->a) :
                        p->b && p->blen == 4 ? dt_parent_index_u32(p->b) : 0;
     return dt_parent_index_add_phandle(phandles, phandle, dt_parent_index[at].node);
+}
+
+/* Max-heap sift-down on dt_phandle_index by phandle key, root is candidate
+ * position; count limits the sub-heap. Promotes the larger child while its key
+ * exceeds the saved root entry, then writes the saved entry to the hole. */
+static void dt_phandle_index_sift_down(int root, int count)
+{
+    struct dt_phandle_index_entry saved = dt_phandle_index[root];
+    int child = 2 * root + 1;
+    while (child < count) {
+        if (child + 1 < count &&
+            dt_phandle_index[child + 1].phandle > dt_phandle_index[child].phandle)
+            ++child;
+        if (dt_phandle_index[child].phandle <= saved.phandle)
+            break;
+        dt_phandle_index[root] = dt_phandle_index[child];
+        root = child;
+        child = 2 * root + 1;
+    }
+    dt_phandle_index[root] = saved;
+}
+
+/* In-place heapsort of the collected handles; stable tie order is not
+ * required because duplicate handles compare equal at lookup. */
+static void dt_phandle_index_sort(void)
+{
+    int count = dt_phandle_index_count;
+    bool sorted = true;
+    for (int i = 0; i + 1 < count; ++i) {
+        if (dt_phandle_index[i].phandle > dt_phandle_index[i + 1].phandle) {
+            sorted = false;
+            break;
+        }
+    }
+    if (sorted) return;
+    for (int i = count / 2 - 1; i >= 0; --i)
+        dt_phandle_index_sift_down(i, count);
+    for (int end = count - 1; end > 0; --end) {
+        struct dt_phandle_index_entry tmp = dt_phandle_index[0];
+        dt_phandle_index[0] = dt_phandle_index[end];
+        dt_phandle_index[end] = tmp;
+        dt_phandle_index_sift_down(0, end);
+    }
 }
 
 /* Bounded length of a NUL-terminated name inside the structure block. */
@@ -144,6 +183,7 @@ void dt_parent_index_begin(const void *f)
     if (depth >= 0 || !count) return;
     dt_phandle_index_count = phandles;
     dt_phandle_index_malformed = malformed;
+    dt_phandle_index_sort();
     dt_parent_index_fdt = f;
     dt_parent_index_count = count;
 }

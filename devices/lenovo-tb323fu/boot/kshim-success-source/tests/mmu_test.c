@@ -53,9 +53,12 @@ int main(void)
     /* Repeated configuration reuses the same table pages and rebuilds them. */
     uint64_t first_root = kshim_mmu_root_table();
     assert(first_root != 0);
+    config.extra_region_count=2;
     assert(!kshim_mmu_configure(&config));
     assert(kshim_mmu_root_table() == first_root);
     assert(entry(0xa90000)&1);
+    assert(!entry(0x80860000));
+    config.extra_region_count=3;
     maps[1].type=KSHIM_MMU_NORMAL_WB;
     assert(kshim_mmu_configure(&config)); maps[1].type=KSHIM_MMU_DEVICE;
     assert(!kshim_mmu_prepare_handoff()); /* failed regular configuration */

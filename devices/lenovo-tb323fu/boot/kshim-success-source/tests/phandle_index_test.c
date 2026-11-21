@@ -429,7 +429,7 @@ int main(void)
         char name[16];
         snprintf(name, sizeof(name), "n%d", i);
         b_begin(&b, name);
-        b_prop_u32(&b, "phandle", (uint32_t)i + 2);
+        b_prop_u32(&b, "phandle", (uint32_t)3001 - (uint32_t)i);
         b_end(&b);
     }
     b_end(&b);
@@ -440,11 +440,11 @@ int main(void)
     dt_parent_index_begin(bulk);
     g_walks = 0;
     for (i = 0; i < 3000; ++i)
-        assert(dt_phandle(bulk, (uint32_t)i + 2) == g_nodes[i + 1]);
+        assert(dt_phandle(bulk, (uint32_t)2 + (uint32_t)i) == g_nodes[3000 - i]);
     assert(g_walks == 0);                 /* 3000 lookups, zero tree walks */
     dt_parent_index_end();
     g_walks = 0;
-    assert(dt_phandle(bulk, 2) == g_nodes[1]);
+    assert(dt_phandle(bulk, 2) == g_nodes[3000]);
     assert(g_walks > 0);                  /* outside the scope: full walk */
 
     puts("dt_phandle_index_test: ok");
