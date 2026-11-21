@@ -122,7 +122,7 @@ def main(argv=None):
         require(v4, 'This launcher does not support next-boot and log settings')
     writing = args.reboot or args.cancel or args.next is not None or args.log is not None
     dev, part_uuid, board, device_number = device_context(
-        require_edl=(not v4 or not writing or args.reboot or args.next == 'edl'))
+        require_edl=(not v4 or args.reboot or args.next == 'edl'))
     fd = os.open(dev, (os.O_RDWR if writing else os.O_RDONLY) | os.O_CLOEXEC)
     try:
         require(os.fstat(fd).st_rdev == device_number, 'Backup device changed')
