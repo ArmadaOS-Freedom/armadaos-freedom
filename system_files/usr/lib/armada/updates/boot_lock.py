@@ -2,7 +2,7 @@
 
 import struct
 
-from .boot_context import BootContextError, _read_regular
+from .boot_context import WITNESS_SOURCES, BootContextError, _read_regular
 
 
 LOCK_PATH = "/sys/firmware/devicetree/base/chosen/armada,boot-lock"
@@ -17,7 +17,8 @@ def decode_boot_lock(raw):
         raise BootLockError("boot-lock witness must be exactly 16 bytes")
 
     version, source, state, flags = struct.unpack(">4I", raw)
-    if version != 1 or source != 1 or flags != 0 or state not in (1, 2):
+    if (version != 1 or source not in WITNESS_SOURCES or flags != 0
+            or state not in (1, 2)):
         raise BootLockError("invalid boot-lock witness cells")
 
     return "locked" if state == 1 else "unlocked"

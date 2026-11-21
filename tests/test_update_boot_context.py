@@ -114,6 +114,17 @@ class BootContextTests(unittest.TestCase):
         self.assertEqual(ctx["inactiveSlot"], "a")
         self.assertEqual(ctx["deployment"], f"armada/{COMMIT_CSUM}.42")
 
+    def test_bootconfig_source_witness_accepted(self):
+        for slot, actual, inactive in ((0, "a", "b"), (1, "b", "a")):
+            with self.subTest(slot=slot):
+                ctx = decode_boot_context(
+                    make_witness(source=2, slot=slot),
+                    make_cmdline(),
+                    make_booted(),
+                )
+                self.assertEqual(ctx["actualSlot"], actual)
+                self.assertEqual(ctx["inactiveSlot"], inactive)
+
     def test_invalid_witness_rejected(self):
         cases = [
             ("none", None),
@@ -123,7 +134,7 @@ class BootContextTests(unittest.TestCase):
             ("version_0", make_witness(version=0)),
             ("version_2", make_witness(version=2)),
             ("source_0", make_witness(source=0)),
-            ("source_2", make_witness(source=2)),
+            ("source_3", make_witness(source=3)),
             ("slot_2", make_witness(slot=2)),
             ("slot_max", make_witness(slot=0xFFFFFFFF)),
             ("flags_nonzero", make_witness(flags=1)),

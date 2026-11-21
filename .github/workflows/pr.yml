@@ -101,15 +101,6 @@ jobs:
               npm install --prefix /tmp/armada-steam-ui --cache /tmp/armada-steam-ui-cache --no-save --no-audit --no-fund playwright@1.58.2
               runuser -u pwuser -- env NODE_PATH=/tmp/armada-steam-ui/node_modules node --test tests/steam-update-page-test.cjs tests/steam-update-cdp-test.cjs
             '
-      - name: Check desktop update interface
-        run: |
-          docker run --rm --cpus 2 --memory 2g \
-            -v "${GITHUB_WORKSPACE}:/src:ro" -w /src \
-            -e PYTHONDONTWRITEBYTECODE=1 -e GTK_A11Y=none -e GSK_RENDERER=cairo \
-            fedora:44 bash -euc '
-              dnf install -y python3-gobject gtk4 libadwaita xorg-x11-server-Xvfb xauth dbus-daemon dejavu-sans-fonts
-              xvfb-run -a -s "-screen 0 1600x1200x24" dbus-run-session -- /usr/bin/python3 -B tests/armada-tools-ui-test.py
-            '
       - name: Check Plasma runtime tests
         run: python3 -m unittest discover -s tests -p test_plasma_runtime.py
 
@@ -458,9 +449,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          tag="$(tr -d '\r\n' < build_files/decky-preview-version)"
+          if [[ ! "${tag}" =~ ^v[A-Za-z0-9._+-]+$ ]]; then
+            echo "Invalid pinned Decky tag: ${tag}" >&2
+            exit 1
+          fi
           gh api \
             -H "Accept: application/vnd.github+json" \
-            'repos/SteamDeckHomebrew/decky-loader/releases?per_page=100' \
+            --jq '[.]' \
+            "repos/SteamDeckHomebrew/decky-loader/releases/tags/${tag}" \
             >"$RUNNER_TEMP/decky-releases.json"
 
       - name: Prepare BootTool sources

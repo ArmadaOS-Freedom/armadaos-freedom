@@ -3,10 +3,10 @@
 # curl and systemctl are stubbed; a rewritten copy of the production script
 # points its hard-coded image paths at a per-case sandbox.
 #
-# Decky platform policy is preview: the newest non-draft eligible stable or
-# prerelease, taken from prefetched release metadata when supplied and otherwise
-# fetched from the exact release-list endpoint. Drafts and non-v tags are excluded.
-# /releases/latest is never used.
+# Decky platform policy is mirrored previews: only the preview version pinned in
+# /ctx/build_files/decky-preview-version is installed. Stable releases and drafts
+# are rejected, as are non-v tags. Prefetched release metadata is preferred over
+# the exact release-list endpoint; /releases/latest is never used.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,8 +15,9 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 LIST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100'
+TAG_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/tags/v3.3.1-pre1'
 LATEST_URL='https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest'
-TARGET_TAG='v3.3.0'
+TARGET_TAG='v3.3.1-pre1'
 
 FAKE="$WORK/fake"
 FIXTURES="$WORK/fixtures"
@@ -37,6 +38,7 @@ sed \
     -e "s|/usr/lib/decky-loader/armada-decky-sync|$FAKE/usr/lib/decky-loader/armada-decky-sync|g" \
     -e "s|/etc/systemd/system/plugin_loader.service|$FAKE/etc/systemd/system/plugin_loader.service|g" \
     -e "s|/run/secrets/decky_releases|$FAKE/run/secrets/decky_releases|g" \
+    -e "s|/ctx/build_files/decky-preview-version|$FAKE/ctx/build_files/decky-preview-version|g" \
     "$SRC" >"$WORK/build-under-test.sh"
 chmod +x "$WORK/build-under-test.sh"
 
@@ -61,16 +63,20 @@ emit() {
 }
 
 case "$url" in
-    "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases?per_page=100")
-        emit "$FIXTURE_DIR/releases.json"
-        exit 0
+    "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/tags/$(<"$FIXTURE_DIR/tag.txt")")
+        if [[ -f "$FIXTURE_DIR/release.json" ]]; then
+            emit "$FIXTURE_DIR/release.json"
+            exit 0
+        fi
+        echo "curl stub: release tag not found" >&2
+        exit 22
         ;;
     "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest")
-        echo "curl stub: refusing releases/latest; preview policy requires the release list" >&2
+        echo "curl stub: refusing releases/latest; preview policy requires the exact pinned tag" >&2
         exit 22
         ;;
     https://api.github.com/repos/SteamDeckHomebrew/decky-loader/*)
-        echo "curl stub: refusing non-contract release-list URL $url" >&2
+        echo "curl stub: refusing non-contract release URL $url" >&2
         exit 22
         ;;
 esac
@@ -124,7 +130,7 @@ import struct
 import sys
 
 out, mode = sys.argv[1], sys.argv[2]
-tag = "v3.3.0"
+tag = "v3.3.1-pre1"
 base = "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/" + tag
 
 
@@ -227,27 +233,35 @@ if mode == "no-eligible":
         release(105, "nightly-build", "2026-10-22T00:00:00Z", False, False),
     ]
 elif mode == "stable-only":
-    # Only the stable release is present; stable selection must succeed.
+    # Only the same-base stable release is present; it must be refused because
+    # the pinned preview tag is a prerelease.
     releases = [
-        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
+        release(101, "v3.3.1", "2026-10-20T12:00:00Z", False, False),
     ]
 else:
     releases = [
         # Older prerelease with its own valid ARM64 asset: latest-by-published_at
         # must win over array order, and refusal cases must not fall back here.
         release(102, "v3.2.10-pre1", "2026-09-02T03:04:05Z", True, False, older_assets),
-        # Older prerelease v3.3.0-pre1 with its own coherent assets: must not
-        # be selected over the newer stable v3.3.0, and must not be reused as
-        # fallback assets for the target stable.
+        # Older prerelease v3.3.0-pre1 with its own coherent assets: must not be
+        # selected over the newer pinned prerelease and must not be reused as
+        # fallback assets for the target release.
         release(103, "v3.3.0-pre1", "2026-10-18T01:21:08Z", True, False, pre_assets),
-        # Target: newest published non-draft stable v3.3.0.
-        release(101, "v3.3.0", "2026-10-20T12:00:00Z", False, False),
+        # Target: pinned non-draft prerelease v3.3.1-pre1.
+        release(101, "v3.3.1-pre1", "2026-10-20T12:00:00Z", True, False),
+        # Newer same-base stable: must never be treated as the target.
+        release(106, "v3.3.1", "2026-10-22T12:00:00Z", False, False),
         # Still newer draft prerelease: drafts must be filtered out.
         release(104, "v3.4.0-pre1", "2026-10-21T09:30:00Z", True, True),
     ]
 
 with open(os.path.join(out, "releases.json"), "w") as handle:
     json.dump(releases, handle, indent=2)
+
+target = next((item for item in releases if item.get("tag_name") == tag), None)
+if target is not None:
+    with open(os.path.join(out, "release.json"), "w") as handle:
+        json.dump(target, handle, indent=2)
 with open(os.path.join(out, "arm64.bin"), "wb") as handle:
     handle.write(served_arm)
 with open(os.path.join(out, "x86.bin"), "wb") as handle:
@@ -282,12 +296,15 @@ assert_exists() { [[ -e "$1" ]] || case_fail "missing $1"; }
 assert_absent() { [[ ! -e "$1" ]] || case_fail "unexpected $1"; }
 
 # Every case must prove the preview-channel policy was exercised: the exact
-# release list with per_page=100 was requested and releases/latest never was.
+# pinned tag was requested from the by-tag endpoint and releases/latest never was.
 assert_preview_release_list() {
-    grep -qxF "$LIST_URL" "$CURL_LOG" ||
-        case_fail "did not request the release list"
+    grep -qxF "$TAG_URL" "$CURL_LOG" ||
+        case_fail "did not request the pinned release by tag"
     if grep -qF "$LATEST_URL" "$CURL_LOG"; then
-        case_fail "requested releases/latest instead of the release list"
+        case_fail "requested releases/latest instead of the pinned release tag"
+    fi
+    if grep -qxF "$LIST_URL" "$CURL_LOG"; then
+        case_fail "requested the release list instead of the pinned release tag"
     fi
 }
 
@@ -315,6 +332,8 @@ setup_case() {
     mkdir -p "$FAKE/ctx/decky" "$FAKE/packages" \
         "$FAKE/usr/share/decky-loader" "$FAKE/usr/lib/decky-loader" \
         "$FAKE/etc/systemd/system" "$FAKE/usr/lib/armada"
+    mkdir -p "$FAKE/ctx/build_files"
+    printf '%s\n' "$TARGET_TAG" >"$FAKE/ctx/build_files/decky-preview-version"
     # Real updates module from the system tree, not a stub: the installer must
     # exercise the actual updates.decky_release selector under PYTHONPATH.
     cp -a "$ROOT/system_files/usr/lib/armada/updates" "$FAKE/usr/lib/armada/updates"
@@ -409,10 +428,10 @@ with open(blob_path, "rb") as handle:
     blob = handle.read()
 expected = {
     "release_id": 101,
-    "tag": "v3.3.0",
+    "tag": "v3.3.1-pre1",
     "published_at": "2026-10-20T12:00:00Z",
     "asset_id": 9002,
-    "url": "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.0/PluginLoader-arm64",
+    "url": "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/v3.3.1-pre1/PluginLoader-arm64",
     "size": len(blob),
     "sha256": hashlib.sha256(blob).hexdigest(),
 }
@@ -484,7 +503,7 @@ PY
         case_fail "downloaded the x86 PluginLoader asset"
     fi
 
-    grep -qE "(raw\.githubusercontent\.com/SteamDeckHomebrew/decky-loader/|github\.com/SteamDeckHomebrew/decky-loader/raw/)(refs/tags/)?v3\.3\.0/dist/plugin_loader-prerelease\.service$" "$CURL_LOG" ||
+    grep -qE "(raw\.githubusercontent\.com/SteamDeckHomebrew/decky-loader/|github\.com/SteamDeckHomebrew/decky-loader/raw/)(refs/tags/)?v3\.3\.1-pre1/dist/plugin_loader-prerelease\.service$" "$CURL_LOG" ||
         case_fail "service not fetched from the $TARGET_TAG prerelease service"
     if grep -qF 'plugin_loader-release.service' "$CURL_LOG"; then
         case_fail "fetched the stable plugin_loader-release.service"
@@ -517,6 +536,9 @@ refusal_case() {
             prefetch-empty | prefetch-malformed)
                 if grep -qE '/releases/download/|/PluginLoader(-arm64)?$|plugin_loader-(release|prerelease)[.]service' "$CURL_LOG"; then
                     case_fail "attempted downloads after an invalid prefetched release list"
+                fi
+                if grep -qxF "$TAG_URL" "$CURL_LOG"; then
+                    case_fail "used the release API despite an invalid prefetched release list"
                 fi
                 ;;
         esac
@@ -605,8 +627,8 @@ sed 's#${HOMEBREW_FOLDER}#/var/home/armada/homebrew#g' \
 
 run_case success success_case
 run_case prefetched-success success_case prefetched-success prefetch
-run_case stable-only success_case stable-only api stable-only
-run_case prefetched-stable-only success_case prefetched-stable-only prefetch stable-only
+run_case stable-only refusal_case stable-only stable-only api
+run_case prefetched-stable-only refusal_case prefetched-stable-only stable-only prefetch
 run_case missing-arm64 refusal_case missing-arm64
 run_case digest-mismatch refusal_case digest-mismatch
 run_case wrong-arch refusal_case wrong-arch

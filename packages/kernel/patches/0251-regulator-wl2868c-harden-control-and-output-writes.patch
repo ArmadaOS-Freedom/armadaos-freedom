@@ -1,0 +1,156 @@
+Subject: [PATCH] regulator: wl2868c: harden control supply and output writes
+
+Power the control logic from the described VSYS supply, or from VIN7 when
+it is the only described input capable of powering I2C. Acquire that supply
+before releasing reset. Elden leaves both inputs unspecified.
+
+Serialize status with the output shadow. Read back the enable register
+after an ambiguous write and retry once inside the regulator callback.
+Try to restore the old mask if enable fails. Report untracked outputs as
+disabled so the regulator core takes the normal enable path.
+
+diff --git a/Documentation/devicetree/bindings/regulator/willsemi,wl2868c.yaml b/Documentation/devicetree/bindings/regulator/willsemi,wl2868c.yaml
+index ce5d233..1d0df3c 100755
+--- a/Documentation/devicetree/bindings/regulator/willsemi,wl2868c.yaml
++++ b/Documentation/devicetree/bindings/regulator/willsemi,wl2868c.yaml
+@@ -29,7 +29,11 @@ properties:
+   vin34-supply: true
+   vin5-supply: true
+   vin6-supply: true
+-  vin7-supply: true
++  vin7-supply:
++    description: LDO7 input. Can also power the I2C interface.
++
++  vsys-supply:
++    description: System bias and control logic supply, when wired separately.
+ 
+   regulators:
+     type: object
+diff --git a/drivers/regulator/wl2868c-regulator.c b/drivers/regulator/wl2868c-regulator.c
+index 46c2a48..7c8ca4c 100755
+--- a/drivers/regulator/wl2868c-regulator.c
++++ b/drivers/regulator/wl2868c-regulator.c
+@@ -12,7 +12,9 @@
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/regulator/driver.h>
+ 
+ #define WL2868C_DEVICE_ID		0x00
+@@ -32,6 +34,23 @@ struct wl2868c {
+ 	struct mutex lock;
+ };
+ 
++static int wl2868c_write_outputs(struct wl2868c *chip, unsigned int ldos)
++{
++	unsigned int target = ldos ? WL2868C_SYS_ENABLE | ldos : 0;
++	unsigned int value;
++	int attempt, ret;
++
++	for (attempt = 0; attempt < 2; attempt++) {
++		ret = regmap_write(chip->regmap, WL2868C_LDO_ENABLE, target);
++		if (!ret)
++			return 0;
++		if (!regmap_read(chip->regmap, WL2868C_LDO_ENABLE, &value) &&
++		    value == target)
++			return 0;
++	}
++	return ret;
++}
++
+ static int wl2868c_enable(struct regulator_dev *rdev)
+ {
+ 	struct wl2868c *chip = rdev_get_drvdata(rdev);
+@@ -53,10 +72,15 @@ static int wl2868c_enable(struct regulator_dev *rdev)
+ 	 * enable; when SYS_EN was clear no output is on at all.
+ 	 */
+ 	ldos = (chip->enabled | bits) & WL2868C_LDO_ENABLE_MASK;
+-	ret = regmap_write(chip->regmap, WL2868C_LDO_ENABLE,
+-			   WL2868C_SYS_ENABLE | ldos);
+-	if (ret)
++	ret = wl2868c_write_outputs(chip, ldos);
++	if (ret) {
++		if (wl2868c_write_outputs(chip, chip->enabled)) {
++			dev_err(chip->dev, "Failed to restore LDO enable mask %#x\n",
++				chip->enabled);
++			return -ENOTRECOVERABLE;
++		}
+ 		return ret;
++	}
+ 
+ 	chip->enabled = ldos;
+ 
+@@ -85,10 +109,13 @@ static int wl2868c_disable(struct regulator_dev *rdev)
+ 	 * the expected output set as well. A bus error does not establish the
+ 	 * physical register state; the next successful full write restores it.
+ 	 */
+-	ret = regmap_write(chip->regmap, WL2868C_LDO_ENABLE,
+-			   ldos ? WL2868C_SYS_ENABLE | ldos : 0);
+-	if (ret)
++	ret = wl2868c_write_outputs(chip, ldos);
++	if (ret) {
++		if (wl2868c_write_outputs(chip, chip->enabled))
++			dev_err(chip->dev, "Failed to restore LDO enable mask %#x\n",
++				chip->enabled);
+ 		return ret;
++	}
+ 
+ 	chip->enabled = ldos;
+ 
+@@ -98,10 +125,15 @@ static int wl2868c_disable(struct regulator_dev *rdev)
+ static int wl2868c_is_enabled(struct regulator_dev *rdev)
+ {
+ 	struct wl2868c *chip = rdev_get_drvdata(rdev);
+-	unsigned int mask = WL2868C_SYS_ENABLE | rdev->desc->enable_mask;
++	unsigned int bits = rdev->desc->enable_mask;
++	unsigned int mask = WL2868C_SYS_ENABLE | bits;
+ 	unsigned int value;
+ 	int ret;
+ 
++	guard(mutex)(&chip->lock);
++	if (!(chip->enabled & bits))
++		return 0;
++
+ 	ret = regmap_read(chip->regmap, WL2868C_LDO_ENABLE, &value);
+ 	if (ret)
+ 		return ret;
+@@ -190,6 +222,25 @@ static int wl2868c_init_outputs(struct wl2868c *chip)
+ 	return 0;
+ }
+ 
++static int wl2868c_enable_control_supply(struct device *dev)
++{
++	const char *supply;
++	int ret;
++
++	if (device_property_present(dev, "vsys-supply"))
++		supply = "vsys";
++	else if (device_property_present(dev, "vin7-supply"))
++		supply = "vin7";
++	else
++		return 0;
++
++	ret = devm_regulator_get_enable_optional(dev, supply);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to enable %s control supply\n",
++				     supply);
++	return 0;
++}
++
+ static int wl2868c_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -207,6 +258,10 @@ static int wl2868c_probe(struct i2c_client *client)
+ 	mutex_init(&chip->lock);
+ 	config.driver_data = chip;
+ 
++	ret = wl2868c_enable_control_supply(dev);
++	if (ret)
++		return ret;
++
+ 	reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+ 	if (IS_ERR(reset))
+ 		return dev_err_probe(dev, PTR_ERR(reset), "Failed to get reset GPIO\n");
