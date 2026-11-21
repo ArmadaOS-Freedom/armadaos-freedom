@@ -1,0 +1,61 @@
+Subject: [PATCH] clk: qcom: limit Elden camera ICC paths to its board contract
+
+The shared kernel serves other SM8750 boards whose CAMCC device trees do
+not declare Elden's provider-owned ICC paths. Keep the legacy zero-path
+GDSC behavior there, instead of failing CAMCC probe with -ENODEV. Select
+the two paths before qcom_cc_probe only on Lenovo Elden. When supplied,
+the binding still requires both named paths together; existing SM8750
+CAMCC nodes without either property remain valid.
+
+diff --git a/drivers/clk/qcom/camcc-sm8750.c b/drivers/clk/qcom/camcc-sm8750.c
+--- a/drivers/clk/qcom/camcc-sm8750.c
++++ b/drivers/clk/qcom/camcc-sm8750.c
+@@ -6,6 +6,7 @@
+ #include <linux/clk-provider.h>
+ #include <linux/interconnect.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ 
+@@ -2442,8 +2443,6 @@
+ 	},
+ 	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+-	.icc_paths = cam_cc_titan_top_icc,
+-	.num_icc_paths = ARRAY_SIZE(cam_cc_titan_top_icc),
+ };
+ 
+ static struct gdsc cam_cc_ipe_0_gdsc = {
+@@ -2704,6 +2703,15 @@
+ 
+ static int cam_cc_sm8750_probe(struct platform_device *pdev)
+ {
++	/* Only Elden supplies the two provider-owned camera ICC paths. */
++	if (of_machine_is_compatible("lenovo,elden")) {
++		cam_cc_titan_top_gdsc.icc_paths = cam_cc_titan_top_icc;
++		cam_cc_titan_top_gdsc.num_icc_paths = ARRAY_SIZE(cam_cc_titan_top_icc);
++	} else {
++		cam_cc_titan_top_gdsc.icc_paths = NULL;
++		cam_cc_titan_top_gdsc.num_icc_paths = 0;
++	}
++
+ 	return qcom_cc_probe(pdev, &cam_cc_sm8750_desc);
+ }
+ 
+diff --git a/Documentation/devicetree/bindings/clock/qcom,sm8450-camcc.yaml b/Documentation/devicetree/bindings/clock/qcom,sm8450-camcc.yaml
+--- a/Documentation/devicetree/bindings/clock/qcom,sm8450-camcc.yaml
++++ b/Documentation/devicetree/bindings/clock/qcom,sm8450-camcc.yaml
+@@ -97,9 +97,9 @@
+             - const: ahb
+             - const: hf_mnoc
+ 
+-      required:
+-        - interconnects
+-        - interconnect-names
++      dependencies:
++        interconnects: [interconnect-names]
++        interconnect-names: [interconnects]
+ 
+ unevaluatedProperties: false
+ 

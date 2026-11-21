@@ -22,8 +22,9 @@ BuildRequires:  meson
 hexagonrpcd serves the files and calls that a Qualcomm Hexagon DSP requests
 from the application processor over FastRPC, such as the sensor hub's
 configuration and registry. This build adds large input buffers and an
-optional writable sensor registry (HEXAGONRPCD_WRITABLE_REGISTRY), and keeps
-serving when a call fails instead of ending the DSP's session.
+optional writable sensor registry (HEXAGONRPCD_WRITABLE_REGISTRY), and answers
+a call it cannot dispatch with an error and keeps listening instead of ending
+the DSP's session (FastRPC transport errors still stop the daemon).
 
 %prep
 %autosetup -n %{name}-%{commit} -p1

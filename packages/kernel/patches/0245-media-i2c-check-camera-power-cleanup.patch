@@ -1,0 +1,686 @@
+Subject: [PATCH] media: i2c: fail closed when camera power ownership is unknown
+
+Track the rails and clocks acquired by each sensor/lens instance, check
+shutdown errors, and finish cleaning the other known resources on failure.
+Regulator disable errors can happen before or after the consumer count is
+decremented, so an unknown reference must not be retried or re-enabled.
+Latch those faults and require a reboot rather than pretend suspension or
+recovery succeeded. Preserve the first streaming error and report PM cleanup
+errors; do not register a sensor whose ID-check shutdown failed.
+
+Keep the original register programming, formats, supply names and timing.
+Tested by extracting these real C functions into injected host API stubs:
+1000 normal cycles per driver plus rail, GPIO, clock, I2C and PM faults.
+Those tests do not establish camera operation on the tablet.
+
+diff --git a/drivers/media/i2c/gc08a8.c b/drivers/media/i2c/gc08a8.c
+index 86c8142..87a651b 100644
+--- a/drivers/media/i2c/gc08a8.c
++++ b/drivers/media/i2c/gc08a8.c
+@@ -33,6 +33,10 @@ struct gc08a8 {
+ 	struct clk *xclk;
+ 	struct gpio_desc *reset;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(gc08a8_supply_names)];
++	/* Only references whose ownership is still known are tracked here. */
++	unsigned long supplies_enabled;
++	bool clock_enabled;
++	int power_error;
+ 	bool streaming;
+ };
+ 
+@@ -485,52 +489,95 @@ static const struct cci_reg_sequence gc08a8_3264x2448_regs[] = {
+ 	{ CCI_REG8(0x0102), 0x09 },
+ };
+ 
++static void gc08a8_assert_reset(struct gc08a8 *sensor)
++{
++	int ret;
++
++	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (ret) {
++		if (!sensor->power_error)
++			sensor->power_error = ret;
++		dev_err(sensor->sd.dev, "Failed to assert reset: %d; reboot required\n", ret);
++	}
++}
++
++static int gc08a8_disable_supplies(struct gc08a8 *sensor)
++{
++	struct device *dev = sensor->sd.dev;
++	int i, ret;
++
++	for (i = ARRAY_SIZE(sensor->supplies) - 1; i >= 0; i--) {
++		if (!(sensor->supplies_enabled & BIT(i)))
++			continue;
++		/*
++		 * A disable error can occur after the consumer reference was
++		 * dropped (for example, while disabling a parent supply).
++		 * Its ownership is then unknown: never retry or re-enable it.
++		 */
++		sensor->supplies_enabled &= ~BIT(i);
++		ret = regulator_disable(sensor->supplies[i].consumer);
++		if (ret) {
++			if (!sensor->power_error)
++				sensor->power_error = ret;
++			dev_err(dev, "Failed to disable %s: %d; reboot required\n",
++				sensor->supplies[i].supply, ret);
++		}
++		fsleep(1000);
++	}
++
++	return sensor->power_error;
++}
++
++static int gc08a8_power_off(struct device *dev)
++{
++	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
++
++	gc08a8_assert_reset(sensor);
++	fsleep(3000);
++	if (sensor->clock_enabled) {
++		clk_disable_unprepare(sensor->xclk);
++		sensor->clock_enabled = false;
++		fsleep(10000);
++	}
++	return gc08a8_disable_supplies(sensor);
++}
++
+ static int gc08a8_power_on(struct device *dev)
+ {
+ 	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
+ 	int i, ret;
+ 
+-	gpiod_set_value_cansleep(sensor->reset, 1);
++	if (sensor->power_error)
++		return sensor->power_error;
++	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (ret)
++		return ret;
+ 	fsleep(1000);
+ 	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
+ 		ret = regulator_enable(sensor->supplies[i].consumer);
+ 		if (ret)
+-			goto disable_supplies;
++			goto power_off;
++		sensor->supplies_enabled |= BIT(i);
+ 		fsleep(1000);
+ 	}
+ 
+ 	ret = clk_prepare_enable(sensor->xclk);
+ 	if (ret)
+-		goto disable_supplies;
++		goto power_off;
++	sensor->clock_enabled = true;
+ 	fsleep(10000);
+-	gpiod_set_value_cansleep(sensor->reset, 0);
++	ret = gpiod_set_value_cansleep(sensor->reset, 0);
++	if (ret)
++		goto power_off;
+ 	fsleep(3000);
+ 	return 0;
+ 
+-disable_supplies:
+-	while (i--) {
+-		regulator_disable(sensor->supplies[i].consumer);
+-		fsleep(1000);
+-	}
++power_off:
++	/* power_off logs and latches cleanup errors; preserve the first error. */
++	gc08a8_power_off(dev);
+ 	return ret;
+ }
+ 
+-static int gc08a8_power_off(struct device *dev)
+-{
+-	struct gc08a8 *sensor = to_gc08a8(dev_get_drvdata(dev));
+-	int i;
+-
+-	gpiod_set_value_cansleep(sensor->reset, 1);
+-	fsleep(3000);
+-	clk_disable_unprepare(sensor->xclk);
+-	fsleep(10000);
+-	for (i = ARRAY_SIZE(sensor->supplies) - 1; i >= 0; i--) {
+-		regulator_disable(sensor->supplies[i].consumer);
+-		fsleep(1000);
+-	}
+-	return 0;
+-}
+-
+ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct gc08a8 *sensor = container_of(ctrl->handler, struct gc08a8, ctrls);
+@@ -549,6 +596,8 @@ static int gc08a8_set_ctrl(struct v4l2_ctrl *ctrl)
+ 		return 0;
+ 	}
+ 
++	if (sensor->power_error)
++		return sensor->power_error;
+ 	ret = pm_runtime_get_if_in_use(dev);
+ 	if (ret <= 0)
+ 		return ret;
+@@ -689,16 +738,30 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+ {
+ 	struct gc08a8 *sensor = to_gc08a8(sd);
+ 	struct v4l2_subdev_state *state;
+-	int ret = 0;
++	int ret = 0, power_ret;
+ 
+ 	state = v4l2_subdev_lock_and_get_active_state(sd);
+-	if (sensor->streaming == !!enable)
++	if (enable && sensor->power_error) {
++		ret = sensor->power_error;
++		goto unlock;
++	}
++	if (sensor->streaming == !!enable) {
++		ret = sensor->power_error;
+ 		goto unlock;
++	}
+ 	if (!enable) {
+ 		ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
+ 		sensor->streaming = false;
+-		/* Reset and remove power even if the stream-off write failed. */
+-		pm_runtime_put_sync(sd->dev);
++		/* Release this stream's PM reference even if either step fails. */
++		if (ret)
++			gc08a8_assert_reset(sensor);
++		power_ret = pm_runtime_put_sync(sd->dev);
++		if (power_ret < 0) {
++			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
++				power_ret);
++			if (!ret)
++				ret = power_ret;
++		}
+ 		goto unlock;
+ 	}
+ 
+@@ -712,10 +775,15 @@ static int gc08a8_s_stream(struct v4l2_subdev *sd, int enable)
+ 	if (!ret)
+ 		ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
+ 	cci_write(sensor->regmap, CCI_REG8(0x0100), 1, &ret);
+-	if (ret)
+-		pm_runtime_put_sync(sd->dev);
+-	else
++	if (ret) {
++		gc08a8_assert_reset(sensor);
++		power_ret = pm_runtime_put_sync(sd->dev);
++		if (power_ret < 0)
++			dev_err(sd->dev, "Failed to power off after stream-start error: %d\n",
++				power_ret);
++	} else {
+ 		sensor->streaming = true;
++	}
+ unlock:
+ 	v4l2_subdev_unlock_state(state);
+ 	return ret;
+@@ -775,7 +843,7 @@ static int gc08a8_probe(struct i2c_client *client)
+ 	struct device *dev = &client->dev;
+ 	struct gc08a8 *sensor;
+ 	u64 id;
+-	int ret, i;
++	int ret, power_ret, i;
+ 
+ 	ret = gc08a8_check_endpoint(dev);
+ 	if (ret)
+@@ -810,9 +878,11 @@ static int gc08a8_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to power sensor\n");
+ 	ret = cci_read(sensor->regmap, CCI_REG16(0x03f0), &id, NULL);
+-	gc08a8_power_off(dev);
++	power_ret = gc08a8_power_off(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
++	if (power_ret)
++		return dev_err_probe(dev, power_ret, "Failed to power off after sensor ID check\n");
+ 	if (id != 0x08a8)
+ 		return dev_err_probe(dev, -ENODEV, "Unexpected sensor ID: %#llx\n", id);
+ 
+@@ -827,7 +897,9 @@ static int gc08a8_probe(struct i2c_client *client)
+ 	if (ret)
+ 		goto clean_entity;
+ 
+-	pm_runtime_set_suspended(dev);
++	ret = pm_runtime_set_suspended(dev);
++	if (ret)
++		goto clean_subdev;
+ 	pm_runtime_enable(dev);
+ 	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
+ 	if (ret)
+@@ -836,6 +908,7 @@ static int gc08a8_probe(struct i2c_client *client)
+ 
+ disable_pm:
+ 	pm_runtime_disable(dev);
++clean_subdev:
+ 	v4l2_subdev_cleanup(&sensor->sd);
+ clean_entity:
+ 	media_entity_cleanup(&sensor->sd.entity);
+@@ -851,9 +924,9 @@ static void gc08a8_remove(struct i2c_client *client)
+ 
+ 	v4l2_async_unregister_subdev(sd);
+ 	pm_runtime_disable(sd->dev);
+-	if (!pm_runtime_status_suspended(sd->dev))
+-		gc08a8_power_off(sd->dev);
+-	pm_runtime_set_suspended(sd->dev);
++	/* Also cover residual resources from a failed runtime resume. */
++	if (!gc08a8_power_off(sd->dev))
++		pm_runtime_set_suspended(sd->dev);
+ 	v4l2_subdev_cleanup(sd);
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(&sensor->ctrls);
+@@ -867,7 +940,12 @@ static int gc08a8_suspend(struct device *dev)
+ 	int ret;
+ 
+ 	state = v4l2_subdev_lock_and_get_active_state(sd);
+-	ret = sensor->streaming ? -EBUSY : pm_runtime_force_suspend(dev);
++	if (sensor->streaming)
++		ret = -EBUSY;
++	else if (sensor->power_error)
++		ret = sensor->power_error;
++	else
++		ret = pm_runtime_force_suspend(dev);
+ 	v4l2_subdev_unlock_state(state);
+ 	return ret;
+ }
+diff --git a/drivers/media/i2c/gt9764.c b/drivers/media/i2c/gt9764.c
+index fec5a10..9cb8cca 100644
+--- a/drivers/media/i2c/gt9764.c
++++ b/drivers/media/i2c/gt9764.c
+@@ -23,6 +23,9 @@ struct gt9764 {
+ 	struct v4l2_ctrl_handler ctrls;
+ 	struct v4l2_ctrl *focus;
+ 	struct regulator_bulk_data supplies[2];
++	/* A disable error makes that reference's ownership unknowable. */
++	unsigned long supplies_enabled;
++	int power_error;
+ 	u32 aac_mode;
+ 	u32 aac_timing;
+ 	u32 settling_time;
+@@ -48,12 +51,24 @@ static int gt9764_set_position(struct gt9764 *lens, u16 position)
+ static int gt9764_power_off(struct device *dev)
+ {
+ 	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
+-	int ret;
+-
+-	ret = regulator_bulk_disable(ARRAY_SIZE(lens->supplies), lens->supplies);
++	int i, ret;
++
++	for (i = ARRAY_SIZE(lens->supplies) - 1; i >= 0; i--) {
++		if (!(lens->supplies_enabled & BIT(i)))
++			continue;
++		/* Never retry an unknown reference or hide a rollback error. */
++		lens->supplies_enabled &= ~BIT(i);
++		ret = regulator_disable(lens->supplies[i].consumer);
++		if (ret) {
++			if (!lens->power_error)
++				lens->power_error = ret;
++			dev_err(dev, "Failed to disable %s: %d; reboot required\n",
++				lens->supplies[i].supply, ret);
++		}
++	}
+ 	/* AN971 requires at least 100 ms off before the next power-up. */
+ 	fsleep(100000);
+-	return ret;
++	return lens->power_error;
+ }
+ 
+ static int gt9764_power_on(struct device *dev)
+@@ -73,14 +88,16 @@ static int gt9764_power_on(struct device *dev)
+ 	unsigned int i;
+ 	int ret;
+ 
++	if (lens->power_error)
++		return lens->power_error;
+ 	ret = regulator_enable(lens->supplies[0].consumer);
+ 	if (ret)
+ 		return ret;
++	lens->supplies_enabled |= BIT(0);
+ 	ret = regulator_enable(lens->supplies[1].consumer);
+-	if (ret) {
+-		regulator_disable(lens->supplies[0].consumer);
+-		return ret;
+-	}
++	if (ret)
++		goto power_off;
++	lens->supplies_enabled |= BIT(1);
+ 	fsleep(10000);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(init); i++) {
+@@ -98,6 +115,7 @@ static int gt9764_power_on(struct device *dev)
+ 		return 0;
+ 
+ power_off:
++	/* The cleanup logs/latches its own errors; preserve the startup error. */
+ 	gt9764_power_off(dev);
+ 	return ret;
+ }
+@@ -109,6 +127,8 @@ static int gt9764_set_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
+ 		return -EINVAL;
++	if (lens->power_error)
++		return lens->power_error;
+ 	ret = pm_runtime_get_if_in_use(lens->sd.dev);
+ 	if (ret <= 0)
+ 		return ret;
+@@ -128,7 +148,7 @@ static int gt9764_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+ 	int ret;
+ 
+ 	mutex_lock(lens->ctrls.lock);
+-	ret = pm_runtime_resume_and_get(sd->dev);
++	ret = lens->power_error ?: pm_runtime_resume_and_get(sd->dev);
+ 	mutex_unlock(lens->ctrls.lock);
+ 	return ret;
+ }
+@@ -199,7 +219,11 @@ static int gt9764_probe(struct i2c_client *client)
+ 	if (ret)
+ 		goto free_ctrls;
+ 
+-	pm_runtime_set_suspended(dev);
++	ret = pm_runtime_set_suspended(dev);
++	if (ret) {
++		media_entity_cleanup(&lens->sd.entity);
++		goto free_ctrls;
++	}
+ 	pm_runtime_enable(dev);
+ 	ret = v4l2_async_register_subdev(&lens->sd);
+ 	if (ret) {
+@@ -221,15 +245,25 @@ static void gt9764_remove(struct i2c_client *client)
+ 
+ 	v4l2_async_unregister_subdev(sd);
+ 	pm_runtime_disable(sd->dev);
+-	if (!pm_runtime_status_suspended(sd->dev))
+-		gt9764_power_off(sd->dev);
+-	pm_runtime_set_suspended(sd->dev);
++	if (!gt9764_power_off(sd->dev))
++		pm_runtime_set_suspended(sd->dev);
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(&lens->ctrls);
+ }
+ 
++static int gt9764_suspend(struct device *dev)
++{
++	struct gt9764 *lens = to_gt9764(dev_get_drvdata(dev));
++	int ret;
++
++	mutex_lock(lens->ctrls.lock);
++	ret = lens->power_error ?: pm_runtime_force_suspend(dev);
++	mutex_unlock(lens->ctrls.lock);
++	return ret;
++}
++
+ static const struct dev_pm_ops gt9764_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++	SYSTEM_SLEEP_PM_OPS(gt9764_suspend, pm_runtime_force_resume)
+ 	RUNTIME_PM_OPS(gt9764_power_off, gt9764_power_on, NULL)
+ };
+ 
+diff --git a/drivers/media/i2c/s5kjns.c b/drivers/media/i2c/s5kjns.c
+index 3b1c7e8..4af91db 100644
+--- a/drivers/media/i2c/s5kjns.c
++++ b/drivers/media/i2c/s5kjns.c
+@@ -34,6 +34,10 @@ struct s5kjns {
+ 	struct clk *xclk;
+ 	struct gpio_desc *reset;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(s5kjns_supply_names)];
++	/* Only references whose ownership is still known are tracked here. */
++	unsigned long supplies_enabled;
++	bool clock_enabled;
++	int power_error;
+ 	bool streaming;
+ };
+ 
+@@ -384,55 +388,95 @@ static const struct cci_reg_sequence s5kjns_4080x3072_regs[] = {
+ 	{ CCI_REG16(0x6226), 0x0000 },
+ };
+ 
++static void s5kjns_assert_reset(struct s5kjns *sensor)
++{
++	int ret;
++
++	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (ret) {
++		if (!sensor->power_error)
++			sensor->power_error = ret;
++		dev_err(sensor->sd.dev, "Failed to assert reset: %d; reboot required\n", ret);
++	}
++}
++
++static int s5kjns_disable_supplies(struct s5kjns *sensor)
++{
++	struct device *dev = sensor->sd.dev;
++	int i, ret;
++
++	for (i = ARRAY_SIZE(sensor->supplies) - 1; i >= 0; i--) {
++		if (!(sensor->supplies_enabled & BIT(i)))
++			continue;
++		/*
++		 * A disable error can occur after the consumer reference was
++		 * dropped (for example, while disabling a parent supply).
++		 * Its ownership is then unknown: never retry or re-enable it.
++		 */
++		sensor->supplies_enabled &= ~BIT(i);
++		ret = regulator_disable(sensor->supplies[i].consumer);
++		if (ret) {
++			if (!sensor->power_error)
++				sensor->power_error = ret;
++			dev_err(dev, "Failed to disable %s: %d; reboot required\n",
++				sensor->supplies[i].supply, ret);
++		}
++		fsleep(1000);
++	}
++
++	return sensor->power_error;
++}
++
++static int s5kjns_power_off(struct device *dev)
++{
++	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
++
++	if (sensor->clock_enabled) {
++		clk_disable_unprepare(sensor->xclk);
++		sensor->clock_enabled = false;
++		fsleep(10000);
++	}
++	s5kjns_assert_reset(sensor);
++	fsleep(1000);
++	return s5kjns_disable_supplies(sensor);
++}
++
+ static int s5kjns_power_on(struct device *dev)
+ {
+ 	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
+ 	int i, ret;
+ 
+-	gpiod_set_value_cansleep(sensor->reset, 1);
++	if (sensor->power_error)
++		return sensor->power_error;
++	ret = gpiod_set_value_cansleep(sensor->reset, 1);
++	if (ret)
++		return ret;
+ 	fsleep(1000);
+ 	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
+ 		ret = regulator_enable(sensor->supplies[i].consumer);
+ 		if (ret)
+-			goto disable_supplies;
++			goto power_off;
++		sensor->supplies_enabled |= BIT(i);
+ 		fsleep(1000);
+ 	}
+ 
+-	gpiod_set_value_cansleep(sensor->reset, 0);
++	ret = gpiod_set_value_cansleep(sensor->reset, 0);
++	if (ret)
++		goto power_off;
+ 	fsleep(1000);
+ 	ret = clk_prepare_enable(sensor->xclk);
+-	if (ret) {
+-		gpiod_set_value_cansleep(sensor->reset, 1);
+-		fsleep(1000);
+-		goto disable_supplies;
+-	}
++	if (ret)
++		goto power_off;
++	sensor->clock_enabled = true;
+ 	fsleep(15000);
+ 	return 0;
+ 
+-disable_supplies:
+-	while (i--) {
+-		regulator_disable(sensor->supplies[i].consumer);
+-		fsleep(1000);
+-	}
++power_off:
++	/* power_off logs and latches cleanup errors; preserve the first error. */
++	s5kjns_power_off(dev);
+ 	return ret;
+ }
+ 
+-static int s5kjns_power_off(struct device *dev)
+-{
+-	struct s5kjns *sensor = to_s5kjns(dev_get_drvdata(dev));
+-	int i;
+-
+-	clk_disable_unprepare(sensor->xclk);
+-	fsleep(10000);
+-	gpiod_set_value_cansleep(sensor->reset, 1);
+-	fsleep(1000);
+-	for (i = ARRAY_SIZE(sensor->supplies) - 1; i >= 0; i--) {
+-		regulator_disable(sensor->supplies[i].consumer);
+-		fsleep(1000);
+-	}
+-	return 0;
+-}
+-
+ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct s5kjns *sensor = container_of(ctrl->handler, struct s5kjns, ctrls);
+@@ -454,6 +498,8 @@ static int s5kjns_set_ctrl(struct v4l2_ctrl *ctrl)
+ 		return 0;
+ 	}
+ 
++	if (sensor->power_error)
++		return sensor->power_error;
+ 	ret = pm_runtime_get_if_in_use(dev);
+ 	if (ret <= 0)
+ 		return ret;
+@@ -609,16 +655,30 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+ {
+ 	struct s5kjns *sensor = to_s5kjns(sd);
+ 	struct v4l2_subdev_state *state;
+-	int ret = 0;
++	int ret = 0, power_ret;
+ 
+ 	state = v4l2_subdev_lock_and_get_active_state(sd);
+-	if (sensor->streaming == !!enable)
++	if (enable && sensor->power_error) {
++		ret = sensor->power_error;
++		goto unlock;
++	}
++	if (sensor->streaming == !!enable) {
++		ret = sensor->power_error;
+ 		goto unlock;
++	}
+ 	if (!enable) {
+ 		ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
+ 		sensor->streaming = false;
+-		/* Reset and remove power even if the stream-off write failed. */
+-		pm_runtime_put_sync(sd->dev);
++		/* Release this stream's PM reference even if either step fails. */
++		if (ret)
++			s5kjns_assert_reset(sensor);
++		power_ret = pm_runtime_put_sync(sd->dev);
++		if (power_ret < 0) {
++			dev_err(sd->dev, "Failed to power off after stream stop: %d\n",
++				power_ret);
++			if (!ret)
++				ret = power_ret;
++		}
+ 		goto unlock;
+ 	}
+ 
+@@ -639,10 +699,15 @@ static int s5kjns_s_stream(struct v4l2_subdev *sd, int enable)
+ 	cci_write(sensor->regmap, CCI_REG16(0x6028), 0x4000, &ret);
+ 	cci_write(sensor->regmap, CCI_REG16(0x0100), 0x0100, &ret);
+ power_off:
+-	if (ret)
+-		pm_runtime_put_sync(sd->dev);
+-	else
++	if (ret) {
++		s5kjns_assert_reset(sensor);
++		power_ret = pm_runtime_put_sync(sd->dev);
++		if (power_ret < 0)
++			dev_err(sd->dev, "Failed to power off after stream-start error: %d\n",
++				power_ret);
++	} else {
+ 		sensor->streaming = true;
++	}
+ unlock:
+ 	v4l2_subdev_unlock_state(state);
+ 	return ret;
+@@ -702,7 +767,7 @@ static int s5kjns_probe(struct i2c_client *client)
+ 	struct device *dev = &client->dev;
+ 	struct s5kjns *sensor;
+ 	u64 id;
+-	int ret, i;
++	int ret, power_ret, i;
+ 
+ 	ret = s5kjns_check_endpoint(dev);
+ 	if (ret)
+@@ -737,9 +802,11 @@ static int s5kjns_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to power sensor\n");
+ 	ret = cci_read(sensor->regmap, CCI_REG16(0x0000), &id, NULL);
+-	s5kjns_power_off(dev);
++	power_ret = s5kjns_power_off(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to read sensor ID\n");
++	if (power_ret)
++		return dev_err_probe(dev, power_ret, "Failed to power off after sensor ID check\n");
+ 	if (id != 0x38ee)
+ 		return dev_err_probe(dev, -ENODEV, "Unexpected sensor ID: %#llx\n", id);
+ 
+@@ -754,7 +821,9 @@ static int s5kjns_probe(struct i2c_client *client)
+ 	if (ret)
+ 		goto clean_entity;
+ 
+-	pm_runtime_set_suspended(dev);
++	ret = pm_runtime_set_suspended(dev);
++	if (ret)
++		goto clean_subdev;
+ 	pm_runtime_enable(dev);
+ 	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
+ 	if (ret)
+@@ -763,6 +832,7 @@ static int s5kjns_probe(struct i2c_client *client)
+ 
+ disable_pm:
+ 	pm_runtime_disable(dev);
++clean_subdev:
+ 	v4l2_subdev_cleanup(&sensor->sd);
+ clean_entity:
+ 	media_entity_cleanup(&sensor->sd.entity);
+@@ -778,9 +848,9 @@ static void s5kjns_remove(struct i2c_client *client)
+ 
+ 	v4l2_async_unregister_subdev(sd);
+ 	pm_runtime_disable(sd->dev);
+-	if (!pm_runtime_status_suspended(sd->dev))
+-		s5kjns_power_off(sd->dev);
+-	pm_runtime_set_suspended(sd->dev);
++	/* Also cover residual resources from a failed runtime resume. */
++	if (!s5kjns_power_off(sd->dev))
++		pm_runtime_set_suspended(sd->dev);
+ 	v4l2_subdev_cleanup(sd);
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(&sensor->ctrls);
+@@ -794,7 +864,12 @@ static int s5kjns_suspend(struct device *dev)
+ 	int ret;
+ 
+ 	state = v4l2_subdev_lock_and_get_active_state(sd);
+-	ret = sensor->streaming ? -EBUSY : pm_runtime_force_suspend(dev);
++	if (sensor->streaming)
++		ret = -EBUSY;
++	else if (sensor->power_error)
++		ret = sensor->power_error;
++	else
++		ret = pm_runtime_force_suspend(dev);
+ 	v4l2_subdev_unlock_state(state);
+ 	return ret;
+ }

@@ -17,15 +17,17 @@ hub keeps; persist itself is never written. Every partition is opened
 read-only: GPT attributes come from udev, the dynamic partition table of super
 is parsed here, ext4 is read with debugfs (no -w) and erofs with dump.erofs.
 
-fw/ is extracted again when the slot or the source partitions change; a stamp
-records what it was made from. Exits 0 without touching anything on every
-board other than lenovo,tb710fu.
+fw/ is extracted again when the slot, the dsp partition or the vendor sensor
+files change; a stamp records what it was made from. Every copy is checked
+against the source listing before it replaces the previous one. Exits 0
+without touching anything on every board other than lenovo,tb710fu.
 """
 
 import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -40,7 +42,7 @@ UDEVADM = os.environ.get('TB710FU_UDEVADM', 'udevadm')
 DEBUGFS = os.environ.get('TB710FU_DEBUGFS', 'debugfs')
 DUMP_EROFS = os.environ.get('TB710FU_DUMP_EROFS', 'dump.erofs')
 
-STAMP_VERSION = 1
+STAMP_VERSION = 2
 
 # Qualcomm A/B attributes in the GPT entry flags (bits 48-63).
 ATTR_ACTIVE = 1 << 50
@@ -112,37 +114,62 @@ def pread_exact(f, size, offset):
     return data
 
 
-def lp_partition_extent(super_path, name, metadata_slot):
-    """Byte offset and size of a dynamic partition stored in one linear extent."""
-    with open(super_path, 'rb') as f:
-        size = f.seek(0, os.SEEK_END)
-        geo = pread_exact(f, LP_GEOMETRY_SIZE, LP_RESERVED)
+def lp_geometry(f):
+    """The primary geometry, or the backup copy when the primary is invalid."""
+    for offset in (LP_RESERVED, LP_RESERVED + LP_GEOMETRY_SIZE):
+        geo = pread_exact(f, LP_GEOMETRY_SIZE, offset)
         magic, struct_size = struct.unpack_from('<II', geo, 0)
         if magic != LP_GEOMETRY_MAGIC or not 52 <= struct_size <= LP_GEOMETRY_SIZE:
-            raise PrepareError('super has no dynamic partition geometry')
+            continue
         checked = bytearray(geo[:struct_size])
         checked[8:40] = bytes(32)
-        if hashlib.sha256(checked).digest() != geo[8:40]:
-            raise PrepareError('super geometry checksum mismatch')
-        max_size, slots, _ = struct.unpack_from('<III', geo, 40)
-        if not 0 <= metadata_slot < slots:
-            raise PrepareError('super has no metadata slot %d' % metadata_slot)
-        base = LP_RESERVED + 2 * LP_GEOMETRY_SIZE + metadata_slot * max_size
-        meta = pread_exact(f, max_size, base)
+        if hashlib.sha256(checked).digest() == geo[8:40]:
+            return struct.unpack_from('<III', geo, 40)
+    raise PrepareError('super has no valid dynamic partition geometry')
 
+
+def lp_metadata_error(meta, max_size):
+    """Why a metadata copy is unusable, or None."""
     magic, major, _, header_size = struct.unpack_from('<IHHI', meta, 0)
     if magic != LP_HEADER_MAGIC or major != 10 or not 128 <= header_size <= max_size:
-        raise PrepareError('super metadata header invalid')
+        return 'header invalid'
     header = bytearray(meta[:header_size])
     header[12:44] = bytes(32)
     if hashlib.sha256(header).digest() != meta[12:44]:
-        raise PrepareError('super metadata header checksum mismatch')
+        return 'header checksum mismatch'
     tables_size, = struct.unpack_from('<I', meta, 44)
     if header_size + tables_size > max_size:
-        raise PrepareError('super metadata tables out of range')
+        return 'tables out of range'
+    if hashlib.sha256(meta[header_size:header_size + tables_size]).digest() != meta[48:80]:
+        return 'tables checksum mismatch'
+    return None
+
+
+def lp_partition_extent(super_path, name, metadata_slot):
+    """Byte offset and size of a dynamic partition stored in one linear extent.
+
+    Like liblp, the backup copy of the slot's metadata is used when the
+    primary copy does not validate.
+    """
+    with open(super_path, 'rb') as f:
+        size = f.seek(0, os.SEEK_END)
+        max_size, slots, _ = lp_geometry(f)
+        if not 0 <= metadata_slot < slots:
+            raise PrepareError('super has no metadata slot %d' % metadata_slot)
+        primary = LP_RESERVED + 2 * LP_GEOMETRY_SIZE
+        errors = []
+        for base in (primary, primary + slots * max_size):
+            meta = pread_exact(f, max_size, base + metadata_slot * max_size)
+            error = lp_metadata_error(meta, max_size)
+            if error is None:
+                break
+            errors.append(error)
+        else:
+            raise PrepareError('super metadata ' + ' / '.join(errors))
+
+    header_size, = struct.unpack_from('<I', meta, 8)
+    tables_size, = struct.unpack_from('<I', meta, 44)
     tables = meta[header_size:header_size + tables_size]
-    if hashlib.sha256(tables).digest() != meta[48:80]:
-        raise PrepareError('super metadata tables checksum mismatch')
 
     def table(index, entry_min):
         offset, count, entry = struct.unpack_from('<III', meta, 80 + 12 * index)
@@ -176,16 +203,14 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def vendor_identity(super_path, offset):
+def check_vendor_erofs(super_path, offset):
     with open(super_path, 'rb') as f:
         head = pread_exact(f, 4096, offset)
-    erofs, = struct.unpack_from('<I', head, EROFS_SB_OFFSET)
+    erofs_magic, = struct.unpack_from('<I', head, EROFS_SB_OFFSET)
     ext4, = struct.unpack_from('<H', head, 1080)
-    if erofs != EROFS_MAGIC:
+    if erofs_magic != EROFS_MAGIC:
         kind = 'ext4' if ext4 == EXT4_MAGIC else 'unknown'
         raise PrepareError('vendor is not erofs (%s)' % kind)
-    # The superblock carries the build time, UUID and checksum of the image.
-    return hashlib.sha256(head).hexdigest()
 
 
 def own_by_root(top):
@@ -198,14 +223,66 @@ def own_by_root(top):
             os.lchown(os.path.join(parent, name), 0, 0)
 
 
-def debugfs_rdump(device, source, dest):
+def debugfs(device, command):
+    """Run one debugfs request. It exits 0 even when the request fails, so
+    anything on stderr besides its version banner counts as an error."""
     # debugfs opens the file system read-only unless -w is given.
-    result = subprocess.run([DEBUGFS, '-R', 'rdump %s %s' % (source, dest), device],
+    result = subprocess.run([DEBUGFS, '-R', command, device],
                             capture_output=True, text=True)
+    errors = [line for line in result.stderr.splitlines()
+              if line.strip() and not line.startswith('debugfs ')]
+    if result.returncode != 0 or errors:
+        raise PrepareError('debugfs %r on %s failed: %s'
+                           % (command, device, '; '.join(errors) or result.returncode))
+    return result.stdout
+
+
+def debugfs_tree(device, directory):
+    """{relative path: size or None for a directory} from debugfs ls -p."""
+    tree = {}
+    for line in debugfs(device, 'ls -p ' + directory).splitlines():
+        # /inode/mode/uid/gid/name/size/
+        fields = line.split('/')
+        if len(fields) != 8 or fields[5] in ('', '.', '..'):
+            continue
+        mode, name, size = int(fields[2], 8), fields[5], fields[6]
+        if stat.S_ISDIR(mode):
+            tree[name] = None
+            for sub, sub_size in debugfs_tree(device, directory + '/' + name).items():
+                tree[name + '/' + sub] = sub_size
+        elif stat.S_ISREG(mode):
+            tree[name] = int(size)
+        else:
+            raise PrepareError('unexpected file type in %s: %s' % (directory, name))
+    return tree
+
+
+def local_tree(top):
+    tree = {}
+    for parent, dirs, files in os.walk(top):
+        rel = os.path.relpath(parent, top)
+        for name in dirs:
+            tree[os.path.normpath(os.path.join(rel, name))] = None
+        for name in files:
+            path = os.path.join(parent, name)
+            tree[os.path.normpath(os.path.join(rel, name))] = os.lstat(path).st_size
+    return tree
+
+
+def debugfs_rdump(device, source, dest):
+    """Copy a directory out of an ext4 image and check that every entry and
+    size arrived; rdump can stop part-way without failing."""
+    expected = debugfs_tree(device, source)
+    if not any(size is not None for size in expected.values()):
+        raise PrepareError('no files in %s on %s' % (source, device))
+    debugfs(device, 'rdump %s %s' % (source, dest))
     name = os.path.join(dest, os.path.basename(source))
-    if result.returncode != 0 or not os.path.isdir(name) or not os.listdir(name):
-        raise PrepareError('cannot copy %s from %s: %s'
-                           % (source, device, result.stderr.strip()))
+    copied = local_tree(name) if os.path.isdir(name) else {}
+    if copied != expected:
+        missing = sorted(set(expected) ^ set(copied)) or sorted(
+            k for k in expected if expected[k] != copied.get(k))
+        raise PrepareError('incomplete copy of %s from %s: %s'
+                           % (source, device, ', '.join(missing[:5])))
     return name
 
 
@@ -230,12 +307,28 @@ def erofs_regular_files(super_path, offset, directory):
     return names
 
 
-def erofs_copy(super_path, offset, source, dest):
+def erofs_read(super_path, offset, source):
     data = erofs(super_path, offset, '--cat', '--path=' + source)
     if not data:
         raise PrepareError('empty vendor file ' + source)
-    with open(dest, 'wb') as f:
-        f.write(data)
+    return data
+
+
+def vendor_sensor_files(super_path, offset):
+    """{path under fw/sensors: contents} of the vendor sensor configuration."""
+    files = {'sns_reg.conf': erofs_read(super_path, offset, '/etc/sensors/sns_reg_config')}
+    for name in erofs_regular_files(super_path, offset, '/etc/sensors/config'):
+        files['config/' + name] = erofs_read(super_path, offset,
+                                             '/etc/sensors/config/' + name)
+    return files
+
+
+def files_sha256(files):
+    h = hashlib.sha256()
+    for name in sorted(files):
+        h.update(name.encode() + b'\0' + str(len(files[name])).encode() + b'\0')
+        h.update(files[name])
+    return h.hexdigest()
 
 
 def fw_complete(fw):
@@ -252,28 +345,38 @@ def read_stamp(fw):
         return None
 
 
+def recover_dir(target):
+    """Finish a swap that stopped between its two renames."""
+    old = target + '.old'
+    if not os.path.exists(target) and os.path.isdir(old):
+        os.rename(old, target)
+
+
 def replace_dir(staged, target):
     old = target + '.old'
+    recover_dir(target)
     shutil.rmtree(old, ignore_errors=True)
-    if os.path.exists(target):
-        os.rename(target, old)
-    os.rename(staged, target)
+    if not os.path.exists(target):
+        os.rename(staged, target)
+        return
+    os.rename(target, old)
+    try:
+        os.rename(staged, target)
+    except BaseException:
+        os.rename(old, target)
+        raise
     shutil.rmtree(old, ignore_errors=True)
 
 
-def extract_fw(fw, stamp, dsp, super_path, vendor_offset):
+def extract_fw(fw, stamp, dsp, sensor_files):
     staged = tempfile.mkdtemp(prefix='.fw-', dir=STATE_DIR)
     try:
         os.makedirs(os.path.join(staged, 'dsp'))
         debugfs_rdump(dsp, '/adsp', os.path.join(staged, 'dsp'))
-        config = os.path.join(staged, 'sensors/config')
-        os.makedirs(config)
-        for name in erofs_regular_files(super_path, vendor_offset,
-                                        '/etc/sensors/config'):
-            erofs_copy(super_path, vendor_offset,
-                       '/etc/sensors/config/' + name, os.path.join(config, name))
-        erofs_copy(super_path, vendor_offset, '/etc/sensors/sns_reg_config',
-                   os.path.join(staged, 'sensors/sns_reg.conf'))
+        os.makedirs(os.path.join(staged, 'sensors/config'))
+        for name, data in sensor_files.items():
+            with open(os.path.join(staged, 'sensors', name), 'wb') as f:
+                f.write(data)
         with open(os.path.join(staged, 'stamp.json'), 'w') as f:
             json.dump(stamp, f, sort_keys=True)
         os.chmod(staged, 0o755)
@@ -307,19 +410,23 @@ def main():
     super_path = partition('super')
     vendor_offset, _ = lp_partition_extent(super_path, 'vendor_' + slot,
                                            0 if slot == 'a' else 1)
+    check_vendor_erofs(super_path, vendor_offset)
+    # The vendor sensor files are small; read them every time so the stamp
+    # covers their contents, not only the image they came from.
+    sensor_files = vendor_sensor_files(super_path, vendor_offset)
     stamp = {
         'version': STAMP_VERSION,
         'slot': slot,
         'dsp_sha256': file_sha256(dsp),
-        'vendor_offset': vendor_offset,
-        'vendor_superblock_sha256': vendor_identity(super_path, vendor_offset),
+        'vendor_sensors_sha256': files_sha256(sensor_files),
     }
 
     fw = os.path.join(STATE_DIR, 'fw')
+    recover_dir(fw)
     if fw_complete(fw) and read_stamp(fw) == stamp:
         log('sensor files of slot %s are current' % slot)
     else:
-        extract_fw(fw, stamp, dsp, super_path, vendor_offset)
+        extract_fw(fw, stamp, dsp, sensor_files)
         log('sensor files extracted from slot ' + slot)
 
     registry = os.path.join(STATE_DIR, 'registry')

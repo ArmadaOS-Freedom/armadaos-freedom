@@ -15,7 +15,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SYSTEM = REPO / 'system_files'
 HELPER = SYSTEM / 'usr/libexec/tb710fu/tb710fu-sensors-prepare'
-PREPARE_UNIT = SYSTEM / 'usr/lib/systemd/system/tb710fu-sensors-prepare.service'
 DAEMON_UNIT = SYSTEM / 'usr/lib/systemd/system/tb710fu-hexagonrpcd.service'
 GENERATOR = SYSTEM / 'usr/lib/systemd/system-generators/tb710fu-sensors-generator'
 SLEEP_HOOK = SYSTEM / 'usr/lib/systemd/system-sleep/45-tb710fu-sensors'
@@ -62,7 +61,8 @@ def lp_super(path, partitions, vendor=b'', slots=3):
     image = bytearray(VENDOR_SECTOR * SECTOR) + vendor + bytes(8192)
     image[4096:8192] = geometry
     image[8192:12288] = geometry
-    for slot in range(slots):
+    # Primary copies of every slot, then the backup copies.
+    for slot in range(2 * slots):
         base = 12288 + slot * max_size
         image[base:base + max_size] = metadata
     Path(path).write_bytes(bytes(image))
@@ -85,14 +85,41 @@ FAKE_DEBUGFS = textwrap.dedent('''\
         log.write('debugfs ' + ' '.join(sys.argv[1:]) + '\\n')
     if '-w' in sys.argv:
         sys.exit('fake debugfs: refusing write mode')
+    # Like the real tool: the banner and errors go to stderr, exit status 0.
+    print('debugfs 1.47.3 (8-Jul-2025)', file=sys.stderr)
     command, device = sys.argv[sys.argv.index('-R') + 1], sys.argv[-1]
-    verb, source, dest = command.split()
-    assert verb == 'rdump'
+    words = command.split()
     root = open(device).read().strip()
+    if words[:2] == ['ls', '-p']:
+        src = os.path.join(root, words[2].lstrip('/'))
+        if not os.path.isdir(src):
+            print(words[2] + ': File not found by ext2_lookup', file=sys.stderr)
+            sys.exit(0)
+        print('/2/040755/0/0/.//')
+        print('/2/040755/0/0/..//')
+        for name in sorted(os.listdir(src)):
+            path = os.path.join(src, name)
+            if os.path.isdir(path):
+                print('/3/040755/0/0/%s//' % name)
+            else:
+                print('/4/100644/0/0/%s/%d/' % (name, os.path.getsize(path)))
+        sys.exit(0)
+    verb, source, dest = words
+    assert verb == 'rdump'
     src = os.path.join(root, source.lstrip('/'))
     if not os.path.isdir(src):
-        sys.exit('rdump: file not found')
-    shutil.copytree(src, os.path.join(dest, os.path.basename(source)))
+        print(source + ': File not found by ext2_lookup', file=sys.stderr)
+        sys.exit(0)
+    target = os.path.join(dest, os.path.basename(source))
+    if os.environ.get('FAKE_DEBUGFS_PARTIAL'):
+        # One file arrives, then a read error; debugfs still exits 0.
+        os.makedirs(target)
+        first = sorted(n for n in os.listdir(src) if os.path.isfile(os.path.join(src, n)))[0]
+        shutil.copy(os.path.join(src, first), target)
+        print('rdump: Attempt to read block from filesystem resulted in short read',
+              file=sys.stderr)
+        sys.exit(0)
+    shutil.copytree(src, target)
 ''')
 
 FAKE_DUMP_EROFS = textwrap.dedent('''\
@@ -179,7 +206,7 @@ class HelperTest(unittest.TestCase):
             partitions['vendor_' + slot] = [(len(image) // SECTOR, VENDOR_SECTOR)]
         lp_super(self.super, partitions, image)
 
-    def run_helper(self, compatible=None):
+    def run_helper(self, compatible=None, **extra):
         Path(self.root / 'flags.json').write_text(json.dumps(self.flags))
         env = dict(os.environ,
                    TB710FU_DT_COMPATIBLE=str(compatible or self.compatible),
@@ -191,7 +218,7 @@ class HelperTest(unittest.TestCase):
                    FAKE_FLAGS=str(self.root / 'flags.json'),
                    FAKE_LOG=str(self.log),
                    FAKE_VENDOR=str(self.vendor),
-                   FAKE_VENDOR_OFFSET=str(VENDOR_SECTOR * SECTOR))
+                   FAKE_VENDOR_OFFSET=str(VENDOR_SECTOR * SECTOR), **extra)
         return subprocess.run(['python3', '-I', str(HELPER)], env=env,
                               capture_output=True, text=True)
 
@@ -226,11 +253,13 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
         stamp = json.loads((fw / 'stamp.json').read_text())
         self.assertEqual(stamp['slot'], 'a')
-        self.assertEqual(stamp['vendor_offset'], VENDOR_SECTOR * SECTOR)
+        self.assertEqual(stamp['version'], 2)
+        self.assertIn('vendor_sensors_sha256', stamp)
         self.assertEqual(self.partition_hashes(), before)
         log = self.log.read_text()
         self.assertNotIn(' -w', log)
         self.assertIn('rdump /adsp', log)
+        self.assertIn('ls -p /adsp', log)
         self.assertIn('rdump /sensors/registry', log)
         self.assertEqual(sorted(p.name for p in self.state.iterdir()), ['fw', 'registry'])
 
@@ -262,6 +291,40 @@ class HelperTest(unittest.TestCase):
         self.assert_ok(self.run_helper())
         self.assertEqual((self.state / 'fw/sensors/sns_reg.conf').read_text(), 'new config')
 
+    def test_changed_sensor_content_reextracts(self):
+        self.assert_ok(self.run_helper())
+        # Same vendor image identity, different sensor file contents.
+        (self.vendor / 'etc/sensors/config/lanai_bmi3x0_0.json').write_text('{"accel":2}')
+        self.assert_ok(self.run_helper())
+        self.assertEqual(
+            (self.state / 'fw/sensors/config/lanai_bmi3x0_0.json').read_text(), '{"accel":2}')
+
+    def test_partial_dump_rejected(self):
+        before = self.partition_hashes()
+        result = self.run_helper(FAKE_DEBUGFS_PARTIAL='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('short read', result.stderr)
+        self.assertEqual(os.listdir(self.state), [])
+        self.assertEqual(self.partition_hashes(), before)
+
+    def test_partial_registry_dump_rejected(self):
+        self.assert_ok(self.run_helper())
+        shutil.rmtree(self.state / 'registry')
+        result = self.run_helper(FAKE_DEBUGFS_PARTIAL='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((self.state / 'registry').exists())
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ['fw'])
+
+    def test_interrupted_swap_is_recovered(self):
+        self.assert_ok(self.run_helper())
+        os.rename(self.state / 'fw', self.state / 'fw.old')
+        self.log.write_text('')
+        result = self.run_helper()
+        self.assert_ok(result)
+        self.assertIn('current', result.stderr)
+        self.assertTrue((self.state / 'fw/sensors/sns_reg.conf').is_file())
+        self.assertFalse((self.state / 'fw.old').exists())
+
     def test_slot_b(self):
         self.flags = {'boot_a': INACTIVE, 'boot_b': ACTIVE}
         self.write_super(slot='b')
@@ -292,10 +355,21 @@ class HelperTest(unittest.TestCase):
             self.assertIn(message, result.stderr)
             self.assertFalse((self.state / 'fw').exists())
 
-    def test_corrupt_metadata_refused(self):
+    def corrupt_super(self, *offsets):
         data = bytearray(self.super.read_bytes())
-        data[12288 + 256] ^= 0xFF
+        for offset in offsets:
+            data[offset] ^= 0xFF
         self.super.write_bytes(bytes(data))
+
+    def test_backup_metadata_used_when_primary_is_corrupt(self):
+        # Primary metadata of slot 0, then the primary geometry.
+        self.corrupt_super(12288 + 256, 4096 + 20)
+        self.assert_ok(self.run_helper())
+        self.assertEqual((self.state / 'fw/sensors/sns_reg.conf').read_text(), 'reg config')
+
+    def test_corrupt_metadata_refused(self):
+        # Primary and backup copies of slot 0 (3 slots of 64 KiB).
+        self.corrupt_super(12288 + 256, 12288 + 3 * 65536 + 256)
         result = self.run_helper()
         self.assertEqual(result.returncode, 1)
         self.assertIn('checksum mismatch', result.stderr)
@@ -376,6 +450,22 @@ class RealToolsTest(HelperTest):
         self.assertEqual((self.state / 'fw/dsp/adsp/fastrpc_shell_0').read_bytes(), b'shell-a2')
         self.assertEqual(written.read_text(), 'hub')
 
+    def test_changed_sensor_content_reextracts(self):
+        self.assert_ok(self.run_helper())
+        (self.vendor / 'etc/sensors/config/lanai_bmi3x0_0.json').write_text('{"accel":2}')
+        self.write_super(tag=b'build-1')
+        self.assert_ok(self.run_helper())
+        self.assertEqual(
+            (self.state / 'fw/sensors/config/lanai_bmi3x0_0.json').read_text(), '{"accel":2}')
+
+    @unittest.skip('needs the fake debugfs that fails part-way')
+    def test_partial_dump_rejected(self):
+        pass
+
+    @unittest.skip('needs the fake debugfs that fails part-way')
+    def test_partial_registry_dump_rejected(self):
+        pass
+
     def test_failed_extraction_keeps_previous_files(self):
         self.assert_ok(self.run_helper())
         os.remove(self.vendor / 'etc/sensors/sns_reg_config')
@@ -393,11 +483,17 @@ def unit_values(path, key):
 
 class IntegrationTest(unittest.TestCase):
     def test_units(self):
-        for unit in (PREPARE_UNIT, DAEMON_UNIT):
-            self.assertEqual(unit_values(unit, 'ConditionFirmware'),
-                             ['device-tree-compatible(lenovo,tb710fu)'])
-        self.assertEqual(unit_values(PREPARE_UNIT, 'ExecStart'),
-                         ['/usr/libexec/tb710fu/tb710fu-sensors-prepare'])
+        self.assertFalse((SYSTEM / 'usr/lib/systemd/system/tb710fu-sensors-prepare.service').exists())
+        self.assertEqual(unit_values(DAEMON_UNIT, 'ConditionFirmware'),
+                         ['device-tree-compatible(lenovo,tb710fu)'])
+        # Staging runs before every start, outside the sandbox, so Restart=
+        # retries a failed staging together with the daemon.
+        self.assertEqual(unit_values(DAEMON_UNIT, 'ExecStartPre'),
+                         ['+/usr/libexec/tb710fu/tb710fu-sensors-prepare'])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'Requires'), [])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'Restart'), ['always'])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'RestartMaxDelaySec'), ['60'])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'StartLimitIntervalSec'), ['0'])
         self.assertEqual(unit_values(DAEMON_UNIT, 'ExecStart'),
                          ['/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s '
                           '-R /var/lib/tb710fu-sensors/fw'])
@@ -407,10 +503,11 @@ class IntegrationTest(unittest.TestCase):
                          ['/var/lib/tb710fu-sensors/registry'])
         self.assertIn('dev-fastrpc\\x2dadsp\\x2dsecure.device',
                       unit_values(DAEMON_UNIT, 'BindsTo'))
-        self.assertIn('tb710fu-sensors-prepare.service', unit_values(DAEMON_UNIT, 'Requires'))
+        wants = ' '.join(unit_values(DAEMON_UNIT, 'Wants'))
+        for label in ('boot_a', 'boot_b', 'dsp_a', 'dsp_b', 'super', 'persist'):
+            self.assertIn('dev-disk-by\\x2dpartlabel-%s.device' % label, wants)
         # Started by udev on the board only, not enabled on every device.
         self.assertNotIn('[Install]', DAEMON_UNIT.read_text())
-        self.assertNotIn('[Install]', PREPARE_UNIT.read_text())
         for path in (HELPER, GENERATOR, SLEEP_HOOK):
             self.assertTrue(os.access(path, os.X_OK), path)
 
@@ -451,35 +548,55 @@ class IntegrationTest(unittest.TestCase):
                      'After=tb710fu-hexagonrpcd.service', 'TimeoutStopSec=3'):
             self.assertIn(line + '\n', dropin)
 
-    def run_sleep_hook(self, compatible, phase, active):
+    def run_sleep_hook(self, compatible, phases, state, start_ok=True, run_dir=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp / 'compatible').write_bytes(compatible)
             log = tmp / 'systemctl.log'
             fake = tmp / 'bin/systemctl'
             fake.parent.mkdir()
-            fake.write_text('#!/bin/sh\necho "$*" >>"%s"\n'
-                            '[ "$2" != is-active ] || [ "%s" = yes ]\n' % (log, active))
+            fake.write_text(textwrap.dedent('''\
+                #!/bin/sh
+                echo "$*" >>"%s"
+                case "$1" in
+                show) echo %s ;;
+                start) [ %s = yes ] ;;
+                esac
+            ''') % (log, state, 'yes' if start_ok else 'no'))
             fake.chmod(0o755)
-            run = tmp / 'run'
+            run = run_dir(tmp) if run_dir else tmp / 'run'
             env = dict(os.environ, TB710FU_DT_COMPATIBLE=str(tmp / 'compatible'),
                        TB710FU_SENSORS_RUN=str(run),
                        PATH=str(fake.parent) + os.pathsep + os.environ['PATH'])
-            calls = []
-            for p in phase:
-                subprocess.run([str(SLEEP_HOOK), p, 'suspend'], check=True, env=env)
-            if log.exists():
-                calls = log.read_text().splitlines()
-            return calls
+            for phase in phases:
+                subprocess.run([str(SLEEP_HOOK), phase, 'suspend'], check=True, env=env,
+                               capture_output=True)
+            calls = log.read_text().splitlines() if log.exists() else []
+            marker = (run / 'proxy-stopped').exists()
+            return calls, marker
 
     def test_sleep_hook(self):
-        self.assertEqual(self.run_sleep_hook(OTHER, ['pre', 'post'], 'yes'), [])
-        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'yes'),
-                         ['-q is-active iio-sensor-proxy.service',
-                          'stop iio-sensor-proxy.service',
-                          'start --no-block iio-sensor-proxy.service'])
-        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'no'),
-                         ['-q is-active iio-sensor-proxy.service'])
+        show = 'show -P ActiveState iio-sensor-proxy.service'
+        stop = 'stop iio-sensor-proxy.service'
+        start = 'start --no-block iio-sensor-proxy.service'
+        self.assertEqual(self.run_sleep_hook(OTHER, ['pre', 'post'], 'active'), ([], False))
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'active'),
+                         ([show, stop, start], False))
+        # A pending Restart= shows as activating: stop it and resume it.
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'activating'),
+                         ([show, stop, start], False))
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'inactive'),
+                         ([show], False))
+        # Rejected start: the marker stays for the next resume.
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'active', start_ok=False),
+                         ([show, stop, start], True))
+
+    def test_sleep_hook_keeps_proxy_without_marker(self):
+        def unwritable(tmp):
+            (tmp / 'file').write_text('')
+            return tmp / 'file' / 'run'
+        calls, _ = self.run_sleep_hook(TB710FU, ['pre'], 'active', run_dir=unwritable)
+        self.assertEqual(calls, ['show -P ActiveState iio-sensor-proxy.service'])
 
     def test_device_tree_secure_fastrpc(self):
         patch = DTS_PATCH.read_text()

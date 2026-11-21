@@ -456,8 +456,12 @@ int kshim_main(
         device_tree_address = 0;
     }
     /* Freeze firmware slot and boot-lock evidence before any mutation. */
-    const int booted_slot = kshim_boot_slot_read(runtime_fdt);
-    const int boot_lock_state = kshim_boot_lock_read(runtime_fdt);
+    int booted_slot_source = 0;
+    int boot_lock_source = 0;
+    const int booted_slot = kshim_boot_slot_read_source(runtime_fdt,
+                                                        &booted_slot_source);
+    const int boot_lock_state = kshim_boot_lock_read_source(runtime_fdt,
+                                                            &boot_lock_source);
     /* Turn translation on before anything else touches memory.  Up to this
      * point every fetch, load and store runs uncached and strictly ordered,
      * which on this platform costs tens of seconds before the menu appears.
@@ -956,10 +960,12 @@ int kshim_main(
                         status = fdt_open_into(blob, blob, sizeof(HandoffDtb));
                     }
                     if (status == 0) {
-                        status = kshim_boot_witness_export(blob, booted_slot);
+                        status = kshim_boot_witness_export_source(blob, booted_slot,
+                                                                  booted_slot_source);
                     }
                     if (status == 0) {
-                        status = kshim_boot_lock_export(blob, boot_lock_state);
+                        status = kshim_boot_lock_export_source(blob, boot_lock_state,
+                                                               boot_lock_source);
                     }
                     if (status == 0) {
                         /* Re-pack the modified DT, then validate the result. */

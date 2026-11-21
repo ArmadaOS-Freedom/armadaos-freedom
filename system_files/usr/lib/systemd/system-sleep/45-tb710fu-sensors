@@ -3,22 +3,36 @@
 # TB710FU: stop the sensor stream across system sleep. With automatic rotation
 # on, iio-sensor-proxy keeps the SSC accelerometer streaming, which wakes the
 # ADSP during s2idle (measured on the TB323FU's SSC). Start it again only if it
-# was running.
+# was running or about to (re)start.
 compatible=${TB710FU_DT_COMPATIBLE:-/sys/firmware/devicetree/base/compatible}
 tr '\0' '\n' <"$compatible" 2>/dev/null | grep -qx 'lenovo,tb710fu' || exit 0
 
+unit=iio-sensor-proxy.service
 marker=${TB710FU_SENSORS_RUN:-/run/tb710fu-sensors}/proxy-stopped
+log() { echo "45-tb710fu-sensors: $*" >&2; }
+
 case "$1" in
 pre)
-	if systemctl -q is-active iio-sensor-proxy.service; then
-		mkdir -p "${marker%/*}" && : >"$marker"
-		systemctl stop iio-sensor-proxy.service
+	# activating also covers a pending Restart= (sub-state auto-restart).
+	case "$(systemctl show -P ActiveState "$unit")" in
+	active|activating|reloading) ;;
+	*) exit 0 ;;
+	esac
+	# Without the marker resume would not start it again: keep it running.
+	if ! { mkdir -p "${marker%/*}" && : >"$marker"; }; then
+		log "cannot record $unit for resume; leaving it running"
+		exit 0
 	fi
+	systemctl stop "$unit"
 	;;
 post)
-	if [ -e "$marker" ]; then
+	[ -e "$marker" ] || exit 0
+	# Keep the marker until systemd accepts the job, so the next resume
+	# retries a rejected start.
+	if systemctl start --no-block "$unit"; then
 		rm -f "$marker"
-		systemctl start --no-block iio-sensor-proxy.service
+	else
+		log "could not queue $unit; will retry on the next resume"
 	fi
 	;;
 esac

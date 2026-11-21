@@ -19,11 +19,13 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 | 机身 Linux | 可进入 ArmadaOS 和 Steam 游戏模式 |
 | 触屏 | 坐标已修正，点击和滑动已确认正常 |
 | Game Mode 显示方向 | 启动时固定 `right`（270°），使用 DPU 硬件旋转；固定方向方案已完成用户实机验收 |
+| 90°方向覆盖 | `0234` 修正 QSEED 反射后的取像方向；90°齿轮及四方向 KMS／寄存器技术核验完成，见[旋转验证记录](rotation.md) |
 | Steam 会话重开 | 一次固定 270°会话重启的技术检查通过；早期方向切换试验的半屏闪烁原因仍单独追踪 |
 | G9 手柄 | 基础按键、单按／双击 Home 及 RGB 控制已确认正常 |
 | Armada Control | 使用四代独立配置，隐藏风扇相关入口 |
+| 相机总线与空闲释放 | `7.2.6-y700-camera2` 实机通过总线同步、双摄 RAW 和 10/20 分钟 RTC 待机唤醒。默认集成版已完成编译与配置检查，后续电源修订待实机验证。 |
 
-这些状态对应已完成的实机操作验证；长期稳定性及其它显示切换场景仍在验证中。
+实机结果对应各项所列版本和场景。长期稳定性及其它显示切换场景仍在验证中。
 
 ## Game Mode 固定横屏
 
@@ -34,6 +36,8 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 2026-11-17，固定 270°方案完成新内核、完整模块和 initramfs 的配套部署、签名 A/B 启动包写入及正常开机，用户确认实机验证完成。开机和一次同方向 Steam 会话重启的 KMS 采样均为两个活动 UBWC plane、rotation 270°、1904×3040@60 Hz，采集日志未见此前的显示提交超时。前序静态标记图和 30 秒齿轮也已实屏确认。
 
 用户验收未逐项列出游戏、刷新率和测试时长；高刷切换、休眠恢复、其它 DPU12 设备及长期稳定性继续分场景验证。早期方向切换试验的半屏闪烁原因仍单独追踪，本次验收不用于宣称已定位该历史故障根因。
+
+90°方向覆盖在此基础上通过 `0234` 修正最终反射下的 QSEED pixel-extension fetch，默认启动仍为270°。2026-11-18至19日完成90°静态／齿轮与四方向硬件状态技术核验；连续重启时的 Decky 退出和 Gamescope 清理报错仍单独保留，未扩称切换生命周期全部通过。补丁原理、构建来源和验证边界见[旋转验证记录](rotation.md)。
 
 ## G9 手柄
 
@@ -53,7 +57,7 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 - **安装与更新：** 公共安装流程仍在完善，OTA 源码策略与钩子已接入，完整的引导载荷同步及系统更新尚未通过端到端验证。
 - **启动器：** 手动／自动机型选择与默认启动项仅在本次启动内生效，持久化暂缓。TF 卡启动及高级启动操作不在上述已确认范围内。
 - **手柄扩展功能：** 独立背键、IMU、震动、其它手柄模式及插拔／休眠恢复尚未完整验证。
-- **相机：** 仅补齐设备树控制节点，功能未验证。
+- **相机：** `7.2.6-y700-camera2` 实测通过内核总线初始化、双摄 RAW、后摄手动调焦和停流后的资源释放，DDR 可退出最高档锁定。默认集成版还需复测这些项目。色彩标定、AE/AWB/AF、软件 ISP、应用集成、DDR/CX/AOSS 深层驻留和精确待机瓦数仍待验证。见[相机与待机记录](camera/README.md)。
 
 ## 内核与启动
 
@@ -82,11 +86,12 @@ ArmadaOS Freedom 为 Y700 四代提供 kShimC 多系统启动、Steam 游戏模�
 <details>
 <summary>设备树适配细节</summary>
 
-相机伴生片段来自同一固定提交的 `sm8750.dtsi` 第 3072–3309 行，摘出 `cci0`、`cci1`、`camss` 三个完整节点并置于 `&soc {}` 下，仅归一化缩进，保留源文件的 BSD-3-Clause SPDX 与 Qualcomm 版权。它补齐 `&camss`、`&cci0`、`&cci0_i2c0`、`&cci1`、`&cci1_i2c0` 标签，不新增驱动。
+相机伴生片段来自同一固定提交的 `sm8750.dtsi` 第 3072–3309 行，摘出 `cci0`、`cci1`、`camss` 三个完整节点并置于 `&soc {}` 下，仅归一化缩进，保留源文件的 BSD-3-Clause SPDX 与 Qualcomm 版权。它补齐 `&camss`、`&cci0`、`&cci0_i2c0`、`&cci1`、`&cci1_i2c0` 标签；对应驱动由共享补丁 0240–0249 提供。
 
 DTS 适配补丁的主要内容：
 
 - 紧接 `#include "sm8750-pmics.dtsi"` 之后包含相机伴生片段。
+- 给 CAMCC 设置共享 TITAN_TOP 域生命周期内的两条最低 ICC 票，CAMSS 仅保留实际消费的两条吞吐路径；空闲关域后归零，不以关闭 fw_devlink 绕过总线同步。
 - 删除 `memory@a0000000` 节点及其 RAM 注释：内存节点由运行时引导 DT（kShim handoff_memory）重建，原作者的固定 RAM map 未在本机确认。
 - `chosen` 保留 `#address-cells`、`#size-cells`、`ranges` 与 simple-framebuffer 模板；`framebuffer` 去掉 unit-address 与固定 `reg`/`width`/`height`/`stride`/`format`，改加 `status = "disabled"`，由运行时 simplefb 处理器按模板填真实地址与尺寸。不向 framebuffer 添加 `memory-region`。
 - 给 `reserved-memory` 下的 `ramoops@c2000000` 与 `splash-region@fc800000` 加 `status = "disabled"`，保留其地址元数据但停用，因为这些固定地址未经验证。

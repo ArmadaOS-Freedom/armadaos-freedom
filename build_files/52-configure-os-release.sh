@@ -23,14 +23,14 @@ fi
 
 install -d -m 0755 /usr/lib /etc
 cat >"${os_release}" <<EOF
-NAME="ArmadaOS Freedom"
+NAME="ArmadaOS-Freedom"
 VERSION="${armada_version}"
 ID=armada
 ID_LIKE="fedora"
 VERSION_ID="${base_version_id}"
 VERSION_CODENAME=freedom
 BUILD_ID="${armada_version}"
-PRETTY_NAME="ArmadaOS Freedom ${armada_version}"
+PRETTY_NAME="ArmadaOS-Freedom ${armada_version}"
 VARIANT="Freedom"
 VARIANT_ID=freedom
 DEFAULT_HOSTNAME=armada

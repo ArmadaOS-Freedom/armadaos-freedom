@@ -111,6 +111,33 @@ class TestSelectPreview(unittest.TestCase):
         self.assertEqual(self.select([same, tie]).release_id, 6)
         self.assertEqual(self.select([tie, same]).release_id, 6)
 
+    def test_prerelease_only_pinned_tag_selects_matching_prerelease(self):
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False),
+            rel(3, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+            rel(4, "v3.4.0-pre1", "2024-07-01T00:00:00Z", prerelease=True),
+        ]
+        r = select_preview(releases, prerelease_only=True, pinned_tag="v3.3.1-pre1")
+        self.assertEqual((r.release_id, r.tag), (3, "v3.3.1-pre1"))
+
+    def test_prerelease_only_excludes_stable_and_pin_excludes_others(self):
+        releases = [
+            rel(1, "v3.3.0", "2024-01-01T00:00:00Z", prerelease=False),
+            rel(2, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False),
+        ]
+        with self.assertRaisesRegex(DeckyReleaseError, "pinned release"):
+            select_preview(releases, prerelease_only=True, pinned_tag="v3.3.1-pre1")
+
+    def test_pinned_tag_must_be_prerelease_when_prerelease_only(self):
+        releases = [
+            rel(1, "v3.3.1", "2024-06-01T00:00:00Z", prerelease=False),
+        ]
+        with self.assertRaises(DeckyReleaseError):
+            select_preview(releases, prerelease_only=True, pinned_tag="v3.3.1")
+        r = select_preview(releases, pinned_tag="v3.3.1")
+        self.assertEqual((r.release_id, r.tag), (1, "v3.3.1"))
+
     def test_no_arm64_no_fallback(self):
         releases = [
             rel(1, "v1", "2024-01-01T00:00:00Z"),
@@ -118,6 +145,29 @@ class TestSelectPreview(unittest.TestCase):
         ]
         with self.assertRaises(DeckyReleaseError):
             self.select(releases)
+
+    def test_require_arm64_skips_newest_missing_and_returns_older_published(self):
+        releases = [
+            rel(1, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+            rel(2, "v3.4.0-pre1", "2024-07-01T00:00:00Z", prerelease=True,
+                assets=[{"id": 1, "name": "other", "size": 1}]),
+        ]
+        r = select_preview(releases, prerelease_only=True, require_arm64=True)
+        self.assertEqual((r.release_id, r.tag), (1, "v3.3.1-pre1"))
+
+    def test_require_arm64_matching_candidate_with_bad_metadata_fails(self):
+        releases = [
+            rel(1, "v3.3.1-pre1", "2024-05-01T00:00:00Z", prerelease=True),
+            rel(2, "v3.4.0-pre1", "2024-07-01T00:00:00Z", prerelease=True,
+                assets=[asset("v3.4.0-pre1", digest=None)]),
+        ]
+        with self.assertRaisesRegex(DeckyReleaseError, "digest"):
+            select_preview(releases, prerelease_only=True, require_arm64=True)
+
+    def test_require_arm64_keeps_nonlist_assets_failing_later(self):
+        releases = [rel(1, "v1", "2024-01-01T00:00:00Z", assets="x")]
+        with self.assertRaises(DeckyReleaseError):
+            select_preview(releases, require_arm64=True)
 
     def test_duplicate_asset_fails(self):
         releases = [rel(1, "v1", "2024-01-01T00:00:00Z", assets=[asset("v1"), asset("v1")])]

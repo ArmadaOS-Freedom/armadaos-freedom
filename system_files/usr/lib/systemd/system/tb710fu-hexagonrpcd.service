@@ -3,20 +3,34 @@
 # loads its sensors for a secure session, and it writes its registry, so the
 # daemon serves a writable copy of it (HEXAGONRPCD_WRITABLE_REGISTRY).
 # 81-armada-tb710fu-sensors.rules starts it when the secure node appears.
+#
+# Every start first stages the hub's files from the Android partitions
+# (tb710fu-sensors-prepare, read-only; "+" runs it outside the sandbox below).
+# A failed staging fails the start, so Restart= retries it together with the
+# daemon, backing off from 3 s to a minute.
 [Unit]
 Description=TB710FU sensor hub FastRPC daemon
 ConditionFirmware=device-tree-compatible(lenovo,tb710fu)
 BindsTo=dev-fastrpc\x2dadsp\x2dsecure.device
 After=dev-fastrpc\x2dadsp\x2dsecure.device
-Requires=tb710fu-sensors-prepare.service
-After=tb710fu-sensors-prepare.service
+After=local-fs.target
+# The partitions the staging reads, for either Android slot.
+Wants=dev-disk-by\x2dpartlabel-boot_a.device dev-disk-by\x2dpartlabel-boot_b.device
+Wants=dev-disk-by\x2dpartlabel-dsp_a.device dev-disk-by\x2dpartlabel-dsp_b.device
+Wants=dev-disk-by\x2dpartlabel-super.device dev-disk-by\x2dpartlabel-persist.device
+After=dev-disk-by\x2dpartlabel-boot_a.device dev-disk-by\x2dpartlabel-boot_b.device
+After=dev-disk-by\x2dpartlabel-dsp_a.device dev-disk-by\x2dpartlabel-dsp_b.device
+After=dev-disk-by\x2dpartlabel-super.device dev-disk-by\x2dpartlabel-persist.device
 StartLimitIntervalSec=0
 
 [Service]
+ExecStartPre=+/usr/libexec/tb710fu/tb710fu-sensors-prepare
 Environment=HEXAGONRPCD_WRITABLE_REGISTRY=/var/lib/tb710fu-sensors/registry
 ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R /var/lib/tb710fu-sensors/fw
 Restart=always
 RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
 
 DevicePolicy=closed
 DeviceAllow=/dev/fastrpc-adsp-secure rw
