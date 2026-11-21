@@ -70,6 +70,40 @@ def require_once(function: str, needle: str, label: str) -> None:
         raise ValueError(f"{label}: expected one {needle!r}, found {count}")
 
 
+def extract_if_block(function: str, condition: str) -> str:
+    start = function.find(condition)
+    if start < 0:
+        raise ValueError(f"conditional block not found: {condition}")
+    brace = function.find("{", start)
+    if brace < 0:
+        raise ValueError(f"conditional block has no body: {condition}")
+    depth = 0
+    for pos in range(brace, len(function)):
+        if function[pos] == "{":
+            depth += 1
+        elif function[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return function[start : pos + 1]
+    raise ValueError(f"unterminated conditional block: {condition}")
+
+
+def require_order(function: str, *needles: str, label: str) -> None:
+    positions = []
+    for needle in needles:
+        position = function.find(needle)
+        if position < 0:
+            raise ValueError(f"{label}: source is missing {needle!r}")
+        positions.append(position)
+    if positions != sorted(positions):
+        raise ValueError(f"{label}: source operations are out of order")
+
+
+def require_absent(function: str, needle: str, label: str) -> None:
+    if needle in function:
+        raise ValueError(f"{label}: unexpected {needle!r}")
+
+
 def extract_case(function: str, case_label: str, next_case: str) -> str:
     start = function.find(case_label)
     if start < 0:
@@ -81,7 +115,12 @@ def extract_case(function: str, case_label: str, next_case: str) -> str:
 
 
 def classify_sources(
-    candidate_text: str, candidate_header: str, dai_text: str, baseline_text: str | None
+    candidate_text: str,
+    candidate_header: str,
+    dai_text: str,
+    soc_pcm_text: str,
+    soc_component_text: str,
+    baseline_text: str | None,
 ) -> dict[str, tuple[str, int]]:
     signatures = {
         "candidate_start": (
@@ -108,6 +147,38 @@ def classify_sources(
         "candidate_callback": (
             candidate_text,
             "static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)",
+        ),
+        "candidate_soc_pcm_hw_clean": (
+            soc_pcm_text,
+            "static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,",
+        ),
+        "candidate_soc_pcm_clean_components": (
+            soc_pcm_text,
+            "static int soc_pcm_hw_clean_components(struct snd_pcm_substream *substream,",
+        ),
+        "candidate_soc_pcm_clean_dais": (
+            soc_pcm_text,
+            "static void soc_pcm_hw_clean_dais(struct snd_soc_pcm_runtime *rtd,",
+        ),
+        "candidate_component_hw_free": (
+            soc_component_text,
+            "int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,",
+        ),
+        "candidate_dpcm_hw_free": (
+            soc_pcm_text,
+            "static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)",
+        ),
+        "candidate_dpcm_hw_params": (
+            soc_pcm_text,
+            "static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,",
+        ),
+        "candidate_dpcm_shutdown": (
+            soc_pcm_text,
+            "static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)",
+        ),
+        "candidate_dpcm_trigger": (
+            soc_pcm_text,
+            "static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)\n{",
         ),
     }
     if baseline_text is not None:
@@ -211,6 +282,125 @@ def classify_sources(
             "idr_find(&apm->graph_info_idr, hdr->token);",
             "baseline callback unmasked token",
         )
+
+    clean = extracted["candidate_soc_pcm_hw_clean"][0]
+    require_order(
+        clean,
+        "ret = soc_pcm_hw_clean_components(substream, rollback, retain_failed);",
+        "if (ret < 0 && stop_on_component_error)",
+        "return ret;",
+        "soc_pcm_hw_clean_dais(rtd, substream, rollback);",
+        label="DPCM FE cleanup aborts before DAI cleanup on component error",
+    )
+    require_once(
+        extracted["candidate_soc_pcm_clean_components"][0],
+        "return snd_soc_pcm_component_hw_free(substream, rollback, retain_failed);",
+        "component cleanup helper",
+    )
+    component_hw_free = extracted["candidate_component_hw_free"][0]
+    require_order(
+        component_hw_free,
+        "ret = 0;",
+        "ret = component->driver->hw_free(component, substream);",
+        "if (ret >= 0 || !retain_failed)",
+        "soc_component_mark_pop(component, hw_params);",
+        label="failed component marks remain available for recovery retry",
+    )
+    require_once(
+        extracted["candidate_soc_pcm_clean_dais"][0],
+        "snd_soc_dai_hw_free(dai, substream, rollback);",
+        "DAI cleanup helper",
+    )
+
+    hw_free = extracted["candidate_dpcm_hw_free"][0]
+    require_order(
+        hw_free,
+        "ret = soc_pcm_hw_clean(fe, substream, 0, true, true);",
+        "if (ret < 0)",
+        "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);",
+        "goto out;",
+        "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);",
+        "dpcm_be_dai_hw_free(fe, stream);",
+        label="FE STOP failure retains the backend",
+    )
+    hw_free_failure = extract_if_block(
+        hw_free, "if (ret < 0) {\n\t\tWRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);"
+    )
+    require_order(
+        hw_free_failure,
+        "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);",
+        "goto out;",
+        label="FE STOP failure exits before backend cleanup",
+    )
+    require_absent(
+        hw_free_failure,
+        "dpcm_be_dai_hw_free(fe, stream);",
+        "failed FE STOP preserves backend parameters",
+    )
+
+    hw_params = extracted["candidate_dpcm_hw_params"][0]
+    require_order(
+        hw_params,
+        "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
+        "ret = soc_pcm_hw_clean_components(substream, 1, true);",
+        "if (ret < 0)",
+        "soc_pcm_hw_clean_dais(fe, substream, 0);",
+        "dpcm_be_dai_hw_free(fe, stream);",
+        "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);",
+        "memcpy(&fe->dpcm[stream].hw_params, params,",
+        label="DPCM retries failed FE cleanup before reconfiguring",
+    )
+    hw_params_recovery = extract_if_block(
+        hw_params, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+    )
+    require_absent(
+        hw_params_recovery,
+        "snd_soc_dapm_stream_stop",
+        "hw_params recovery does not repeat DAPM cleanup",
+    )
+    require_absent(
+        hw_params_recovery,
+        "snd_soc_link_hw_free",
+        "hw_params recovery does not repeat machine-link cleanup",
+    )
+    require_once(
+        hw_params_recovery,
+        "ret = soc_pcm_hw_clean_components(substream, 1, true);",
+        "hw_params component-only recovery attempt",
+    )
+
+    shutdown = extracted["candidate_dpcm_shutdown"][0]
+    require_order(
+        shutdown,
+        "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
+        "ret = soc_pcm_hw_clean_components(substream, 1, false);",
+        "dev_err(fe->dev,",
+        "soc_pcm_hw_clean_dais(fe, substream, 0);",
+        "dpcm_be_dai_hw_free(fe, stream);",
+        "dpcm_be_dai_shutdown(fe, stream);",
+        label="PCM close performs final FE cleanup before backend shutdown",
+    )
+    shutdown_recovery = extract_if_block(
+        shutdown, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+    )
+    require_order(
+        shutdown_recovery,
+        "ret = soc_pcm_hw_clean_components(substream, 1, false);",
+        "soc_pcm_hw_clean_dais(fe, substream, 0);",
+        "dpcm_be_dai_hw_free(fe, stream);",
+        "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);",
+        label="close completes best-effort cleanup after the final STOP attempt",
+    )
+
+    trigger = extracted["candidate_dpcm_trigger"][0]
+    require_order(
+        trigger,
+        "if (READ_ONCE(fe->dpcm[stream].hw_free_failed)",
+        "cmd == SNDRV_PCM_TRIGGER_START",
+        "goto out;",
+        "switch (trigger)",
+        label="DPCM blocks START while FE STOP remains unresolved",
+    )
     return extracted
 
 
@@ -968,6 +1158,74 @@ static void check_unmap_replies(void)
 	CHECK(pthread_mutex_destroy(&apm.lock) == 0);
 }
 
+static void check_dpcm_stop_failure_recovery(void)
+{
+	struct snd_soc_dai_link link = { .name = "FE2" };
+	struct device device = {};
+	struct snd_soc_pcm_runtime fe = {
+		.dai_link = &link,
+		.dev = &device,
+	};
+	struct snd_pcm_substream substream = { .stream = SNDRV_PCM_STREAM_CAPTURE };
+	int ret;
+
+	memset(fe.dpcm, 0, sizeof(fe.dpcm));
+	simulated_whole_clean_calls = 0;
+	simulated_component_clean_calls = 0;
+	simulated_dai_free_calls = 0;
+	simulated_be_free_calls = 0;
+	simulated_be_shutdown_calls = 0;
+
+	/* Failed FE STOP keeps the DAI and BE allocations alive. */
+	simulated_component_result = -ETIMEDOUT;
+	ret = simulate_dpcm_hw_free(&fe, &substream);
+	CHECK(ret == -ETIMEDOUT);
+	CHECK(fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
+	CHECK(simulated_whole_clean_calls == 1);
+	CHECK(simulated_dai_free_calls == 0);
+	CHECK(simulated_be_free_calls == 0);
+
+	/* A failed hw_params retry leaves the backend intact for another retry. */
+	simulated_component_clean_calls = 0;
+	ret = simulate_dpcm_hw_params_recovery(&fe, &substream);
+	CHECK(ret == -ETIMEDOUT);
+	CHECK(fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
+	CHECK(simulated_component_clean_calls == 1);
+	CHECK(simulated_component_rollback == 1);
+	CHECK(simulated_component_retain);
+	CHECK(simulated_dai_free_calls == 0);
+	CHECK(simulated_be_free_calls == 0);
+	CHECK(simulated_whole_clean_calls == 1);
+
+	/* A successful retry releases the stale BE state and clears the guard. */
+	simulated_component_result = 0;
+	ret = simulate_dpcm_hw_params_recovery(&fe, &substream);
+	CHECK(ret == 0);
+	CHECK(!fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
+	CHECK(fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].state == SND_SOC_DPCM_STATE_HW_FREE);
+	CHECK(simulated_component_rollback == 1);
+	CHECK(simulated_component_retain);
+	CHECK(simulated_dai_free_calls == 1);
+	CHECK(simulated_be_free_calls == 1);
+	CHECK(simulated_whole_clean_calls == 1);
+
+	/* Close drops the retained mark and finishes teardown despite STOP failure. */
+	fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = true;
+	simulated_component_result = -ETIMEDOUT;
+	simulated_component_clean_calls = 0;
+	simulated_dai_free_calls = 0;
+	simulated_be_free_calls = 0;
+	simulated_be_shutdown_calls = 0;
+	simulate_dpcm_shutdown_recovery(&fe, &substream);
+	CHECK(simulated_component_clean_calls == 1);
+	CHECK(simulated_component_rollback == 1);
+	CHECK(!simulated_component_retain);
+	CHECK(simulated_dai_free_calls == 1);
+	CHECK(simulated_be_free_calls == 1);
+	CHECK(simulated_be_shutdown_calls == 1);
+	CHECK(!fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
+}
+
 static void check_failed_pcm_prepare(void)
 {
 	struct q6apm_dai_rtd prtd = { .state = Q6APM_STREAM_RUNNING };
@@ -994,6 +1252,7 @@ int main(void)
 	check_concurrent_start_during_stop();
 	check_stop_replies();
 	check_unmap_replies();
+	check_dpcm_stop_failure_recovery();
 	check_failed_pcm_prepare();
 #ifdef HAVE_BASELINE
 	check_baseline_unmap();
@@ -1007,6 +1266,104 @@ int main(void)
 '''
 
 
+DPCM_SIM_PREAMBLE = r'''
+struct snd_soc_dai_link {
+	const char *name;
+};
+
+struct fake_dpcm_runtime {
+	bool hw_free_failed;
+	int state;
+};
+
+struct snd_soc_pcm_runtime {
+	struct fake_dpcm_runtime dpcm[2];
+	struct snd_soc_dai_link *dai_link;
+	struct device *dev;
+};
+
+#define SND_SOC_DPCM_UPDATE_FE 1
+#define SND_SOC_DPCM_UPDATE_NO 0
+#define SND_SOC_DPCM_STATE_HW_FREE 8
+
+static int simulated_component_result;
+static int simulated_whole_clean_calls;
+static int simulated_component_clean_calls;
+static int simulated_component_rollback;
+static int simulated_component_retain;
+static int simulated_dai_free_calls;
+static int simulated_be_free_calls;
+static int simulated_be_shutdown_calls;
+
+static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
+				     int stream, int state)
+{
+	(void)fe;
+	(void)stream;
+	(void)state;
+}
+
+static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *fe,
+			    struct snd_pcm_substream *substream,
+			    int rollback, bool stop_on_component_error,
+			    bool retain_failed)
+{
+	(void)fe;
+	(void)substream;
+	(void)rollback;
+	(void)stop_on_component_error;
+	(void)retain_failed;
+	simulated_whole_clean_calls++;
+	return simulated_component_result;
+}
+
+static int soc_pcm_hw_clean_components(struct snd_pcm_substream *substream,
+				       int rollback, bool retain_failed)
+{
+	(void)substream;
+	simulated_component_clean_calls++;
+	simulated_component_rollback = rollback;
+	simulated_component_retain = retain_failed;
+	return simulated_component_result;
+}
+
+static void soc_pcm_hw_clean_dais(struct snd_soc_pcm_runtime *fe,
+				 struct snd_pcm_substream *substream, int rollback)
+{
+	(void)fe;
+	(void)substream;
+	(void)rollback;
+	simulated_dai_free_calls++;
+}
+
+static void dpcm_be_dai_hw_free(struct snd_soc_pcm_runtime *fe, int stream)
+{
+	(void)fe;
+	(void)stream;
+	simulated_be_free_calls++;
+}
+
+static void dpcm_be_dai_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
+{
+	(void)fe;
+	(void)stream;
+	simulated_be_shutdown_calls++;
+}
+
+static void snd_soc_dpcm_mutex_unlock(struct snd_soc_pcm_runtime *fe)
+{
+	(void)fe;
+}
+
+static int soc_pcm_ret(struct snd_soc_pcm_runtime *fe, int ret)
+{
+	(void)fe;
+	return ret;
+}
+
+'''
+
+
 def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     candidate_start, _ = extracted["candidate_start"]
     candidate_stop, _ = extracted["candidate_stop"]
@@ -1014,6 +1371,22 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     candidate_trigger, _ = extracted["candidate_trigger"]
     candidate_unmap, _ = extracted["candidate_unmap"]
     candidate_callback, _ = extracted["candidate_callback"]
+    hw_free, _ = extracted["candidate_dpcm_hw_free"]
+    hw_params, _ = extracted["candidate_dpcm_hw_params"]
+    shutdown, _ = extracted["candidate_dpcm_shutdown"]
+    hw_free_core_start = hw_free.find(
+        "ret = soc_pcm_hw_clean(fe, substream, 0, true, true);"
+    )
+    hw_free_core_end = hw_free.find("\nout:", hw_free_core_start)
+    if hw_free_core_start < 0 or hw_free_core_end < 0:
+        raise ValueError("could not isolate DPCM FE hw_free state transition")
+    hw_free_core = hw_free[hw_free_core_start:hw_free_core_end]
+    hw_params_retry = extract_if_block(
+        hw_params, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+    )
+    shutdown_retry = extract_if_block(
+        shutdown, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+    )
     parts = [
         "#define HAVE_BASELINE 1" if "baseline_start" in extracted else "",
         PREAMBLE,
@@ -1031,6 +1404,25 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         "#define apm_callback candidate_apm_callback",
         candidate_callback,
         "#undef apm_callback",
+        DPCM_SIM_PREAMBLE,
+        "static int simulate_dpcm_hw_free(struct snd_soc_pcm_runtime *fe, "
+        "struct snd_pcm_substream *substream)\n{\n"
+        "\tint stream = substream->stream;\n\tint ret;\n"
+        + hw_free_core
+        + "\nout:\n"
+        "\tdpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);\n"
+        "\tsnd_soc_dpcm_mutex_unlock(fe);\n"
+        "\treturn soc_pcm_ret(fe, ret);\n}\n",
+        "static int simulate_dpcm_hw_params_recovery(struct snd_soc_pcm_runtime *fe, "
+        "struct snd_pcm_substream *substream)\n{\n"
+        "\tint ret = 0, stream = substream->stream;\n"
+        + hw_params_retry
+        + "\nout:\n\treturn ret;\n}\n",
+        "static void simulate_dpcm_shutdown_recovery(struct snd_soc_pcm_runtime *fe, "
+        "struct snd_pcm_substream *substream)\n{\n"
+        "\tint stream = substream->stream;\n\tint ret = 0;\n"
+        + shutdown_retry
+        + "\tdpcm_be_dai_shutdown(fe, stream);\n}\n",
     ]
     if "baseline_start" in extracted:
         baseline_start, _ = extracted["baseline_start"]
@@ -1095,17 +1487,36 @@ def main() -> int:
     candidate = resolve_q6apm_c(args.kernel_source_tree, "candidate")
     candidate_header = candidate.with_name(Q6APM_H_REL.name)
     candidate_dai = candidate.with_name(Q6APM_DAI_NAME)
+    if args.kernel_source_tree.is_dir():
+        candidate_soc_pcm = args.kernel_source_tree / "sound/soc/soc-pcm.c"
+        candidate_soc_component = args.kernel_source_tree / "sound/soc/soc-component.c"
+    else:
+        raise SystemExit(
+            "DPCM teardown validation requires a kernel source tree; pass the "
+            "tree directory instead of a direct q6apm.c path"
+        )
     if not candidate_header.is_file():
         raise SystemExit(f"candidate header not found at {candidate_header}")
+    if not candidate_soc_pcm.is_file():
+        raise SystemExit(f"candidate DPCM source not found at {candidate_soc_pcm}")
+    if not candidate_soc_component.is_file():
+        raise SystemExit(f"candidate component source not found at {candidate_soc_component}")
     baseline = (
         resolve_q6apm_c(args.baseline, "baseline") if args.baseline else None
     )
     candidate_text = candidate.read_text(encoding="utf-8")
     candidate_header_text = candidate_header.read_text(encoding="utf-8")
     dai_text = candidate_dai.read_text(encoding="utf-8")
+    soc_pcm_text = candidate_soc_pcm.read_text(encoding="utf-8")
+    soc_component_text = candidate_soc_component.read_text(encoding="utf-8")
     baseline_text = baseline.read_text(encoding="utf-8") if baseline else None
     extracted = classify_sources(
-        candidate_text, candidate_header_text, dai_text, baseline_text
+        candidate_text,
+        candidate_header_text,
+        dai_text,
+        soc_pcm_text,
+        soc_component_text,
+        baseline_text,
     )
     harness = build_harness(extracted)
 
@@ -1149,6 +1560,10 @@ def main() -> int:
         "candidate_sha256": digest(candidate),
         "candidate_header": str(candidate_header),
         "candidate_header_sha256": digest(candidate_header),
+        "candidate_soc_pcm": str(candidate_soc_pcm.resolve()),
+        "candidate_soc_pcm_sha256": digest(candidate_soc_pcm),
+        "candidate_soc_component": str(candidate_soc_component.resolve()),
+        "candidate_soc_component_sha256": digest(candidate_soc_component),
         "candidate_dai_sha256": digest(candidate_dai),
         "baseline_negative_controls": baseline is not None,
         "extracted": {

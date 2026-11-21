@@ -26,10 +26,27 @@ are matched to the pending command by opcode and request token. The UNMAP
 caller publishes completion only after storing the DSP status, and clears
 only its selected mapping handle after a matching successful response. Failed
 prepare blocks START in either PCM direction until a later prepare succeeds.
-Persistent DSP failure still leaves DPCM to perform best-effort cleanup; this
-does not repair callback or graph-object lifetime after final teardown.
+If capture component `hw_free` cannot stop the FE graph, DPCM returns the error
+and retains the BE parameters. A later `hw_params` retries only FE component
+cleanup; after it succeeds, DPCM releases the old DAI/BE parameters before
+configuring the new stream. PCM close makes one final FE cleanup attempt before
+BE shutdown, then continues best-effort resource release if STOP still fails.
+Callback lifetime after final port teardown is unchanged.
 
 ## Validation
+
+### Historical device validation for `92fa202c` (2026-11-20)
+
+The matching locally built `7.2.6-y700-audio1` kernel booted on TB322FC with
+GNU build ID `4906e0d0df63a57b6efd02470f27659abac49231`. Capture prepare/free
+without START, start/drop and reconfigure/reprepare passed on this kernel; the
+trace showed FE2 STOP before BE120 shutdown, and all 72 observed synchronous
+DSP commands returned success. The CI disk image for this revision was built,
+but it was not installed or booted; the device results came from the matching
+local build. The earlier device status above remains historical context.
+
+This was normal-path coverage only. Final close after a real DSP STOP timeout,
+other Qualcomm boards and acoustic output remain unvalidated.
 
 The `494f90ea` audio2 kernel was built locally, installed and booted on the
 TB322FC. The tested kernel included both `0750` and the now-separated `0751`.
@@ -50,10 +67,28 @@ and covers delayed and duplicate replies, token/opcode mismatches, DSP errors,
 mapping ownership and both PCM START guards. The PR review fix passed 320/320
 patch applications and the full kernel host source checks in a clean Linux
 7.2.6 tree; the AudioReach harness reported 191 checks. Patch-catalogue tests
-passed 4/4. These local source checks stop before kernel compilation. CI for
-the updated PR head is pending. The previous head's x86_64 package matrix item
-was skipped. CodeRabbit's `COMMENTED` status is an automated review result,
-not a human approval. Current checks must be read from PR #159.
+passed 4/4. These local source checks stop before kernel compilation. At head
+`076d2af5`, Linked issue, patch catalogue, unit tests, kernel host source
+checks, CodeRabbit and the ARM container-image job passed; the x86_64 package
+matrix item was skipped. No human review decision is recorded.
+
+### STOP failure recovery review fix (2026-11-21)
+
+CodeRabbit's earlier finding on capture FE STOP failure was valid: Linux
+7.2.6 ignored the component `hw_free` result in `soc_pcm_hw_clean()`, so DPCM
+continued freeing the BE. The fix propagates the FE component error, keeps BE
+state allocated on failure, blocks prepare/START while cleanup is unresolved,
+and retries FE component cleanup at the next `hw_params` before releasing the
+old BE state. PCM close performs one last retry before BE shutdown and logs a
+persistent failure while completing best-effort teardown.
+
+Validation for this review fix passed on 2026-11-21. The complete 319-patch
+series applied to a clean Linux 7.2.6 source tree with zero fuzz. The lifecycle
+harness reported 219 checks, the full kernel host source checks passed, and
+the ARM64 build compiled `soc-component.o`, `soc-pcm.o`, `q6apm.o`,
+`q6apm-dai.o` and `q6apm-lpass-dais.o`. Patch-catalogue validation is recorded
+with the repository checks. Existing device results cover normal STOP only;
+DSP STOP failure injection and recovery remain untested on hardware.
 
 Remaining limits: no UNMAP request was observed on hardware; no persistent DSP
 failure recovery was tested; one RTC wake does not establish battery standby

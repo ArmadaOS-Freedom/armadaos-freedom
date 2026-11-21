@@ -1338,4 +1338,4 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0750-ASoC-qcom-harden-audioreach-teardown.patch`
   source: armada
   upstream: local
-  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Reject PCM starts after a failed reprepare. Shared AudioReach code; persistent DSP failure still uses best-effort DPCM cleanup.
+  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Propagate capture FE hw_free errors through DPCM, preserve BE resources and failed component marks, retry cleanup before reconfiguration, and make a final best-effort retry at close. Shared AudioReach code; persistent DSP failure still limits callback lifetime guarantees after final teardown.
