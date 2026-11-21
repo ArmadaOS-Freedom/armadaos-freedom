@@ -94,6 +94,10 @@ def _identity(source, plan_sha256=None):
     disk = (source.get('bootSource') == 'armada_boot' and
             'fromSlot' in source and source['fromSlot'] is None and
             'targetSlot' in source and source['targetSlot'] is None)
+    if source.get('bootSource') == 'armada_boot' and not (
+            'fromSlot' in source and 'targetSlot' in source and
+            source['fromSlot'] is None and source['targetSlot'] is None):
+        return None
     if (identity['transactionId'] is None or identity['oldDeployment'] is None or
             identity['newDeployment'] is None or
             (not disk and (
@@ -125,15 +129,15 @@ def document_identity(prepared, plan, plan_sha256=None):
         return None
     if plan_sha256 is not None and plan_sha256 != prepared.get('planSha256'):
         return None
-    if 'fromSlot' not in plan or 'targetSlot' not in plan:
-        return None
-    armada_boot = (plan.get('armadaBootSwitch') is not None or
+    armada_boot = ('armadaBootSwitch' in plan or
                    plan.get('bootSource') == 'armada_boot')
     if armada_boot:
-        if (plan.get('fromSlot') is not None or
-                plan.get('targetSlot') is not None or
+        if ('fromSlot' not in plan or 'targetSlot' not in plan or
+                plan['fromSlot'] is not None or plan['targetSlot'] is not None or
                 not isinstance(plan.get('armadaBootSwitch'), dict)):
             return None
+    elif 'fromSlot' not in plan or 'targetSlot' not in plan:
+        return None
     source = {
         'transactionId': prepared.get('transactionId'),
         'planSha256': prepared.get('planSha256'),

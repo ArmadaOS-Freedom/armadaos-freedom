@@ -58,6 +58,9 @@ _GEN_RE = re.compile(r"gen-[0-9a-f]{32}")
 
 _MAX_U32_SIGNED = 2**31 - 1
 
+_OFFLINE_STAGED_MARKER = ".offline-staged"
+_OFFLINE_STAGED_BYTES = b"1\n"
+
 
 def _check_file(
     path: Path,
@@ -147,6 +150,21 @@ def _parse_manifest(raw: bytes) -> tuple:
         board, k_size, i_size, d_size,
         k_sha.hex(), i_sha.hex(), d_sha.hex(),
     )
+
+
+def is_offline_staged(generation: Path) -> bool:
+    """Return True iff the generation has an exact small offline-staged marker.
+
+    Missing or malformed markers return False. I/O errors other than a
+    missing file/marker propagate.
+    """
+    marker = Path(generation) / _OFFLINE_STAGED_MARKER
+    try:
+        raw = _io.read_bounded(
+            marker, len(_OFFLINE_STAGED_BYTES))
+    except FileNotFoundError:
+        return False
+    return raw == _OFFLINE_STAGED_BYTES
 
 
 def _verify_signature(der: bytes, raw: bytes, trusted_key) -> None:
@@ -312,6 +330,12 @@ def stage_generation(
     os.mkdir(gen, 0o755)          # exclusive; fails if exists
 
     try:
+        if on_stage is not None:
+            _write_exclusive(gen / _OFFLINE_STAGED_MARKER,
+                             _OFFLINE_STAGED_BYTES, 0o600)
+            _io.fsync_dir(gen)
+            _io.fsync_dir(armada)
+
         model_dir = gen / model
         os.mkdir(model_dir, 0o755)
 

@@ -251,8 +251,14 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         )
 
         status = boot_disk_switch.read_trial_status(
-            {"deployment": _OLD_BINDING}, root=self.root,
+            self.initial, root=self.root,
         )
+        self.assertTrue(status["selectorCheckpointed"])
+        os.unlink(os.fspath(self.boot / "armada" / "activated-switch.json"))
+        status = boot_disk_switch.read_trial_status(
+            self.initial, root=self.root,
+        )
+        self.assertFalse(status["selectorCheckpointed"])
         self.assertEqual(status["state"], "available")
         self.assertEqual(status["recordState"], "prepared")
         self.assertEqual(status["runningDeployment"], "old")
@@ -624,6 +630,38 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         # Another plan could still execute against the failed target, so it is kept.
         self.assertTrue((self.boot / "armada" / _NEW_GEN).is_dir())
         self.assertTrue((self.boot / "armada" / _OLD_GEN).is_dir())
+
+    def test_reclaim_abandoned_preparations_keeps_target_referenced_by_fake_plan(self):
+        """Only unreferenced abandoned preparations are reclaimed."""
+        from updates import offline_session
+
+        armada = self.boot / "armada"
+        gen_a = armada / ("gen-" + "a" * 32)
+        gen_b = armada / ("gen-" + "b" * 32)
+        gen_c = armada / ("gen-" + "c" * 32)
+        gen_a.mkdir()
+        gen_b.mkdir()
+        gen_c.mkdir()
+        (gen_a / ".offline-staged").write_bytes(b"1\n")
+        (gen_b / ".offline-staged").write_bytes(b"1\n")
+
+        base = Path(self._tmp.name) / "offline-sessions"
+        txn = base / ("d" * 32) / "transaction"
+        txn.mkdir(parents=True)
+        status = {"phase": "awaiting_recovery_export", "state": "awaiting_recovery_export"}
+        plan = {"armadaBootSwitch": {"expected": _OLD_GEN, "target": gen_b.name}}
+        (txn / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        (txn / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+        with mock.patch.object(offline_session, "_DEFAULT_BASE", base):
+            boot_disk_switch._reclaim_abandoned_preparations(
+                self.boot, "seed", _OLD_BINDING, self.initial["model"])
+
+        self.assertFalse(gen_a.exists())
+        self.assertTrue(gen_b.is_dir())
+        self.assertTrue(gen_c.is_dir())
+        self.assertTrue((armada / _OLD_GEN).is_dir())
+        self.assertTrue((armada / _NEW_GEN).is_dir())
 
     def test_ensure_root_binding_retries_ostree_fsync(self):
         """First call fails fsyncing ostree parent; retry synchronizes both dirs."""

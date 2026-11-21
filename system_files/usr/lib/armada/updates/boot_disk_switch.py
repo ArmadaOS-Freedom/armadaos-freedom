@@ -17,6 +17,7 @@ from . import deployment_options, deployment_store, signature
 _COMPLETED_NAME = "finished-switch.json"
 _PENDING_NAME = "pending-switch.json"
 _RECOVERED_NAME = "recovered-switch.json"
+_ACTIVATED_NAME = "activated-switch.json"
 _PENDING_SCHEMA = 1
 _RECEIPT_KEYS = {'transactionId', 'planSha256', 'fromSlot', 'targetSlot'}
 _MAX_PENDING_BYTES = 4096
@@ -136,10 +137,17 @@ def _validate_receipt(receipt):
         raise BootDiskSwitchError("receipt fromSlot/targetSlot malformed")
 
 
-def _read_pending(boot, *, completed=False, recovered=False):
-    if completed and recovered:
+def _read_pending(boot, *, completed=False, recovered=False, activated=False):
+    if sum((completed, recovered, activated)) > 1:
         raise BootDiskSwitchError("pending record selector is ambiguous")
-    name = _COMPLETED_NAME if completed else (_RECOVERED_NAME if recovered else _PENDING_NAME)
+    if completed:
+        name = _COMPLETED_NAME
+    elif recovered:
+        name = _RECOVERED_NAME
+    elif activated:
+        name = _ACTIVATED_NAME
+    else:
+        name = _PENDING_NAME
     path = boot / "armada" / name
     try:
         lst = path.lstat()
@@ -306,20 +314,20 @@ def _remove_recovery_pointer(boot):
         raise BootDiskSwitchError(f"cannot fsync recovery pointer removal: {exc}") from exc
 
 
-def _live_offline_plan_uses(boot, pending):
+def _live_offline_plan_generations(boot):
     from . import offline_session
     base = offline_session._DEFAULT_BASE
+    refs = set()
     try:
         base_lst = base.lstat()
     except FileNotFoundError:
-        return False
+        return refs
     if not stat.S_ISDIR(base_lst.st_mode):
-        return False
-    target = pending.get("target")
+        return refs
     try:
         it = os.scandir(base)
     except FileNotFoundError:
-        return False
+        return refs
     with it:
         for entry in it:
             if offline_session._SESSION_ID.fullmatch(entry.name) is None:
@@ -347,9 +355,75 @@ def _live_offline_plan_uses(boot, pending):
             if not isinstance(plan, dict):
                 continue
             switch = plan.get("armadaBootSwitch")
-            if isinstance(switch, dict) and target in (switch.get("target"), switch.get("expected")):
-                return True
-    return False
+            if isinstance(switch, dict):
+                for ref in (switch.get("target"), switch.get("expected")):
+                    if isinstance(ref, str):
+                        refs.add(ref)
+    return refs
+
+
+def _live_offline_plan_uses(boot, pending):
+    return pending.get("target") in _live_offline_plan_generations(boot)
+
+def _reclaim_abandoned_preparations(boot, expected, deployment, model):
+    armada = boot / "armada"
+    if _read_pending(boot) is not None:
+        return
+    completed = _read_pending(boot, completed=True)
+    if completed is not None and (
+            completed["target"] != expected
+            or completed["newDeployment"] != deployment
+            or completed["model"] != model):
+        return
+    if completed is None and expected != "seed":
+        return
+    keep = {expected}
+    if completed is not None:
+        keep.add(completed["expected"])
+        keep.add(completed["target"])
+    link = armada / "recovery"
+    try:
+        target_link = os.readlink(os.fspath(link))
+    except FileNotFoundError:
+        target_link = None
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot read recovery pointer: {exc}") from exc
+    if target_link is not None:
+        if _GEN_DIR_RE.fullmatch(target_link) is None:
+            raise BootDiskSwitchError("recovery pointer is not canonical")
+        keep.add(target_link)
+    for name in _live_offline_plan_generations(boot):
+        keep.add(name)
+    removed = False
+    try:
+        it = os.scandir(armada)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot scan armada dir: {exc}") from exc
+    with it:
+        for entry in it:
+            if entry.name in keep or not entry.name.startswith("gen-"):
+                continue
+            if _GEN_DIR_RE.fullmatch(entry.name) is None:
+                continue
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                path = Path(entry.path)
+                if completed is not None:
+                    shutil.rmtree(path)
+                else:
+                    if not boot_disk_generation.is_offline_staged(path):
+                        continue
+                    shutil.rmtree(path)
+            except OSError as exc:
+                raise BootDiskSwitchError(
+                    f"cannot remove abandoned preparation {entry.name}: {exc}") from exc
+            removed = True
+    if removed:
+        try:
+            _io.fsync_dir(armada)
+        except OSError as exc:
+            raise BootDiskSwitchError(f"cannot fsync armada dir: {exc}") from exc
 
 def _clear_pending_durably(boot):
     armada = boot / "armada"
@@ -412,6 +486,7 @@ def prepare(root, initial, target, package, *, trusted_key, on_stage=None):
         for key, value in package["armadaBootCapsules"][model].items()
     }
     boot_disk_selector.ensure_root_binding(root, target)
+    _reclaim_abandoned_preparations(boot, expected, initial["deployment"], model)
     staged = boot_disk_generation.stage_generation(
         boot,
         model,
@@ -536,6 +611,12 @@ def activate(root, initial, plan, *, trusted_key, receipt=None, reclaim_failed_t
     except OSError as checkpoint_exc:
         raise BootDiskSwitchUncertainError(
             "ARMADA_BOOT activation uncertain: checkpoint failed") from checkpoint_exc
+    if receipt is not None:
+        try:
+            _write_switch_durably(boot, _ACTIVATED_NAME, record)
+        except Exception as write_exc:
+            raise BootDiskSwitchUncertainError(
+                "ARMADA_BOOT activation uncertain: activated receipt not durable") from write_exc
 
 
 def confirm(root, initial, *, trusted_key):
@@ -567,9 +648,11 @@ def confirm(root, initial, *, trusted_key):
         previous_binding=pending["currentDeployment"])
     _write_switch_durably(boot, _COMPLETED_NAME, pending)
     (boot / "armada" / _RECOVERED_NAME).unlink(missing_ok=True)
+    retained = {target, expected}
+    retained.update(_live_offline_plan_generations(boot))
     for entry in (boot / "armada").iterdir():
         if (entry.name.startswith("gen-") and _GEN_DIR_RE.fullmatch(entry.name)
-                and entry.name not in {target, expected} and entry.is_dir() and not entry.is_symlink()):
+                and entry.name not in retained and entry.is_dir() and not entry.is_symlink()):
             shutil.rmtree(entry)
     _remove_recovery_pointer(boot)
     _clear_pending_durably(boot)
@@ -693,6 +776,10 @@ def read_trial_status(context, root=Path("/sysroot")):
     boot = _resolve_boot(root)
     pending = _read_pending(boot)
     recovered = _read_pending(boot, recovered=True)
+    try:
+        activated = _read_pending(boot, activated=True)
+    except BootDiskSwitchError:
+        activated = None
     record = pending if pending is not None else _read_pending(boot, completed=True)
     if record is None and recovered is None:
         return {"state": "empty"}
@@ -737,6 +824,17 @@ def read_trial_status(context, root=Path("/sysroot")):
         "runningDeployment": running, "bootConfirmed": pending is None,
         **record["receipt"],
     }
+    if pending is not None:
+        result["selectorCheckpointed"] = (
+            activated is not None and activated == pending and
+            selected == activated["target"] and
+            context.get("model") == activated["model"])
+    elif activated is not None:
+        result["selectorCheckpointed"] = (
+            activated == record and selected == activated["target"] and
+            context.get("model") == activated["model"])
+    else:
+        result["selectorCheckpointed"] = False
     if pending is None:
         result["finalization"] = {"state": "complete"}
     return result

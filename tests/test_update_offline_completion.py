@@ -171,6 +171,8 @@ class IdentityTests(unittest.TestCase):
                             bootSource='armada_boot', **{field: None})
                 self.assertIsNone(offline_completion.session_identity(
                     {'state': 'awaiting_reboot', 'result': body}))
+        original_slots = receipt(bootSource='armada_boot')
+        self.assertIsNone(offline_completion.session_identity(original_slots))
 
     def test_document_identity_accepts_null_plan_slots_with_switch(self):
         plan = {'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
@@ -194,6 +196,13 @@ class IdentityTests(unittest.TestCase):
         del without_switch['armadaBootSwitch']
         self.assertIsNone(offline_completion.document_identity(prepared, without_switch, SHA))
         self.assertIsNone(offline_completion.document_identity(prepared, base_plan, OTHER_SHA))
+        no_boot_source = dict(base_plan, armadaBootSwitch=None,
+                              fromSlot='a', targetSlot='b')
+        no_boot_source.pop('armadaBootSwitch', None)
+        no_boot_source_without_slots = dict(no_boot_source)
+        no_boot_source_without_slots['armadaBootSwitch'] = None
+        self.assertIsNone(offline_completion.document_identity(
+            prepared, no_boot_source_without_slots, SHA))
 
 
 class ExecuteCompletionTests(unittest.TestCase):

@@ -419,6 +419,15 @@ updates. An update switches the selected generation and keeps the previous
 verified generation for rollback. Updates and rollback leave both raw Android
 boot partitions and the Android slot selector alone and preserve user data.
 
+The launcher reads ext4 without replaying the journal. The updater checkpoints
+`ARMADA_BOOT` before changing the Linux selector and again before reporting the
+switch as complete. After an unclean shutdown, the launcher can use boot files
+only when the selected generation is readable and passes verification. If the
+selected Linux generation cannot be read or verified, the launcher falls back
+to the Android entry. If storage cannot be safely handed off, the launcher
+halts. If Android also fails to start, recovery requires repairing the
+filesystem or restoring boot files from a separate recovery environment.
+
 The disk-boot package declares installer 0.9.19 and updater 0.8.2 as its
 minimum versions. A fresh installation creates the layout. On an existing
 internal installation, overwrite can reuse a matching partition layout
