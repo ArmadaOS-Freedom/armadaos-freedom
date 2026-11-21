@@ -49,10 +49,10 @@ class FakeSensor:
 
 
 class AutoRotateTest(unittest.TestCase):
-    def make(self, sensor, override=False, fail_rotate=0):
-        if not callable(override):
-            fixed = override
-            override = lambda: fixed
+    def make(self, sensor, setting='auto', fail_rotate=0, default='normal'):
+        if not callable(setting):
+            stored = setting
+            setting = lambda: stored
         calls = []
         state = {'fail': fail_rotate}
 
@@ -62,7 +62,8 @@ class AutoRotateTest(unittest.TestCase):
                 raise RuntimeError('gamescope not ready')
             calls.append(target)
 
-        rotator = autorotate.AutoRotate(sensor, rotate=rotate, override=override)
+        rotator = autorotate.AutoRotate(sensor, rotate=rotate, setting=setting,
+                                        default=default)
         return rotator, calls
 
     def test_mapping_follows_kwin(self):
@@ -94,25 +95,70 @@ class AutoRotateTest(unittest.TestCase):
         rotator.refresh()
         self.assertEqual((calls, absent.claims), ([], 0))
 
-    def test_override_wins_without_claiming(self):
-        sensor = FakeSensor('left-up')
-        rotator, calls = self.make(sensor, override=True)
-        rotator.refresh()
-        self.assertEqual((calls, sensor.claims), ([], 0))
+    def test_not_selected_never_claims(self):
+        for setting in ('', 'normal', 'left', 'right', 'upsidedown'):
+            sensor = FakeSensor('left-up')
+            rotator, calls = self.make(sensor, setting=setting)
+            rotator.refresh()
+            self.assertEqual((calls, sensor.claims), ([], 0), setting)
 
-    def test_override_releases_and_clearing_reclaims(self):
+    def test_leaving_auto_restores_choice_or_default(self):
         sensor = FakeSensor('left-up')
-        state = {'fixed': False}
-        rotator, calls = self.make(sensor, override=lambda: state['fixed'])
+        state = {'setting': 'auto'}
+        rotator, calls = self.make(sensor, setting=lambda: state['setting'], default='right')
         rotator.refresh()
         self.assertEqual((calls, sensor.claims), (['left'], 1))
-        state['fixed'] = True
-        sensor.props['AccelerometerOrientation'] = 'right-up'
+        # A fixed choice: release the sensor and show the choice at once.
+        state['setting'] = 'upsidedown'
         rotator.refresh()
-        self.assertEqual((calls, sensor.releases, rotator.claimed), (['left'], 1, False))
-        state['fixed'] = False
+        self.assertEqual((calls, sensor.releases, rotator.claimed),
+                         (['left', 'upsidedown'], 1, False))
         rotator.refresh()
-        self.assertEqual((calls, sensor.claims), (['left', 'right'], 2))
+        self.assertEqual(calls, ['left', 'upsidedown'])
+        # Back to auto, then no override: the device default.
+        state['setting'] = 'auto'
+        rotator.refresh()
+        self.assertEqual((calls[-1], sensor.claims), ('left', 2))
+        state['setting'] = ''
+        rotator.refresh()
+        self.assertEqual(calls[-1], 'right')
+
+    def test_leaving_auto_already_in_place_or_never_rotated(self):
+        sensor = FakeSensor('normal')
+        state = {'setting': 'auto'}
+        rotator, calls = self.make(sensor, setting=lambda: state['setting'])
+        rotator.refresh()
+        state['setting'] = ''
+        rotator.refresh()
+        self.assertEqual(calls, ['normal'])
+        # Not selected from the start: the display is left alone.
+        sensor = FakeSensor('left-up')
+        rotator, calls = self.make(sensor, setting='left')
+        rotator.refresh()
+        self.assertEqual(calls, [])
+
+    def test_failed_restore_is_retried(self):
+        sensor = FakeSensor('left-up')
+        state = {'setting': 'auto'}
+        rotator, calls = self.make(sensor, setting=lambda: state['setting'])
+        rotator.refresh()
+        rotator.rotate = lambda target: (_ for _ in ()).throw(RuntimeError('gamescope busy'))
+        state['setting'] = ''
+        rotator.refresh()
+        self.assertEqual(rotator.applied, 'left')
+        rotator.rotate = calls.append
+        rotator.refresh()
+        self.assertEqual((calls, rotator.applied), (['left', 'normal'], None))
+
+    def test_restore_does_not_need_sensorproxy(self):
+        sensor = FakeSensor('left-up')
+        state = {'setting': 'auto'}
+        rotator, calls = self.make(sensor, setting=lambda: state['setting'])
+        rotator.refresh()
+        rotator.owner_changed(None)
+        state['setting'] = 'normal'
+        rotator.refresh()
+        self.assertEqual(calls, ['left', 'normal'])
 
     def test_flat_keeps_orientation_until_lifted(self):
         sensor = FakeSensor('left-up')
@@ -166,16 +212,17 @@ class AutoRotateTest(unittest.TestCase):
         rotator.close()
         self.assertEqual(sensor.releases, 1)
 
-    def test_override_parsing(self):
+    def test_setting_parsing(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'display-orientation.conf'
-            self.assertFalse(autorotate.override_active(path))
-            for text, expected in (('orientation=left\n', True),
-                                   ('orientation=\n', False),
-                                   ('orientation=left\norientation=bogus\n', False),
-                                   ('orientation=bogus\norientation=normal\n', True)):
+            self.assertEqual(autorotate.orientation_setting(path), '')
+            for text, expected in (('orientation=left\n', 'left'),
+                                   ('orientation=auto\n', 'auto'),
+                                   ('orientation=\n', ''),
+                                   ('orientation=auto\norientation=bogus\n', ''),
+                                   ('orientation=bogus\norientation=normal\n', 'normal')):
                 path.write_text(text)
-                self.assertEqual(autorotate.override_active(path), expected, text)
+                self.assertEqual(autorotate.orientation_setting(path), expected, text)
 
     def test_gamescopectl_command(self):
         seen = {}
@@ -203,12 +250,12 @@ class AutoRotateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'display-orientation.conf'
             # A comment with a byte that is not UTF-8 does not hide the choice.
-            path.write_bytes(b'# caf\xe9\norientation = right \n')
-            self.assertTrue(autorotate.override_active(path))
+            path.write_bytes(b'# caf\xe9\norientation = auto \n')
+            self.assertEqual(autorotate.orientation_setting(path), 'auto')
             path.write_bytes(b'orientation=right\r\n')
-            self.assertTrue(autorotate.override_active(path))
-            path.write_bytes(b'orientation=right\norientation=\xff\n')
-            self.assertFalse(autorotate.override_active(path))
+            self.assertEqual(autorotate.orientation_setting(path), 'right')
+            path.write_bytes(b'orientation=auto\norientation=\xff\n')
+            self.assertEqual(autorotate.orientation_setting(path), '')
 
     def test_device_env_failure_is_not_unsupported(self):
         with tempfile.TemporaryDirectory() as tmp:

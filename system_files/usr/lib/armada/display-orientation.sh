@@ -17,6 +17,11 @@ if [[ -f "$_armada_display_orientation_config" && -r "$_armada_display_orientati
 				normal|left|right|upsidedown)
 					_armada_display_orientation=$_armada_display_orientation_value
 					;;
+				auto)
+					# Game Mode starts at the device default and
+					# armada-gamemode-autorotate follows the sensor.
+					_armada_display_orientation=
+					;;
 				*)
 					# An empty or malformed value disables the override.
 					_armada_display_orientation=
