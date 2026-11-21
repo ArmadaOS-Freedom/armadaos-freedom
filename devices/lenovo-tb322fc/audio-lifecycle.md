@@ -2,10 +2,12 @@
 
 ## PR #159 scope
 
-PR #159 contains patch `0750-ASoC-qcom-harden-audioreach-teardown.patch`, the
-AudioReach lifecycle host regression and its kernel-build integration. The
-Elden SoundWire/LPASS system-sleep candidate `0751` was removed from this PR
-after review identified it as a separate change. The `0751` candidate and its
+PR #159 contains patches
+`0750-ASoC-qcom-harden-audioreach-teardown.patch` and
+`0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch`, the AudioReach
+lifecycle host regression and its kernel-build integration. The Elden
+SoundWire/LPASS system-sleep candidate `0751` was removed from this PR after
+review identified it as a separate change. The `0751` candidate and its
 review correction are retained outside the repository at
 `D:\AIWORK\y700-elden-audio-sleep-candidate-20261121.patch` (SHA-256
 `64c110808ac5784f16218ba6dc964e301ecf2cb2dd69b8fd379c130043b81af6`). It is
@@ -15,7 +17,8 @@ CodeRabbit reviewed head `494f90ea` on 2026-11-20. Its scope check requires the
 Elden sleep patch to be submitted separately; the wake-IRQ ordering comment
 also identified a valid failure path in that patch. The saved local candidate
 includes that correction, but the corrected candidate has not been rebuilt or
-tested on hardware. This PR keeps the tested AudioReach patch `0750` only.
+tested on hardware. This PR keeps the AudioReach lifecycle changes in `0750`
+and the DPCM route guard in `0752`; the Elden sleep candidate remains separate.
 
 ## AudioReach change
 
@@ -84,12 +87,13 @@ persistent failure while completing best-effort teardown.
 
 Validation for this review fix passed on 2026-11-21. The complete 319-patch
 base series applied to a clean Linux 7.2.6 source tree with zero fuzz. The
-follow-up DPCM route guard is carried as patch `0751`, making 320 active kernel
-patches in the tested tree. The lifecycle harness reported 223 checks, the full kernel host source checks passed, and
-the ARM64 build compiled `soc-component.o`, `soc-pcm.o`, `q6apm.o`,
-`q6apm-dai.o` and `q6apm-lpass-dais.o`. Patch-catalogue validation is recorded
-with the repository checks. Existing device results cover normal STOP only;
-DSP STOP failure injection and recovery remain untested on hardware.
+follow-up DPCM route guard is carried as patch `0752`, making 320 active kernel
+patches in the tested tree. The lifecycle harness reported 223 checks, the full
+kernel host source checks passed, and the ARM64 build compiled
+`soc-component.o`, `soc-pcm.o`, `q6apm.o`, `q6apm-dai.o` and
+`q6apm-lpass-dais.o`. Patch-catalogue validation is recorded with the
+repository checks. Existing device results cover normal STOP only; DSP STOP
+failure injection and recovery remain untested on hardware.
 
 Remaining limits: no UNMAP request was observed on hardware; no persistent DSP
 failure recovery was tested; one RTC wake does not establish battery standby
@@ -101,7 +105,7 @@ code affects other Qualcomm boards, which need their own regression coverage.
 Reviewing the Linux 7.2.6 call graph found that a DAPM mixer/mux update enters
 `snd_soc_dpcm_runtime_update()`, whose old-path shutdown continues to BE STOP,
 `hw_free` and shutdown without consulting the FE component `hw_free` result.
-The lifecycle patch now checks all FE directions for an unresolved
+Patch `0752` now checks all FE directions for an unresolved
 `hw_free_failed` state before changing any DPCM path and returns `-EBUSY` while
 one is present. This keeps a route update from bypassing the retained-BE
 protection. The guard is covered by the extracted-C host harness: a failure on
