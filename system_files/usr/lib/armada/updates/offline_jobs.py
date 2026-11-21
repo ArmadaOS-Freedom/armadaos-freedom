@@ -241,7 +241,10 @@ class OfflineJobManager:
         if verdict.get('state') == offline_completion.AWAITING_REBOOT:
             if verdict.get('restartEligible') is not True:
                 return None
-        elif verdict.get('state') != offline_completion.CONFIRMED:
+        elif not (verdict.get('state') == offline_completion.CONFIRMED or
+                  (status.get('bootSource') == 'armada_boot' and
+                   verdict.get('state') in (offline_completion.AWAITING_CONFIRMATION,
+                                            offline_completion.FINALIZING))):
             return None
         return status
 

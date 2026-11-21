@@ -391,7 +391,7 @@ def resolve_execute_status(prepared, plan, plan_sha256, status, report, ack,
     verdict = evaluate(
         {'state': 'awaiting_reboot', 'result': checked_status},
         trial, identity)
-    if verdict.get('state') == CONFIRMED:
+    if verdict.get('state') in (AWAITING_CONFIRMATION, FINALIZING, CONFIRMED):
         return identity, checked_status
     if (verdict.get('state') == AWAITING_REBOOT and
             verdict.get('restartEligible') is True and

@@ -317,6 +317,34 @@ class OfflineJobRecoveryCases:
         self.assertEqual(restarted['restart']['state'], 'dispatched')
         self.assertEqual(self.reboot.call_count, 1)
 
+        live_cases = (
+            ('prepared', {'recordState': 'prepared',
+                          'bootConfirmed': False}, 'awaiting_confirmation'),
+            ('confirmed', {'recordState': 'confirmed',
+                           'bootConfirmed': True,
+                           'finalization': {'state': 'pending'}}, 'finalizing'),
+        )
+        for name, evidence_overrides, expected in live_cases:
+            with self.subTest(case=name):
+                with self.store.session_lock(sid) as session:
+                    receipt = self.store.read_receipt(session)
+                    receipt['state'] = 'failed'
+                    receipt.pop('restart', None)
+                    receipt['result'] = {'state': 'recovery_required',
+                                         'bootSource': 'armada_boot'}
+                    self.store.update_receipt(session, receipt)
+                self.trial.return_value = self.evidence(
+                    sid, bootSource='armada_boot', fromSlot=None,
+                    targetSlot=None, selectorCheckpointed=False,
+                    runningDeployment='new', **evidence_overrides)
+                adopted = mgr.status(sid)
+                self.assertEqual(adopted['state'], 'awaiting_reboot')
+                self.assertEqual(adopted['completion']['state'], expected)
+                self.assertFalse(adopted['completion']['restartEligible'])
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    mgr.request_restart(sid)
+        self.assertEqual(self.reboot.call_count, 1)
+
     def test_completion_pointer_is_keyed_by_transaction(self):
         first = self.submitted_session(TX)
         second = self.submitted_session(OTHER_TX)
