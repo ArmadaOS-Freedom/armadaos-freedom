@@ -427,6 +427,10 @@ Android user data and the verified backup. For an offline upgrade, the
 signed descriptor must declare `offline-upgrade` and support the installed
 model and updater version.
 
+Updater 0.8.1 and older cannot upgrade using this release, either online or
+offline. This release provides no bridge for such installations; do not use
+overwrite if Linux data must be preserved.
+
 Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
 (TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part
 of the same all-profile package for installation, but its update slot backend

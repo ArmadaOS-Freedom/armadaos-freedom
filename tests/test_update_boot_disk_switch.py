@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +27,7 @@ _OLD_POINTER = f"/ostree/boot.0/default/{_OLD_COMMIT}/0"
 _NEW_POINTER = f"/ostree/boot.1/default/{_NEW_COMMIT}/0"
 _TID = "11111111-2222-3333-4444-555555555555"
 _PLAN_SHA = "c" * 64
+_INSTALLED_RECOVERY_WANTS_PATH = boot_disk_switch.RECOVERY_WANTS_PATH
 
 
 def _make_gen_dir(parent: Path, name: str, binding_bytes: bytes) -> Path:
@@ -158,6 +161,45 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         return json.loads(path.read_bytes())
 
     # -------------------------------------------------------------------- tests
+
+    def test_systemctl_enable_real_unit_in_fake_root_creates_recovery_wants(self):
+        """Real systemctl --root enables the recovery unit inside a fake root."""
+        if shutil.which("systemctl") is None:
+            self.skipTest("systemctl not available")
+        fake_root = Path(self._tmp.name) / "fake-root"
+        fake_root.mkdir()
+        unit_src = (Path(__file__).resolve().parents[1]
+                    / "system_files/usr/lib/systemd/system/armada-linux-recovery.service")
+        unit_rel = Path("usr/lib/systemd/system/armada-linux-recovery.service")
+        unit_dst = fake_root / unit_rel
+        unit_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(unit_src, unit_dst)
+        subprocess.run(
+            ["systemctl", "--root", os.fspath(fake_root), "enable",
+             "armada-linux-recovery.service"],
+            check=True, capture_output=True,
+        )
+        wants_rel = _INSTALLED_RECOVERY_WANTS_PATH.relative_to("/")
+        link = fake_root / wants_rel
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(os.fspath(link)),
+                         "/usr/lib/systemd/system/armada-linux-recovery.service")
+
+    def test_write_switch_durably_fsync_failure_cleans_tmp(self):
+        """os.fsync failure propagates and leaves no pending or tmp artifact."""
+        payload = {"schema": 1, "transactionId": _TID}
+        with mock.patch.object(boot_disk_switch.os, "fsync",
+                               side_effect=OSError("injected fsync failure")):
+            with self.assertRaises(OSError):
+                boot_disk_switch._write_switch_durably(
+                    self.boot, boot_disk_switch._PENDING_NAME, dict(payload))
+        armada = self.boot / "armada"
+        self.assertFalse((armada / boot_disk_switch._PENDING_NAME).exists())
+        self.assertEqual(
+            [p.name for p in armada.iterdir()
+             if p.name.startswith(".pending.") and p.name.endswith(".tmp")],
+            [],
+        )
 
     def test_activate_writes_pending_and_switches_selector(self):
         plan = self._make_plan()
@@ -464,6 +506,113 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertIsNone(self._read_pending())
         self.assertEqual(self.verify_mock.call_count, 1)
         self.assertEqual(self.verify_mock.call_args.args[0].name, _OLD_GEN)
+
+    def test_recover_pending_rmtree_failure_keeps_failed_generation_then_ensure_ready_cleans(self):
+        """A failed rmtree during recovery preserves the failed generation until ensure_ready."""
+        boot_disk_switch.activate(
+            self.root, self.initial, self._make_plan(),
+            trusted_key=self.trusted_key, receipt=self._make_receipt(),
+            reclaim_failed_target=True,
+        )
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+        self.assertIsNotNone(self._read_pending())
+        self.assertTrue((self.boot / "armada" / _NEW_GEN).is_dir())
+
+        real_rmtree = boot_disk_switch.shutil.rmtree
+        calls = []
+
+        def _failing_rmtree(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError("simulated rmtree failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(
+            boot_disk_switch.shutil, "rmtree", side_effect=_failing_rmtree,
+        ):
+            with self.assertRaisesRegex(
+                boot_disk_switch.BootDiskSwitchError,
+                "cannot remove failed target",
+            ):
+                boot_disk_switch.recover_pending(
+                    self.root, self.initial, trusted_key=self.trusted_key,
+                )
+
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertIsNotNone(self._read_pending())
+        self.assertTrue((self.boot / "armada" / _OLD_GEN).is_dir())
+        self.assertTrue((self.boot / "armada" / _NEW_GEN).is_dir())
+
+        boot_disk_switch.ensure_ready(self.root, self.initial)
+
+        self.assertIsNone(self._read_pending())
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertTrue((self.boot / "armada" / _OLD_GEN).is_dir())
+        self.assertFalse((self.boot / "armada" / _NEW_GEN).exists())
+
+    def test_recover_pending_awaiting_recovery_export_keeps_failed_target(self):
+        """A pending awaiting_recovery_export transaction keeps the failed target."""
+        from updates import offline_session  # local import; no new top-level imports.
+
+        boot_disk_switch.activate(
+            self.root, self.initial, self._make_plan(),
+            trusted_key=self.trusted_key, receipt=self._make_receipt(),
+            reclaim_failed_target=True,
+        )
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+
+        base = Path(self._tmp.name) / "offline-sessions"
+        txn = base / ("d" * 32) / "transaction"
+        txn.mkdir(parents=True)
+        status = {"phase": "awaiting_recovery_export", "state": "awaiting_recovery_export"}
+        plan = {"armadaBootSwitch": self._make_plan()}
+        (txn / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        (txn / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+        with mock.patch.object(offline_session, "_DEFAULT_BASE", base):
+            recovered = boot_disk_switch.recover_pending(
+                self.root, self.initial, trusted_key=self.trusted_key,
+            )
+
+        self.assertTrue(recovered)
+        self.assertIsNone(self._read_pending())
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        # Another plan could still execute against the failed target, so it is kept.
+        self.assertTrue((self.boot / "armada" / _NEW_GEN).is_dir())
+        self.assertTrue((self.boot / "armada" / _OLD_GEN).is_dir())
+
+    def test_ensure_root_binding_retries_ostree_fsync(self):
+        """First call fails fsyncing ostree parent; retry synchronizes both dirs."""
+        ostree_dir = self.root / "ostree"
+        armada_dir = ostree_dir / "armada"
+        if armada_dir.exists():
+            armada_dir.rmdir()
+
+        real_fsync_dir = boot_disk_selector._io.fsync_dir
+        calls = []
+        state = {"failed": False}
+
+        def _fsync_dir(path):
+            calls.append(Path(path))
+            if not state["failed"] and Path(path) == ostree_dir:
+                state["failed"] = True
+                raise OSError(5, "simulated ostree fsync failure")
+            return real_fsync_dir(path)
+
+        with mock.patch.object(boot_disk_selector._io, "fsync_dir", side_effect=_fsync_dir):
+            with self.assertRaises(OSError):
+                boot_disk_selector.ensure_root_binding(self.root, _OLD_BINDING)
+
+            self.assertTrue(state["failed"])
+            self.assertTrue(armada_dir.is_dir())
+
+            calls.clear()
+            result = boot_disk_selector.ensure_root_binding(self.root, _OLD_BINDING)
+
+        self.assertEqual(result, f"/ostree/armada/{_OLD_BINDING.split('/', 1)[1]}")
+        self.assertIn(armada_dir, calls)
+        self.assertIn(ostree_dir, calls)
+        self.assertLess(calls.index(armada_dir), calls.index(ostree_dir))
 
     def test_activate_missing_capability_leaves_old_selector(self):
         """Missing recovery capability aborts before any pending or pointer changes."""

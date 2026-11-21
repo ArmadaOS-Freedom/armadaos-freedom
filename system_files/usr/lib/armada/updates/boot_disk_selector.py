@@ -59,7 +59,6 @@ def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str)
             os.mkdir(os.fspath(armada_dir), 0o755)
         except FileExistsError:
             pass
-        _io.fsync_dir(ostree_dir)
         armada_lst = armada_dir.lstat()
     except OSError as exc:
         raise ValueError(f"cannot stat armada directory: {exc}") from exc
@@ -89,6 +88,7 @@ def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str)
             raise ValueError("binding symlink has unexpected target")
 
     _io.fsync_dir(armada_dir)
+    _io.fsync_dir(ostree_dir)
     return f"/ostree/armada/{basename}"
 
 

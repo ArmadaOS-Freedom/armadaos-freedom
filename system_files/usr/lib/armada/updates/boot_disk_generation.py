@@ -304,6 +304,7 @@ def stage_generation(
             continue
         _check_file(Path(kernel), k_size, k_sha)
         _check_file(Path(initramfs), i_size, i_sha)
+        _fsync_verified_generation(existing, model)
         return existing_name
 
     name = "gen-%s" % (uuid.uuid4().hex,)
@@ -339,6 +340,41 @@ def stage_generation(
         raise
 
     return name
+
+
+def _fsync_required_file(path: Path, expected_size: int) -> None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file: %s" % (path,))
+        if st.st_size != expected_size:
+            raise ValueError("size mismatch: %s" % (path,))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_verified_generation(gen: Path, model: str) -> None:
+    gen = Path(gen)
+    model_dir = gen / model
+    manifest_raw = _io.read_bounded(model_dir / "manifest.bin", MANIFEST_LEN)
+    _, k_size, i_size, d_size, _, _, _ = _parse_manifest(manifest_raw)
+    _fsync_required_file(gen / "binding.bin", BINDING_LEN)
+    _fsync_required_file(gen / "kernel.img", k_size)
+    _fsync_required_file(gen / "initramfs.img", i_size)
+    _fsync_required_file(model_dir / "manifest.bin", MANIFEST_LEN)
+    der = _io.read_bounded(model_dir / "manifest.sig", MAX_SIG_LEN)
+    _fsync_required_file(model_dir / "manifest.sig", len(der))
+    _fsync_required_file(model_dir / "board.dtb", d_size)
+    _io.fsync_dir(model_dir)
+    _io.fsync_dir(gen)
+    _io.fsync_dir(gen.parent)
+    _io.fsync_dir(gen.parent.parent)
 
 
 def _write_exclusive(path: Path, data: bytes, mode: int) -> None:

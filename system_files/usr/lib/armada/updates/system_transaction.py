@@ -402,7 +402,8 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
                     boot_disk_switch.activate(
                         root, initial, plan, trusted_key=trusted_key,
                         receipt={key: status[key] for key in
-                                 ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')})
+                                 ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
+                        reclaim_failed_target=(mode == 'online'))
                 except boot_disk_switch.BootDiskSwitchUncertainError:
                     selector_committed = True
                     raise

@@ -427,7 +427,8 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                 boot_disk_switch.activate(
                     Path(plan['sysrootPath']), initial, switch, trusted_key=trusted_key,
                     receipt={key: status[key] for key in
-                             ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')})
+                             ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
+                    reclaim_failed_target=True)
                 status.update(state='awaiting_reboot', phase='awaiting_reboot',
                               requiresReboot=True, bootWriteState='not_started')
                 system_transaction._save_json(work, 'status.json', status)

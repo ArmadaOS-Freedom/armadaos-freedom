@@ -21,7 +21,7 @@ _RECEIPT_KEYS = {'transactionId', 'planSha256', 'fromSlot', 'targetSlot'}
 _MAX_PENDING_BYTES = 4096
 BOOT_RECOVERY_VERSION_PATH = Path("/sys/firmware/devicetree/base/chosen/armada,boot-recovery-version")
 RECOVERY_SERVICE_PATH = Path("/usr/lib/systemd/system/armada-linux-recovery.service")
-RECOVERY_WANTS_PATH = Path("/etc/systemd/system/sysinit.target.wants/armada-linux-recovery.service")
+RECOVERY_WANTS_PATH = Path("/etc/systemd/system/multi-user.target.wants/armada-linux-recovery.service")
 _DEPLOYMENT_RE = re.compile(r"default/([0-9a-f]{64})\.(0|[1-9][0-9]{0,9})")
 _GEN_DIR_RE = re.compile(r"(?:seed|gen-[0-9a-f]{32})")
 _UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
@@ -155,8 +155,11 @@ def _read_pending(boot, *, completed=False):
     required = {"schemaVersion", "expected", "target", "currentDeployment",
                 "newDeployment", "model"}
     missing = required - set(doc)
-    if missing or not set(doc) <= required | {"receipt"}:
+    allowed = required | {"receipt", "reclaimFailedTarget"}
+    if missing or not set(doc) <= allowed:
         raise BootDiskSwitchError(f"pending record missing fields: {sorted(missing)}")
+    if "reclaimFailedTarget" in doc and type(doc["reclaimFailedTarget"]) is not bool:
+        raise BootDiskSwitchError("pending record reclaimFailedTarget must be boolean")
     if doc["schemaVersion"] != _PENDING_SCHEMA:
         raise BootDiskSwitchError("pending record schema version mismatch")
     for key in ("expected", "target"):
@@ -220,11 +223,20 @@ def _write_switch_durably(boot, name, doc):
         except _io.ShortWriteError as exc:
             raise BootDiskSwitchError(f"short write pending record: {exc}") from exc
         os.fsync(fd)
-    finally:
+    except BaseException:
         try:
             os.close(fd)
         except OSError:
             pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     try:
         if name == _PENDING_NAME:
             os.link(tmp_path, final_path)
@@ -232,7 +244,10 @@ def _write_switch_durably(boot, name, doc):
             os.replace(tmp_path, final_path)
         _io.fsync_dir(armada)
     finally:
-        tmp_path.unlink(missing_ok=True)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _publish_recovery_pointer(boot, expected):
@@ -286,6 +301,51 @@ def _remove_recovery_pointer(boot):
     except OSError as exc:
         raise BootDiskSwitchError(f"cannot fsync recovery pointer removal: {exc}") from exc
 
+
+def _live_offline_plan_uses(boot, pending):
+    from . import offline_session
+    base = offline_session._DEFAULT_BASE
+    try:
+        base_lst = base.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(base_lst.st_mode):
+        return False
+    target = pending.get("target")
+    try:
+        it = os.scandir(base)
+    except FileNotFoundError:
+        return False
+    with it:
+        for entry in it:
+            if offline_session._SESSION_ID.fullmatch(entry.name) is None:
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            work = Path(entry.path) / "transaction"
+            try:
+                wl = work.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(wl.st_mode) or work.is_symlink():
+                continue
+            try:
+                raw = _io.read_bounded(work / "status.json", offline_session._JSON_MAX)
+                status = _io.strict_loads(raw.decode("utf-8"))
+                if not isinstance(status, dict):
+                    continue
+                if status.get("phase") != "awaiting_recovery_export" or status.get("state") != "awaiting_recovery_export":
+                    continue
+                raw = _io.read_bounded(work / "plan.json", offline_session._JSON_MAX)
+                plan = _io.strict_loads(raw.decode("utf-8"))
+            except (FileNotFoundError, ValueError):
+                continue
+            if not isinstance(plan, dict):
+                continue
+            switch = plan.get("armadaBootSwitch")
+            if isinstance(switch, dict) and target in (switch.get("target"), switch.get("expected")):
+                return True
+    return False
 
 def _clear_pending_durably(boot):
     armada = boot / "armada"
@@ -404,7 +464,7 @@ def plan_rollback(root, initial, target, *, trusted_key):
     }
 
 
-def activate(root, initial, plan, *, trusted_key, receipt=None):
+def activate(root, initial, plan, *, trusted_key, receipt=None, reclaim_failed_target=False):
     boot, expected = _active(root, initial, trusted_key)
     target = plan["target"]
     if (expected != plan["expected"] or expected == target or plan["model"] != initial["model"]
@@ -419,6 +479,10 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
     if receipt is not None:
         _validate_receipt(receipt)
         record["receipt"] = receipt
+    if not isinstance(reclaim_failed_target, bool):
+        raise BootDiskSwitchError("reclaim_failed_target must be boolean")
+    if reclaim_failed_target:
+        record["reclaimFailedTarget"] = True
     try:
         _checkpoint_boot(boot, dry_run=True)
     except OSError as checkpoint_exc:
@@ -483,6 +547,9 @@ def confirm(root, initial, *, trusted_key):
         raise BootDiskSwitchError("pending ARMADA_BOOT switch is for another model")
     if initial["deployment"] == pending["currentDeployment"]:
         if selected == expected:
+            _checkpoint_boot(boot)
+            if pending.get("reclaimFailedTarget") is True:
+                _reclaim_failed_target(boot, pending, _read_pending(boot, completed=True))
             _remove_recovery_pointer(boot)
             _clear_pending_durably(boot)
         elif selected != target:
@@ -512,10 +579,47 @@ def ensure_ready(root, initial):
         return
     if (initial["deployment"] == pending["currentDeployment"]
             and _read_boot_active(boot)[1] == pending["expected"]):
+        _checkpoint_boot(boot)
+        if pending.get("reclaimFailedTarget") is True:
+            _reclaim_failed_target(boot, pending, _read_pending(boot, completed=True))
         _remove_recovery_pointer(boot)
         _clear_pending_durably(boot)
         return
     raise BootDiskSwitchError("an ARMADA_BOOT change already awaits restart or confirmation")
+
+
+def _reclaim_failed_target(boot, pending, completed):
+    name = pending["target"]
+    if not _GEN_DIR_RE.fullmatch(name) or not name.startswith("gen-"):
+        return
+    if name in {pending["expected"], _read_boot_active(boot)[1]}:
+        return
+    if completed is not None and name in {completed.get("expected"), completed.get("target")}:
+        return
+    if _live_offline_plan_uses(boot, pending):
+        return
+    armada = boot / "armada"
+    path = armada / name
+    try:
+        lst = path.lstat()
+    except FileNotFoundError:
+        try:
+            _io.fsync_dir(armada)
+        except OSError as exc:
+            raise BootDiskSwitchError(f"cannot fsync armada dir: {exc}") from exc
+        return
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot stat failed target: {exc}") from exc
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot remove failed target: {exc}") from exc
+    try:
+        _io.fsync_dir(armada)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot fsync armada dir: {exc}") from exc
 
 
 def recover_pending(root, initial, *, trusted_key):
@@ -571,6 +675,8 @@ def recover_pending(root, initial, *, trusted_key):
     except OSError as checkpoint_exc:
         raise BootDiskSwitchError(
             "ARMADA_BOOT checkpoint failed after recovery") from checkpoint_exc
+    if pending.get("reclaimFailedTarget") is True:
+        _reclaim_failed_target(boot, pending, completed)
     _remove_recovery_pointer(boot)
     _clear_pending_durably(boot)
     return True
