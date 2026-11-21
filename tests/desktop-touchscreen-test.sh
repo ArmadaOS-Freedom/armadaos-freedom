@@ -81,6 +81,7 @@ assert_eq "$(device_env_value 'AYN Odin 2' ARMADA_DEVICE_ID)" ayn-odin-2 'odin d
 assert_eq "$odin_calibration" '' 'odin calibration empty'
 assert_eq "$odin_touchscreen" '' 'odin touchscreen empty'
 assert_eq "$(device_env_value 'AYN Odin 2' ARMADA_GAMEMODE_PEN_TOUCH)" '' 'odin pen bridge off'
+assert_eq "$(device_env_value 'AYN Odin 2' ARMADA_GAMEMODE_AUTOROTATE)" 0 'odin game mode autorotate off'
 assert_eq "$(device_env_value 'Lenovo Legion Tab Y700 5th Gen' ARMADA_GAMEMODE_PEN_TOUCH)" '' 'tb323fu pen bridge off'
 
 # --- device-env: Lenovo Legion Y700 Gen4 devicetree identification ----------
@@ -185,6 +186,7 @@ assert_eq "$(dt_value ARMADA_PANEL_ORIENTATION)" normal 'tb710fu orientation def
 assert_eq "$(dt_value ARMADA_GAMESCOPE_USE_ROTATION_SHADER)" 1 'tb710fu composes rotation (DPU rotation fails with -E2BIG)'
 assert_eq "$(dt_value ARMADA_DESKTOP_TOUCHSCREEN_CALIBRATION)" '' 'tb710fu calibration empty'
 assert_eq "$(dt_value ARMADA_GAMEMODE_PEN_TOUCH)" NVTCapacitivePen 'tb710fu game mode pen bridge'
+assert_eq "$(dt_value ARMADA_GAMEMODE_AUTOROTATE)" 1 'tb710fu game mode follows the accelerometer'
 write_dt_model 'Some Unrecognized Board'
 write_dt_compatible 'qcom,sm8650' 'lenovo,tb710fu'
 assert_eq "$(dt_value ARMADA_DEVICE_ID)" lenovo-tb710fu 'tb710fu second compatible device id'

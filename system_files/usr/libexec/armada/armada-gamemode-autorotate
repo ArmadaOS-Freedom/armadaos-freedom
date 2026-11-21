@@ -1,0 +1,274 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Rotate Game Mode with the accelerometer when the user asks for it.
+
+Automatic rotation is a choice in Armada Control's Game Mode orientation
+setting: ``orientation=auto`` in /etc/armada/display-orientation.conf, offered
+only on devices whose profile sets ``ARMADA_GAMEMODE_AUTOROTATE=1`` (the only
+devices that run this service). With any other setting the service holds no
+sensor claim and does nothing.
+
+While ``auto`` is selected it claims the SensorProxy accelerometer and, when
+the orientation changes, rotates gamescope's internal display with
+``gamescopectl rotate_display`` (gamescope patch 0048). Gamescope re-lays out
+Steam for the new output size and maps touch through the same orientation.
+While the device lies flat (tilt face-up or face-down) the last orientation is
+kept. When ``auto`` is deselected the display goes back to the chosen fixed
+orientation, or to the device default, at once.
+
+SensorProxy names the edge of the panel that points up; gamescope's names are
+the panel-orientation quirks, where "left" (90 degrees) puts the top of the
+picture on the panel's left edge. So left-up maps to left, as in KWin.
+"""
+
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+LOG = logging.getLogger("armada-gamemode-autorotate")
+CONFIG_KEY = "ARMADA_GAMEMODE_AUTOROTATE"
+SENSOR_NAME = "net.hadess.SensorProxy"
+SENSOR_PATH = "/net/hadess/SensorProxy"
+OVERRIDE_CONFIG = Path(os.environ.get(
+    "ARMADA_DISPLAY_ORIENTATION_CONFIG", "/etc/armada/display-orientation.conf"))
+GAMESCOPE_DISPLAY = os.environ.get("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-primary")
+REFRESH_SECONDS = 5
+CALL_TIMEOUT_MS = 5000
+
+FLAT_TILTS = ("face-up", "face-down")
+
+ORIENTATIONS = {
+    "normal": "normal",
+    "left-up": "left",
+    "right-up": "right",
+    "bottom-up": "upsidedown",
+}
+
+
+def shell_env(helper=None, runner=subprocess.run):
+    """The ARMADA_* variables the device-env helper exports, or None when the
+    helper fails (so a broken lookup is not mistaken for "disabled")."""
+    helper = helper or os.environ.get(
+        "ARMADA_DEVICE_ENV", "/usr/libexec/armada/device-env")
+    command = (
+        f'out=$({shlex.quote(helper)}) || exit; eval "$out" || exit; '
+        'for name in "${!ARMADA_@}"; do printf "%s=%s\\n" "$name" "${!name}"; done'
+    )
+    proc = runner(["bash", "-c", command], check=False, text=True,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        LOG.error("device-env failed (%s): %s", proc.returncode,
+                  (proc.stderr or "").strip())
+        return None
+    env = {}
+    for line in (proc.stdout or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            env[key] = value
+    return env
+
+
+def supported(env):
+    return env.get(CONFIG_KEY) == "1"
+
+
+# display-orientation.sh, which applies the fixed orientation at session start,
+# matches ^[[:space:]]*orientation[[:space:]]*=(.*)$ line by line, trims the
+# value and lets the last assignment win; an invalid value clears it. Parse
+# the same way, on bytes, so stray bytes elsewhere cannot hide a valid choice.
+_OVERRIDE_LINE = re.compile(rb"^[ \t\n\v\f\r]*orientation[ \t\n\v\f\r]*=(.*)$")
+FIXED = ("normal", "left", "right", "upsidedown")
+AUTO = "auto"
+
+
+def orientation_setting(path=OVERRIDE_CONFIG):
+    """The stored Game Mode orientation: a FIXED value, AUTO, or "" (none)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    orientation = ""
+    for line in data.split(b"\n"):
+        match = _OVERRIDE_LINE.match(line)
+        if match:
+            value = match.group(1).strip(b" \t\n\v\f\r").decode("ascii", "replace")
+            orientation = value if value in FIXED + (AUTO,) else ""
+    return orientation
+
+
+def gamescope_rotate(orientation, runner=subprocess.run):
+    env = dict(os.environ, GAMESCOPE_WAYLAND_DISPLAY=GAMESCOPE_DISPLAY)
+    try:
+        runner(["/usr/bin/gamescopectl", "rotate_display", orientation],
+               check=True, capture_output=True, text=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"gamescopectl rotate_display {orientation}: {error}") from error
+
+
+class AutoRotate:
+    def __init__(self, sensor, rotate=gamescope_rotate, setting=orientation_setting,
+                 default="normal"):
+        self.sensor = sensor
+        self.rotate = rotate
+        self.setting = setting
+        self.default = default if default in FIXED else "normal"
+        self.claimed = False
+        self.present = True
+        # What this service last set; None when it has not rotated the display.
+        self.applied = None
+        self.last_error = None
+
+    def refresh(self):
+        try:
+            setting = self.setting()
+            if setting != AUTO:
+                # Not selected: no sensor claim, and put back what the user
+                # chose (or the device default) if this service had rotated.
+                self.release()
+                if self.applied is not None:
+                    target = setting or self.default
+                    if target != self.applied:
+                        self.rotate(target)
+                        LOG.info("Automatic rotation off, Game Mode back to %s", target)
+                    self.applied = None
+                self.last_error = None
+                return True
+            # Between SensorProxy instances there is nothing to ask; the name
+            # watch refreshes again when it reappears.
+            if not self.present:
+                return True
+            props = self.sensor.properties()
+            if not props.get("HasAccelerometer"):
+                return True
+            if not self.claimed:
+                self.sensor.claim()
+                self.claimed = True
+                props = self.sensor.properties()
+            # Lying flat, SensorProxy keeps reporting the last orientation;
+            # wait until the device is held up again.
+            if props.get("AccelerometerTilt") in FLAT_TILTS:
+                return True
+            target = ORIENTATIONS.get(props.get("AccelerometerOrientation"))
+            if target is None:
+                return True
+            if target != self.applied:
+                self.rotate(target)
+                self.applied = target
+                LOG.info("Game Mode rotated to %s", target)
+            self.last_error = None
+        except RuntimeError as error:
+            # Gamescope may not be up yet or SensorProxy may be restarting;
+            # the periodic refresh retries.
+            if str(error) != self.last_error:
+                LOG.warning("Automatic rotation unavailable: %s", error)
+                self.last_error = str(error)
+        return True
+
+    def owner_changed(self, owner):
+        self.claimed = False
+        self.present = bool(owner)
+        if owner:
+            self.refresh()
+
+    def release(self):
+        if self.claimed:
+            self.claimed = False
+            try:
+                self.sensor.release()
+            except RuntimeError:
+                pass
+
+    def close(self):
+        self.release()
+
+
+def main(argv):
+    if argv[1:] == ["--supported"]:
+        # ExecCondition: 1 skips the unit, 255 fails it (and Restart= retries).
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+        env = shell_env()
+        if env is None:
+            return 255
+        return 0 if supported(env) else 1
+    if argv[1:]:
+        print("usage: armada-gamemode-autorotate [--supported]", file=sys.stderr)
+        return 2
+
+    # Import here so the state machine can be tested without a bus or GI.
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+    class SensorProxy:
+        def call(self, interface, method, parameters=None):
+            try:
+                return bus.call_sync(
+                    SENSOR_NAME, SENSOR_PATH, interface, method, parameters,
+                    None, Gio.DBusCallFlags.NO_AUTO_START, CALL_TIMEOUT_MS, None,
+                )
+            except GLib.Error as error:
+                raise RuntimeError(str(error)) from error
+
+        def properties(self):
+            return self.call(
+                "org.freedesktop.DBus.Properties", "GetAll",
+                GLib.Variant("(s)", (SENSOR_NAME,)),
+            ).unpack()[0]
+
+        def claim(self):
+            self.call(SENSOR_NAME, "ClaimAccelerometer")
+
+        def release(self):
+            self.call(SENSOR_NAME, "ReleaseAccelerometer")
+
+    env = shell_env() or {}
+    rotator = AutoRotate(SensorProxy(), default=env.get("ARMADA_PANEL_ORIENTATION", "normal"))
+
+    def properties_changed(_bus, _sender, _path, _interface, _signal, params):
+        interface, changed, invalidated = params.unpack()
+        if interface == SENSOR_NAME and any(
+            key in changed or key in invalidated
+            for key in ("HasAccelerometer", "AccelerometerOrientation", "AccelerometerTilt")
+        ):
+            rotator.refresh()
+
+    bus.signal_subscribe(
+        SENSOR_NAME, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+        SENSOR_PATH, None, Gio.DBusSignalFlags.NONE, properties_changed,
+    )
+    Gio.bus_watch_name_on_connection(
+        bus, SENSOR_NAME, Gio.BusNameWatcherFlags.NONE,
+        lambda _bus, _name, owner: rotator.owner_changed(owner),
+        lambda _bus, _name: rotator.owner_changed(None),
+    )
+    # Armada Control replaces the file atomically; watching the directory
+    # makes a new choice apply at once, the timer covers missed events.
+    try:
+        monitor = Gio.File.new_for_path(str(OVERRIDE_CONFIG.parent)).monitor_directory(
+            Gio.FileMonitorFlags.WATCH_MOVES, None)
+        monitor.connect("changed", lambda *_args: rotator.refresh())
+    except GLib.Error as error:
+        LOG.warning("Not watching %s (%s); checking every %d s",
+                    OVERRIDE_CONFIG.parent, error, REFRESH_SECONDS)
+    GLib.timeout_add_seconds(REFRESH_SECONDS, rotator.refresh)
+
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rotator.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

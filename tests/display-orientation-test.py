@@ -95,7 +95,8 @@ class DisplayOrientationTest(unittest.TestCase):
     def test_missing_config_reports_disabled_state(self):
         self.assertEqual(
             control.action_get_display_orientation({}),
-            {"supported": True, "orientation": "", "defaultOrientation": "normal"},
+            {"supported": True, "orientation": "", "defaultOrientation": "normal",
+             "autoSupported": False},
         )
 
     def test_default_orientation_follows_valid_device_profile(self):
@@ -134,7 +135,8 @@ class DisplayOrientationTest(unittest.TestCase):
             with patch.object(control, "device_env", side_effect=error):
                 self.assertEqual(
                     control.action_get_display_orientation({}),
-                    {"supported": True, "orientation": "", "defaultOrientation": "normal"},
+                    {"supported": True, "orientation": "", "defaultOrientation": "normal",
+             "autoSupported": False},
                 )
 
     def test_set_roundtrips_every_orientation(self):
@@ -143,6 +145,7 @@ class DisplayOrientationTest(unittest.TestCase):
                 "supported": True,
                 "orientation": orientation,
                 "defaultOrientation": "normal",
+                "autoSupported": False,
             }
             self.assertEqual(
                 control.action_set_display_orientation({"orientation": orientation}), expected
@@ -151,6 +154,34 @@ class DisplayOrientationTest(unittest.TestCase):
                 self.config.read_text(encoding="utf-8"), f"orientation={orientation}\n"
             )
             self.assertEqual(control.action_get_display_orientation({}), expected)
+
+    def test_auto_is_offered_only_where_the_profile_enables_it(self):
+        enabled = {"ARMADA_GAMEMODE_AUTOROTATE": "1", "ARMADA_PANEL_ORIENTATION": "normal"}
+        with patch.object(control, "device_env", return_value=enabled):
+            state = control.action_set_display_orientation({"orientation": "auto"})
+            self.assertEqual(state["orientation"], "auto")
+            self.assertTrue(state["autoSupported"])
+            self.assertEqual(self.config.read_text(encoding="utf-8"), "orientation=auto\n")
+            self.assertEqual(control.action_get_display_orientation({})["orientation"], "auto")
+        self.config.write_text("orientation=left\n", encoding="utf-8")
+        for env in ({}, {"ARMADA_GAMEMODE_AUTOROTATE": "0"}):
+            with patch.object(control, "device_env", return_value=env):
+                self.assertFalse(control.action_get_display_orientation({})["autoSupported"])
+                with self.assertRaises(ValueError):
+                    control.action_set_display_orientation({"orientation": "auto"})
+        with patch.object(control, "device_env", side_effect=OSError("device-env missing")):
+            with self.assertRaises(ValueError):
+                control.action_set_display_orientation({"orientation": "auto"})
+        self.assertEqual(self.config.read_text(encoding="utf-8"), "orientation=left\n")
+
+    def test_helper_starts_auto_at_the_inherited_orientation(self):
+        # "auto" is no fixed override: gamescope starts at the device default and
+        # armada-gamemode-autorotate follows the sensor from there.
+        self.config.write_text("orientation=auto\n", encoding="utf-8")
+        self.assertEqual(self.run_helper(orientation="right")["ORIENTATION"], "right")
+        self.assertEqual(self.run_helper(unset_orientation=True)["ORIENTATION"], "<unset>")
+        self.config.write_text("orientation=auto\norientation=left\n", encoding="utf-8")
+        self.assertEqual(self.run_helper(orientation="right")["ORIENTATION"], "left")
 
     def test_empty_and_malformed_values_read_as_disabled(self):
         for text in (
@@ -206,7 +237,8 @@ class DisplayOrientationTest(unittest.TestCase):
         self.assertEqual(control.action_get_display_orientation({})["orientation"], "right")
         self.assertEqual(
             control.action_set_display_orientation({"orientation": ""}),
-            {"supported": True, "orientation": "", "defaultOrientation": "normal"},
+            {"supported": True, "orientation": "", "defaultOrientation": "normal",
+             "autoSupported": False},
         )
         self.assertEqual(self.config.read_text(encoding="utf-8"), "orientation=\n")
         self.assertEqual(control.action_get_display_orientation({})["orientation"], "")
