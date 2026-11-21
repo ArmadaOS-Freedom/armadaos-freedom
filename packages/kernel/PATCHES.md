@@ -1106,6 +1106,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0072)
   upstream: unknown
   notes: Forces the PCIe pipe memory on for the Kaanapali clock controller so the pipe clock remains usable while the link is active. Kaanapali-gated; SM8750 and other SoCs are not touched.
+- `patches/0212a-clk-qcom-kaanapali-force-ufs-axi-memory.patch`
+  source: https://github.com/torvalds/linux/commit/ab3c9fbc73091b3c132fce5827ef7de2f5bcd58a
+  upstream: https://github.com/torvalds/linux/commit/ab3c9fbc73091b3c132fce5827ef7de2f5bcd58a
+  notes: Preserve Kaanapali UFS PHY AXI clock memory across system suspend in MCQ mode. Hunk context refreshed after `0212`.
 - `patches/0213-clk-qcom-branch-clear-enable-on-failure.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0073)
   upstream: unknown
