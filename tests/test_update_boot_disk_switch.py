@@ -4,10 +4,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+ARMADA_LIB = Path(__file__).resolve().parents[1] / "system_files" / "usr" / "lib" / "armada"
+if str(ARMADA_LIB) not in sys.path:
+    sys.path.insert(0, str(ARMADA_LIB))
 
 from updates import (
     boot_disk_generation,
