@@ -419,9 +419,16 @@ class SourceTests(unittest.TestCase):
                 SourceImage.from_seed(self.repo, self.commit, FREEDOM_ORIGIN, digest)
 
     def test_seed_selects_explicit_commit_over_newer_import(self):
+        before = {r for r in self.refs() if r.startswith('ostree/container/image/')}
         run(*EXT, "pull", self.path, oci(self.work / "v2", "newer image"))
-        newer_ref = next(r for r in self.refs() if "/v2_3A_latest" in r)
-        newer = run("ostree", "rev-parse", f"--repo={self.path}", newer_ref)
+        after = {r for r in self.refs() if r.startswith('ostree/container/image/')}
+        new_refs = sorted(after - before)
+        self.assertEqual(
+            len(new_refs), 1,
+            f"expected exactly one new image ref after pull; "
+            f"before={sorted(before)!r} after={sorted(after)!r} new={new_refs!r}",
+        )
+        newer = run("ostree", "rev-parse", f"--repo={self.path}", new_refs[0])
         self.assertNotEqual(newer, self.commit)
         self.source = SourceImage.from_seed(
             self.repo, self.commit, FREEDOM_ORIGIN, seed_manifest_digest(self.work / "v1"))
