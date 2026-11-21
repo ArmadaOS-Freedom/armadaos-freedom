@@ -16,6 +16,7 @@
 #include <armada_disk_boot_key.h>
 #include <boot_disk_stage.h>
 #include <boot_ext4.h>
+#include <boot_disk_native.h>
 #endif
 #if defined(CONFIG_KSHIM_STORAGE_ENTRY_PROBE) && CONFIG_KSHIM_STORAGE_ENTRY_PROBE
 #include <storage_probe_io.h>
@@ -345,7 +346,7 @@ static uint32_t unique_disk_diagnostic_index(const MANIFEST_VIEW *view, uint64_t
 static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t linux_base,
                              const struct device_info *info, uint32_t next_action,
                              bool *one_shot, uint32_t *boot_target,
-                             uint32_t diagnostic_index)
+                             uint32_t diagnostic_index, bool *recovery_selected)
 {
     uint32_t indexes[MANIFEST_MAX_ENTRIES];
     char labels[MANIFEST_MAX_ENTRIES][96];
@@ -357,6 +358,15 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
 #endif
     uint64_t advanced_mask = 0;
     size_t count = 0, initial = 0, selected = 0;
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
+    defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS && \
+    defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+    size_t recovery_candidate = MANIFEST_MAX_ENTRIES;
+    size_t recovery_count = 0;
+    uint8_t recovery_uuid[16];
+    memset(recovery_uuid, 0, sizeof(recovery_uuid));
+#endif
+    *recovery_selected = false;
     for (uint32_t i = 0; i + 1 < view->manifest->header.entry_count; ++i) {
         const MANIFEST_ENTRY *entry = view->entries[i];
         if (!(entry->flags & MF_ENTRY_FLAG_EXECUTABLE)) continue;
@@ -422,6 +432,14 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
                 } else {
                     descriptions[count] = KSHIM_MENU_DESC_INTERNAL;
                     roles[count] = KSHIM_MENU_ROLE_INTERNAL;
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
+    defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS
+                    if (info->board == DEVICE_BOARD_TB322FC || info->board == DEVICE_BOARD_TB323FU) {
+                        recovery_candidate = i;
+                        memcpy(recovery_uuid, disk_entry.boot_uuid, sizeof(recovery_uuid));
+                        ++recovery_count;
+                    }
+#endif
                 }
             }
         }
@@ -464,6 +482,44 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
             return indexes[match_idx];
         }
     }
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
+    defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS && \
+    defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+    if (recovery_count == 1 && count < MANIFEST_MAX_ENTRIES) {
+        const MANIFEST_ENTRY *rec_entry = view->entries[recovery_candidate];
+        const void *rec_blob =
+            (const void *)(uintptr_t)(linux_base + rec_entry->offset);
+        struct kshim_disk_entry rec_disk_entry;
+        if (kshim_disk_entry_decode(rec_blob, (size_t)rec_entry->size,
+                                    &rec_disk_entry) == 0 &&
+            memcmp(rec_disk_entry.boot_uuid, recovery_uuid,
+                   sizeof(recovery_uuid)) == 0) {
+            _Alignas(64) uint8_t recovery_scratch[KSHIM_EXT4_SCRATCH_BYTES];
+            int available = kshim_disk_boot_recovery_available(&rec_disk_entry,
+                                   recovery_scratch,
+                                   sizeof(recovery_scratch));
+            if (!storage_settings_native_handoff_safe()) {
+                __asm__ volatile("msr daifset, #0xf" ::: "memory");
+                for (;;) __asm__ volatile("wfe");
+            }
+            if (available) {
+                advanced_mask |= UINT64_C(1) << count;
+                indexes[count] = recovery_candidate;
+                memcpy(labels[count], rec_entry->name,
+                       rec_entry->name_len < sizeof(labels[0]) ?
+                           rec_entry->name_len : sizeof(labels[0]) - 1);
+                size_t rec_n = rec_entry->name_len < sizeof(labels[0]) ?
+                    rec_entry->name_len : sizeof(labels[0]) - 1;
+                labels[count][rec_n] = 0;
+                names[count] = labels[count];
+                descriptions[count] = KSHIM_MENU_DESC_INTERNAL;
+                roles[count] = KSHIM_MENU_ROLE_LINUX_ROLLBACK;
+                payload_boards[count] = info->board;
+                ++count;
+            }
+        }
+    }
+#endif
 #if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS
     if (kshim_platform_select_localized_settings(fdt, names, descriptions, roles, info,
             payload_boards, count, initial, view->manifest->header.timeout_ms,
@@ -478,6 +534,12 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
     *boot_target=roles[selected]==KSHIM_MENU_ROLE_ANDROID ? 1u :
                  roles[selected]==KSHIM_MENU_ROLE_INTERNAL ? 2u :
                  roles[selected]==KSHIM_MENU_ROLE_TF ? 3u : 0u;
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
+    defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS && \
+    defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+    if (roles[selected] == KSHIM_MENU_ROLE_LINUX_ROLLBACK)
+        *recovery_selected = true;
+#endif
     return indexes[selected];
 }
 
@@ -547,7 +609,8 @@ static int stage_disk_menu_entry(uint64_t linux_base, uint64_t manifest_address,
                                  const void *runtime_fdt, enum device_board board,
                                  const MANIFEST_ENTRY *entry,
                                  struct kshim_disk_entry *descriptor,
-                                 struct kshim_disk_boot_image *image)
+                                 struct kshim_disk_boot_image *image,
+                                 bool recovery)
 {
     struct dt_range excluded[5];
     struct kshim_resources *r;
@@ -566,6 +629,8 @@ static int stage_disk_menu_entry(uint64_t linux_base, uint64_t manifest_address,
     if (kshim_disk_entry_decode((const void *)(uintptr_t)(linux_base + entry->offset),
                                 (size_t)entry->size, descriptor) != 0)
         return -501;
+
+    descriptor->recovery = recovery;
 
     packed_ptr = (const uint64_t *)(uintptr_t)(linux_base + 0x10);
     packed_span = *packed_ptr;
@@ -676,6 +741,37 @@ static int set_disk_linux_chosen(void *blob, size_t capacity,
     rc = fdt_setprop_string(blob, chosen, "armada,boot-source", "armada_boot");
     if (rc)
         return rc;
+
+    rc = fdt_delprop(blob, chosen, "armada,boot-recovery");
+    if (rc != -FDT_ERR_NOTFOUND && rc != 0)
+        return rc;
+
+#if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
+    defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS && \
+    defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
+    if (board == DEVICE_BOARD_TB322FC || board == DEVICE_BOARD_TB323FU) {
+        fdt32_t recovery_version = cpu_to_fdt32(1u);
+        rc = fdt_setprop(blob, chosen, "armada,boot-recovery-version",
+                         &recovery_version, sizeof(recovery_version));
+        if (rc)
+            return rc;
+        if (descriptor->recovery) {
+            const uint8_t marker = 0;
+            rc = fdt_setprop(blob, chosen, "armada,boot-recovery",
+                             &marker, sizeof(marker));
+            if (rc)
+                return rc;
+        }
+    } else {
+        rc = fdt_delprop(blob, chosen, "armada,boot-recovery-version");
+        if (rc != -FDT_ERR_NOTFOUND && rc != 0)
+            return rc;
+    }
+#else
+    rc = fdt_delprop(blob, chosen, "armada,boot-recovery-version");
+    if (rc != -FDT_ERR_NOTFOUND && rc != 0)
+        return rc;
+#endif
 
     return 0;
 }
@@ -1171,9 +1267,10 @@ int kshim_main(
 #endif
         uint32_t boot_target=0;
         bool one_shot=false;
+        bool recovery_selected=false;
         uint32_t selected_index = select_image(&view, device_tree_address, linux_base,
                                                &device_info, consumed_action, &one_shot, &boot_target,
-                                               diagnostic_index);
+                                               diagnostic_index, &recovery_selected);
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS
         kshim_platform_bind_settings(NULL);
         if (!storage_settings_native_handoff_safe()) {
@@ -1208,7 +1305,8 @@ int kshim_main(
                 disk_stage_rc = stage_disk_menu_entry(
                     linux_base, manifest_address + manifest_size,
                     (const void *)(uintptr_t)runtime_fdt,
-                    device_info.board, entry, &disk_descriptor, &disk_image);
+                    device_info.board, entry, &disk_descriptor, &disk_image,
+                    recovery_selected);
             }
             if (!storage_settings_native_handoff_safe()) {
                 __asm__ volatile("msr daifset, #0xf" ::: "memory");

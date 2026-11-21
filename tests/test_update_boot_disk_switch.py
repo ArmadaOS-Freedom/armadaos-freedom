@@ -72,6 +72,29 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         }
         self.trusted_key = b"test-key"
 
+        # Real per-test recovery paths and a valid mocked systemd unit symlink so
+        # the production capability check runs for real against temp files.
+        self.recovery_version = Path(self._tmp.name) / "bootloader" / "entries" / "armada-boot.conf"
+        self.recovery_service = Path(self._tmp.name) / "systemd" / "armada-boot-check.service"
+        self.recovery_wants = (
+            Path(self._tmp.name) / "systemd" / "multi-user.target.wants"
+            / "armada-boot-check.service")
+        self.recovery_version.parent.mkdir(parents=True)
+        self.recovery_version.write_bytes(b"\x00\x00\x00\x01")
+        self.recovery_service.parent.mkdir(parents=True, exist_ok=True)
+        self.recovery_service.write_bytes(b"# unit")
+        self.recovery_wants.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.fspath(self.recovery_service), os.fspath(self.recovery_wants))
+
+        for name, value in (
+            ("BOOT_RECOVERY_VERSION_PATH", self.recovery_version),
+            ("RECOVERY_SERVICE_PATH", self.recovery_service),
+            ("RECOVERY_WANTS_PATH", self.recovery_wants),
+        ):
+            patcher = mock.patch.object(boot_disk_switch, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
         # Patch mount resolution only; verification is stubbed separately.
         self._resolve_patcher = mock.patch.object(
             boot_disk_switch, "_resolve_boot", return_value=self.boot,
@@ -121,8 +144,8 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         return {
             "transactionId": _TID,
             "planSha256": _PLAN_SHA,
-            "fromSlot": "a",
-            "targetSlot": "b",
+            "fromSlot": None,
+            "targetSlot": None,
         }
 
     def _read_selector(self) -> str:
@@ -156,7 +179,11 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(self._read_selector(), _NEW_GEN)
         self.assertEqual(
             self.checkpoint_mock.call_args_list,
-            [mock.call(self.boot, dry_run=True), mock.call(self.boot)],
+            [
+                mock.call(self.boot, dry_run=True),
+                mock.call(self.boot),
+                mock.call(self.boot),
+            ],
         )
 
     def test_read_trial_status_transitions(self):
@@ -205,7 +232,7 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         # promote_confirmed_deployment hit exactly once with exact order.
         self.assertEqual(
             self._promote_calls,
-            [(self.root, _NEW_BINDING, _OLD_BINDING)],
+            [(self.root, new_context["deployment"], self.initial["deployment"])],
         )
 
         finished = json.loads(
@@ -213,6 +240,8 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(finished["receipt"]["transactionId"], _TID)
         self.assertEqual(finished["currentDeployment"], _OLD_BINDING)
         self.assertEqual(finished["newDeployment"], _NEW_BINDING)
+        self.assertEqual(finished["receipt"]["fromSlot"], None)
+        self.assertEqual(finished["receipt"]["targetSlot"], None)
 
         # Pending cleared, completed retained, previous generation retained.
         self.assertFalse((self.boot / "armada" / "pending-switch.json").exists())
@@ -296,7 +325,7 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         plan = self._make_plan()
         receipt = self._make_receipt()
 
-        self.checkpoint_mock.side_effect = [None, OSError("simulated post failure")]
+        self.checkpoint_mock.side_effect = [None, None, OSError("simulated post failure")]
 
         with self.assertRaises(boot_disk_switch.BootDiskSwitchUncertainError):
             boot_disk_switch.activate(
@@ -365,6 +394,90 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertFalse(
             (self.boot / "armada" / "finished-switch.json").exists())
         self.assertFalse((self.boot / "armada" / "pending-switch.json").exists())
+
+    def test_recover_pending_broken_new_boot_restores_old(self):
+        """A broken new boot recovers to the exact old generation without promoting."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+        boot_disk_switch.activate(
+            self.root, self.initial, plan,
+            trusted_key=self.trusted_key, receipt=receipt,
+        )
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+        recovery = self.boot / "armada" / "recovery"
+        self.assertTrue(recovery.is_symlink())
+        self.assertEqual(os.readlink(recovery), _OLD_GEN)
+
+        old_bytes = (self.boot / "armada" / _OLD_GEN / "binding.bin").read_bytes()
+        new_bytes = (self.boot / "armada" / _NEW_GEN / "binding.bin").read_bytes()
+        # Byte sentinels for preserved data areas beyond the generations.
+        for name in ("userdata", "home", "boot_a", "boot_b", "slot-metadata"):
+            (self.boot / "armada" / name).write_bytes(b"sentinel-" + name.encode())
+
+        self.verify_mock.reset_mock()
+        self._promote_calls.clear()
+        recovered = boot_disk_switch.recover_pending(
+            self.root, self.initial, trusted_key=self.trusted_key,
+        )
+        self.assertTrue(recovered)
+        self.assertEqual(self._promote_calls, [])
+        self.verify_mock.assert_called_once_with(
+            self.boot / "armada" / _OLD_GEN, "TB322FC", trusted_key=self.trusted_key)
+        self.assertFalse(recovery.exists() or recovery.is_symlink())
+        self.assertIsNone(self._read_pending())
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertTrue((self.boot / "armada" / _OLD_GEN).is_dir())
+        self.assertTrue((self.boot / "armada" / _NEW_GEN).is_dir())
+        self.assertEqual((self.boot / "armada" / _OLD_GEN / "binding.bin").read_bytes(), old_bytes)
+        self.assertEqual((self.boot / "armada" / _NEW_GEN / "binding.bin").read_bytes(), new_bytes)
+        for name in ("userdata", "home", "boot_a", "boot_b", "slot-metadata"):
+            self.assertEqual(
+                (self.boot / "armada" / name).read_bytes(),
+                b"sentinel-" + name.encode(),
+            )
+        self.assertFalse((self.boot / "armada" / _NEW_GEN / "kernel.img").exists())
+
+    def test_recover_pending_retry_old_selector_pointer_absent(self):
+        """Retry with old selector + pointer already absent but pending still present."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+        boot_disk_switch.activate(
+            self.root, self.initial, plan,
+            trusted_key=self.trusted_key, receipt=receipt,
+        )
+        # Simulate partial recovery: selector restored, recovery pointer already gone.
+        os.unlink(os.fspath(self.boot / "armada" / "recovery"))
+        selector = self.boot / "armada" / "boot"
+        os.unlink(os.fspath(selector))
+        os.symlink(_OLD_GEN, selector)
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertTrue((self.boot / "armada" / "pending-switch.json").exists())
+        self._promote_calls.clear()
+        self.verify_mock.reset_mock()
+        recovered = boot_disk_switch.recover_pending(
+            self.root, self.initial, trusted_key=self.trusted_key,
+        )
+        self.assertTrue(recovered)
+        self.assertEqual(self._promote_calls, [])
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertFalse((self.boot / "armada" / "recovery").exists())
+        self.assertIsNone(self._read_pending())
+        self.assertEqual(self.verify_mock.call_count, 1)
+        self.assertEqual(self.verify_mock.call_args.args[0].name, _OLD_GEN)
+
+    def test_activate_missing_capability_leaves_old_selector(self):
+        """Missing recovery capability aborts before any pending or pointer changes."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+        os.unlink(os.fspath(self.recovery_wants))
+        with self.assertRaises(boot_disk_switch.BootDiskSwitchError):
+            boot_disk_switch.activate(
+                self.root, self.initial, plan,
+                trusted_key=self.trusted_key, receipt=receipt,
+            )
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertIsNone(self._read_pending())
+        self.assertFalse((self.boot / "armada" / "recovery").exists())
 
 
 if __name__ == "__main__":

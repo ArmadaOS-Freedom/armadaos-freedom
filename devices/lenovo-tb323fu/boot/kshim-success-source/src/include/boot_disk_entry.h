@@ -8,6 +8,7 @@
 
 struct kshim_disk_entry {
     bool diagnostic;
+    bool recovery; /* runtime-only; never encoded on the wire */
     uint8_t boot_uuid[16];
     uint8_t root_uuid[16];
 };

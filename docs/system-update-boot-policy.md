@@ -29,6 +29,15 @@ those fields track raw Android Boot writes and Android slot control. Both
 Android boot images, Android slot selection and user partitions are preserved.
 The updater changes the Linux deployment and boot files on `ARMADA_BOOT`.
 
+## Recovering an unconfirmed update
+
+On ARMADA_BOOT installations, if a prepared update does not reach a usable
+graphical Linux session, recovery requires a boot launcher capable of selecting
+the previous signed boot generation and a retained previous build. Entry is
+through the launcher's Advanced boot menu; recovery uses the retained signed
+payload on `ARMADA_BOOT` and shares the Linux data partition. It does not
+change either Android boot slot or Android partitions.
+
 ## Existing embedded-boot layouts
 
 The remaining sections describe installations that embed Linux boot material

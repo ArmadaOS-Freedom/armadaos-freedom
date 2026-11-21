@@ -48,4 +48,15 @@ int kshim_disk_boot_native_read(const struct kshim_disk_entry *entry,
                                 void *scratch,
                                 size_t scratch_bytes);
 
+/*
+ * Availability probe: reports whether a recovery boot image is present on
+ * the resolved boot partition of this entry. Read-only, synchronous, no
+ * payload reads and no device writes. Only /armada/recovery/binding.bin is
+ * attempted via the existing bounded decode helper. Returns nonzero on
+ * success (recovery present and decodable), 0 otherwise.
+ */
+int kshim_disk_boot_recovery_available(const struct kshim_disk_entry *entry,
+                                       void *scratch,
+                                       size_t scratch_bytes);
+
 #endif /* KSHIM_BOOT_DISK_NATIVE_H */

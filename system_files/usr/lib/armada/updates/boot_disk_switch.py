@@ -11,7 +11,7 @@ import stat
 import struct
 from pathlib import Path
 
-from . import _io, boot_disk_generation, boot_disk_selector, boot_payload
+from . import _io, boot_context, boot_disk_generation, boot_disk_selector, boot_payload
 from . import deployment_options, deployment_store, signature
 
 _COMPLETED_NAME = "finished-switch.json"
@@ -19,6 +19,9 @@ _PENDING_NAME = "pending-switch.json"
 _PENDING_SCHEMA = 1
 _RECEIPT_KEYS = {'transactionId', 'planSha256', 'fromSlot', 'targetSlot'}
 _MAX_PENDING_BYTES = 4096
+BOOT_RECOVERY_VERSION_PATH = Path("/sys/firmware/devicetree/base/chosen/armada,boot-recovery-version")
+RECOVERY_SERVICE_PATH = Path("/usr/lib/systemd/system/armada-linux-recovery.service")
+RECOVERY_WANTS_PATH = Path("/etc/systemd/system/sysinit.target.wants/armada-linux-recovery.service")
 _DEPLOYMENT_RE = re.compile(r"default/([0-9a-f]{64})\.(0|[1-9][0-9]{0,9})")
 _GEN_DIR_RE = re.compile(r"(?:seed|gen-[0-9a-f]{32})")
 _UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
@@ -170,6 +173,34 @@ def _read_pending(boot, *, completed=False):
     return doc
 
 
+def _require_recovery_support():
+    """Require old launcher/system supports recovery rollback before switching."""
+    try:
+        raw = boot_context._read_regular(BOOT_RECOVERY_VERSION_PATH, 4)
+    except (OSError, ValueError) as exc:
+        raise BootDiskSwitchError(
+            "old launcher lacks boot-recovery-version device-tree capability") from exc
+    if raw != b"\x00\x00\x00\x01":
+        raise BootDiskSwitchError(
+            "old launcher lacks boot-recovery-version device-tree capability")
+    service = RECOVERY_SERVICE_PATH
+    try:
+        st = service.lstat()
+    except OSError as exc:
+        raise BootDiskSwitchError(
+            "old deployment lacks recovery service") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise BootDiskSwitchError("old deployment recovery service is not a regular file")
+    wants = RECOVERY_WANTS_PATH
+    try:
+        target = wants.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise BootDiskSwitchError(
+            "old deployment lacks recovery wants link") from exc
+    if target != service:
+        raise BootDiskSwitchError("old deployment recovery wants link is not the recovery service")
+
+
 def _write_switch_durably(boot, name, doc):
     """Exclusive creation under boot/armada, temp + fsync + rename + fsync dir."""
     armada = boot / "armada"
@@ -202,6 +233,58 @@ def _write_switch_durably(boot, name, doc):
         _io.fsync_dir(armada)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _publish_recovery_pointer(boot, expected):
+    armada = boot / "armada"
+    if not armada.is_dir() or armada.is_symlink():
+        raise BootDiskSwitchError("boot/armada missing for recovery pointer")
+    link = armada / "recovery"
+    try:
+        lst = link.lstat()
+    except FileNotFoundError:
+        lst = None
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot inspect recovery pointer: {exc}") from exc
+    if lst is not None and not stat.S_ISLNK(lst.st_mode):
+        raise BootDiskSwitchError("boot/armada/recovery exists and is not a symlink")
+    tmp_name = f".recovery.{secrets.token_hex(12)}.tmp"
+    tmp_path = armada / tmp_name
+    try:
+        os.symlink(expected, tmp_path)
+        os.replace(tmp_path, link)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot publish recovery pointer: {exc}") from exc
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        _io.fsync_dir(armada)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot fsync recovery pointer: {exc}") from exc
+
+
+def _remove_recovery_pointer(boot):
+    armada = boot / "armada"
+    link = armada / "recovery"
+    try:
+        lst = link.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot inspect recovery pointer: {exc}") from exc
+    if not stat.S_ISLNK(lst.st_mode):
+        raise BootDiskSwitchError("boot/armada/recovery is not a symlink; refusing removal")
+    try:
+        link.unlink()
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot remove recovery pointer: {exc}") from exc
+    try:
+        _io.fsync_dir(armada)
+    except OSError as exc:
+        raise BootDiskSwitchError(f"cannot fsync recovery pointer removal: {exc}") from exc
 
 
 def _clear_pending_durably(boot):
@@ -328,6 +411,7 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
             or plan["currentDeployment"] != initial["deployment"]):
         raise BootDiskSwitchError("running ARMADA_BOOT generation changed after preparation")
     _verified_generation(boot, target, plan["model"], plan["newDeployment"], trusted_key)
+    _require_recovery_support()
     boot_disk_selector.ensure_root_binding(root, plan["newDeployment"])
     if _read_pending(boot) is not None:
         raise BootDiskSwitchError("another ARMADA_BOOT update awaits reboot")
@@ -341,6 +425,16 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
         raise BootDiskSwitchError(
             "ARMADA_BOOT checkpoint unsupported or not permitted") from checkpoint_exc
     _write_switch_durably(boot, _PENDING_NAME, record)
+    _publish_recovery_pointer(boot, expected)
+    try:
+        _checkpoint_boot(boot)
+    except OSError as checkpoint_exc:
+        try:
+            _remove_recovery_pointer(boot)
+        except BootDiskSwitchError:
+            pass
+        raise BootDiskSwitchUncertainError(
+            "ARMADA_BOOT activation uncertain: checkpoint failed") from checkpoint_exc
     try:
         boot_disk_selector.activate_generation(boot, expected, target)
     except Exception as exc:
@@ -389,6 +483,7 @@ def confirm(root, initial, *, trusted_key):
         raise BootDiskSwitchError("pending ARMADA_BOOT switch is for another model")
     if initial["deployment"] == pending["currentDeployment"]:
         if selected == expected:
+            _remove_recovery_pointer(boot)
             _clear_pending_durably(boot)
         elif selected != target:
             raise BootDiskSwitchError("pending ARMADA_BOOT selector drift")
@@ -404,6 +499,7 @@ def confirm(root, initial, *, trusted_key):
         if (entry.name.startswith("gen-") and _GEN_DIR_RE.fullmatch(entry.name)
                 and entry.name not in {target, expected} and entry.is_dir() and not entry.is_symlink()):
             shutil.rmtree(entry)
+    _remove_recovery_pointer(boot)
     _clear_pending_durably(boot)
     return True
 
@@ -416,9 +512,68 @@ def ensure_ready(root, initial):
         return
     if (initial["deployment"] == pending["currentDeployment"]
             and _read_boot_active(boot)[1] == pending["expected"]):
+        _remove_recovery_pointer(boot)
         _clear_pending_durably(boot)
         return
     raise BootDiskSwitchError("an ARMADA_BOOT change already awaits restart or confirmation")
+
+
+def recover_pending(root, initial, *, trusted_key):
+    """Recover an interrupted switch when boot witness indicates recovery.
+
+    Idempotent: selector may already be old or still target.
+    """
+    if initial.get("bootSource") != "armada_boot":
+        return False
+    boot = _resolve_boot(root)
+    pending = _read_pending(boot)
+    if pending is None:
+        return False
+    if initial.get("model") != pending.get("model"):
+        raise BootDiskSwitchError("pending ARMADA_BOOT switch is for another model")
+    if initial.get("deployment") != pending.get("currentDeployment"):
+        raise BootDiskSwitchError("running deployment is not the pending previous generation")
+    completed = _read_pending(boot, completed=True)
+    if completed == pending:
+        raise BootDiskSwitchError("pending ARMADA_BOOT switch already confirmed")
+    active = _read_boot_active(boot)[1]
+    link = boot / "armada" / "recovery"
+    try:
+        target_link = os.readlink(os.fspath(link))
+    except FileNotFoundError:
+        target_link = None
+        if active != pending["expected"]:
+            raise BootDiskSwitchError("recovery pointer missing for pending switch")
+    except OSError as exc:
+        raise BootDiskSwitchError("recovery pointer missing for pending switch") from exc
+    if target_link is not None and target_link != pending["expected"]:
+        raise BootDiskSwitchError("recovery pointer does not match pending expected generation")
+    if active not in {pending["expected"], pending["target"]}:
+        raise BootDiskSwitchError("active ARMADA_BOOT generation is not pending expected or target")
+    if active == pending["target"] and target_link != pending["expected"]:
+        raise BootDiskSwitchError("recovery pointer does not match pending expected generation")
+    _verified_generation(
+        boot, pending["expected"], pending["model"], pending["currentDeployment"], trusted_key)
+    boot_disk_selector.ensure_root_binding(root, pending["currentDeployment"])
+    if active == pending["target"]:
+        try:
+            _checkpoint_boot(boot, dry_run=True)
+        except OSError as checkpoint_exc:
+            raise BootDiskSwitchError(
+                "ARMADA_BOOT checkpoint unsupported or not permitted") from checkpoint_exc
+        boot_disk_selector.activate_generation(boot, pending["target"], pending["expected"])
+    if _read_boot_active(boot)[1] != pending["expected"]:
+        raise BootDiskSwitchError("recovery did not restore previous ARMADA_BOOT generation")
+    if _read_pending(boot) != pending:
+        raise BootDiskSwitchError("pending ARMADA_BOOT record changed during recovery")
+    try:
+        _checkpoint_boot(boot)
+    except OSError as checkpoint_exc:
+        raise BootDiskSwitchError(
+            "ARMADA_BOOT checkpoint failed after recovery") from checkpoint_exc
+    _remove_recovery_pointer(boot)
+    _clear_pending_durably(boot)
+    return True
 
 
 def read_trial_status(context, root=Path("/sysroot")):

@@ -2,6 +2,7 @@
 #ifndef KSHIM_BOOT_DISK_LOAD_H
 #define KSHIM_BOOT_DISK_LOAD_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -60,6 +61,7 @@ int kshim_disk_boot_read(const struct kshim_blockdev   *dev,
                          const struct kshim_partition  *part,
                          const uint8_t                  public_key[65],
                          uint32_t                       board,
+                         bool                           recovery,
                          void                          *dtb_scratch,
                          size_t                         dtb_scratch_bytes,
                          kshim_disk_boot_place_fn       place,

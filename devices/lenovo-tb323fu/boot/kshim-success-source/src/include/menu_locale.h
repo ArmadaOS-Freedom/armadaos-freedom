@@ -77,7 +77,9 @@ typedef enum kshim_menu_role_t {
     KSHIM_MENU_ROLE_DEVICE_TB323FU,
     /* Highest valid role; the role tables are sized with it + 1. */
     KSHIM_MENU_ROLE_BOOT_SLOT,
-    KSHIM_MENU_ROLE_MAX = KSHIM_MENU_ROLE_BOOT_SLOT
+    /* Appended so existing numeric role values are preserved. */
+    KSHIM_MENU_ROLE_LINUX_ROLLBACK,
+    KSHIM_MENU_ROLE_MAX = KSHIM_MENU_ROLE_LINUX_ROLLBACK
 } kshim_menu_role_t;
 
 /* Localized label for a known role. UNKNOWN and BASE return `fallback`
@@ -282,6 +284,8 @@ typedef enum kshim_menu_text_id {
     KSHIM_TEXT_SETTINGS_BOOT_LOG_OPEN,
     KSHIM_TEXT_SETTINGS_BOOT_LOG_CLOSED,
     KSHIM_TEXT_SETTINGS_BOOT_LOG_DESC,
+    KSHIM_TEXT_DESC_RECOVERY_LINUX,
+    KSHIM_TEXT_NAME_RECOVERY_LINUX,
     KSHIM_TEXT_COUNT
 } kshim_menu_text_id;
 

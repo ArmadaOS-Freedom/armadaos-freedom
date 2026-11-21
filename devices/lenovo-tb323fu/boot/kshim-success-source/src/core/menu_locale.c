@@ -64,6 +64,7 @@ static const char *const kshim_menu_text_table[2][KSHIM_TEXT_COUNT] = {
         [KSHIM_TEXT_DESC_FASTBOOT]  = "进入 Fastboot 模式，通过 USB 连接电脑进行维护或刷写。",
         [KSHIM_TEXT_DESC_EDL]       = "进入高通 9008 下载模式，配合电脑端工具进行备份、恢复或刷写。",
         [KSHIM_TEXT_DESC_BACK]      = "返回系统启动选项。",
+        [KSHIM_TEXT_DESC_RECOVERY_LINUX] = "启动原版本 Linux。",
         [KSHIM_TEXT_STATUS]         = "选择要启动的系统",
 
         [KSHIM_TEXT_MENU_TITLE]     = "KShimC 启动器",
@@ -89,6 +90,7 @@ static const char *const kshim_menu_text_table[2][KSHIM_TEXT_COUNT] = {
         [KSHIM_TEXT_NAME_INTERNAL]    = "启动机身 ArmadaOS",
         [KSHIM_TEXT_NAME_TF]          = "启动 TF 卡 ArmadaOS",
         [KSHIM_TEXT_NAME_DIAGNOSTIC]  = "Linux 诊断模式",
+        [KSHIM_TEXT_NAME_RECOVERY_LINUX] = "恢复原版本 Linux",
 
         [KSHIM_TEXT_LANGUAGE_LABEL]   = "语言 / Language",
         [KSHIM_TEXT_LANGUAGE_STATE]   = "简体中文",
@@ -211,6 +213,7 @@ static const char *const kshim_menu_text_table[2][KSHIM_TEXT_COUNT] = {
         [KSHIM_TEXT_DESC_FASTBOOT]  = "Enter Fastboot mode and connect to a computer over USB for maintenance or flashing.",
         [KSHIM_TEXT_DESC_EDL]       = "Enter Qualcomm 9008 download mode for backup, recovery, or flashing with a computer.",
         [KSHIM_TEXT_DESC_BACK]      = "Return to the system boot options.",
+        [KSHIM_TEXT_DESC_RECOVERY_LINUX] = "Boot the Linux from before the update, keeping personal files.",
         [KSHIM_TEXT_STATUS]         = "Select a system to boot",
 
         [KSHIM_TEXT_MENU_TITLE]     = "KShim boot menu",
@@ -236,6 +239,7 @@ static const char *const kshim_menu_text_table[2][KSHIM_TEXT_COUNT] = {
         [KSHIM_TEXT_NAME_INTERNAL]    = "Start internal ArmadaOS",
         [KSHIM_TEXT_NAME_TF]          = "Start TF card ArmadaOS",
         [KSHIM_TEXT_NAME_DIAGNOSTIC]  = "Linux diagnostics",
+        [KSHIM_TEXT_NAME_RECOVERY_LINUX] = "Restore previous Linux",
 
         [KSHIM_TEXT_LANGUAGE_LABEL]   = "语言 / Language",
         [KSHIM_TEXT_LANGUAGE_STATE]   = "English",
@@ -352,6 +356,7 @@ static const kshim_menu_text_id kshim_menu_role_name_table[KSHIM_MENU_ROLE_MAX +
     [KSHIM_MENU_ROLE_FASTBOOT]   = KSHIM_TEXT_FASTBOOT,
     [KSHIM_MENU_ROLE_EDL]        = KSHIM_TEXT_EDL,
     [KSHIM_MENU_ROLE_BACK]       = KSHIM_TEXT_BACK,
+    [KSHIM_MENU_ROLE_LINUX_ROLLBACK] = KSHIM_TEXT_NAME_RECOVERY_LINUX,
     [KSHIM_MENU_ROLE_LANG_ZH]    = KSHIM_TEXT_LANG_ZH_NAME,
     [KSHIM_MENU_ROLE_LANG_EN]    = KSHIM_TEXT_LANG_EN_NAME,
     [KSHIM_MENU_ROLE_DEVICE_INFO] = KSHIM_TEXT_INFO_LABEL,
@@ -380,6 +385,7 @@ static const kshim_menu_text_id kshim_menu_role_desc_table[KSHIM_MENU_ROLE_MAX +
     [KSHIM_MENU_ROLE_FASTBOOT]   = KSHIM_TEXT_DESC_FASTBOOT,
     [KSHIM_MENU_ROLE_EDL]        = KSHIM_TEXT_DESC_EDL,
     [KSHIM_MENU_ROLE_BACK]       = KSHIM_TEXT_DESC_BACK,
+    [KSHIM_MENU_ROLE_LINUX_ROLLBACK] = KSHIM_TEXT_DESC_RECOVERY_LINUX,
     [KSHIM_MENU_ROLE_LANG_ZH]    = KSHIM_TEXT_DESC_LANG_ZH,
     [KSHIM_MENU_ROLE_LANG_EN]    = KSHIM_TEXT_DESC_LANG_EN,
     [KSHIM_MENU_ROLE_DEVICE_INFO] = KSHIM_TEXT_INFO_DESC,

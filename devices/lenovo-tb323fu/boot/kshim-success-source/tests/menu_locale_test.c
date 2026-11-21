@@ -79,6 +79,8 @@ static const struct role_case role_cases[] = {
       "TB322FC", "TB322FC" },
     { KSHIM_MENU_ROLE_DEVICE_TB323FU, "Y700 五代（TB323FU）", "Y700 Gen5 (TB323FU)",
       "TB323FU", "TB323FU" },
+    { KSHIM_MENU_ROLE_LINUX_ROLLBACK, "恢复原版本 Linux", "Restore previous Linux",
+      "原版本", "keeping personal files" },
 };
 
 #define ROLE_CASE_COUNT (sizeof role_cases / sizeof role_cases[0])
@@ -159,7 +161,8 @@ static void check_role_values(void)
     assert(KSHIM_MENU_ROLE_DEVICE_TB322FC == 21);
     assert(KSHIM_MENU_ROLE_DEVICE_TB323FU == 22);
     assert(KSHIM_MENU_ROLE_BOOT_SLOT == 23);
-    assert(KSHIM_MENU_ROLE_MAX == KSHIM_MENU_ROLE_BOOT_SLOT);
+    assert(KSHIM_MENU_ROLE_LINUX_ROLLBACK == 24);
+    assert(KSHIM_MENU_ROLE_MAX == KSHIM_MENU_ROLE_LINUX_ROLLBACK);
 }
 
 /* The changed/added session-settings strings are non-empty in both languages

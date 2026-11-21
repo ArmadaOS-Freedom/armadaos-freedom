@@ -67,6 +67,7 @@ int kshim_disk_entry_decode(const void *data, size_t bytes,
     }
 
     entry.diagnostic = (diagnostic != 0u);
+    entry.recovery = false;
     memcpy(entry.boot_uuid, p + 16, 16u);
     memcpy(entry.root_uuid, p + 32, 16u);
 

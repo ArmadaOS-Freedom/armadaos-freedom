@@ -185,6 +185,19 @@ def confirm_trial() -> dict:
             if boot_source != b"armada_boot\0":
                 raise ConfirmationError("invalid disk boot witness")
             initial = physical_slots.inspect_physical_slots()
+            try:
+                recovery = boot_context._read_regular(
+                    boot_context.BOOT_SOURCE_PATH.with_name("armada,boot-recovery"), 1)
+            except FileNotFoundError:
+                recovery = None
+            if recovery is not None:
+                if recovery != b"\0":
+                    raise ConfirmationError("invalid boot recovery marker")
+                recovered = boot_disk_switch.recover_pending(
+                        SYSROOT_PATH, initial, trusted_key=signature.DEFAULT_TRUSTED_KEY)
+                return {'state': 'rolled_back' if recovered else 'not_pending',
+                        'bootSource': 'armada_boot',
+                        'deployment': initial['deployment']}
             evidence = boot_disk_switch.read_trial_status(initial, SYSROOT_PATH)
             if (evidence.get("recordState") != "prepared" or
                     evidence.get("runningDeployment") != "new"):
