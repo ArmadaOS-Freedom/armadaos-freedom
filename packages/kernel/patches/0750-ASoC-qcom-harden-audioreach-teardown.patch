@@ -1,0 +1,685 @@
+From: 181981772 <181981772@qq.com>
+Subject: [PATCH] ASoC: qcom: q6apm: harden capture and graph teardown
+
+Capture prepare starts the frontend before the PCM START trigger. If an
+application frees an already prepared stream, DPCM can shut down the
+backend before the frontend's close callback stops its graph. Stop the
+capture frontend during component hw_free and serialize the transition
+with read requeue. Keep fragment ownership in close and reprepare.
+
+Serialize shared graph START and STOP and keep the last reference on
+failure. Abort PCM playback and LPASS reprepare when STOP fails. Reject
+PCM START in either direction after failed reprepare until another
+prepare succeeds, and do not queue playback buffers in the meantime.
+
+Match STOP and UNMAP basic responses by opcode and transaction token.
+Publish the DSP status through a completion, independent of the legacy
+opcode-only wait queue. For UNMAP, keep the graph and mapping selection
+in the initiating thread. Clear only the requested handle after a
+matching successful response, so a late reply cannot finish a later
+UNMAP or clear its mapping.
+
+Propagate capture FE hw_free failure through DPCM so the backend stays open
+for a failed attempt and the FE cannot be reused. Retain only failed component
+hw_params marks, retry those components before the next hw_params releases
+old DAI/BE state, and retry them once more before close shuts down the backend.
+Persistent STOP failure is reported while ALSA close completes best-effort
+resource release. Callback lifetime after final port teardown is unchanged.
+
+Signed-off-by: 181981772 <181981772@qq.com>
+---
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index 82a5f78..19c134e 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -81,6 +81,9 @@ struct q6apm_dai_rtd {
+ 	struct q6apm_graph *graph;
+ 	spinlock_t lock;
+ 	bool notify_on_drain;
++	bool graph_stopped;
++	bool prepare_failed;
++	struct mutex capture_lock;	/* serializes capture read and STOP */
+ };
+ 
+ struct q6apm_dai_data {
+@@ -137,7 +140,7 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
+ 		snd_pcm_period_elapsed(substream);
+ 		break;
+ 	case APM_CLIENT_EVENT_CMD_EOS_DONE:
+-		prtd->state = Q6APM_STREAM_STOPPED;
++		WRITE_ONCE(prtd->state, Q6APM_STREAM_STOPPED);
+ 		break;
+ 	case APM_CLIENT_EVENT_DATA_WRITE_DONE:
+ 		snd_pcm_period_elapsed(substream);
+@@ -145,8 +148,10 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
+ 		break;
+ 	case APM_CLIENT_EVENT_DATA_READ_DONE:
+ 		snd_pcm_period_elapsed(substream);
+-		if (prtd->state == Q6APM_STREAM_RUNNING)
++		mutex_lock(&prtd->capture_lock);
++		if (READ_ONCE(prtd->state) == Q6APM_STREAM_RUNNING)
+ 			q6apm_read(prtd->graph);
++		mutex_unlock(&prtd->capture_lock);
+ 
+ 		break;
+ 	default:
+@@ -211,19 +216,80 @@ static void event_handler_compr(uint32_t opcode, uint32_t token,
+ 	}
+ }
+ 
++static int q6apm_dai_stop_capture(struct q6apm_dai_rtd *prtd)
++{
++	int ret;
++
++	mutex_lock(&prtd->capture_lock);
++	if (READ_ONCE(prtd->state) == Q6APM_STREAM_IDLE ||
++	    prtd->graph_stopped) {
++		mutex_unlock(&prtd->capture_lock);
++		return 0;
++	}
++
++	WRITE_ONCE(prtd->state, Q6APM_STREAM_STOPPED);
++	mutex_unlock(&prtd->capture_lock);
++
++	ret = q6apm_graph_stop(prtd->graph);
++	if (ret)
++		return ret;
++
++	mutex_lock(&prtd->capture_lock);
++	prtd->graph_stopped = true;
++	mutex_unlock(&prtd->capture_lock);
++	return 0;
++}
++
+ static void q6apm_dai_release_graph(struct q6apm_dai_rtd *prtd, int stream)
+ {
+-	if (prtd->state)
++	int ret;
++
++	if (stream == SNDRV_PCM_STREAM_CAPTURE) {
++		ret = q6apm_dai_stop_capture(prtd);
++		if (ret)
++			dev_err(prtd->graph->dev,
++				"Failed to stop capture graph %d\n", ret);
++	} else if (READ_ONCE(prtd->state)) {
+ 		q6apm_graph_stop(prtd->graph);
++	}
+ 	q6apm_free_fragments(prtd->graph, stream);
+ 	q6apm_graph_close(prtd->graph);
+ 	prtd->graph = NULL;
+-	prtd->state = Q6APM_STREAM_IDLE;
++	prtd->graph_stopped = false;
++	WRITE_ONCE(prtd->state, Q6APM_STREAM_IDLE);
+ 	prtd->queue_ptr = 0;
+ 	prtd->last_pos_index = 0;
+ 	prtd->push_pull_size = 0;
+ }
+ 
++static int q6apm_dai_hw_free(struct snd_soc_component *component,
++			     struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct q6apm_dai_rtd *prtd;
++	int ret;
++
++	/*
++	 * Capture prepare starts the FE before the BE trigger.  Stop the FE
++	 * while ASoC hw_free is still ahead of BE shutdown.  Keep the fragments
++	 * until close or the next prepare, matching their existing lifetime.
++	 */
++	if (substream->stream != SNDRV_PCM_STREAM_CAPTURE || !runtime)
++		return 0;
++
++	prtd = runtime->private_data;
++	if (!prtd || !prtd->graph)
++		return 0;
++
++	ret = q6apm_dai_stop_capture(prtd);
++	if (ret) {
++		dev_err(component->dev, "Failed to stop capture graph %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 			     struct snd_pcm_substream *substream)
+ {
+@@ -234,6 +300,10 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 	struct q6apm_dai_data *pdata;
+ 	int ret;
+ 
++	/* ALSA can leave a previously prepared PCM in PREPARED on error. */
++	if (prtd)
++		WRITE_ONCE(prtd->prepare_failed, true);
++
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata)
+ 		return -EINVAL;
+@@ -249,11 +319,25 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 	cfg.bit_width = prtd->bits_per_sample;
+ 	cfg.fmt = SND_AUDIOCODEC_PCM;
+ 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
+-	if (prtd->state) {
+-		/* clear the previous setup if any  */
+-		q6apm_graph_stop(prtd->graph);
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
++		ret = q6apm_dai_stop_capture(prtd);
++		if (ret) {
++			dev_err(dev, "Failed to stop previous capture graph %d\n", ret);
++			return ret;
++		}
++		if (READ_ONCE(prtd->state) != Q6APM_STREAM_IDLE) {
++			/* clear the previous setup if any */
++			q6apm_free_fragments(prtd->graph, substream->stream);
++			prtd->graph_stopped = false;
++			WRITE_ONCE(prtd->state, Q6APM_STREAM_IDLE);
++		}
++	} else if (READ_ONCE(prtd->state) != Q6APM_STREAM_IDLE) {
++		/* clear the previous setup if any */
++		ret = q6apm_graph_stop(prtd->graph);
++		if (ret)
++			return ret;
+ 		q6apm_free_fragments(prtd->graph, substream->stream);
+-		prtd->state = Q6APM_STREAM_IDLE;
++		WRITE_ONCE(prtd->state, Q6APM_STREAM_IDLE);
+ 	}
+ 
+ 	prtd->queue_ptr = 0;
+@@ -311,6 +395,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 		dev_err(dev, "Failed to Start Graph %d\n", ret);
+ 		return ret;
+ 	}
++	prtd->graph_stopped = false;
+ 	if (!q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
+ 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 			int i;
+@@ -321,7 +406,8 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 	}
+ 
+ 	/* Now that graph as been prepared and started update the internal state accordingly */
+-	prtd->state = Q6APM_STREAM_RUNNING;
++	WRITE_ONCE(prtd->state, Q6APM_STREAM_RUNNING);
++	WRITE_ONCE(prtd->prepare_failed, false);
+ 
+ 	return 0;
+ }
+@@ -332,8 +418,9 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+ 	int i, ret = 0, avail_periods;
+ 
+-	/* SYNC_PTR can get here before prepare has allocated fragments */
+-	if (!prtd->graph || prtd->state == Q6APM_STREAM_IDLE)
++	/* SYNC_PTR can run before prepare or after a failed reprepare. */
++	if (READ_ONCE(prtd->prepare_failed) || !prtd->graph ||
++	    READ_ONCE(prtd->state) == Q6APM_STREAM_IDLE)
+ 		return 0;
+ 
+ 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph))
+@@ -365,10 +452,12 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		if (READ_ONCE(prtd->prepare_failed))
++			ret = -EPIPE;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 		/* TODO support be handled via SoftPause Module */
+-		prtd->state = Q6APM_STREAM_STOPPED;
++		WRITE_ONCE(prtd->state, Q6APM_STREAM_STOPPED);
+ 		prtd->queue_ptr = 0;
+ 		prtd->last_pos_index = 0;
+ 		break;
+@@ -407,6 +496,7 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+ 		return -ENOMEM;
+ 
+ 	spin_lock_init(&prtd->lock);
++	mutex_init(&prtd->capture_lock);
+ 	prtd->substream = substream;
+ 	prtd->graph = q6apm_graph_open(dev, event_handler, prtd, graph_id, substream->stream);
+ 	if (IS_ERR(prtd->graph)) {
+@@ -1091,6 +1181,7 @@ static const struct snd_soc_component_driver q6apm_fe_dai_component = {
+ 	.pcm_new	= q6apm_dai_pcm_new,
+ 	.pcm_free	= q6apm_dai_pcm_free,
+ 	.hw_params	= q6apm_dai_hw_params,
++	.hw_free	= q6apm_dai_hw_free,
+ 	.pointer	= q6apm_dai_pointer,
+ 	.trigger	= q6apm_dai_trigger,
+ 	.ack		= q6apm_dai_ack,
+diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+index 11da559..717c8d4 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -252,9 +252,10 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 	}
+ 
+ 	if (dai_data->is_port_started[dai->id]) {
+-		q6apm_graph_stop(dai_data->graph[dai->id]);
++		rc = q6apm_graph_stop(dai_data->graph[dai->id]);
++		if (rc)
++			return rc;
+ 		dai_data->is_port_started[dai->id] = false;
+-
+ 	}
+ 	dai_data->is_prepared[dai->id] = false;
+ 
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 8af5514..c3f0376 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -40,6 +40,43 @@ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
+ 					NULL, &apm->wait, pkt, rsp_opcode);
+ }
+ 
++static int q6apm_send_tracked_cmd(struct q6apm *apm, struct gpr_pkt *pkt)
++{
++	gpr_device_t *gdev = apm->gdev;
++	u32 opcode = pkt->hdr.opcode;
++	int ret;
++
++	/* Use the APM command mutex without its opcode-only result slot. */
++	lockdep_assert_held(&apm->lock);
++	spin_lock(&apm->reply_lock);
++	if (!++apm->reply_token)
++		apm->reply_token++;
++	pkt->hdr.token = apm->reply_token;
++	reinit_completion(&apm->reply_done);
++	apm->reply_opcode = opcode;
++	spin_unlock(&apm->reply_lock);
++
++	pkt->hdr.src_port = gdev->svc_id;
++	ret = gpr_send_pkt(gdev, pkt);
++	if (ret >= 0) {
++		if (!wait_for_completion_timeout(&apm->reply_done, 5 * HZ)) {
++			dev_err(apm->dev, "Command %#x timed out\n", opcode);
++			ret = -ETIMEDOUT;
++		} else if (apm->reply_status) {
++			dev_err(apm->dev, "Command %#x failed: %#x\n", opcode, apm->reply_status);
++			ret = -EINVAL;
++		} else {
++			ret = 0;
++		}
++	}
++
++	spin_lock(&apm->reply_lock);
++	apm->reply_opcode = 0;
++	spin_unlock(&apm->reply_lock);
++
++	return ret;
++}
++
+ static void q6apm_put_audioreach_graph(struct kref *ref);
+ 
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+@@ -66,6 +103,7 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
+ 	if (!graph)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	mutex_init(&graph->start_stop_lock);
+ 	graph->apm = apm;
+ 	graph->info = info;
+ 	graph->id = graph_id;
+@@ -127,6 +165,15 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
+ 	list_for_each_entry(sg, &info->sg_list, node)
+ 		mgmt_cmd->sub_graph_id_list[i++] = sg->sub_graph_id;
+ 
++	if (opcode == APM_CMD_GRAPH_STOP) {
++		int ret;
++
++		mutex_lock(&apm->lock);
++		ret = q6apm_send_tracked_cmd(apm, pkt);
++		mutex_unlock(&apm->lock);
++		return ret;
++	}
++
+ 	return q6apm_send_cmd_sync(apm, pkt, 0);
+ }
+ 
+@@ -334,31 +381,40 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
+ 	struct apm_cmd_shared_mem_unmap_regions *cmd;
+ 	struct q6apm *apm = dev_get_drvdata(dev->parent);
+ 	struct audioreach_graph_info *info;
+-	uint32_t mem_map_handle;
+-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
+-						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id);
+-	if (IS_ERR(pkt))
+-		return PTR_ERR(pkt);
++	struct gpr_pkt *pkt __free(kfree) = NULL;
++	u32 mem_map_handle, *handle;
++	int ret;
+ 
++	/* Keep graph info and the selected mapping alive across the wait. */
++	mutex_lock(&apm->lock);
+ 	info = idr_find(&apm->graph_info_idr, graph_id);
+-	if (!info)
+-		return -ENODEV;
+-
+-	if (is_pos_buf) {
+-		if (!info->pos_buf_mem_map_handle)
+-			return 0;
+-		mem_map_handle = info->pos_buf_mem_map_handle;
+-	} else {
++	if (!info) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	handle = is_pos_buf ? &info->pos_buf_mem_map_handle : &info->mem_map_handle;
++	mem_map_handle = READ_ONCE(*handle);
++	if (!mem_map_handle) {
++		ret = 0;
++		goto unlock;
++	}
+ 
+-		if (!info->mem_map_handle)
+-			return 0;
+-		mem_map_handle = info->mem_map_handle;
++	pkt = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd), APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
++	if (IS_ERR(pkt)) {
++		ret = PTR_ERR(pkt);
++		goto unlock;
+ 	}
+ 
+ 	cmd = (void *)pkt + GPR_HDR_SIZE;
+ 	cmd->mem_map_handle = mem_map_handle;
+ 
+-	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_SHARED_MEM_UNMAP_REGIONS);
++	ret = q6apm_send_tracked_cmd(apm, pkt);
++	if (!ret)
++		cmpxchg(handle, mem_map_handle, 0);
++
++unlock:
++	mutex_unlock(&apm->lock);
++	return ret;
+ }
+ 
+ int q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int graph_id)
+@@ -827,31 +883,49 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
+ int q6apm_graph_start(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+-	int ret;
++	int ret = 0;
++
++	mutex_lock(&ar_graph->start_stop_lock);
+ 
+ 	if (ar_graph->start_count == 0) {
+ 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
+ 		if (ret)
+-			return ret;
++			goto unlock;
+ 	}
+ 
+ 	ar_graph->start_count++;
+ 
+-	return 0;
++unlock:
++	mutex_unlock(&ar_graph->start_stop_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_start);
+ 
+ int q6apm_graph_stop(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
++	int ret;
+ 
+-	if (ar_graph->start_count == 0)
+-		return 0;
++	mutex_lock(&ar_graph->start_stop_lock);
+ 
+-	if (--ar_graph->start_count > 0)
+-		return 0;
++	if (ar_graph->start_count == 0) {
++		ret = 0;
++		goto unlock;
++	}
++
++	if (ar_graph->start_count > 1) {
++		ar_graph->start_count--;
++		ret = 0;
++		goto unlock;
++	}
++
++	ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
++	if (!ret)
++		ar_graph->start_count--;
+ 
+-	return audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
++unlock:
++	mutex_unlock(&ar_graph->start_stop_lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_stop);
+ 
+@@ -897,6 +971,8 @@ static int apm_probe(gpr_device_t *gdev)
+ 	apm->dev = dev;
+ 	apm->gdev = gdev;
+ 	init_waitqueue_head(&apm->wait);
++	spin_lock_init(&apm->reply_lock);
++	init_completion(&apm->reply_done);
+ 
+ 	INIT_LIST_HEAD(&apm->widget_list);
+ 	idr_init(&apm->graph_idr);
+@@ -967,7 +1043,6 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 		case APM_CMD_GRAPH_PREPARE:
+ 		case APM_CMD_GRAPH_CLOSE:
+ 		case APM_CMD_GRAPH_FLUSH:
+-		case APM_CMD_GRAPH_STOP:
+ 		case APM_CMD_SET_CFG:
+ 			apm->result.opcode = result->opcode;
+ 			apm->result.status = result->status;
+@@ -976,19 +1051,16 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 					result->opcode);
+ 			wake_up(&apm->wait);
+ 			break;
++		case APM_CMD_GRAPH_STOP:
+ 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
+-			apm->result.opcode = hdr->opcode;
+-			apm->result.status = 0;
+-			rsp = data->payload;
+-
+-			info = idr_find(&apm->graph_info_idr, hdr->token);
+-			if (info)
+-				info->mem_map_handle = 0;
+-			else
+-				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
+-					result->opcode);
+-
+-			wake_up(&apm->wait);
++			spin_lock(&apm->reply_lock);
++			if (apm->reply_opcode == result->opcode &&
++			    hdr->token == apm->reply_token) {
++				apm->reply_opcode = 0;
++				apm->reply_status = result->status;
++				complete(&apm->reply_done);
++			}
++			spin_unlock(&apm->reply_lock);
+ 			break;
+ 		default:
+ 			break;
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 9092359..bd91b25 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -3,6 +3,8 @@
+ #define __Q6APM_H__
+ #include <linux/types.h>
+ #include <linux/atomic.h>
++#include <linux/completion.h>
++#include <linux/spinlock.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/kernel.h>
+@@ -57,6 +59,12 @@ struct q6apm {
+ 	/* For Graph OPEN/START/STOP/CLOSE operations */
+ 	wait_queue_head_t wait;
+ 	struct gpr_ibasic_rsp_result_t result;
++	/* Match STOP and UNMAP replies to one request, even after a timeout. */
++	spinlock_t reply_lock;
++	struct completion reply_done;
++	u32 reply_token;
++	u32 reply_opcode;
++	u32 reply_status;
+ 
+ 	struct mutex cmd_lock;
+ 	struct mutex lock;
+@@ -86,6 +94,8 @@ struct audioreach_graph {
+ 	struct audioreach_graph_info *info;
+ 	uint32_t id;
+ 	int state;
++	/* Serialize graph START and STOP. */
++	struct mutex start_stop_lock;
+ 	int start_count;
+ 	/* Cached Graph data */
+ 	void *graph;
+diff --git a/include/sound/soc-component.h b/include/sound/soc-component.h
+index 4b7d795..163765f 100644
+--- a/include/sound/soc-component.h
++++ b/include/sound/soc-component.h
+@@ -431,2 +431,2 @@ int snd_soc_pcm_component_hw_params(struct snd_pcm_substream *substream,
+-void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+-				   int rollback);
++int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
++				   int rollback, bool retain_failed);
+diff --git a/include/sound/soc-dpcm.h b/include/sound/soc-dpcm.h
+index af24665..683d7c4 100644
+--- a/include/sound/soc-dpcm.h
++++ b/include/sound/soc-dpcm.h
+@@ -97,0 +98 @@ struct snd_soc_dpcm_runtime {
++	bool hw_free_failed;
+diff --git a/sound/soc/soc-component.c b/sound/soc/soc-component.c
+index 2ce2451..69ee865 100644
+--- a/sound/soc/soc-component.c
++++ b/sound/soc/soc-component.c
+@@ -1118,2 +1118,2 @@ int snd_soc_pcm_component_hw_params(struct snd_pcm_substream *substream,
+-void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+-				   int rollback)
++int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
++				   int rollback, bool retain_failed)
+@@ -1123 +1123 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+-	int i, ret;
++	int i, ret, err = 0;
+@@ -1125,0 +1126 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
++		ret = 0;
+@@ -1131 +1132 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+-			if (ret < 0)
++			if (ret < 0) {
+@@ -1132,0 +1134,3 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
++				if (!err)
++					err = ret;
++			}
+@@ -1135,2 +1139,3 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+-		/* remove marked substream */
+-		soc_component_mark_pop(component, hw_params);
++		/* Keep failed marks for a precise cleanup retry when requested. */
++		if (ret >= 0 || !retain_failed)
++			soc_component_mark_pop(component, hw_params);
+@@ -1137,0 +1143,2 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
++
++	return err;
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index 0e49290..081a5d7 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -1127,2 +1127,8 @@ static void soc_pcm_codec_params_fixup(struct snd_pcm_hw_params *params,
+-static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
+-			    struct snd_pcm_substream *substream, int rollback)
++static int soc_pcm_hw_clean_components(struct snd_pcm_substream *substream,
++					 int rollback, bool retain_failed)
++{
++	return snd_soc_pcm_component_hw_free(substream, rollback, retain_failed);
++}
++
++static void soc_pcm_hw_clean_dais(struct snd_soc_pcm_runtime *rtd,
++				  struct snd_pcm_substream *substream, int rollback)
+@@ -1132,0 +1139,12 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
++	for_each_rtd_dais(rtd, i, dai)
++		if (snd_soc_dai_stream_valid(dai, substream->stream))
++			snd_soc_dai_hw_free(dai, substream, rollback);
++}
++
++static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
++			    struct snd_pcm_substream *substream, int rollback,
++			    bool stop_on_component_error, bool retain_failed)
++{
++	struct snd_soc_dai *dai;
++	int i, ret;
++
+@@ -1153 +1171,3 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
+-	snd_soc_pcm_component_hw_free(substream, rollback);
++	ret = soc_pcm_hw_clean_components(substream, rollback, retain_failed);
++	if (ret < 0 && stop_on_component_error)
++		return ret;
+@@ -1156,3 +1176 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
+-	for_each_rtd_dais(rtd, i, dai)
+-		if (snd_soc_dai_stream_valid(dai, substream->stream))
+-			snd_soc_dai_hw_free(dai, substream, rollback);
++	soc_pcm_hw_clean_dais(rtd, substream, rollback);
+@@ -1160 +1178 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
+-	return 0;
++	return stop_on_component_error ? ret : 0;
+@@ -1169 +1187 @@ static int __soc_pcm_hw_free(struct snd_soc_pcm_runtime *rtd,
+-	return soc_pcm_hw_clean(rtd, substream, 0);
++	return soc_pcm_hw_clean(rtd, substream, 0, false, false);
+@@ -1285 +1303 @@ out:
+-		soc_pcm_hw_clean(rtd, substream, 1);
++		soc_pcm_hw_clean(rtd, substream, 1, false, false);
+@@ -2105,0 +2124 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
++	int ret = 0;
+@@ -2109,0 +2129,11 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
++	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
++		/* Retry only FE components; DAPM and link cleanup already ran. */
++		ret = soc_pcm_hw_clean_components(substream, 1, false);
++		if (ret < 0)
++			dev_err(fe->dev,
++				"FE hw_free retry failed (%d); forcing best-effort close\n",
++				ret);
++		soc_pcm_hw_clean_dais(fe, substream, 0);
++		dpcm_be_dai_hw_free(fe, stream);
++		WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);
++	}
+@@ -2124 +2154 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
+-	return 0;
++	return soc_pcm_ret(fe, ret);
+@@ -2171,0 +2202 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
++	int ret;
+@@ -2179 +2210,6 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
+-	soc_pcm_hw_clean(fe, substream, 0);
++	ret = soc_pcm_hw_clean(fe, substream, 0, true, true);
++	if (ret < 0) {
++		WRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);
++		goto out;
++	}
++	WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);
+@@ -2185,0 +2222 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
++out:
+@@ -2189 +2226 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
+-	return 0;
++	return soc_pcm_ret(fe, ret);
+@@ -2277,0 +2315,11 @@ static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,
++	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
++		/* Retry only failed FE components; do not repeat DAPM/link cleanup. */
++		ret = soc_pcm_hw_clean_components(substream, 1, true);
++		if (ret < 0)
++			goto out;
++
++		soc_pcm_hw_clean_dais(fe, substream, 0);
++		dpcm_be_dai_hw_free(fe, stream);
++		fe->dpcm[stream].state = SND_SOC_DPCM_STATE_HW_FREE;
++		WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);
++	}
+@@ -2513,0 +2562,8 @@ static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)
++	if (READ_ONCE(fe->dpcm[stream].hw_free_failed) &&
++	    (cmd == SNDRV_PCM_TRIGGER_START ||
++	     cmd == SNDRV_PCM_TRIGGER_RESUME ||
++	     cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE ||
++	     cmd == SNDRV_PCM_TRIGGER_DRAIN)) {
++		ret = -EIO;
++		goto out;
++	}
+@@ -2638,0 +2695,4 @@ static int dpcm_fe_dai_prepare(struct snd_pcm_substream *substream)
++	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
++		ret = -EIO;
++		goto out;
++	}
