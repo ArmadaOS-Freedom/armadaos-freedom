@@ -575,6 +575,58 @@ class OfflinePrepareTest(unittest.TestCase):
             self.assertIn("outside the transaction", str(ctx.exception))
             env.assert_untouched()
 
+    def test_manifest_save_failure_removes_new_generation(self) -> None:
+        with self._case() as env, ExitStack() as stack:
+            env.physical["bootSource"] = "armada_boot"
+            generation = env.temp / "generation"
+            generation.mkdir()
+            neighbor = env.temp / "keep.bin"
+            neighbor.write_bytes(b"keep")
+            pkg = json.loads(env.document)
+            pkg["armadaBootCapsules"] = {env.physical["model"]: {}}
+
+            original = env.import_payload.side_effect
+
+            def import_augmented(**kwargs):
+                result = original(**kwargs)
+                result["package"] = pkg
+                return result
+
+            env.import_payload.side_effect = import_augmented
+            stack.enter_context(mock.patch.object(
+                offline_prepare.boot_disk_switch, "ensure_ready"))
+            stack.enter_context(mock.patch.object(
+                offline_prepare, "_read_recovery_for_disk", return_value=env.journal))
+            stack.enter_context(mock.patch.object(
+                offline_prepare.package_contract, "load_package", return_value=pkg))
+            stack.enter_context(mock.patch.object(
+                offline_prepare.boot_sources, "capture_boot_sources",
+                side_effect=lambda initial, output_dir, **kwargs: env.capture(
+                    output_dir=output_dir, boot_tool_path=None)["sources"]))
+
+            def stage(*args, on_stage=None, **kwargs):
+                if on_stage is not None:
+                    on_stage("gen-test", generation)
+                return {}
+
+            stack.enter_context(mock.patch.object(
+                offline_prepare.boot_disk_switch, "prepare", side_effect=stage))
+            real_save = system_transaction._save_json
+
+            def save(directory, name, payload):
+                if name == "recovery-manifest.json":
+                    raise OSError("manifest disk full")
+                return real_save(directory, name, payload)
+
+            stack.enter_context(mock.patch.object(
+                system_transaction, "_save_json", side_effect=save))
+            with self.assertRaisesRegex(
+                system_transaction.SystemTransactionError, "manifest disk full"
+            ):
+                env.run()
+            self.assertFalse(generation.exists())
+            self.assertEqual(neighbor.read_bytes(), b"keep")
+
     def test_failed_status_persistence_error_recorded(self) -> None:
         with self._case() as env:
             env.candidate.side_effect = RuntimeError("candidate tool failed")
