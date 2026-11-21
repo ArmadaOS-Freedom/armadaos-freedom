@@ -298,8 +298,8 @@ index 75071d6..5f9ccd6 100644
  	struct wlr_surface *kb_focus_surface;
  	std::unordered_map<struct wlr_surface *, std::pair<int, int>> current_dropdown_surfaces;
  	double mouse_surface_cursorx = 0.0f;
-@@ -272,7 +274,7 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain = true
- void wlserver_key( uint32_t key, bool press, uint32_t time );
+@@ -275,7 +277,7 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain = true
+ void wlserver_keyboard_release_modifiers();
  void wlserver_set_keyboard_layout( const char *pszLayout );
  
 -void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x = 0, int y = 0 );

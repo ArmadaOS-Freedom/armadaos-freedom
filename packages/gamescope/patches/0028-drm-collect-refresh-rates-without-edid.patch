@@ -170,17 +170,20 @@ index 975da2e..f44dcb9 100644
  			if ( pChroma && pChroma->red_x != 0.0f )
  			{
  				drm_log.infof( "[colorimetry]: EDID with colorimetry detected. Using it" );
-@@ -3314,8 +3318,8 @@ namespace gamescope
- 			const di_cta_colorimetry_block *pColorimetry = nullptr;
+@@ -3669,10 +3673,10 @@ namespace gamescope
+ 		if ( !bHasKnownHDRInfo || !ofScriptMaxCLL || !ofScriptMaxFALL || !ofScriptMinCLL )
+ 		{
+ 			// libdisplay-info 0.4.0 and newer also find these in DisplayID 2 CTA-861 data blocks.
+-			const di_hdr_static_metadata *pHDRStaticMetadata = di_info_get_hdr_static_metadata( pInfo );
+-			const di_supported_signal_colorimetry *pColorimetry = di_info_get_supported_signal_colorimetry( pInfo );
++			const di_hdr_static_metadata *pHDRStaticMetadata = pInfo ? di_info_get_hdr_static_metadata( pInfo ) : nullptr;
++			const di_supported_signal_colorimetry *pColorimetry = pInfo ? di_info_get_supported_signal_colorimetry( pInfo ) : nullptr;
  
- 			const di_edid_cta* pCTA = NULL;
--			const di_edid_ext *const *ppExts = di_edid_get_extensions( pEdid );
--			for ( ; *ppExts != nullptr; ppExts++ )
-+			const di_edid_ext *const *ppExts = pEdid ? di_edid_get_extensions( pEdid ) : nullptr;
-+			for ( ; ppExts && *ppExts != nullptr; ppExts++ )
+-			if ( pColorimetry->bt2020_rgb && pHDRStaticMetadata->pq )
++			if ( pColorimetry && pHDRStaticMetadata && pColorimetry->bt2020_rgb && pHDRStaticMetadata->pq )
  			{
- 				if ( ( pCTA = di_edid_ext_get_cta( *ppExts ) ) )
- 					break;
+ 				if ( !bHasKnownHDRInfo )
+ 				{
 diff --git a/src/mode_list_file.h b/src/mode_list_file.h
 index 87bcbee..07280d9 100644
 --- a/src/mode_list_file.h
