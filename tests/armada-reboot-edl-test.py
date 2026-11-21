@@ -129,7 +129,11 @@ class Tests(unittest.TestCase):
         for argv in ([], ['--check']):
             out=io.StringIO()
             with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(out):
-                self.assertEqual(edl.main(argv),0);status=json.loads(out.getvalue());self.assertTrue(status['ready']);self.assertTrue(status['v4SettingsAvailable'])
+                self.assertEqual(edl.main(argv),0)
+                status=json.loads(out.getvalue())
+                self.assertTrue(status['ready'])
+                self.assertTrue(status['v4SettingsAvailable'])
+                write.assert_not_called()
         with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(edl.Refuse,'no EDL'):
                 edl.main(['--reboot'])
