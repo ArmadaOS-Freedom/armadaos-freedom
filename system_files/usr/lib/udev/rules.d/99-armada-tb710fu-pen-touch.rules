@@ -1,0 +1,15 @@
+# TB710FU: armada-pen-touch replays the NT36532 pen as a one-finger uinput
+# touch ("Armada pen touch", BUS_VIRTUAL). Gamescope associates real SPI
+# touchscreens with the internal panel by walking their bus, which a uinput
+# device does not have, so a Game Mode orientation override would rotate the
+# picture but not the pen. Tag the bridge so Gamescope associates it with the
+# internal panel; the panel is natively landscape, so there is no desktop
+# calibration matrix to undo ("normal"). Real touch devices must not match.
+ACTION!="add|change", GOTO="armada_tb710fu_pen_touch_end"
+SUBSYSTEM!="input", GOTO="armada_tb710fu_pen_touch_end"
+KERNEL!="event*", GOTO="armada_tb710fu_pen_touch_end"
+DEVPATH!="/devices/virtual/input/input*/event*", GOTO="armada_tb710fu_pen_touch_end"
+ATTRS{name}!="Armada pen touch", GOTO="armada_tb710fu_pen_touch_end"
+ATTRS{id/bustype}!="0006", GOTO="armada_tb710fu_pen_touch_end"
+PROGRAM=="/usr/bin/grep -azFxq lenovo,tb710fu /sys/firmware/devicetree/base/compatible", ENV{GAMESCOPE_TOUCH_CALIBRATION}="normal"
+LABEL="armada_tb710fu_pen_touch_end"

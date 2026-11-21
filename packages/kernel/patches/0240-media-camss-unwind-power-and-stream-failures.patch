@@ -1,0 +1,182 @@
+Subject: [PATCH] media: camss: unwind parent power and partially started pipelines
+
+Derived from h0cheung/tb322fc-linux-kernel commit
+dc7d14dc64c8d4f86220b30cd126b17d805c8474. Balance the VFE parent
+reference if CSID power-up fails. Stop every already-started subdevice
+on failure, and always finish pipeline teardown and buffer flushing.
+The sensor which failed start performs its own local error unwind.
+No extra scatter-gather contiguity restriction is introduced.
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
+index 48459b4..592c1df 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.c
++++ b/drivers/media/platform/qcom/camss/camss-csid.c
+@@ -696,44 +696,28 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
+ 
+ 		ret = pm_runtime_resume_and_get(dev);
+ 		if (ret < 0)
+-			return ret;
++			goto put_parent;
+ 
+ 		ret = regulator_bulk_enable(csid->num_supplies,
+ 					    csid->supplies);
+-		if (ret < 0) {
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto put_pm;
+ 
+ 		ret = csid_set_clock_rates(csid);
+-		if (ret < 0) {
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto disable_regulators;
+ 
+ 		ret = camss_enable_clocks(csid->nclocks, csid->clock, dev);
+-		if (ret < 0) {
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto disable_regulators;
+ 
+ 		csid->phy.need_vc_update = true;
+ 
+ 		enable_irq(csid->irq);
+ 
+ 		ret = csid->res->hw_ops->reset(csid);
+-		if (ret < 0) {
+-			disable_irq(csid->irq);
+-			camss_disable_clocks(csid->nclocks, csid->clock);
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto disable_clocks;
+ 
+ 		csid->res->hw_ops->hw_version(csid);
+ 	} else {
+@@ -746,6 +730,17 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
+ 	}
+ 
+ 	return ret;
++
++disable_clocks:
++	disable_irq(csid->irq);
++	camss_disable_clocks(csid->nclocks, csid->clock);
++disable_regulators:
++	regulator_bulk_disable(csid->num_supplies, csid->supplies);
++put_pm:
++	pm_runtime_put_sync(dev);
++put_parent:
++	csid->res->parent_dev_ops->put(camss, csid->id);
++	return ret;
+ }
+ 
+ /*
+diff --git a/drivers/media/platform/qcom/camss/camss-video.c b/drivers/media/platform/qcom/camss/camss-video.c
+index 0852eb6..db32959 100644
+--- a/drivers/media/platform/qcom/camss/camss-video.c
++++ b/drivers/media/platform/qcom/camss/camss-video.c
+@@ -249,11 +249,37 @@ static int video_prepare_streaming(struct vb2_queue *q)
+ 	return ret;
+ }
+ 
++/* Stop the started subdevices, excluding the one that failed to start. */
++static void video_stop_subdevices(struct camss_video *video,
++				  struct media_entity *stop)
++{
++	struct media_entity *entity = &video->vdev.entity;
++	struct v4l2_subdev *subdev;
++	struct media_pad *pad;
++	int ret;
++
++	while (entity != stop) {
++		pad = &entity->pads[0];
++		if (!(pad->flags & MEDIA_PAD_FL_SINK))
++			break;
++		pad = media_pad_remote_pad_first(pad);
++		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
++			break;
++		entity = pad->entity;
++		if (entity == stop)
++			break;
++		subdev = media_entity_to_v4l2_subdev(entity);
++		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
++		if (ret && ret != -ENOIOCTLCMD)
++			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
++	}
++}
++
+ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
+ {
+ 	struct camss_video *video = vb2_get_drv_priv(q);
+ 	struct video_device *vdev = &video->vdev;
+-	struct media_entity *entity;
++	struct media_entity *entity = &vdev->entity;
+ 	struct media_pad *pad;
+ 	struct v4l2_subdev *subdev;
+ 	int ret;
+@@ -268,7 +294,6 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	if (ret < 0)
+ 		goto error;
+ 
+-	entity = &vdev->entity;
+ 	while (1) {
+ 		pad = &entity->pads[0];
+ 		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+@@ -289,6 +314,7 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	return 0;
+ 
+ error:
++	video_stop_subdevices(video, entity);
+ 	video_device_pipeline_stop(vdev);
+ 
+ flush_buffers:
+@@ -300,35 +326,9 @@ flush_buffers:
+ static void video_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct camss_video *video = vb2_get_drv_priv(q);
+-	struct video_device *vdev = &video->vdev;
+-	struct media_entity *entity;
+-	struct media_pad *pad;
+-	struct v4l2_subdev *subdev;
+-	int ret;
+-
+-	entity = &vdev->entity;
+-	while (1) {
+-		pad = &entity->pads[0];
+-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+-			break;
+-
+-		pad = media_pad_remote_pad_first(pad);
+-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+-			break;
+-
+-		entity = pad->entity;
+-		subdev = media_entity_to_v4l2_subdev(entity);
+-
+-		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
+-
+-		if (ret) {
+-			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
+-			return;
+-		}
+-	}
+-
+-	video_device_pipeline_stop(vdev);
+ 
++	video_stop_subdevices(video, NULL);
++	video_device_pipeline_stop(&video->vdev);
+ 	video->ops->flush_buffers(video, VB2_BUF_STATE_ERROR);
+ }
+ 

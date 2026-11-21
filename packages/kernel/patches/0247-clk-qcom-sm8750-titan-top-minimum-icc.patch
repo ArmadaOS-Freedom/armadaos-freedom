@@ -1,0 +1,278 @@
+Subject: [PATCH] clk: qcom: keep SM8750 TITAN_TOP minimum ICC votes in the provider
+
+The shared domain can stay on for CCI/PHY after CAMSS suspends or
+unloads. Give its provider two minimum 1/1 kB/s paths, independently
+of CAMSS throughput. Vote before boot-on publication and power-on,
+and drop only after confirmed power-off. Propagate API failures and
+track partial rollback. Other GDSCs keep the existing single-path flow.
+The opt-in candidate builds CAMCC in and suppresses force-unbind.
+The floor still needs device validation; lower RPMh commit errors are
+not propagated by the existing ICC set callback and must be checked
+in logs. Failed probe with physical power still on is a rejection,
+not a supported recovery mode.
+
+diff --git a/drivers/clk/qcom/camcc-sm8750.c b/drivers/clk/qcom/camcc-sm8750.c
+index 4dac298..5e45321 100644
+--- a/drivers/clk/qcom/camcc-sm8750.c
++++ b/drivers/clk/qcom/camcc-sm8750.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/interconnect.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -2422,6 +2423,15 @@ static struct clk_branch cam_cc_tfe_2_main_fast_ahb_clk = {
+ 	},
+ };
+ 
++/*
++ * Keep the multimedia NoC non-idle while any TITAN_TOP consumer is active.
++ * These are minimum presence votes, not the CAMSS streaming bandwidth.
++ */
++static struct icc_bulk_data cam_cc_titan_top_icc[] = {
++	{ .name = "ahb", .avg_bw = 1, .peak_bw = 1 },
++	{ .name = "hf_mnoc", .avg_bw = 1, .peak_bw = 1 },
++};
++
+ static struct gdsc cam_cc_titan_top_gdsc = {
+ 	.gdscr = 0x1134c,
+ 	.en_rest_wait_val = 0x2,
+@@ -2432,6 +2442,8 @@ static struct gdsc cam_cc_titan_top_gdsc = {
+ 	},
+ 	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
++	.icc_paths = cam_cc_titan_top_icc,
++	.num_icc_paths = ARRAY_SIZE(cam_cc_titan_top_icc),
+ };
+ 
+ static struct gdsc cam_cc_ipe_0_gdsc = {
+@@ -2699,6 +2711,8 @@ static struct platform_driver cam_cc_sm8750_driver = {
+ 	.probe = cam_cc_sm8750_probe,
+ 	.driver = {
+ 		.name = "camcc-sm8750",
++		/* Shared GDSCs must not be torn down beneath CCI/PHY users. */
++		.suppress_bind_attrs = true,
+ 		.of_match_table = cam_cc_sm8750_match_table,
+ 	},
+ };
+diff --git a/drivers/clk/qcom/gdsc.c b/drivers/clk/qcom/gdsc.c
+index 13f7784..34a4f5e 100644
+--- a/drivers/clk/qcom/gdsc.c
++++ b/drivers/clk/qcom/gdsc.c
+@@ -296,6 +296,106 @@ static void gdsc_retain_ff_on(struct gdsc *sc)
+ 	regmap_update_bits(sc->regmap, sc->gdscr, mask, mask);
+ }
+ 
++/*
++ * A shared domain may outlive any one consumer. These optional minimum votes
++ * belong to its provider, independently of the consumers' throughput votes.
++ * Callers serialize transitions with the genpd lock; probe runs before publish.
++ */
++static int gdsc_icc_drop(struct gdsc *sc, unsigned long mask)
++{
++	int ret, first_error = 0;
++	unsigned int i;
++
++	for (i = sc->num_icc_paths; i-- > 0;) {
++		if (!(mask & sc->icc_votes & BIT(i)))
++			continue;
++
++		ret = icc_set_bw(sc->icc_paths[i].path, 0, 0);
++		if (ret) {
++			dev_err(sc->icc_dev, "%s: failed to drop %s vote: %d\n",
++				sc->pd.name, sc->icc_paths[i].name, ret);
++			if (!first_error)
++				first_error = ret;
++			continue;
++		}
++		sc->icc_votes &= ~BIT(i);
++	}
++
++	return first_error;
++}
++
++static int gdsc_icc_enable(struct gdsc *sc)
++{
++	unsigned long added = 0;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < sc->num_icc_paths; i++) {
++		if (sc->icc_votes & BIT(i))
++			continue;
++
++		ret = icc_set_bw(sc->icc_paths[i].path,
++				 sc->icc_paths[i].avg_bw,
++				 sc->icc_paths[i].peak_bw);
++		if (ret) {
++			/* Only undo votes established by this transaction. */
++			gdsc_icc_drop(sc, added);
++			return ret;
++		}
++		sc->icc_votes |= BIT(i);
++		added |= BIT(i);
++	}
++
++	return 0;
++}
++
++static void gdsc_icc_release(void *data)
++{
++	struct gdsc *sc = data;
++	int off;
++
++	/* Probe failure and provider teardown cannot retain devres handles. */
++	if (sc->icc_votes) {
++		off = gdsc_check_status(sc, GDSC_OFF);
++		if (off <= 0)
++			dev_warn(sc->icc_dev,
++				 "%s: releasing provider ICC votes without confirmed off (%d)\n",
++				 sc->pd.name, off);
++	}
++	gdsc_icc_drop(sc, sc->icc_votes);
++	/* The devres ICC handles are released after this action. */
++	sc->icc_votes = 0;
++}
++
++static int gdsc_icc_get(struct device *dev, struct gdsc *sc)
++{
++	unsigned int i;
++	int ret;
++
++	if (!sc->num_icc_paths)
++		return 0;
++
++	if (sc->needs_icc || sc->num_icc_paths > BITS_PER_LONG)
++		return -EINVAL;
++
++	sc->icc_dev = dev;
++	sc->icc_votes = 0;
++	ret = devm_of_icc_bulk_get(dev, sc->num_icc_paths, sc->icc_paths);
++	if (ret)
++		return dev_err_probe(dev, ret, "%s: failed to get domain ICC paths\n",
++				     sc->pd.name);
++
++	/* A NULL path means that the DT omitted the required interconnects. */
++	for (i = 0; i < sc->num_icc_paths; i++) {
++		if (!sc->icc_paths[i].path)
++			return dev_err_probe(dev, -ENODEV,
++					     "%s: missing %s interconnect\n",
++					     sc->pd.name, sc->icc_paths[i].name);
++	}
++
++	return devm_add_action_or_reset(dev, gdsc_icc_release, sc);
++}
++
+ static int gdsc_enable_hw(struct gdsc *sc)
+ {
+ 	int ret;
+@@ -439,7 +539,21 @@ static int gdsc_enable(struct generic_pm_domain *domain)
+ 		sc->rpm_held = true;
+ 	}
+ 
++	ret = gdsc_icc_enable(sc);
++	if (ret)
++		goto err_rpm;
++
+ 	ret = gdsc_enable_hw(sc);
++	if (ret && sc->num_icc_paths) {
++		/* A failed enable can have left the switch powered. */
++		if (gdsc_check_status(sc, GDSC_OFF) > 0)
++			gdsc_icc_drop(sc, sc->icc_votes);
++		else
++			dev_err(sc->icc_dev,
++				"%s: enable failed, keeping votes until confirmed off\n",
++				sc->pd.name);
++	}
++err_rpm:
+ 	if (ret && sc->rpm_held) {
+ 		pm_runtime_put(sc->rpm_dev);
+ 		sc->rpm_held = false;
+@@ -451,9 +565,23 @@ static int gdsc_enable(struct generic_pm_domain *domain)
+ static int gdsc_disable(struct generic_pm_domain *domain)
+ {
+ 	struct gdsc *sc = domain_to_gdsc(domain);
+-	int ret;
++	int off, ret;
+ 
+ 	ret = gdsc_disable_hw(sc, domain);
++	if (!ret && sc->num_icc_paths) {
++		/* Never idle the NoC before the switch is confirmed off. */
++		off = gdsc_check_status(sc, GDSC_OFF);
++		if (off > 0)
++			gdsc_icc_drop(sc, sc->icc_votes);
++		else if (off < 0)
++			dev_warn(sc->icc_dev,
++				 "%s: failed to read off status (%d), retaining ICC votes\n",
++				 sc->pd.name, off);
++		else
++			dev_warn(sc->icc_dev,
++				 "%s: switch not off, retaining ICC votes\n",
++				 sc->pd.name);
++	}
+ 	if (!ret && sc->rpm_held) {
+ 		pm_runtime_put(sc->rpm_dev);
+ 		sc->rpm_held = false;
+@@ -685,6 +813,15 @@ int gdsc_register(struct gdsc_desc *desc,
+ 	if (!data->domains)
+ 		return -ENOMEM;
+ 
++	/* Acquire every optional bulk path before touching any domain. */
++	for (i = 0; i < num; i++) {
++		if (!scs[i])
++			continue;
++		ret = gdsc_icc_get(dev, scs[i]);
++		if (ret)
++			return ret;
++	}
++
+ 	for (i = 0; i < num; i++) {
+ 		if (!scs[i] || !scs[i]->needs_icc)
+ 			continue;
+@@ -719,10 +856,19 @@ int gdsc_register(struct gdsc_desc *desc,
+ 			continue;
+ 		scs[i]->regmap = regmap;
+ 		scs[i]->rcdev = rcdev;
++		/* Cover a boot-on domain before initialization and publication. */
++		ret = gdsc_icc_enable(scs[i]);
++		if (ret) {
++			dev_err_probe(dev, ret, "%s: failed to vote domain ICC\n",
++				      scs[i]->pd.name);
++			goto err_pm_genpd_remove;
++		}
+ 		ret = gdsc_init(scs[i]);
+ 		if (ret)
+ 			goto err_pm_genpd_remove;
+ 		initialized = i + 1;
++		if (scs[i]->num_icc_paths && gdsc_check_status(scs[i], GDSC_OFF) > 0)
++			gdsc_icc_drop(scs[i], scs[i]->icc_votes);
+ 		if (of_machine_is_compatible("lenovo,baldur") && desc->pd_list &&
+ 		    scs[i]->pwrsts != PWRSTS_ON && pm_runtime_enabled(dev)) {
+ 			scs[i]->rpm_dev = dev;
+diff --git a/drivers/clk/qcom/gdsc.h b/drivers/clk/qcom/gdsc.h
+index e2e0230..6df9077 100644
+--- a/drivers/clk/qcom/gdsc.h
++++ b/drivers/clk/qcom/gdsc.h
+@@ -10,6 +10,7 @@
+ #include <linux/pm_domain.h>
+ 
+ struct icc_path;
++struct icc_bulk_data;
+ struct regmap;
+ struct regulator;
+ struct reset_controller_dev;
+@@ -85,6 +86,12 @@ struct gdsc {
+ 	bool				needs_icc;
+ 	unsigned int			icc_path_index;
+ 	struct icc_path			*icc_path;
++
++	/* Optional provider-owned minimum votes for a shared domain. */
++	struct icc_bulk_data		*icc_paths;
++	unsigned int			num_icc_paths;
++	unsigned long			icc_votes;
++	struct device			*icc_dev;
+ };
+ 
+ struct gdsc_desc {

@@ -1,9 +1,14 @@
+import contextlib
+import io
 import pathlib
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import verify
 import fetch
+import refresh
 
 
 class VersionTests(unittest.TestCase):
@@ -39,9 +44,6 @@ class OverrideTests(unittest.TestCase):
 
 class ManifestSelectionTests(unittest.TestCase):
     def test_override_or_live_manifest_uses_the_same_package_checks(self):
-        import contextlib
-        from unittest.mock import patch
-
         for version, saved_version in (("123", "123"), ("124", "123"), ("123", None)):
             with self.subTest(version=version, saved_version=saved_version), tempfile.TemporaryDirectory() as directory:
                 with contextlib.chdir(directory):
@@ -62,9 +64,6 @@ class ManifestSelectionTests(unittest.TestCase):
                         self.assertEqual(request.call_count, int(version != saved_version))
 
     def test_bad_override_does_not_fall_back_to_network(self):
-        import contextlib
-        from unittest.mock import patch
-
         with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
             pathlib.Path("feed").mkdir()
             pathlib.Path("manifests").mkdir()
@@ -73,6 +72,83 @@ class ManifestSelectionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     fetch.prepare_manifest("123", pathlib.Path("feed"))
                 request.assert_not_called()
+
+
+class RefreshTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = pathlib.Path(cls._tmp.name)
+        cls.manifests = cls.root / "manifests"
+        cls.manifests.mkdir()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        for entry in self.manifests.iterdir():
+            entry.unlink()
+        self.base = self.root / "BASE.env"
+        self.base.write_text("STEAM_CLIENT_VERSION=0\n")
+
+    @staticmethod
+    def manifest(version):
+        return ('"linuxarm64"\n{\n'
+                '\t"version"\t"' + version + '"\n'
+                '\t"bins"\n'
+                '\t{\n'
+                '\t\t"file"\t"steam-bootstrap-bins.zip.' + 'b' * 64 + '"\n'
+                '\t\t"sha2"\t"' + 'b' * 64 + '"\n'
+                '\t}\n'
+                '}\n')
+
+    def invoke(self, version):
+        source = self.root / "source.manifest"
+        source.write_text(self.manifest(version))
+        stdout = io.StringIO()
+        with patch.object(refresh, "BASE", self.base), \
+             patch.object(refresh, "MANIFESTS", self.manifests), \
+             patch.object(sys, "argv", ["refresh.py", str(source)]), \
+             contextlib.redirect_stdout(stdout):
+            refresh.main()
+        return stdout.getvalue()
+
+    def test_numeric(self):
+        self.base.write_text("STEAM_CLIENT_VERSION=99\n")
+        out = self.invoke("100")
+        self.assertEqual(self.base.read_text(), "STEAM_CLIENT_VERSION=100\n")
+        self.assertEqual((self.manifests / "100").read_bytes(), self.manifest("100").encode("utf-8"))
+        self.assertEqual(out, "100\n")
+
+    def test_equal_or_older(self):
+        self.base.write_text("STEAM_CLIENT_VERSION=100\n")
+        before = self.base.read_bytes()
+        for version in ("100", "99"):
+            with self.subTest(version=version):
+                out = self.invoke(version)
+                self.assertEqual(out, "")
+                self.assertEqual(self.base.read_bytes(), before)
+                self.assertEqual(list(self.manifests.iterdir()), [])
+
+    def test_conflicting_manifest(self):
+        self.base.write_text("STEAM_CLIENT_VERSION=99\n")
+        conflict = self.manifest("100").replace("bins", "other")
+        target = self.manifests / "100"
+        target.write_text(conflict)
+        with self.assertRaises(ValueError):
+            self.invoke("100")
+        self.assertEqual(self.base.read_text(), "STEAM_CLIENT_VERSION=99\n")
+        self.assertEqual(target.read_text(), conflict)
+
+    def test_retry_with_saved_manifest(self):
+        self.base.write_text("STEAM_CLIENT_VERSION=99\n")
+        saved = self.manifest("100")
+        (self.manifests / "100").write_text(saved)
+        out = self.invoke("100")
+        self.assertEqual(self.base.read_text(), "STEAM_CLIENT_VERSION=100\n")
+        self.assertEqual(out, "100\n")
+        self.assertEqual(sorted(p.name for p in self.manifests.iterdir()), ["100"])
 
 
 if __name__ == "__main__":

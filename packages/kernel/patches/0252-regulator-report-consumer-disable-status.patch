@@ -1,0 +1,162 @@
+Subject: [PATCH] regulator: report whether disable released the consumer vote
+
+Report the reference change under the regulator lock. Provider errors
+can precede the reference drop, while parent-supply and voltage errors
+can arrive after it. Retry only when the caller still holds the vote.
+
+For a retained vote, reject enable on the failed handle. Another consumer
+may acquire a vote if the provider confirms the output is on. An ambiguous
+disable can leave the output off even though use_count is nonzero, in which
+case the usual enable path would skip programming the provider. After the
+reference has dropped or the owner detaches without clearing the fault,
+the remaining supply or use-count accounting cannot be repaired by retrying
+that handle. Keep those cases blocked until provider reinitialization.
+
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 0836ec3..6a0699a 100755
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -2662,6 +2662,12 @@ static void destroy_regulator(struct regulator *regulator)
+ 	regulator_lock(rdev);
+ 	list_del(&regulator->list);
+ 
++	if (regulator->disable_error) {
++		rdev->disable_failures--;
++		rdev->disable_state_lost = true;
++		rdev_err(rdev, "consumer removed after a failed disable: %pe\n",
++			 ERR_PTR(regulator->disable_error));
++	}
+ 	rdev->open_count--;
+ 	rdev->exclusive = 0;
+ 	regulator_unlock(rdev);
+@@ -3139,6 +3145,21 @@ static int _regulator_handle_consumer_disable(struct regulator *regulator)
+ 	return 0;
+ }
+ 
++static int regulator_check_disable_fault(struct regulator *regulator)
++{
++	struct regulator_dev *rdev = regulator->rdev;
++	int ret;
++
++	if (regulator->disable_error || rdev->disable_state_lost)
++		return -ENOTRECOVERABLE;
++	if (!rdev->disable_failures)
++		return 0;
++	if (rdev->ena_pin || !rdev->desc->ops->is_enabled)
++		return -EAGAIN;
++	ret = _regulator_is_enabled(rdev);
++	return ret > 0 ? 0 : ret ?: -EAGAIN;
++}
++
+ /* locks held by regulator_enable() */
+ static int _regulator_enable(struct regulator *regulator)
+ {
+@@ -3147,6 +3168,10 @@ static int _regulator_enable(struct regulator *regulator)
+ 
+ 	lockdep_assert_held_once(&rdev->mutex.base);
+ 
++	ret = regulator_check_disable_fault(regulator);
++	if (ret)
++		return ret;
++
+ 	if (rdev->use_count == 0 && rdev->supply) {
+ 		ret = _regulator_enable(rdev->supply);
+ 		if (ret < 0)
+@@ -3344,6 +3369,46 @@ int regulator_disable(struct regulator *regulator)
+ }
+ EXPORT_SYMBOL_GPL(regulator_disable);
+ 
++/**
++ * regulator_disable_with_status - Disable and report consumption of one vote
++ * @regulator: regulator source
++ * @released: whether this call dropped the consumer's enable reference
++ *
++ * A parent-supply or voltage adjustment failure can be reported after the
++ * consumer reference was dropped. Use @released to determine whether another
++ * disable is needed, regardless of the return value.
++ * Retry a retained reference with this API. A failed handle cannot enable
++ * again until its retry succeeds. Other consumers may enable if the rail is
++ * confirmed on. Errors after reference release, or an unresolved error when
++ * the handle is put, block enables until provider reinitialization because
++ * supply or use-count accounting can no longer be repaired by the caller.
++ *
++ * Return: 0 on success or a negative error number on failure.
++ */
++int regulator_disable_with_status(struct regulator *regulator, bool *released)
++{
++	struct regulator_dev *rdev = regulator->rdev;
++	struct ww_acquire_ctx ww_ctx;
++	unsigned int enable_count;
++	int ret;
++
++	regulator_lock_dependent(rdev, &ww_ctx);
++	enable_count = regulator->enable_count;
++	ret = _regulator_disable(regulator);
++	*released = regulator->enable_count < enable_count;
++	if (ret && *released)
++		rdev->disable_state_lost = true;
++	if (ret && !regulator->disable_error)
++		rdev->disable_failures++;
++	else if (!ret && regulator->disable_error)
++		rdev->disable_failures--;
++	regulator->disable_error = ret;
++	regulator_unlock_dependent(rdev, &ww_ctx);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(regulator_disable_with_status);
++
+ /* locks held by regulator_force_disable() */
+ static int _regulator_force_disable(struct regulator_dev *rdev)
+ {
+diff --git a/drivers/regulator/internal.h b/drivers/regulator/internal.h
+index b3d48dc..cbb1ae1 100755
+--- a/drivers/regulator/internal.h
++++ b/drivers/regulator/internal.h
+@@ -51,6 +51,7 @@ struct regulator {
+ 	int uA_load;
+ 	unsigned int enable_count;
+ 	unsigned int deferred_disables;
++	int disable_error;
+ 	struct regulator_voltage voltage[REGULATOR_STATES_NUM];
+ 	const char *supply_name;
+ 	struct device_attribute dev_attr;
+diff --git a/include/linux/regulator/consumer.h b/include/linux/regulator/consumer.h
+index 56fe269..6f0a0dd 100755
+--- a/include/linux/regulator/consumer.h
++++ b/include/linux/regulator/consumer.h
+@@ -194,6 +194,7 @@ int devm_regulator_bulk_register_supply_alias(struct device *dev,
+ /* regulator output control and status */
+ int __must_check regulator_enable(struct regulator *regulator);
+ int regulator_disable(struct regulator *regulator);
++int regulator_disable_with_status(struct regulator *regulator, bool *released);
+ int regulator_force_disable(struct regulator *regulator);
+ int regulator_is_enabled(struct regulator *regulator);
+ int regulator_disable_deferred(struct regulator *regulator, int ms);
+@@ -420,6 +421,13 @@ static inline int regulator_disable(struct regulator *regulator)
+ 	return 0;
+ }
+ 
++static inline int regulator_disable_with_status(struct regulator *regulator,
++						bool *released)
++{
++	*released = true;
++	return 0;
++}
++
+ static inline int regulator_force_disable(struct regulator *regulator)
+ {
+ 	return 0;
+diff --git a/include/linux/regulator/driver.h b/include/linux/regulator/driver.h
+index 99a82b5..333c88b 100755
+--- a/include/linux/regulator/driver.h
++++ b/include/linux/regulator/driver.h
+@@ -627,6 +627,8 @@ struct regulator_dev {
+ 	u32 use_count;
+ 	u32 open_count;
+ 	u32 bypass_count;
++	unsigned int disable_failures;
++	bool disable_state_lost;
+ 
+ 	/* lists we belong to */
+ 	struct list_head list; /* list of all regulators */

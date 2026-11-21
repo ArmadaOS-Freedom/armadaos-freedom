@@ -32,6 +32,10 @@ class DecodeBootLockTests(unittest.TestCase):
         self.assertEqual(decode_boot_lock(self._cells(state=1)), "locked")
         self.assertEqual(decode_boot_lock(self._cells(state=2)), "unlocked")
 
+    def test_bootconfig_source(self):
+        self.assertEqual(decode_boot_lock(self._cells(source=2, state=1)), "locked")
+        self.assertEqual(decode_boot_lock(self._cells(source=2, state=2)), "unlocked")
+
     def test_rejects_bad_length(self):
         for raw in (b"", b"\x00" * 15, b"\x00" * 17, b"\x00" * 32,
                     bytearray(15), "not bytes at all", None):
@@ -40,7 +44,7 @@ class DecodeBootLockTests(unittest.TestCase):
 
     def test_rejects_bad_wire(self):
         for kw in ({"version": 0}, {"version": 2}, {"source": 0},
-                   {"source": 2}, {"state": 0}, {"state": 3},
+                   {"source": 3}, {"state": 0}, {"state": 3},
                    {"flags": 1}, {"flags": 0xFFFFFFFF}):
             with self.assertRaises(BootLockError):
                 decode_boot_lock(self._cells(**kw))
