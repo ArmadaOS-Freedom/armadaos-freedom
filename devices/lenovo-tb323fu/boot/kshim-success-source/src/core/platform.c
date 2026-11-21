@@ -1369,14 +1369,8 @@ static int menu_fill_settings(struct menu_selection *menu)
      * next_action (plus preserved flags). Back stays last. */
     menu->next_boot_row = menu->boot_log_row = 0;
     if (settings_pending_rows_eligible(menu)) {
-        snprintf(menu->setting_next_boot_name, sizeof(menu->setting_next_boot_name),
-                 kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_FMT),
-                 settings_next_boot_value(&menu->store->values));
-        menu->next_boot_row = menu->pages[MENU_PAGE_SETTINGS].count;
-        if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], menu->setting_next_boot_name,
-                        kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_DESC),
-                        MENU_NEXT_BOOT_CYCLE, 0, KSHIM_MENU_ROLE_DEFAULT))
-            return -1;
+        /* The debug toggle is always shown on supported boards with a v3
+         * internal store; it also reveals the optional one-shot action. */
         if (settings_boot_log_row_eligible(menu)) {
             snprintf(menu->setting_boot_log_name, sizeof(menu->setting_boot_log_name),
                      kshim_menu_text(KSHIM_TEXT_SETTINGS_BOOT_LOG_FMT),
@@ -1386,6 +1380,16 @@ static int menu_fill_settings(struct menu_selection *menu)
             if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], menu->setting_boot_log_name,
                             kshim_menu_text(KSHIM_TEXT_SETTINGS_BOOT_LOG_DESC),
                             MENU_BOOT_LOG_TOGGLE, 0, KSHIM_MENU_ROLE_DEFAULT))
+                return -1;
+        }
+        if (menu->boot_log_row && settings_boot_log_open(&menu->store->values)) {
+            snprintf(menu->setting_next_boot_name, sizeof(menu->setting_next_boot_name),
+                     kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_FMT),
+                     settings_next_boot_value(&menu->store->values));
+            menu->next_boot_row = menu->pages[MENU_PAGE_SETTINGS].count;
+            if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], menu->setting_next_boot_name,
+                            kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_DESC),
+                            MENU_NEXT_BOOT_CYCLE, 0, KSHIM_MENU_ROLE_DEFAULT))
                 return -1;
         }
     }
@@ -1776,7 +1780,8 @@ static int menu_activate(struct menu_selection *menu, size_t index,
     }
 #endif
     if (action == MENU_NEXT_BOOT_CYCLE) {
-        if (!settings_pending_rows_eligible(menu)) {
+        if (!settings_boot_log_row_eligible(menu) || !menu->boot_log_row ||
+            !settings_boot_log_open(&menu->store->values)) {
             *failure = KSHIM_STR_UNAVAILABLE;
             return 0;
         }

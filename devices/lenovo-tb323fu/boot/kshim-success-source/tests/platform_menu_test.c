@@ -2499,25 +2499,47 @@ static void test_settings_pending_menu(void)
         kshim_platform_bind_settings(&session);
         struct menu_selection menu={0};size_t selected=99;uint64_t sequence=0;const char *failure=NULL;
         assert(menu_build(&menu,names,NULL,roles,&info,boards,3,0,UINT64_C(1)<<2,1,1,1)==0);
+        /* Existing log flag determines visible mode: debug toggle before the
+         * optional next action row. Default is log enabled (flag clear). */
+        assert(menu_build(&menu,names,NULL,roles,&info,boards,3,0,UINT64_C(1)<<2,1,1,1)==0);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.boot_log_row]==MENU_BOOT_LOG_TOGGLE);
+        assert(menu.boot_log_row+1==menu.next_boot_row);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.next_boot_row]==MENU_NEXT_BOOT_CYCLE);
+        /* Queue an action, then disable debug logging: NEXT_BOOT hides but the
+         * already pending action is preserved. */
         const uint8_t expected[]={KSHIM_ACTION_ANDROID,KSHIM_ACTION_LINUX,KSHIM_ACTION_LINUX_DIAG};
-        for (size_t i=0;i<3;++i) {
-            menu.page=MENU_PAGE_SETTINGS;
-            assert(menu_activate(&menu,menu.next_boot_row,&selected,&failure)==2);
-            struct kshim_config_values read={0};
-            assert(kshim_config_load(store,&read,&sequence)==0);
-            assert(kshim_next_action_value(read.next_action)==expected[i]);
-        }
         menu.page=MENU_PAGE_SETTINGS;
-        assert(menu_activate(&menu,menu.boot_log_row,&selected,&failure)==2);
+        assert(menu_activate(&menu,menu.next_boot_row,&selected,&failure)==2);
         struct kshim_config_values read={0};
         assert(kshim_config_load(store,&read,&sequence)==0);
-        assert((read.next_action&KSHIM_FLAG_NO_BOOT_LOG)!=0);
-        assert(kshim_next_action_value(read.next_action)==KSHIM_ACTION_LINUX_DIAG);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
         menu.page=MENU_PAGE_SETTINGS;
         assert(menu_activate(&menu,menu.boot_log_row,&selected,&failure)==2);
+        for (size_t row=0;row<menu.pages[MENU_PAGE_SETTINGS].count;++row)
+            assert(menu.pages[MENU_PAGE_SETTINGS].actions[row]!=MENU_NEXT_BOOT_CYCLE);
+        assert(menu.pages[MENU_PAGE_SETTINGS].initial==menu.boot_log_row);
+        memset(&read,0,sizeof(read));
+        assert(kshim_config_load(store,&read,&sequence)==0);
+        assert((read.next_action&KSHIM_FLAG_NO_BOOT_LOG)!=0);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
+        /* Re-enable: next action reappears at the following row, with the
+         * pending action still intact. */
+        menu.page=MENU_PAGE_SETTINGS;
+        assert(menu_activate(&menu,menu.boot_log_row,&selected,&failure)==2);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.boot_log_row]==MENU_BOOT_LOG_TOGGLE);
+        assert(menu.boot_log_row+1==menu.next_boot_row);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.next_boot_row]==MENU_NEXT_BOOT_CYCLE);
         memset(&read,0,sizeof(read));
         assert(kshim_config_load(store,&read,&sequence)==0);
         assert((read.next_action&KSHIM_FLAG_NO_BOOT_LOG)==0);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
+        for (size_t i=1;i<3;++i) {
+            menu.page=MENU_PAGE_SETTINGS;
+            assert(menu_activate(&menu,menu.next_boot_row,&selected,&failure)==2);
+            memset(&read,0,sizeof(read));
+            assert(kshim_config_load(store,&read,&sequence)==0);
+            assert(kshim_next_action_value(read.next_action)==expected[i]);
+        }
         assert(kshim_next_action_value(read.next_action)==KSHIM_ACTION_LINUX_DIAG);
         assert(read.default_target==BOOT_TARGET_INTERNAL && read.last_target==BOOT_TARGET_INTERNAL);
         assert(selected==99);
