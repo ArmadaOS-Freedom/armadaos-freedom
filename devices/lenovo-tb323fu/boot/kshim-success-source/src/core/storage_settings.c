@@ -82,7 +82,8 @@ int kshim_settings_note_boot(struct kshim_settings_session *s,uint32_t target)
 /* Return the action only after its removal is durable. Reboot callers must
  * not dispatch a request after a failed clear. Normal settings/history and
  * the no-boot-log flag stay in place across the clear. */
-int kshim_settings_take_action(struct kshim_settings_session *s,uint32_t *action)
+int kshim_settings_take_action(struct kshim_settings_session *s,uint32_t *action,
+                               int diagnostic_accepted)
 {
     if (!s || !action) return KSHIM_STORAGE_ARG;
     *action=0;
@@ -93,14 +94,13 @@ int kshim_settings_take_action(struct kshim_settings_session *s,uint32_t *action
     /* TB322FC/TB323FU internal medium: convert the diagnostic request to a
      * plain Linux boot in the same verified transaction.  Other actions and
      * other media/boards keep the existing cleared-to-NONE behavior. */
-    uint32_t replacement=(requested==KSHIM_ACTION_LINUX_DIAG &&
-                          s->source==KSHIM_SETTINGS_INTERNAL &&
-                          (s->medium[0].config.board_id==1 ||
-                           s->medium[0].config.board_id==2)) ?
-                          KSHIM_ACTION_LINUX : KSHIM_ACTION_NONE;
+    int diag_ok=(requested==KSHIM_ACTION_LINUX_DIAG&&diagnostic_accepted&&
+                 s->source==KSHIM_SETTINGS_INTERNAL&&
+                 (s->medium[0].config.board_id==1||s->medium[0].config.board_id==2));
+    uint32_t replacement=diag_ok?KSHIM_ACTION_LINUX:KSHIM_ACTION_NONE;
     struct kshim_config_values next=s->values;
     next.next_action=kshim_next_action_pack(replacement,kshim_next_action_flags(packed));
     int rc=kshim_settings_save(s,&next);
-    if (!rc) *action=requested;
+    if (!rc&&(requested!=KSHIM_ACTION_LINUX_DIAG||diag_ok)) *action=requested;
     return rc;
 }
