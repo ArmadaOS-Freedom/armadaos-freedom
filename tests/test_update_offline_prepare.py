@@ -600,6 +600,8 @@ class OfflinePrepareTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 offline_prepare.package_contract, "load_package", return_value=pkg))
             stack.enter_context(mock.patch.object(
+                offline_prepare.package_contract, "require_operation"))
+            stack.enter_context(mock.patch.object(
                 offline_prepare.boot_sources, "capture_boot_sources",
                 side_effect=lambda initial, output_dir, **kwargs: env.capture(
                     output_dir=output_dir, boot_tool_path=None)["sources"]))
