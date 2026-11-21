@@ -9,7 +9,8 @@ and maps touch through the same orientation.
 
 Only devices whose profile sets ``ARMADA_GAMEMODE_AUTOROTATE=1`` run it. A
 fixed orientation chosen in Armada Control (/etc/armada/display-orientation.conf)
-wins: while it is set, the sensor is not followed.
+wins: while it is set, the accelerometer is released and not followed. While
+the device lies flat (tilt face-up or face-down) the last orientation is kept.
 
 SensorProxy names the edge of the panel that points up; gamescope's names are
 the panel-orientation quirks, where "left" (90 degrees) puts the top of the
@@ -34,6 +35,8 @@ GAMESCOPE_DISPLAY = os.environ.get("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-prima
 REFRESH_SECONDS = 5
 CALL_TIMEOUT_MS = 5000
 
+FLAT_TILTS = ("face-up", "face-down")
+
 ORIENTATIONS = {
     "normal": "normal",
     "left-up": "left",
@@ -43,15 +46,20 @@ ORIENTATIONS = {
 
 
 def shell_env(helper=None, runner=subprocess.run):
-    """Return the ARMADA_* variables the device-env helper exports."""
+    """The ARMADA_* variables the device-env helper exports, or None when the
+    helper fails (so a broken lookup is not mistaken for "disabled")."""
     helper = helper or os.environ.get(
         "ARMADA_DEVICE_ENV", "/usr/libexec/armada/device-env")
     command = (
-        f'eval "$({shlex.quote(helper)})"; '
+        f'out=$({shlex.quote(helper)}) || exit; eval "$out" || exit; '
         'for name in "${!ARMADA_@}"; do printf "%s=%s\\n" "$name" "${!name}"; done'
     )
     proc = runner(["bash", "-c", command], check=False, text=True,
-                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        LOG.error("device-env failed (%s): %s", proc.returncode,
+                  (proc.stderr or "").strip())
+        return None
     env = {}
     for line in (proc.stdout or "").splitlines():
         if "=" in line:
@@ -60,23 +68,29 @@ def shell_env(helper=None, runner=subprocess.run):
     return env
 
 
-def supported(env=None):
-    env = shell_env() if env is None else env
+def supported(env):
     return env.get(CONFIG_KEY) == "1"
 
 
+# display-orientation.sh, which applies the fixed orientation at session start,
+# matches ^[[:space:]]*orientation[[:space:]]*=(.*)$ line by line, trims the
+# value and lets the last assignment win; an invalid value clears it. Parse
+# the same way, on bytes, so stray bytes elsewhere cannot hide a valid choice.
+_OVERRIDE_LINE = re.compile(rb"^[ \t\n\v\f\r]*orientation[ \t\n\v\f\r]*=(.*)$")
+_ORIENTATION_VALUES = (b"normal", b"left", b"right", b"upsidedown")
+
+
 def override_active(path=OVERRIDE_CONFIG):
-    """Same parsing as armada-control: the last assignment wins."""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        data = path.read_bytes()
+    except OSError:
         return False
-    orientation = ""
-    for line in lines:
-        match = re.match(r"\s*orientation\s*=\s*(.*)$", line)
+    orientation = b""
+    for line in data.split(b"\n"):
+        match = _OVERRIDE_LINE.match(line)
         if match:
-            value = match.group(1).strip()
-            orientation = value if value in ("normal", "left", "right", "upsidedown") else ""
+            value = match.group(1).strip(b" \t\n\v\f\r")
+            orientation = value if value in _ORIENTATION_VALUES else b""
     return bool(orientation)
 
 
@@ -105,6 +119,11 @@ class AutoRotate:
         if not self.present:
             return True
         try:
+            # A fixed orientation wins; do not keep the sensor polling for
+            # readings that would be ignored. Clearing it reclaims below.
+            if self.override():
+                self.release()
+                return True
             props = self.sensor.properties()
             if not props.get("HasAccelerometer"):
                 return True
@@ -112,8 +131,12 @@ class AutoRotate:
                 self.sensor.claim()
                 self.claimed = True
                 props = self.sensor.properties()
+            # Lying flat, SensorProxy keeps reporting the last orientation;
+            # wait until the device is held up again.
+            if props.get("AccelerometerTilt") in FLAT_TILTS:
+                return True
             target = ORIENTATIONS.get(props.get("AccelerometerOrientation"))
-            if target is None or self.override():
+            if target is None:
                 return True
             if target != self.applied:
                 self.rotate(target)
@@ -134,17 +157,26 @@ class AutoRotate:
         if owner:
             self.refresh()
 
-    def close(self):
+    def release(self):
         if self.claimed:
+            self.claimed = False
             try:
                 self.sensor.release()
             except RuntimeError:
                 pass
 
+    def close(self):
+        self.release()
+
 
 def main(argv):
     if argv[1:] == ["--supported"]:
-        return 0 if supported() else 1
+        # ExecCondition: 1 skips the unit, 255 fails it (and Restart= retries).
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+        env = shell_env()
+        if env is None:
+            return 255
+        return 0 if supported(env) else 1
     if argv[1:]:
         print("usage: armada-gamemode-autorotate [--supported]", file=sys.stderr)
         return 2
@@ -186,7 +218,7 @@ def main(argv):
         interface, changed, invalidated = params.unpack()
         if interface == SENSOR_NAME and any(
             key in changed or key in invalidated
-            for key in ("HasAccelerometer", "AccelerometerOrientation")
+            for key in ("HasAccelerometer", "AccelerometerOrientation", "AccelerometerTilt")
         ):
             rotator.refresh()
 

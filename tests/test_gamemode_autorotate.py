@@ -1,6 +1,7 @@
 """armada-gamemode-autorotate: sensor orientation to gamescope rotation."""
 
 import importlib.machinery
+import os
 import importlib.util
 import subprocess
 import tempfile
@@ -29,7 +30,8 @@ autorotate = load()
 
 class FakeSensor:
     def __init__(self, orientation='normal', has=True):
-        self.props = {'HasAccelerometer': has, 'AccelerometerOrientation': orientation}
+        self.props = {'HasAccelerometer': has, 'AccelerometerOrientation': orientation,
+                      'AccelerometerTilt': 'vertical'}
         self.claims = 0
         self.releases = 0
         self.fail = None
@@ -48,6 +50,9 @@ class FakeSensor:
 
 class AutoRotateTest(unittest.TestCase):
     def make(self, sensor, override=False, fail_rotate=0):
+        if not callable(override):
+            fixed = override
+            override = lambda: fixed
         calls = []
         state = {'fail': fail_rotate}
 
@@ -57,7 +62,7 @@ class AutoRotateTest(unittest.TestCase):
                 raise RuntimeError('gamescope not ready')
             calls.append(target)
 
-        rotator = autorotate.AutoRotate(sensor, rotate=rotate, override=lambda: override)
+        rotator = autorotate.AutoRotate(sensor, rotate=rotate, override=override)
         return rotator, calls
 
     def test_mapping_follows_kwin(self):
@@ -89,11 +94,38 @@ class AutoRotateTest(unittest.TestCase):
         rotator.refresh()
         self.assertEqual((calls, absent.claims), ([], 0))
 
-    def test_override_wins(self):
+    def test_override_wins_without_claiming(self):
         sensor = FakeSensor('left-up')
         rotator, calls = self.make(sensor, override=True)
         rotator.refresh()
+        self.assertEqual((calls, sensor.claims), ([], 0))
+
+    def test_override_releases_and_clearing_reclaims(self):
+        sensor = FakeSensor('left-up')
+        state = {'fixed': False}
+        rotator, calls = self.make(sensor, override=lambda: state['fixed'])
+        rotator.refresh()
+        self.assertEqual((calls, sensor.claims), (['left'], 1))
+        state['fixed'] = True
+        sensor.props['AccelerometerOrientation'] = 'right-up'
+        rotator.refresh()
+        self.assertEqual((calls, sensor.releases, rotator.claimed), (['left'], 1, False))
+        state['fixed'] = False
+        rotator.refresh()
+        self.assertEqual((calls, sensor.claims), (['left', 'right'], 2))
+
+    def test_flat_keeps_orientation_until_lifted(self):
+        sensor = FakeSensor('left-up')
+        sensor.props['AccelerometerTilt'] = 'face-up'
+        rotator, calls = self.make(sensor)
+        rotator.refresh()
+        sensor.props['AccelerometerTilt'] = 'face-down'
+        rotator.refresh()
         self.assertEqual(calls, [])
+        # Lifted with the same orientation: only the tilt changed.
+        sensor.props['AccelerometerTilt'] = 'tilted-up'
+        rotator.refresh()
+        self.assertEqual(calls, ['left'])
 
     def test_failed_rotation_is_retried(self):
         sensor = FakeSensor('left-up')
@@ -158,11 +190,44 @@ class AutoRotateTest(unittest.TestCase):
         self.assertIn('GAMESCOPE_WAYLAND_DISPLAY', seen['env'])
         self.assertEqual(seen['timeout'], 5)
 
-        def failing(args, **kwargs):
-            raise subprocess.CalledProcessError(1, args)
+        def failing(args, check=False, **kwargs):
+            # Like subprocess.run: a failed command only raises with check=True.
+            if check:
+                raise subprocess.CalledProcessError(1, args)
+            return subprocess.CompletedProcess(args, 1)
 
         with self.assertRaises(RuntimeError):
             autorotate.gamescope_rotate('left', runner=failing)
+
+    def test_override_parsing_matches_session_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'display-orientation.conf'
+            # A comment with a byte that is not UTF-8 does not hide the choice.
+            path.write_bytes(b'# caf\xe9\norientation = right \n')
+            self.assertTrue(autorotate.override_active(path))
+            path.write_bytes(b'orientation=right\r\n')
+            self.assertTrue(autorotate.override_active(path))
+            path.write_bytes(b'orientation=right\norientation=\xff\n')
+            self.assertFalse(autorotate.override_active(path))
+
+    def test_device_env_failure_is_not_unsupported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = Path(tmp) / 'device-env'
+            helper.write_text('#!/bin/sh\necho broken >&2\nexit 3\n')
+            helper.chmod(0o755)
+            self.assertIsNone(autorotate.shell_env(str(helper)))
+            result = subprocess.run(
+                ['python3', str(SCRIPT), '--supported'], capture_output=True, text=True,
+                env=dict(os.environ, ARMADA_DEVICE_ENV=str(helper)))
+            self.assertEqual(result.returncode, 255, result.stderr)
+            helper.write_text('#!/bin/sh\necho ARMADA_GAMEMODE_AUTOROTATE=0\n')
+            result = subprocess.run(
+                ['python3', str(SCRIPT), '--supported'], capture_output=True, text=True,
+                env=dict(os.environ, ARMADA_DEVICE_ENV=str(helper)))
+            self.assertEqual(result.returncode, 1, result.stderr)
+            helper.write_text('#!/bin/sh\necho ARMADA_GAMEMODE_AUTOROTATE=1\n')
+            self.assertEqual(autorotate.shell_env(str(helper)),
+                             {'ARMADA_GAMEMODE_AUTOROTATE': '1'})
 
     def test_supported_needs_profile_flag(self):
         self.assertTrue(autorotate.supported({'ARMADA_GAMEMODE_AUTOROTATE': '1'}))
