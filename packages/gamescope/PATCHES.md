@@ -110,3 +110,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0045-steamcompmgr-freedom-touch-placeholder.patch`
   source: armadaos-freedom
   notes: Extends the transparent Steam placeholder suppression to a visible Freedom Touch overlay; real Steam menus, the no-overlay fallback and normal layer reservations are kept.
+
+- `patches/0047-wlserver-associate-normal-virtual-touch-with-internal-panel.patch`
+  source: armada
+  notes: Extends 0040 to a virtual touch device on a natively landscape panel. A device tagged `GAMESCOPE_TOUCH_CALIBRATION=normal` (the TB710FU pen-as-touch bridge, `99-armada-tb710fu-pen-touch.rules`) is associated with the internal panel like the real SPI touchscreen, without any calibration undo, so a Game Mode orientation override rotates the pen together with the picture. Real buses, untagged devices and the `right` tag are unchanged. Regression: `GAMESCOPE_SOURCE_DIR=/path/to/patched/gamescope python3 tests/gamescope-touch-orientation-test.py`.

@@ -484,8 +484,9 @@ int kshim_mmu_configure(const kshim_mmu_config_t *config)
 
     mCleanReadOnly = config->fdt != NULL &&
         fdt_node_check_compatible(config->fdt, 0, "qcom,pineapple") == 0;
+    /* allocate_table() zeroes each table it hands out; clearing all of
+     * mTables here would be 256 KiB of uncached stores. */
     memset(&mMmu, 0, sizeof(mMmu));
-    memset(mTables, 0, sizeof(mTables));
     mMmu.root = allocate_table();
     if (mMmu.root == NULL)
         return -2;
@@ -654,16 +655,19 @@ uint64_t kshim_mmu_root_table(void)
 
 int kshim_mmu_prepare_handoff(void)
 {
-    if (!mMmu.configured)
-        return 0;
-    /* On SM8650 the FDT can be mapped read-only for the menu and edited
-     * after the MMU is off; the next kernel would then see the stale clean
-     * lines, so read-only write-back regions are cleaned there too.  The
-     * early configuration records its writable DT mapping for the same reason. */
-    for (size_t index = 0; index < mMmu.region_count; index++) {
-        if (mMmu.regions[index].type == KSHIM_MMU_NORMAL_WB &&
-            ((mMmu.regions[index].permissions & KSHIM_MMU_WRITE) || mCleanReadOnly))
-            clean_range(mMmu.regions[index].base, mMmu.regions[index].size);
+    /* startup.S turned the instruction cache on at entry, so it must be
+     * turned off here even when configuration or mapping failed and there
+     * is no mapped region to clean.  Only the clean is conditional. */
+    if (mMmu.configured) {
+        /* On SM8650 the FDT can be mapped read-only for the menu and edited
+         * after the MMU is off; the next kernel would then see the stale clean
+         * lines, so read-only write-back regions are cleaned there too.  The
+         * early configuration records its writable DT mapping for the same reason. */
+        for (size_t index = 0; index < mMmu.region_count; index++) {
+            if (mMmu.regions[index].type == KSHIM_MMU_NORMAL_WB &&
+                ((mMmu.regions[index].permissions & KSHIM_MMU_WRITE) || mCleanReadOnly))
+                clean_range(mMmu.regions[index].base, mMmu.regions[index].size);
+        }
     }
 #if defined(__aarch64__)
     __asm__ volatile("dsb sy\nic iallu\ndsb sy\nisb" ::: "memory");
@@ -775,8 +779,9 @@ int kshim_mmu_configure_early(const kshim_mmu_early_config_t *config)
 
     mCleanReadOnly = config->fdt != NULL &&
         fdt_node_check_compatible(config->fdt, 0, "qcom,pineapple") == 0;
+    /* allocate_table() zeroes each table it hands out; clearing all of
+     * mTables here would be 256 KiB of uncached stores. */
     memset(&mMmu, 0, sizeof(mMmu));
-    memset(mTables, 0, sizeof(mTables));
     mMmu.root = allocate_table();
     if (mMmu.root == NULL)
         return -4;

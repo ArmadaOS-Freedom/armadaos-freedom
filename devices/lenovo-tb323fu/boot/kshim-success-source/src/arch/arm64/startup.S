@@ -63,9 +63,21 @@ _platform_init:
     cmp x9, #0x4
     b.ne _dead
 
+/*
+ * The previous bootloader enters with the MMU and both caches off. Turn the
+ * instruction cache on now (allowed with the MMU off; fetches are then
+ * Normal cacheable): otherwise every instruction up to
+ * kshim_mmu_configure_early(), BSS and stack clearing included, is fetched
+ * from DRAM. Stale lines are dropped first. kshim_mmu_prepare_handoff() turns
+ * it off again with the MMU.
+ */
 _setup_el1:
+    ic iallu
+    dsb nsh
+    isb
     mrs x0, sctlr_el1
     orr x0, x0, #SCTLR_SPAN_BIT
+    orr x0, x0, #SCTLR_I_BIT
     msr sctlr_el1, x0
     mrs x0, cpacr_el1
     orr x0, x0, CPACR_FPEN_BIT
@@ -74,8 +86,12 @@ _setup_el1:
     b _setup_gots
 
 _setup_el2:
+    ic iallu
+    dsb nsh
+    isb
     mrs x0, sctlr_el2
     orr x0, x0, #SCTLR_SPAN_BIT
+    orr x0, x0, #SCTLR_I_BIT
     msr sctlr_el2, x0
     mrs x0, cptr_el2
     bic x0, x0, #(1 << 10) // CPTR_EL2.TFP

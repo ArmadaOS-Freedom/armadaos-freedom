@@ -264,6 +264,33 @@ finally:
     else:
         os.environ["PATH"] = saved_path
 
+# --- armada-game-launch: appid() skips literal "0" -------------------------
+saved_appid = {k: os.environ.get(k) for k in
+               ("STEAM_COMPAT_APP_ID", "SteamAppId", "SteamGameId")}
+try:
+    for k in saved_appid:
+        os.environ.pop(k, None)
+    os.environ["STEAM_COMPAT_APP_ID"] = "0"
+    check("non-Steam compat id 0 ignored", launch.appid() is None)
+    os.environ["SteamAppId"] = "111"
+    check("SteamAppId fallback after compat 0", launch.appid() == "111")
+    os.environ["STEAM_COMPAT_APP_ID"] = "0"
+    os.environ["SteamAppId"] = "111"
+    os.environ["SteamGameId"] = "222"
+    check("compat 0 falls to SteamAppId priority", launch.appid() == "111")
+    os.environ.pop("SteamAppId", None)
+    check("compat 0 falls to SteamGameId", launch.appid() == "222")
+    os.environ["STEAM_COMPAT_APP_ID"] = "999"
+    os.environ["SteamAppId"] = "111"
+    os.environ["SteamGameId"] = "222"
+    check("nonzero compat id takes priority", launch.appid() == "999")
+finally:
+    for k, v in saved_appid.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
 base_fex = os.path.join(WORK, "base-fex.json")
 with open(base_fex, "w") as f:
     # an older bundled Config.json: the unsupported thunks are still advertised

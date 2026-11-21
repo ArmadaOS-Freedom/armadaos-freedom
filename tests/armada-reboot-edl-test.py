@@ -121,6 +121,25 @@ class Tests(unittest.TestCase):
                 else:
                     self.assertEqual(json.loads(out.getvalue())['log'],'off')
                     self.assertEqual(current['best']['values'][4],0x100)
+    def test_v4_checks_without_edl_and_no_write(self):
+        f,h,r=self.makefile(3,3)
+        def fake_context(*,require_edl=True):
+            if require_edl:raise edl.Refuse('no EDL')
+            return (Path(f.name),PART,1,0)
+        for argv in ([], ['--check']):
+            out=io.StringIO()
+            with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(out):
+                self.assertEqual(edl.main(argv),0)
+                status=json.loads(out.getvalue())
+                self.assertTrue(status['ready'])
+                self.assertTrue(status['v4SettingsAvailable'])
+                write.assert_not_called()
+        with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(edl.Refuse,'no EDL'):
+                edl.main(['--reboot'])
+            with self.assertRaisesRegex(edl.Refuse,'no EDL'):
+                edl.main(['--next','edl'])
+        write.assert_not_called()
     def test_legacy_check_requires_edl_and_next_fails_read_only(self):
         f,h,r=self.makefile()
         gates=[]

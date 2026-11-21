@@ -2,37 +2,188 @@
 #include <dt.h>
 #include <string.h>
 
+/* Explicit-scope one-pass index over the validated blob. The algorithm is the
+ * upstream kshim kernel/dt/dt.c index (commits 8e150f, 93e1dda, ef00dd):
+ * fdt_next_node() plus one fdt_getprop() per node used to rescan every node's
+ * properties, which is quadratic on large Android trees. A property belongs
+ * to the innermost open node and precedes its subnodes, so one raw pass over
+ * the structure block records each node's parent, its "compatible" value and
+ * its phandle. Unlike upstream there is no persistent cache, no hashing and no
+ * revalidation policy: the lifetime stays the caller's begin/end scope. */
 #define DT_PARENT_INDEX_MAX 8192
+#define DT_PARENT_INDEX_DEPTH_MAX 64
+#define DT_TAGALIGN(x) (((x) + 3U) & ~3U)
+
 struct dt_parent_index_entry { int node, parent; uint32_t compatible_offset; int compatible_length; };
+struct dt_phandle_index_entry { uint32_t phandle; int node; };
+
 static struct dt_parent_index_entry dt_parent_index[DT_PARENT_INDEX_MAX];
+static struct dt_phandle_index_entry dt_phandle_index[DT_PARENT_INDEX_MAX];
+static int dt_phandle_index_count;
+static bool dt_phandle_index_malformed;
 static const void *dt_parent_index_fdt;
 static int dt_parent_index_count = -1;
+
+/* phandle / linux,phandle as seen while one node's properties are read. */
+struct dt_parent_index_props { const void *a, *b; int alen, blen; };
+
+/* Big-endian 32-bit read: FDT is big-endian on every host, and the structure
+ * block offset is not necessarily aligned for a direct 32-bit load. */
+static uint32_t dt_parent_index_u32(const void *p)
+{
+    const uint8_t *b = p;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+}
+
+/* Append in scan order; equal handles stay in separate entries. Ordering is
+ * established once by dt_parent_index_sort_phandles() before publishing. */
+static bool dt_parent_index_add_phandle(int *count, uint32_t phandle, int node)
+{
+    if (!phandle || phandle == UINT32_MAX) return true;
+    if (*count >= DT_PARENT_INDEX_MAX) return false;
+    dt_phandle_index[*count].phandle = phandle;
+    dt_phandle_index[*count].node = node;
+    ++*count;
+    return true;
+}
+
+/* A node's properties are complete: record its phandle the way
+ * fdt_get_phandle() reads it and flag anything dt_phandle() must refuse, so one
+ * bad property refuses every lookup exactly as the full walk did. */
+static bool dt_parent_index_finish(int at, const struct dt_parent_index_props *p,
+                                   int *phandles, bool *malformed)
+{
+    if ((p->a && p->alen != 4) || (p->b && p->blen != 4) ||
+        (p->a && p->b && dt_parent_index_u32(p->a) != dt_parent_index_u32(p->b)))
+        *malformed = true;
+    uint32_t phandle = p->a && p->alen == 4 ? dt_parent_index_u32(p->a) :
+                       p->b && p->blen == 4 ? dt_parent_index_u32(p->b) : 0;
+    return dt_parent_index_add_phandle(phandles, phandle, dt_parent_index[at].node);
+}
+
+/* Max-heap sift-down on dt_phandle_index by phandle key, root is candidate
+ * position; count limits the sub-heap. Promotes the larger child while its key
+ * exceeds the saved root entry, then writes the saved entry to the hole. */
+static void dt_phandle_index_sift_down(int root, int count)
+{
+    struct dt_phandle_index_entry saved = dt_phandle_index[root];
+    int child = 2 * root + 1;
+    while (child < count) {
+        if (child + 1 < count &&
+            dt_phandle_index[child + 1].phandle > dt_phandle_index[child].phandle)
+            ++child;
+        if (dt_phandle_index[child].phandle <= saved.phandle)
+            break;
+        dt_phandle_index[root] = dt_phandle_index[child];
+        root = child;
+        child = 2 * root + 1;
+    }
+    dt_phandle_index[root] = saved;
+}
+
+/* In-place heapsort of the collected handles; stable tie order is not
+ * required because duplicate handles compare equal at lookup. */
+static void dt_phandle_index_sort(void)
+{
+    int count = dt_phandle_index_count;
+    bool sorted = true;
+    for (int i = 0; i + 1 < count; ++i) {
+        if (dt_phandle_index[i].phandle > dt_phandle_index[i + 1].phandle) {
+            sorted = false;
+            break;
+        }
+    }
+    if (sorted) return;
+    for (int i = count / 2 - 1; i >= 0; --i)
+        dt_phandle_index_sift_down(i, count);
+    for (int end = count - 1; end > 0; --end) {
+        struct dt_phandle_index_entry tmp = dt_phandle_index[0];
+        dt_phandle_index[0] = dt_phandle_index[end];
+        dt_phandle_index[end] = tmp;
+        dt_phandle_index_sift_down(0, end);
+    }
+}
+
+/* Bounded length of a NUL-terminated name inside the structure block. */
+static uint32_t dt_parent_index_length(const char *name, uint32_t limit)
+{
+    uint32_t length = 0;
+    while (length < limit && name[length]) ++length;
+    return length;
+}
 
 void dt_parent_index_begin(const void *f)
 {
     dt_parent_index_fdt = NULL;
     dt_parent_index_count = -1;
-    int node = -1, depth = -1, count = 0, stack[64];
-    while ((node = fdt_next_node(f, node, &depth)) >= 0) {
-        if (depth < 0) break;
-        if (depth >= 64 || count >= DT_PARENT_INDEX_MAX) {
-            dt_parent_index_count = -1;
-            return;
+    dt_phandle_index_count = 0;
+    dt_phandle_index_malformed = false;
+    if (!f) return;
+    const char *base = (const char *)f + fdt_off_dt_struct(f);
+    const char *strings = (const char *)f + fdt_off_dt_strings(f);
+    uint32_t limit = fdt_version(f) >= 17 ? (uint32_t)fdt_size_dt_struct(f) :
+                     (uint32_t)(fdt_totalsize(f) - fdt_off_dt_struct(f));
+    int stack[DT_PARENT_INDEX_DEPTH_MAX], depth = -1, count = 0, phandles = 0, open = -1;
+    bool malformed = false;
+    struct dt_parent_index_props props = {0};
+
+    if (limit < 4) return;
+    for (uint32_t offset = 0; offset <= limit - 4;) {
+        uint32_t tag = dt_parent_index_u32(base + offset);
+        if (tag == FDT_BEGIN_NODE) {
+            if (open >= 0 && !dt_parent_index_finish(open, &props, &phandles, &malformed))
+                return;
+            if (++depth >= DT_PARENT_INDEX_DEPTH_MAX || count >= DT_PARENT_INDEX_MAX)
+                return; /* too deep or too large: lookups fall back to libfdt */
+            dt_parent_index[count].node = (int)offset;
+            dt_parent_index[count].parent =
+                depth ? dt_parent_index[stack[depth - 1]].node : -FDT_ERR_NOTFOUND;
+            dt_parent_index[count].compatible_offset = 0;
+            dt_parent_index[count].compatible_length = 0;
+            stack[depth] = open = count++;
+            props = (struct dt_parent_index_props){0};
+            offset += 4 + DT_TAGALIGN(dt_parent_index_length(base + offset + 4,
+                                                            limit - offset - 4) + 1);
+        } else if (tag == FDT_PROP) {
+            if (depth < 0 || limit - offset < 12) return;
+            uint32_t length = dt_parent_index_u32(base + offset + 4);
+            const char *name = strings + dt_parent_index_u32(base + offset + 8);
+            const char *value = base + offset + 12;
+            int at = stack[depth];
+            /* First occurrence wins, as with fdt_getprop(). */
+            if (open == at && !strcmp(name, "compatible")) {
+                if (!dt_parent_index[at].compatible_offset) {
+                    dt_parent_index[at].compatible_offset =
+                        (uint32_t)(value - (const char *)f);
+                    dt_parent_index[at].compatible_length = (int)length;
+                }
+            } else if (open == at && !strcmp(name, "phandle")) {
+                if (!props.a)
+                    props = (struct dt_parent_index_props){value, props.b,
+                                                           (int)length, props.blen};
+            } else if (open == at && !strcmp(name, "linux,phandle")) {
+                if (!props.b)
+                    props = (struct dt_parent_index_props){props.a, value,
+                                                           props.alen, (int)length};
+            }
+            offset += 12 + DT_TAGALIGN(length);
+        } else if (tag == FDT_END_NODE) {
+            if (open >= 0 && !dt_parent_index_finish(open, &props, &phandles, &malformed))
+                return;
+            open = -1;
+            offset += 4;
+            if (--depth < 0) break; /* the root closed: the pass is complete */
+        } else if (tag == FDT_NOP) {
+            offset += 4;
+        } else {
+            break; /* FDT_END */
         }
-        stack[depth] = node;
-        dt_parent_index[count].node = node;
-        dt_parent_index[count].parent = depth ? stack[depth - 1] : -FDT_ERR_NOTFOUND;
-        int len;
-        const void *prop = fdt_getprop(f, node, "compatible", &len);
-        dt_parent_index[count].compatible_offset =
-            prop ? (uint32_t)((const char *)prop - (const char *)f) : 0;
-        dt_parent_index[count].compatible_length = len;
-        ++count;
     }
-    if (node < 0) {
-        dt_parent_index_count = -1;
-        return;
-    }
+    if (depth >= 0 || !count) return;
+    dt_phandle_index_count = phandles;
+    dt_phandle_index_malformed = malformed;
+    dt_phandle_index_sort();
     dt_parent_index_fdt = f;
     dt_parent_index_count = count;
 }
@@ -41,6 +192,8 @@ void dt_parent_index_end(void)
 {
     dt_parent_index_fdt = NULL;
     dt_parent_index_count = -1;
+    dt_phandle_index_count = 0;
+    dt_phandle_index_malformed = false;
 }
 
 int dt_parent_offset(const void *fdt, int offset)
@@ -59,7 +212,7 @@ int dt_parent_offset(const void *fdt, int offset)
 
 int dt_node_offset_by_compatible(const void *f, int start, const char *compatible)
 {
-    if (dt_parent_index_fdt == f && dt_parent_index_count >= 0) {
+    if (compatible && dt_parent_index_fdt == f && dt_parent_index_count >= 0) {
         int i = 0;
         if (start >= 0) {
             int lo = 0, hi = dt_parent_index_count - 1, found = -1;
@@ -152,6 +305,26 @@ int dt_bool(const void *f, int node, const char *property, bool *value)
 int dt_phandle(const void *f, uint32_t handle)
 {
     if (!handle || handle == UINT32_MAX) return -1;
+    /* Inside the parent-index scope the sorted phandle table answers without a
+     * tree walk; the build records the same strict rules as the walk below, so
+     * a malformed property, a disagreement or a second match still fails. */
+    if (dt_parent_index_fdt == f && dt_parent_index_count >= 0) {
+        if (dt_phandle_index_malformed) return -1;
+        int at = -1, lo = 0, hi = dt_phandle_index_count - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (dt_phandle_index[mid].phandle == handle) { at = mid; break; }
+            if (dt_phandle_index[mid].phandle < handle) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        /* Absent, or more than one node matched: the full walk refused both. */
+        if (at < 0 || (at > 0 && dt_phandle_index[at - 1].phandle == handle) ||
+            (at + 1 < dt_phandle_index_count &&
+             dt_phandle_index[at + 1].phandle == handle))
+            return -1;
+        int node = dt_phandle_index[at].node;
+        return dt_available(f, node) ? node : -1;
+    }
     int found = -1;
     for (int n = fdt_next_node(f, -1, NULL); n >= 0; n = fdt_next_node(f, n, NULL)) {
         uint32_t h, legacy;

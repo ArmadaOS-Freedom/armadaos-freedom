@@ -235,6 +235,12 @@ kshim_test(dt_phandle_scan_test phandle_scan_test.c)
 target_link_libraries(dt_phandle_scan_test PRIVATE kshim_dt)
 target_link_options(dt_phandle_scan_test PRIVATE -Wl,--wrap=fdt_getprop)
 
+# Indexed phandle lookup: wrap fdt_next_node to observe that bulk indexed
+# lookups never walk the tree.
+kshim_test(dt_phandle_index_test phandle_index_test.c)
+target_link_libraries(dt_phandle_index_test PRIVATE kshim_dt)
+target_link_options(dt_phandle_index_test PRIVATE -Wl,--wrap=fdt_next_node)
+
 kshim_test(dt_probe_report_test probe_report_test.c)
 target_link_libraries(dt_probe_report_test PRIVATE kshim_dt)
 
