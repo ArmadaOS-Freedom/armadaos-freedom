@@ -74,7 +74,7 @@ int main(void) {
     ovf[0].size = 0x2000ull;
     base = 0xCAFEBABEull;
     int orc = kshim_disk_boot_find_memory(fdt, fdt_bytes, 6ull*1024*1024, ovf, 1, &base);
-    if (orc == 0 && base != 0x80400000ull) return 16;
+    if (orc == 0 || base != 0xCAFEBABEull) return 16;
 
     free(buf);
     return rc;
