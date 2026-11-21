@@ -84,14 +84,12 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
 index 7f1cf97..861156d 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -102,6 +102,7 @@
- #include "BufferMemo.h"
- #include "vrclient_detect.h"
+@@ -103,4 +103,5 @@
  #include "Utils/Process.h"
+ #include "Utils/PresentTiming.h"
 +#include "Utils/SteamUIRefresh.h"
+ #include "Utils/CommitQueue.h"
  
- #include "wlr_begin.hpp"
- #include "wlr/types/wlr_pointer_constraints_v1.h"
 @@ -498,6 +499,11 @@ gamescope::ConVar<bool> cv_hdr_enabled{ "hdr_enabled", false, "Whether or not HD
  gamescope::ConVar<bool> cv_hdr_content_driven{ "hdr_content_driven", false, "Only drive a panel in HDR while an HDR app is running." };
  bool g_bHDRItmEnable = false;
@@ -190,7 +188,8 @@ index 7f1cf97..861156d 100644
  		{
  			GetBackend()->HackTemporarySetDynamicRefresh( nTargetRefreshHz );
  		}
-@@ -6920,15 +6989,23 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+@@ -6953,17 +6953,25 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx, steamcompmgr_win_t *w = nullptr, uint64_t now = 0 )
+ {
  	bool bSendCallback = true;
  
  	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
@@ -216,22 +215,18 @@ index 7f1cf97..861156d 100644
 -			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
 +			uint64_t schedule = w->last_commit_first_latch_time + nLimitedCycle;
  
- 			static constexpr uint64_t k_ulVRRScheduleFudge = 200'000; // 0.2ms
  			if ( now + k_ulVRRScheduleFudge < schedule )
-@@ -6944,11 +7021,11 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+ 			{
+ 				bSendCallback = false;
+@@ -6989,7 +6989,7 @@
  	}
  	else
  	{
 -		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
 +		if ( nTargetFPS && bLimitFPS && nRefreshHz > nTargetFPS )
  		{
- 			if ( cv_limiter_use_elapsed_time && w )
- 			{
--				uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
-+				uint64_t schedule = w->last_commit_first_latch_time + nLimitedCycle;
- 				uint64_t fudge = g_SteamCompMgrAppRefreshCycle / 2;
+ 			int nVblankDivisor = nRefreshHz / nTargetFPS;
  
- 				if ( now + fudge < schedule )
 @@ -7393,6 +7470,28 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
  		g_nSteamCompMgrTargetFPS = get_prop( ctx, ctx->root, ctx->atoms.gamescopeFPSLimit, 0 );
  		update_runtime_info();
@@ -261,26 +256,20 @@ index 7f1cf97..861156d 100644
  	for (int i = 0; i < gamescope::GAMESCOPE_SCREEN_TYPE_COUNT; i++)
  	{
  		if ( ev->atom == ctx->atoms.gamescopeDynamicRefresh[i] )
-@@ -8310,10 +8409,18 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
- 
- 	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
- 
--	uint64_t refresh_cycle = g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w )
+@@ -8069,4 +8069,12 @@ static uint64_t window_refresh_cycle( steamcompmgr_win_t *w )
+ {
+-	return g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w )
 +	// Original limiter/app cycle for this window first, then the UI ceiling on
 +	// top of it. The ceiling may only slow a window down, never speed it up.
 +	const uint64_t nOriginalWindowRefreshCycle = g_nSteamCompMgrTargetFPS && steamcompmgr_window_should_limit_fps( w )
- 		? g_SteamCompMgrLimitedAppRefreshCycle
- 		: g_SteamCompMgrAppRefreshCycle;
- 
-+	uint64_t refresh_cycle = gamescope::SteamUIWindowRefreshCycle(
+ 		? g_SteamCompMgrLimitedAppRefreshCycle : g_SteamCompMgrAppRefreshCycle;
++
++	return gamescope::SteamUIWindowRefreshCycle(
 +		steamui_active_refresh( GetCurrentFocus() ),
 +		steamui_is_active_window( w ),
 +		g_SteamCompMgrAppRefreshCycle,
 +		nOriginalWindowRefreshCycle );
-+
- 	commit_t *lastCommit = get_window_last_done_commit_peek(w);
- 	if (lastCommit)
- 	{
+ }
 @@ -9218,6 +9325,8 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
  
  	ctx->atoms.gamescopeDisplayRefreshRateFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK", false );
@@ -346,19 +335,16 @@ index a748009..e59fe24 100644
  
  gamescope_tests = executable(
  	'gamescope_tests',
--	unittest_src + ['test_convar.cpp', 'test_focus_placement.cpp', 'test_mangoapp_config.cpp', 'test_mangoapp_control.cpp', 'test_mode_list.cpp', 'test_process.cpp', 'test_upscale.cpp', 'test_utils_parsers.cpp', 'test_utils_string.cpp', 'test_utils_vblank_schedule.cpp', 'test_vrclient_detect.cpp', 'test_display_lookup.cpp', 'test_drm_composition.cpp', 'test_client_format_policy.cpp', 'test_edid.cpp'],
-+	unittest_src + ['test_convar.cpp', 'test_focus_placement.cpp', 'test_mangoapp_config.cpp', 'test_mangoapp_control.cpp', 'test_mode_list.cpp', 'test_process.cpp', 'test_upscale.cpp', 'test_utils_parsers.cpp', 'test_utils_steam_ui_refresh.cpp', 'test_utils_string.cpp', 'test_utils_vblank_schedule.cpp', 'test_vrclient_detect.cpp', 'test_display_lookup.cpp', 'test_drm_composition.cpp', 'test_client_format_policy.cpp', 'test_edid.cpp'],
+-	unittest_src + ['../src/color_helpers.cpp', 'test_color_helpers.cpp', 'test_convar.cpp', 'test_focus_placement.cpp', 'test_mangoapp_config.cpp', 'test_mangoapp_control.cpp', 'test_mode_list.cpp', 'test_present_timing_schedule.cpp', 'test_process.cpp', 'test_swapchain_wire.cpp', 'test_upscale.cpp', 'test_utils_commit_queue.cpp', 'test_utils_parsers.cpp', 'test_utils_string.cpp', 'test_utils_vblank_schedule.cpp', 'test_vrclient_detect.cpp', 'test_edid.cpp', 'test_display_lookup.cpp', 'test_drm_composition.cpp', 'test_client_format_policy.cpp'] + swapchain_client_src + limiter_client_src + [swapchain_server_header],
++	unittest_src + ['../src/color_helpers.cpp', 'test_color_helpers.cpp', 'test_convar.cpp', 'test_focus_placement.cpp', 'test_mangoapp_config.cpp', 'test_mangoapp_control.cpp', 'test_mode_list.cpp', 'test_present_timing_schedule.cpp', 'test_process.cpp', 'test_swapchain_wire.cpp', 'test_upscale.cpp', 'test_utils_commit_queue.cpp', 'test_utils_parsers.cpp', 'test_utils_steam_ui_refresh.cpp', 'test_utils_string.cpp', 'test_utils_vblank_schedule.cpp', 'test_vrclient_detect.cpp', 'test_edid.cpp', 'test_display_lookup.cpp', 'test_drm_composition.cpp', 'test_client_format_policy.cpp'] + swapchain_client_src + limiter_client_src + [swapchain_server_header],
  	include_directories: [srcdir, sol2_include],
- 	dependencies: [catch2_dep, luajit_dep, cap_dep, displayinfo_dep, drm_dep, glm_dep, wlroots_dep],
+ 	dependencies: [catch2_dep, luajit_dep, cap_dep, displayinfo_dep, drm_dep, glm_dep, vulkan_dep, wlroots_dep, dep_wayland, wayland_server],
  	cpp_args: gamescope_cpp_args,
-@@ -24,6 +24,7 @@ test('mode_list', gamescope_tests, args: ['[mode_list]'])
- test('upscale', gamescope_tests, args: ['[upscale]'])
- test('utils/parsers', gamescope_tests, args: ['[parsers]'])
+@@ -27,3 +27,4 @@ test('utils/parsers', gamescope_tests, args: ['[parsers]'])
  test('utils/process', gamescope_tests, args: ['[process]'], depends: [reaper_test_helper])
 +test('utils/steam_ui_refresh', gamescope_tests, args: ['[steam_ui_refresh]'])
  test('utils/string', gamescope_tests, args: ['[string]'])
  test('utils/vblank_schedule', gamescope_tests, args: ['[vblank_schedule]'])
- test('vrclient_detect', gamescope_tests, args: ['[vrclient_detect]'])
 diff --git a/tests/test_utils_steam_ui_refresh.cpp b/tests/test_utils_steam_ui_refresh.cpp
 new file mode 100644
 index 0000000..f5a1e5a

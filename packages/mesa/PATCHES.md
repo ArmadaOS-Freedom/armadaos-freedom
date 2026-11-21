@@ -15,6 +15,8 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0003-ir3-disable-bindless-ubo-const-lowering.patch`
   source: https://github.com/ROCKNIX/distribution/blob/0adbe00f1745512609b289ef9435df897c28b780/projects/ROCKNIX/packages/graphics/mesa/patches/SM8550/0001-freedreno-ir3-vulkan-disable-bindless-ubo-const-lowering.patch
   notes: offsets updated for Mesa 26.2.0
+- `patches/0015-ir3-array-to-ssa-resolve-trivial-phi-chains.patch`
+  source: https://github.com/armada-os/armada/blob/a0659ce363d2360e4cc7a46cd799ea171df087ee/packages/mesa/patches/0015-ir3-array-to-ssa-resolve-trivial-phi-chains.patch
 
 ## Variants
 
