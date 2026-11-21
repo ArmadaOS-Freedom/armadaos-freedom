@@ -241,6 +241,7 @@ def stage_generation(
     binding: bytes,
     capsule: Mapping[str, bytes],
     trusted_key=signature.DEFAULT_TRUSTED_KEY,
+    on_stage=None,
 ) -> str:
     """Stage a new generation under boot/armada.
 
@@ -331,6 +332,8 @@ def stage_generation(
 
         # Re-verify the staged generation with the same verifier.
         verify_generation(gen, model, trusted_key=trusted_key)
+        if on_stage is not None:
+            on_stage(name, gen)
     except BaseException:
         shutil.rmtree(gen, ignore_errors=True)
         raise

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import stat
 import uuid
 
@@ -161,6 +162,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
               'requiresReboot': False}
     work = None
     created = False
+    created_generation = None
     with trial_confirmation._locked():
         try:
             if type(expected_channel) is not str or expected_channel not in _CHANNELS:
@@ -278,8 +280,13 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             if disk:
                 status['phase'] = 'preparing_armada_boot'
                 system_transaction._save_json(work, 'status.json', status)
+                def _generation_created(name, path):
+                    nonlocal created_generation
+                    created_generation = path
+
                 switch_plan = boot_disk_switch.prepare(
-                    root, initial, target_deployment, package, trusted_key=trusted_key)
+                    root, initial, target_deployment, package, trusted_key=trusted_key,
+                    on_stage=_generation_created)
                 old_sha = {
                     slot: boot_candidate._verify_claim(sources['slots'][slot]['boot'], 'old boot')['sha256']
                     for slot in ('a', 'b')
@@ -393,9 +400,19 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
         except Exception as exc:
             status.update(failedPhase=status.get('phase'), phase='failed',
                           state='failed', error=str(exc))
+            persisted = False
             if created:
                 try:
                     system_transaction._save_json(work, 'status.json', status)
+                    persisted = True
                 except Exception as save_exc:
                     status['persistenceError'] = str(save_exc)
+            if created_generation is not None and (persisted or not created):
+                try:
+                    if created_generation.is_dir():
+                        shutil.rmtree(created_generation)
+                        _io.fsync_dir(created_generation.parent, nofollow=True)
+                except OSError as cleanup_exc:
+                    status.setdefault('supplementalErrors', []).append(
+                        'generation cleanup failed: %s' % (cleanup_exc,))
             raise system_transaction.SystemTransactionError(str(exc), status) from exc

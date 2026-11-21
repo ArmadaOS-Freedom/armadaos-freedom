@@ -216,7 +216,7 @@ def _read_boot_active(boot):
     return link, target
 
 
-def prepare(root, initial, target, package, *, trusted_key):
+def prepare(root, initial, target, package, *, trusted_key, on_stage=None):
     boot, expected = _active(root, initial, trusted_key)
     options = deployment_options.read_deployment_options(
         sysroot_path=root,
@@ -258,6 +258,7 @@ def prepare(root, initial, target, package, *, trusted_key):
         binding=boot_disk_generation.encode_binding(legacy_ostree_pointer, target),
         capsule=capsule,
         trusted_key=trusted_key,
+        on_stage=on_stage,
     )
     return {
         "expected": expected,
