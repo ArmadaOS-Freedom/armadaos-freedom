@@ -118,8 +118,12 @@ the same request with `sudo armada-reboot-edl --next android` (also `linux`,
 `diagnostic` or `edl`), then request a normal reboot. `--check` reads state,
 and `--cancel` clears a pending request.
 
-The Boot logging setting is available when the internal backup has a version 3
-descriptor. It controls future log writes for the internal Linux and diagnostic entries, and keeps existing records.
+The Launcher debug mode setting is available when the internal backup has a version 3
+descriptor, and is shown before the optional one-shot action row on supported
+TB322FC and TB323FU boards. It controls future log writes for the internal Linux
+and diagnostic entries, and keeps existing records. When it is off, the
+one-shot action row is hidden and a queued one-shot action is preserved; turning
+it back on shows the next boot action again.
 `sudo armada-reboot-edl --log on` and `--log off` change the same setting in Linux.
 
 ## Linux entry to EDL
