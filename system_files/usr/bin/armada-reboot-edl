@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arm a one-shot launcher EDL request. Default is a read-only capability check."""
+"""Manage one-shot launcher requests. Default is a read-only capability check."""
 import argparse
 import fcntl
 import json
@@ -41,39 +41,55 @@ def parse_store(header, region, partition_uuid, board):
     for index in (0, 1):
         raw = region[(index+1)*SLOT_BYTES:(index+2)*SLOT_BYTES]
         version = u32(raw, 8)
-        if version not in (1, 2, 3):
+        if version not in (1, 2, 3, 4):
             continue
-        reserved = (68, 72, 76)[version-1]
+        reserved = 68 if version == 1 else 72 if version == 2 else 76
         values = [u32(raw, 56), u32(raw, 60), u32(raw, 64),
-                  u32(raw, 68) if version >= 2 else 0, u32(raw, 72) if version == 3 else 0]
+                  u32(raw, 68) if version >= 2 else 0, u32(raw, 72) if version >= 3 else 0]
+        packed = values[4]
+        valid_action = (packed <= 1 if version < 4 else
+                        (packed & ~0x1ff) == 0 and (packed & 0xff) <= 4)
         if (raw[:8] == b'KSCFGR1\0' and u32(raw, 12) == SLOT_BYTES and u64(raw, 16) > 0 and
             raw[24:40] == part and raw[40:56] == installation and values[0] <= 2 and
             values[1] <= (3 if version == 1 else 4) and values[2] <= 1 and values[3] <= 3 and
-            values[4] <= 1 and not any(raw[reserved:4092]) and zlib.crc32(raw[:4092]) == u32(raw, 4092)):
-            valid.append({'index': index, 'sequence': u64(raw, 16), 'values': values, 'raw': raw})
+            valid_action and
+            not any(raw[reserved:4092]) and zlib.crc32(raw[:4092]) == u32(raw, 4092)):
+            valid.append({'index': index, 'sequence': u64(raw, 16), 'values': values, 'raw': raw,
+                          'version': version})
     require(valid, 'No valid saved settings; boot the launcher and save settings first')
     if len(valid) == 2 and valid[0]['sequence'] == valid[1]['sequence']:
         require(valid[0]['raw'] == valid[1]['raw'], 'Conflicting settings generations')
     best = max(valid, key=lambda item: item['sequence'])
     return {'header': header, 'region': region, 'partition_uuid': partition_uuid, 'board': board,
-            'partition_bytes': part, 'installation': installation, 'best': best}
+            'partition_bytes': part, 'installation': installation, 'best': best,
+            'descriptor_version': layout.descriptor_version}
 
-def set_request(fd, store, action):
-    require(action in (0, 1), 'Unknown request')
+def set_request(fd, store, action, *, log_enabled=None):
+    require(isinstance(action, int) and 0 <= action <= 4, 'Unknown request')
     require(os.pread(fd, REGION_BYTES, 0) == store['header'] and
             os.pread(fd, REGION_BYTES, REGION_OFFSET) == store['region'],
             'Settings changed since they were read')
     best = store['best']
-    if best['values'][4] == action:
+    old_raw = best['values'][4]
+    old_flag = old_raw & 0x100
+    if log_enabled is None:
+        flag = old_flag
+    elif log_enabled:
+        flag = 0
+    else:
+        flag = 0x100
+    packed = action | flag
+    if old_raw == packed:
         return best['sequence']
     require(best['sequence'] < 2**64-1, 'Settings sequence exhausted')
+    version = 3 if packed <= 1 else 4
     sequence = best['sequence'] + 1
     raw = bytearray(SLOT_BYTES)
     raw[:8] = b'KSCFGR1\0'
-    struct.pack_into('<IIQ', raw, 8, 3, SLOT_BYTES, sequence)
+    struct.pack_into('<IIQ', raw, 8, version, SLOT_BYTES, sequence)
     raw[24:40] = store['partition_bytes']
     raw[40:56] = store['installation']
-    struct.pack_into('<5I', raw, 56, *best['values'][:4], action)
+    struct.pack_into('<5I', raw, 56, *best['values'][:4], packed)
     struct.pack_into('<I', raw, 4092, zlib.crc32(raw[:4092]))
     offset = REGION_OFFSET + (2-best['index']) * SLOT_BYTES
     require(os.pwrite(fd, raw, offset) == SLOT_BYTES, 'Incomplete settings write; not rebooting')
@@ -81,8 +97,14 @@ def set_request(fd, store, action):
     require(os.pread(fd, SLOT_BYTES, offset) == raw, 'Settings readback failed; not rebooting')
     return sequence
 
-def device_context():
-    return locate_recovery_partition(require_edl=True)
+def launcher_settings_available():
+    try:
+        return Path('/proc/device-tree/chosen/kshim,launcher-settings-version').read_bytes() == struct.pack('>I', 4)
+    except FileNotFoundError:
+        return False
+
+def device_context(*, require_edl=True):
+    return locate_recovery_partition(require_edl=require_edl)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -90,31 +112,58 @@ def main(argv=None):
     mode.add_argument('--check', action='store_true', help='Check support without writing (default)')
     mode.add_argument('--reboot', action='store_true', help='Arm one-shot EDL and reboot normally')
     mode.add_argument('--cancel', action='store_true', help='Cancel an armed request without rebooting')
+    mode.add_argument('--next', choices=('android', 'linux', 'diagnostic', 'edl'),
+                        help='Store a next-boot action (write only)')
+    mode.add_argument('--log', choices=('on', 'off'),
+                        help='Enable/disable boot logging (write only)')
     args = parser.parse_args(argv)
-    dev, part_uuid, board, device_number = device_context()
-    writing = args.reboot or args.cancel
+    v4 = launcher_settings_available()
+    if args.next is not None or args.log is not None:
+        require(v4, 'This launcher does not support next-boot and log settings')
+    writing = args.reboot or args.cancel or args.next is not None or args.log is not None
+    dev, part_uuid, board, device_number = device_context(
+        require_edl=(not v4 or args.reboot or args.next == 'edl'))
     fd = os.open(dev, (os.O_RDWR if writing else os.O_RDONLY) | os.O_CLOEXEC)
     try:
         require(os.fstat(fd).st_rdev == device_number, 'Backup device changed')
         fcntl.flock(fd, (fcntl.LOCK_EX if writing else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         store = parse_store(os.pread(fd, REGION_BYTES, 0), os.pread(fd, REGION_BYTES, REGION_OFFSET), part_uuid, board)
+        packed = store['best']['values'][4]
+        current_action = packed & 0xff
         if not writing:
             print(json.dumps({'ready': True, 'board': board, 'partition': str(dev),
-                              'sequence': store['best']['sequence'], 'pending_edl': bool(store['best']['values'][4])}))
+                              'sequence': store['best']['sequence'], 'pending_edl': current_action == 1,
+                              'nextAction': current_action, 'v4SettingsAvailable': v4,
+                              'bootLogEnabled': store['descriptor_version'] == 3 and not (packed & 0x100)}))
             return 0
+        require(v4 or store['best']['version'] < 4, 'This launcher firmware does not support this settings record')
         if args.cancel:
             sequence = set_request(fd, store, 0)
             print(json.dumps({'cancelled': True, 'sequence': sequence}))
             return 0
-        require(store['best']['values'][4] == 0, 'An EDL request is already armed')
-        sequence = set_request(fd, store, 1)
-        print(json.dumps({'armed_edl': True, 'sequence': sequence}), flush=True)
-        result = subprocess.run(['systemctl', 'reboot'], check=False)
-        if result.returncode:
-            current = parse_store(os.pread(fd, REGION_BYTES, 0), os.pread(fd, REGION_BYTES, REGION_OFFSET), part_uuid, board)
-            set_request(fd, current, 0)
-            raise Refuse('System reboot failed; the EDL request was cancelled')
-        return 0
+        if args.reboot:
+            require(current_action == 0, 'A next action is already armed')
+            sequence = set_request(fd, store, 1)
+            print(json.dumps({'armed_edl': True, 'sequence': sequence}), flush=True)
+            result = subprocess.run(['systemctl', 'reboot'], check=False)
+            if result.returncode:
+                current = parse_store(os.pread(fd, REGION_BYTES, 0), os.pread(fd, REGION_BYTES, REGION_OFFSET), part_uuid, board)
+                set_request(fd, current, 0)
+                raise Refuse('System reboot failed; the EDL request was cancelled')
+            return 0
+        action_map = {'android': 2, 'linux': 3, 'diagnostic': 4, 'edl': 1}
+        next_action = action_map[args.next] if args.next is not None else None
+        if next_action is not None:
+            require(current_action in (0, next_action), 'A different next action is already pending')
+            sequence = set_request(fd, store, next_action)
+            print(json.dumps({'next': args.next, 'sequence': sequence}))
+            return 0
+        if args.log is not None:
+            require(store['descriptor_version'] == 3, 'Boot log storage is not provisioned')
+            sequence = set_request(fd, store, current_action, log_enabled=args.log == 'on')
+            print(json.dumps({'log': args.log, 'sequence': sequence}))
+            return 0
+        raise Refuse('No action requested')
     finally:
         os.close(fd)
 

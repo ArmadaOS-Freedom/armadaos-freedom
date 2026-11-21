@@ -44,3 +44,7 @@ struct kshim_initrd_context {
 /* Returns 0 on success, non-zero on rejection or mutation failure. */
 int kshim_initrd_apply(void *handoff, size_t capacity,
                        const struct kshim_initrd_context *ctx);
+
+int kshim_initrd_apply_disk(void *handoff, size_t capacity,
+                            uint64_t kernel_start, uint64_t kernel_size,
+                            uint64_t initrd_start, uint64_t initrd_bytes);

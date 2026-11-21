@@ -41,4 +41,4 @@ int kshim_settings_save(struct kshim_settings_session *,
 int kshim_settings_note_boot(struct kshim_settings_session *,uint32_t target);
 /* Consume a one-shot request through the normal verified transaction. Output
  * remains0 on failure; successful consumption never changes boot defaults. */
-int kshim_settings_take_action(struct kshim_settings_session *,uint32_t *action);
+int kshim_settings_take_action(struct kshim_settings_session *,uint32_t *action,int diagnostic_target_valid);

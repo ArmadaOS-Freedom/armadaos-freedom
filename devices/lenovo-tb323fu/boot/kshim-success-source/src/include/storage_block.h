@@ -41,4 +41,8 @@ uint32_t kshim_crc32(const void *, size_t);
  * and unique ARMADA_BACKUP name. Never repairs or writes GPT. */
 int kshim_gpt_find_backup(const struct kshim_blockdev *, struct kshim_partition *,
                           void *scratch, size_t scratch_bytes);
+/* Same GPT validation as kshim_gpt_find_backup, but matches exactly the
+ * UTF-16LE partition name ARMADA_BOOT (the Linux boot partition). */
+int kshim_gpt_find_linux_boot(const struct kshim_blockdev *, struct kshim_partition *,
+                              void *scratch, size_t scratch_bytes);
 #endif

@@ -1,8 +1,8 @@
 # Launcher settings storage
 
-The TB322FC launcher stores settings in the internal UFS backup partition and supports
-remembering the last boot target. Native settings are enabled in the TB322FC profile;
-TB323FU and TF hardware integration are not enabled by this change.
+The TB322FC and TB323FU launchers store settings in the internal UFS backup
+partition. They can remember the last boot target, queue a one-shot boot and
+control whether the launcher writes boot logs.
 
 The storage policy discovers internal UFS and TF independently when adapters are available. Each usable medium
 must have a GPT partition named ARMADA_BACKUP with a nonzero unique partition UUID
@@ -14,7 +14,7 @@ local to one installation and are not compared between media. If neither medium 
 settings, an explicitly provisioned empty internal store is preferred, followed by TF.
 A failed save stays an error on the selected medium; it does not silently write elsewhere.
 
-## v3 backup layout
+## Backup layout
 
 All offsets below are relative to the start of ARMADA_BACKUP.
 
@@ -26,7 +26,9 @@ All offsets below are relative to the start of ARMADA_BACKUP.
 | Config descriptor | 2147418112 | 4096 | Installer |
 | Config slot A | 2147422208 | 4096 | Launcher |
 | Config slot B | 2147426304 | 4096 | Launcher |
-| Reserved zero bytes | 2147430400 | 53248 | Reserved |
+| Boot log slots (descriptor v3) | 2147430400 | 16384 | Launcher |
+| Update transaction slots (descriptor v3) | 2147446784 | 8192 | Launcher and updater |
+| Reserved zero bytes (descriptor v3) | 2147454976 | 28672 | Reserved |
 
 The v3 outer JSON header declares configRegionOffset, configRegionBytes,
 configPartitionUuid and configBoardId. These fields are checked against the descriptor,
@@ -45,26 +47,36 @@ Integers are little-endian; UUIDs use RFC 4122 byte order, not GPT mixed-endian 
 Each 4096-byte structure ends with IEEE CRC-32 over its first 4092 bytes.
 
 Descriptor:
-- 0: KSCFGV3 followed by NUL; 8: version 1; 12: length 4096.
+- 0: KSCFGV3 followed by NUL; 8: descriptor version 1, 2 or 3; 12: length 4096.
 - 16: partition length u64; 24: recovery payload end u64; 32: region offset u64.
 - 40: region length 65536; 44: slot length 4096.
 - 48: partition UUID; 64: installation UUID.
 - 80/84: slot offsets 4096/8192 relative to config region.
-- 88: actual board ID (1 TB322FC, 2 TB323FU); 92..4091: zero.
+- 88: actual board ID (1 TB322FC, 2 TB323FU).
+- Descriptors 1/2: 92..4091 must be zero. Descriptor 2 permits the reserved
+  boot-log area to contain opaque bytes.
+- Descriptor 3: 92/96: update transaction slot offsets 28672/32768 relative to
+  the config region; 100: slot length 4096; 104..4091: zero. Boot log slots start
+  at offsets 12288 and 20480. Each uses the first 4096 bytes of its 8192-byte slot.
 
 Settings record:
-- 0: KSCFGR1 followed by NUL (family magic); 8: version 1, 2 or 3; 12: length 4096.
+- 0: KSCFGR1 followed by NUL (family magic); 8: record version 1, 2, 3 or 4; 12: length 4096.
 - 16: nonzero sequence u64; 24: partition UUID; 40: installation UUID.
 - 56: device choice (auto / TB322FC / TB323FU = 0/1/2).
-- 60: default target (manifest / Android / internal / TF = 0/1/2/3; versions 2/3 also accept remember-last = 4).
+- 60: default target (manifest / Android / internal / TF = 0/1/2/3; versions 2 through 4 also accept remember-last = 4).
 - 64: language (Chinese / English = 0/1).
 - Version 1: 68..4091 must be zero; loaded last target is 0 (no history).
-- Versions 2/3: 68: last target (none / Android / internal / TF = 0/1/2/3).
+- Versions 2 through 4: 68: last target (none / Android / internal / TF = 0/1/2/3).
 - Version 2: 72..4091 must be zero.
 - Version 3: 72: next action (none / one-shot EDL = 0/1); 76..4091 must be zero.
 
-New saves write version 3. The reader accepts all three versions without moving the config
-region or changing its descriptor. Older launchers cannot read newer settings record versions; a rollback that must preserve settings needs a compatible reader.
+Version 4 uses the word at offset 72. The low byte selects none (0), EDL (1),
+Android (2), internal Linux (3), or internal Linux diagnostic (4). Bit 8 disables
+boot logging. Bits 9 through 31 and bytes 76 through 4091 must be zero.
+
+A save uses version 3 when the word is 0 or 1 and uses version 4 otherwise.
+All four record versions use the same region and descriptor. A rollback that
+preserves active version 4 settings needs a compatible launcher.
 
 The newest valid record wins. Two different valid records with equal sequence numbers
 are a conflict. Save writes the older or invalid slot, flushes the device and reads back
@@ -85,6 +97,34 @@ booting. Merely highlighting a row, changing language or using a power action do
 change the history. Fixed default modes also retain the actual launch history. Enabling
 remember mode without history preserves the current valid default. A repeated launch
 of the same recorded target skips writing unless an earlier save is uncertain.
+
+## One-shot boot and boot logging
+
+The launcher Settings page can queue Android, internal Linux or internal Linux
+diagnostic for the next reboot. The launcher consumes the request durably before
+dispatch and keeps the permanent default and last normal boot target. An absent
+or ambiguous target falls back to the regular boot selection.
+
+A one-shot TB322FC or TB323FU diagnostic schedules ordinary Linux for the
+following boot. The matching initramfs reboots at the dracut pre-mount
+checkpoint. A diagnostic chosen directly from the TB322FC boot menu still stops
+at the pre-mount shell; a TB323FU manual diagnostic instead continues using
+verbose startup arguments. With logging enabled, the automatic return
+preserves the diagnostic and ordinary handoffs in the two recovery-area log
+records.
+
+With the advertised `kshim,launcher-settings-version` capability, Linux can make
+the same request with `sudo armada-reboot-edl --next android` (also `linux`,
+`diagnostic` or `edl`), then request a normal reboot. `--check` reads state,
+and `--cancel` clears a pending request.
+
+The Launcher debug mode setting is available when the internal backup has a version 3
+descriptor, and is shown before the optional one-shot action row on supported
+TB322FC and TB323FU boards. It controls future log writes for the internal Linux
+and diagnostic entries, and keeps existing records. When it is off, the
+one-shot action row is hidden and a queued one-shot action is preserved; turning
+it back on shows the next boot action again.
+`sudo armada-reboot-edl --log on` and `--log off` change the same setting in Linux.
 
 ## Linux entry to EDL
 

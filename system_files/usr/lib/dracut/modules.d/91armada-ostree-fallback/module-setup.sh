@@ -19,6 +19,9 @@ install() {
     inst_script "$moddir/armada-bound-deployment.sh" \
         /usr/libexec/armada/armada-bound-deployment
 
+    # Diagnostic auto-return: sourced in pre-mount before pivot.
+    inst_hook pre-mount 90 "$moddir/armada-diagnostic-return.sh"
+
     # Inside prepare-root's start job: ordered after sysroot.mount by its own unit.
     mkdir -p "$initdir/$systemdsystemunitdir/ostree-prepare-root.service.d"
     printf '[Service]\nExecStartPre=/usr/libexec/armada/armada-ostree-fallback\nExecStartPost=/usr/libexec/armada/armada-ostree-fallback --restore\n' \

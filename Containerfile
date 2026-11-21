@@ -149,6 +149,7 @@ RUN python3 -m venv /opt/kconfig \
 ENV PATH="/opt/kconfig/bin:${PATH}"
 
 COPY build_files/build-edl-runtime.sh build_files/edl_device_config.py build_files/edl-devices.json /runtime-source/build_files/
+COPY system_files/etc/pki/containers/armadaos-freedom.pub /runtime-source/system_files/etc/pki/containers/armadaos-freedom.pub
 COPY build_files/update_ab_inspect.c build_files/update_ufs_boot.c build_files/update_ufs_boot.h /runtime-source/build_files/
 COPY devices/lenovo-tb323fu/boot/kshim-success-source /runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source
 

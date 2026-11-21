@@ -382,3 +382,96 @@ int kshim_initrd_apply(void *handoff, size_t capacity,
     }
     return 0;
 }
+
+int kshim_initrd_apply_disk(void *handoff, size_t capacity,
+                           uint64_t kernel_start, uint64_t kernel_size,
+                           uint64_t initrd_start, uint64_t initrd_bytes)
+{
+    uint64_t kernel_end, initrd_end, rounded_end;
+    int chosen, rc;
+
+    if (!handoff || capacity > (size_t)INT_MAX)
+        return -FDT_ERR_BADVALUE;
+    if (kernel_size == 0 || initrd_bytes == 0)
+        return -FDT_ERR_BADVALUE;
+
+    /* Overflow-safe half-open intervals. */
+    if (kernel_start > UINT64_MAX - kernel_size)
+        return -FDT_ERR_BADVALUE;
+    if (initrd_start > UINT64_MAX - initrd_bytes)
+        return -FDT_ERR_BADVALUE;
+    kernel_end = kernel_start + kernel_size;
+    initrd_end = initrd_start + initrd_bytes;
+
+    /* Initrd base must be 64 KiB aligned. */
+    if ((initrd_start & (INITRD_PAGE_64K - 1)) != 0)
+        return -FDT_ERR_BADVALUE;
+
+    /* Page-rounded safety end for reservation coverage. */
+    if (initrd_end > UINT64_MAX - (INITRD_PAGE_64K - 1))
+        return -FDT_ERR_BADVALUE;
+    rounded_end = (initrd_end + (INITRD_PAGE_64K - 1)) & ~(INITRD_PAGE_64K - 1);
+
+    /* Non-overlap: exact kernel vs page-rounded initrd. */
+    if (kernel_start < rounded_end && initrd_start < kernel_end)
+        return -FDT_ERR_BADVALUE;
+
+    /* Validate the incoming blob before mutation. */
+    rc = dt_validate(handoff, capacity);
+    if (rc != 0)
+        return rc;
+
+    /* Both must reside within a single 32 GiB span (1 GiB-aligned floor). */
+    {
+        uint64_t span_lo, span_hi;
+        span_lo = (kernel_start < initrd_start ? kernel_start : initrd_start)
+                  & ~(INITRD_WINDOW_ALIGN - 1);
+        span_hi = kernel_end > rounded_end ? kernel_end : rounded_end;
+        if (span_hi - span_lo > INITRD_WINDOW_MAX)
+            return -FDT_ERR_BADVALUE;
+    }
+
+    /* Kernel fully covered and reservation-free. */
+    if (!initrd_ram_covers(handoff, kernel_start, kernel_end))
+        return -FDT_ERR_BADVALUE;
+    if (initrd_reservations_conflict(handoff, kernel_start, kernel_end))
+        return -FDT_ERR_BADVALUE;
+
+    /* Rounded initrd interval fully covered and reservation-free. */
+    if (!initrd_ram_covers(handoff, initrd_start, rounded_end))
+        return -FDT_ERR_BADVALUE;
+    if (initrd_reservations_conflict(handoff, initrd_start, rounded_end))
+        return -FDT_ERR_BADVALUE;
+
+
+
+    /* All semantic checks passed: open in place, then mutate. */
+    rc = fdt_open_into(handoff, handoff, (int)capacity);
+    if (rc != 0)
+        return rc;
+
+    chosen = fdt_path_offset(handoff, "/chosen");
+    if (chosen < 0)
+        return chosen;
+
+    /* Drop any previous reference; not-present is fine. */
+    rc = fdt_delprop(handoff, chosen, "kshim,initrd-entry");
+    if (rc != 0 && rc != -FDT_ERR_NOTFOUND)
+        return rc;
+
+    chosen = fdt_path_offset(handoff, "/chosen");
+    if (chosen < 0)
+        return chosen;
+    rc = fdt_setprop_u64(handoff, chosen, "linux,initrd-start", initrd_start);
+    if (rc != 0)
+        return rc;
+
+    chosen = fdt_path_offset(handoff, "/chosen");
+    if (chosen < 0)
+        return chosen;
+    rc = fdt_setprop_u64(handoff, chosen, "linux,initrd-end", initrd_end);
+    if (rc != 0)
+        return rc;
+
+    return 0;
+}

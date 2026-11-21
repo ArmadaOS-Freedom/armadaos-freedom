@@ -592,6 +592,7 @@ enum menu_action {
      * row that cannot be booted for the current effective board; it must never
      * return a payload. */
     MENU_SETTINGS, MENU_DEVICE, MENU_DEFAULT,
+    MENU_NEXT_BOOT_CYCLE, MENU_BOOT_LOG_TOGGLE,
     MENU_DEVICE_SET, MENU_DEFAULT_SET, MENU_UNAVAILABLE,
     MENU_AB, MENU_AB_CHOOSE, MENU_AB_COMMIT,
 };
@@ -663,8 +664,16 @@ struct menu_selection {
     char setting_device_name[KSHIM_INFO_VALUE_LEN];
     char setting_default_name[KSHIM_INFO_VALUE_LEN];
     char setting_language_name[KSHIM_INFO_VALUE_LEN];
+    /* One-shot next-boot row and boot-log row (only on TB322FC/TB323FU with
+     * internal settings). Buffers live for the whole menu. */
+    char setting_next_boot_name[KSHIM_INFO_VALUE_LEN];
+    char setting_boot_log_name[KSHIM_INFO_VALUE_LEN];
+    size_t next_boot_row, boot_log_row;
     char device_auto_name[KSHIM_INFO_VALUE_LEN];
-    char setting_descriptions[3][576];
+    /* Up to 5 settings rows can carry the storage-suffix description; the
+     * last row (Back) is skipped, so the array matches the maximum non-Back
+     * rows when the two pending rows are present. */
+    char setting_descriptions[5][576];
     int current_slot;
     char ab_overview[1536];
     char ab_details[2][1536];
@@ -690,6 +699,24 @@ static int settings_persist(struct menu_selection *menu, const struct boot_setti
     if (!menu->store->save_uncertain && v.device_choice == old->device_choice && v.default_target == old->default_target &&
         v.language == old->language && v.last_target == old->last_target) return 0;
     if (kshim_settings_save(menu->store, &v) == 0) return 0;
+    *failure = kshim_menu_text(KSHIM_TEXT_SETTINGS_SAVE_FAILED);
+    return -1;
+}
+/* Flush only the pending one-shot action/flags. Preserves device/default/
+ * language/last_target exactly as they are in the bound store. Uses the same
+ * save-failure wording as settings_persist. Returns 0 on success or on no-op,
+ * -1 on failure. Never touches boot_settings or the persistent default. */
+static int settings_persist_pending(struct menu_selection *menu,
+                                    uint32_t next_action, const char **failure)
+{
+    if (!menu->store) return 0;
+    struct kshim_config_values v = menu->store->values;
+    v.next_action = next_action;
+    if (!menu->store->save_uncertain && v.next_action == menu->store->values.next_action)
+        return 0;
+    if (kshim_settings_save(menu->store, &v) == 0) {
+        return 0;
+    }
     *failure = kshim_menu_text(KSHIM_TEXT_SETTINGS_SAVE_FAILED);
     return -1;
 }
@@ -721,6 +748,8 @@ static int menu_append(struct menu_page *page, const char *name, const char *des
     case MENU_SETTINGS:
     case MENU_DEVICE:
     case MENU_DEFAULT:
+    case MENU_NEXT_BOOT_CYCLE:
+    case MENU_BOOT_LOG_TOGGLE:
     case MENU_AB:
     case MENU_AB_CHOOSE:
         page->action_labels[row] = KSHIM_MENU_ACTION_ENTER;
@@ -1092,6 +1121,44 @@ static void settings_fill_device_name(const struct menu_selection *menu,
                  settings_board_code(menu->effective));
     }
 }
+/* Feature gate for the compact pending-action rows: physical TB322FC / TB323FU
+ * only, internal settings store present. Must never widen a detected board to a
+ * different one; an UNKNOWN or other board hides the rows. */
+static int settings_pending_rows_eligible(const struct menu_selection *menu)
+{
+    if (!menu->store) return 0;
+    if (menu->store->source != KSHIM_SETTINGS_INTERNAL) return 0;
+    if (menu->info && (menu->info->board == DEVICE_BOARD_TB322FC ||
+                       menu->info->board == DEVICE_BOARD_TB323FU))
+        return 1;
+    return 0;
+}
+/* The boot-log row additionally requires an internal store with a v3
+ * descriptor. There is no accessor; the raw field is read directly on the
+ * bound store only (never on a null store or a non-internal medium). */
+static int settings_boot_log_row_eligible(const struct menu_selection *menu)
+{
+    if (!settings_pending_rows_eligible(menu)) return 0;
+    return menu->store->medium[0].config.descriptor_version == 3;
+}
+/* Human-readable label for the current one-shot action; falls back to None when
+ * the flag-only encoding has no action. Preserves the EDL request so a user
+ * can see it is still queued. */
+static const char *settings_next_boot_value(const struct kshim_config_values *v)
+{
+    uint32_t a = kshim_next_action_value(v->next_action);
+    switch (a) {
+    case 1: return kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_EDL);
+    case 2: return kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_ANDROID);
+    case 3: return kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_LINUX);
+    case 4: return kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_DIAG);
+    default: return kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_NONE);
+    }
+}
+static int settings_boot_log_open(const struct kshim_config_values *v)
+{
+    return kshim_next_action_flags(v->next_action) & KSHIM_FLAG_NO_BOOT_LOG ? 0 : 1;
+}
 /* Fill the Settings "default system" row name with the current value. */
 static const char *settings_system_name(kshim_menu_role_t role)
 {
@@ -1296,6 +1363,36 @@ static int menu_fill_settings(struct menu_selection *menu)
                     KSHIM_MENU_ROLE_LANGUAGE))
         return -1;
 #endif
+    /* Compact pending-action row: present only on physical TB322FC/TB323FU
+     * with an internal settings store. Never queues reboot, never edits the
+     * persistent default or last boot; cycling here only writes the one-shot
+     * next_action (plus preserved flags). Back stays last. */
+    menu->next_boot_row = menu->boot_log_row = 0;
+    if (settings_pending_rows_eligible(menu)) {
+        /* The debug toggle is always shown on supported boards with a v3
+         * internal store; it also reveals the optional one-shot action. */
+        if (settings_boot_log_row_eligible(menu)) {
+            snprintf(menu->setting_boot_log_name, sizeof(menu->setting_boot_log_name),
+                     kshim_menu_text(KSHIM_TEXT_SETTINGS_BOOT_LOG_FMT),
+                     kshim_menu_text(settings_boot_log_open(&menu->store->values) ?
+                         KSHIM_TEXT_SETTINGS_BOOT_LOG_OPEN : KSHIM_TEXT_SETTINGS_BOOT_LOG_CLOSED));
+            menu->boot_log_row = menu->pages[MENU_PAGE_SETTINGS].count;
+            if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], menu->setting_boot_log_name,
+                            kshim_menu_text(KSHIM_TEXT_SETTINGS_BOOT_LOG_DESC),
+                            MENU_BOOT_LOG_TOGGLE, 0, KSHIM_MENU_ROLE_DEFAULT))
+                return -1;
+        }
+        if (menu->boot_log_row && settings_boot_log_open(&menu->store->values)) {
+            snprintf(menu->setting_next_boot_name, sizeof(menu->setting_next_boot_name),
+                     kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_FMT),
+                     settings_next_boot_value(&menu->store->values));
+            menu->next_boot_row = menu->pages[MENU_PAGE_SETTINGS].count;
+            if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], menu->setting_next_boot_name,
+                            kshim_menu_text(KSHIM_TEXT_SETTINGS_NEXT_BOOT_DESC),
+                            MENU_NEXT_BOOT_CYCLE, 0, KSHIM_MENU_ROLE_DEFAULT))
+                return -1;
+        }
+    }
     if (menu_append(&menu->pages[MENU_PAGE_SETTINGS], KSHIM_STR_BACK,
                     KSHIM_MENU_DESC_BACK,
                     MENU_BACK, 0, KSHIM_MENU_ROLE_BACK))
@@ -1682,6 +1779,56 @@ static int menu_activate(struct menu_selection *menu, size_t index,
         return 2;
     }
 #endif
+    if (action == MENU_NEXT_BOOT_CYCLE) {
+        if (!settings_boot_log_row_eligible(menu) || !menu->boot_log_row ||
+            !settings_boot_log_open(&menu->store->values)) {
+            *failure = KSHIM_STR_UNAVAILABLE;
+            return 0;
+        }
+        /* Cycle NONE -> ANDROID -> LINUX -> DIAG -> NONE. An existing EDL
+         * request never matches any of these so the first press lands on
+         * NONE (the only path that clears it); subsequent presses move on.
+         * ANDROID/LINUX/DIAG also require a unique board-safe candidate. */
+        uint32_t cur_flags = kshim_next_action_flags(menu->store->values.next_action);
+        uint32_t a = kshim_next_action_value(menu->store->values.next_action);
+        uint32_t next_action = kshim_next_action_pack(KSHIM_ACTION_NONE, cur_flags);
+        for (int step = 1; step <= 5; ++step) {
+            unsigned cand = (a == KSHIM_ACTION_EDL ? 4u : a) + (unsigned)step;
+            cand %= 5;
+            if (cand == KSHIM_ACTION_EDL) continue;
+            size_t caller;
+            if (cand == KSHIM_ACTION_ANDROID) {
+                if (!settings_system_caller(menu, BOOT_TARGET_ANDROID, &caller))
+                    continue;
+            } else if (cand == KSHIM_ACTION_LINUX) {
+                if (!settings_role_match(menu, KSHIM_MENU_ROLE_INTERNAL, &caller)) continue;
+            } else if (cand == KSHIM_ACTION_LINUX_DIAG) {
+                if (!settings_role_match(menu, KSHIM_MENU_ROLE_DIAGNOSTIC, &caller)) continue;
+            }
+            next_action = kshim_next_action_pack(cand, cur_flags);
+            break;
+        }
+        if (settings_persist_pending(menu, next_action, failure)) return 0;
+        if (menu_fill(menu)) return 2;
+        menu->page = MENU_PAGE_SETTINGS;
+        menu->pages[MENU_PAGE_SETTINGS].initial = menu->next_boot_row;
+        return 2;
+    }
+    if (action == MENU_BOOT_LOG_TOGGLE) {
+        if (!settings_boot_log_row_eligible(menu)) {
+            *failure = KSHIM_STR_UNAVAILABLE;
+            return 0;
+        }
+        uint32_t flags = kshim_next_action_flags(menu->store->values.next_action);
+        uint32_t pending = kshim_next_action_value(menu->store->values.next_action);
+        flags ^= KSHIM_FLAG_NO_BOOT_LOG;
+        uint32_t next_action = kshim_next_action_pack(pending, flags);
+        if (settings_persist_pending(menu, next_action, failure)) return 0;
+        if (menu_fill(menu)) return 2;
+        menu->page = MENU_PAGE_SETTINGS;
+        menu->pages[MENU_PAGE_SETTINGS].initial = menu->boot_log_row;
+        return 2;
+    }
     if (action == MENU_DEVICE) {
         menu->page = MENU_PAGE_DEVICE;
         menu->pages[MENU_PAGE_DEVICE].initial = (size_t)menu->boot.device_choice;

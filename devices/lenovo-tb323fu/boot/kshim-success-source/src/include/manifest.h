@@ -19,6 +19,7 @@ typedef enum {
     MF_ENTRY_TYPE_BLOB,
     MF_ENTRY_TYPE_DTB,
     MF_ENTRY_TYPE_MANIFEST,
+    MF_ENTRY_TYPE_DISK_LINUX,
 } MANIFEST_ENTRY_TYPE;
 
 typedef enum {

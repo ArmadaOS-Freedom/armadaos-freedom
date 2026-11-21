@@ -193,3 +193,43 @@ int kshim_ufs_settings_ab_mark_success(struct kshim_ufs_settings *b,
     struct kshim_ab_status status;
     return ufs_ab(b,&status,true,true,0,expected_current);
 }
+
+/* storage_ufs_settings.c */
+
+int kshim_ufs_settings_read_boot(struct kshim_ufs_settings *b,
+                                 int (*reader)(const struct kshim_blockdev *, void *),
+                                 void *ctx)
+{
+	struct kshim_config_store current;
+	int r;
+	int fr;
+
+	if (!b || !b->preflight || !reader)
+		return -1;
+
+	r = begin_config(b, false, &current);
+	if (r)
+		return r;
+
+	r = reader(&b->lun.block, ctx);
+
+	fr = finish(b);
+	if (fr)
+		return fr;
+
+	return r;
+}
+
+int kshim_ufs_settings_log_boot(struct kshim_ufs_settings *b, uint32_t target,
+                                 uint32_t phase, int32_t status)
+{
+    if (!b || !b->preflight)
+        return KSHIM_STORAGE_ARG;
+    struct kshim_config_store current;
+    int rc=begin_config(b,true,&current);
+    if (rc) return rc; /* already released or never claimed */
+    rc=kshim_config_log_boot(&current,target,phase,status);
+    int cleanup=finish(b);
+    if (cleanup) return cleanup;
+    return rc;
+}
