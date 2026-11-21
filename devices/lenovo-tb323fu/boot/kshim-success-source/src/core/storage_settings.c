@@ -2,7 +2,12 @@
 #include <storage_settings.h>
 #include <string.h>
 static int values_valid(const struct kshim_config_values *v)
-{ return v&&v->device_choice<=2&&v->default_target<=4&&v->language<=1&&v->last_target<=3&&v->next_action<=1; }
+{
+    return v && v->device_choice <= 2 && v->default_target <= 4 &&
+           v->language <= 1 && v->last_target <= 3 &&
+           (v->next_action & ~(KSHIM_ACTION_MASK | KSHIM_FLAGS_KNOWN)) == 0 &&
+           kshim_next_action_value(v->next_action) <= KSHIM_ACTION_MAX;
+}
 int kshim_settings_open(struct kshim_settings_session *s,
                         const struct kshim_blockdev *internal,
                         const struct kshim_blockdev *tf,uint32_t board,
@@ -75,15 +80,26 @@ int kshim_settings_note_boot(struct kshim_settings_session *s,uint32_t target)
     return kshim_settings_save(s,&next);
 }
 /* Return the action only after its removal is durable. Reboot callers must
- * not dispatch a request after a failed clear. Normal settings/history stay. */
+ * not dispatch a request after a failed clear. Normal settings/history and
+ * the no-boot-log flag stay in place across the clear. */
 int kshim_settings_take_action(struct kshim_settings_session *s,uint32_t *action)
 {
     if (!s || !action) return KSHIM_STORAGE_ARG;
     *action=0;
-    if (!s->values.next_action) return 0;
-    if (s->values.next_action!=1) return KSHIM_STORAGE_ARG;
+    uint32_t packed=s->values.next_action;
+    uint32_t requested=kshim_next_action_value(packed);
+    if (!values_valid(&s->values)) return KSHIM_STORAGE_ARG;
+    if (!requested) return 0;   /* flag-only or none: nothing to consume */
+    /* TB322FC/TB323FU internal medium: convert the diagnostic request to a
+     * plain Linux boot in the same verified transaction.  Other actions and
+     * other media/boards keep the existing cleared-to-NONE behavior. */
+    uint32_t replacement=(requested==KSHIM_ACTION_LINUX_DIAG &&
+                          s->source==KSHIM_SETTINGS_INTERNAL &&
+                          (s->medium[0].config.board_id==1 ||
+                           s->medium[0].config.board_id==2)) ?
+                          KSHIM_ACTION_LINUX : KSHIM_ACTION_NONE;
     struct kshim_config_values next=s->values;
-    uint32_t requested=next.next_action;next.next_action=0;
+    next.next_action=kshim_next_action_pack(replacement,kshim_next_action_flags(packed));
     int rc=kshim_settings_save(s,&next);
     if (!rc) *action=requested;
     return rc;

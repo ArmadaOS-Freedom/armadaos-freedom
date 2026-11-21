@@ -218,7 +218,7 @@ static int kshim_append_uuid(char *out, size_t cap, size_t *used,
 int kshim_disk_bootargs(char out[2048], const char *signed_args,
                         const struct kshim_disk_entry *entry,
                         const struct kshim_disk_binding *binding,
-                        uint32_t board)
+                        uint32_t board, int auto_return)
 {
     size_t used = 0;
     size_t i, n;
@@ -283,8 +283,9 @@ int kshim_disk_bootargs(char out[2048], const char *signed_args,
     }
 
     /* Board-specific diagnostics. */
-    if (board == 1 && entry->diagnostic) {
-        /* TB322FC */
+    if (board == 1 && entry->diagnostic && !auto_return) {
+        /* TB322FC: manual diagnostic keeps the interactive pre-mount shell;
+         * auto-return must omit rd.break so the hook can reboot cleanly. */
         if (any) {
             if (kshim_append_cstr(out, 2048, &used, " ") != 0)
                 return -1;
