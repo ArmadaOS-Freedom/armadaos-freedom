@@ -60,8 +60,19 @@ class OfflinePrepareTest(unittest.TestCase):
 
     def _signed_package(self, *, commit: str = NEW_COMMIT, min_ver: str = "0.8.0",
                         operations: list[str] | None = None,
-                        priv_key: Path | None = None) -> tuple[bytes, bytes, dict]:
+                        priv_key: Path | None = None,
+                        extra_models: tuple[str, ...] = ()) -> tuple[bytes, bytes, dict]:
         pkg = release_fixture._upgrade_package_dict()
+        for idx, extra in enumerate(extra_models):
+            manifest = f"manifests/{extra.lower()}.json"
+            recovery = f"recovery/{extra}.json"
+            pkg["supportedModels"].append(extra)
+            pkg["files"].append(release_fixture.fixture._file_record(
+                manifest, "manifest", size=512, seed=40 + idx))
+            pkg["files"].append(release_fixture.fixture._file_record(
+                recovery, "manifest", size=128, seed=45 + idx))
+            pkg["modelManifests"][extra] = manifest
+            pkg["recoveryManifests"][extra] = recovery
         pkg["ostreeCommit"] = commit
         if operations is not None:
             pkg["operations"] = operations
@@ -93,7 +104,11 @@ class OfflinePrepareTest(unittest.TestCase):
             lock_path.parent.mkdir(parents=True, exist_ok=True)
 
             if document is None or signature_b64 is None:
-                doc, sig, _ = self._signed_package(commit=commit)
+                # The shared fixture package lists the Y700 models; a TB710FU
+                # case signs a package that also supports TB710FU.
+                doc, sig, _ = self._signed_package(
+                    commit=commit,
+                    extra_models=("TB710FU",) if model == "TB710FU" else ())
                 document = doc if document is None else document
                 signature_b64 = sig if signature_b64 is None else signature_b64
 
@@ -103,7 +118,7 @@ class OfflinePrepareTest(unittest.TestCase):
             sig_file.write_bytes(signature_b64)
 
             inactive = "b" if actual == "a" else "a"
-            board = 1 if model == "TB322FC" else 2
+            board = {"TB322FC": 1, "TB323FU": 2, "TB710FU": 3}.get(model, 99)
             physical = {
                 "model": model,
                 "actualSlot": actual,
@@ -283,7 +298,7 @@ class OfflinePrepareTest(unittest.TestCase):
             )
 
     def test_prepare_success_models_and_slots(self) -> None:
-        for model in ("TB322FC", "TB323FU"):
+        for model in ("TB322FC", "TB323FU", "TB710FU"):
             for actual in ("a", "b"):
                 with self.subTest(model=model, actual=actual), self._case(model=model, actual=actual) as env:
                     status = env.run()
@@ -308,8 +323,11 @@ class OfflinePrepareTest(unittest.TestCase):
                     manifest = json.loads(manifest_raw.decode("utf-8"))
                     self.assertEqual(manifest["installationUuid"], str(INSTALL_UUID))
                     self.assertEqual(manifest["recoveryPartUuid"], str(RECOVERY_UUID))
-                    self.assertEqual(manifest["board"], 1 if model == "TB322FC" else 2)
-                    self.assertEqual(len(manifest["files"]), 18 if model == "TB322FC" else 19)
+                    self.assertEqual(
+                        manifest["board"],
+                        {"TB322FC": 1, "TB323FU": 2, "TB710FU": 3}[model])
+                    # Only the GBL board (TB323FU) also captures efisp.
+                    self.assertEqual(len(manifest["files"]), 19 if model == "TB323FU" else 18)
                     for entry in manifest["files"]:
                         fpath = env.work / entry["path"]
                         self.assertTrue(fpath.is_relative_to(env.work))
@@ -343,10 +361,10 @@ class OfflinePrepareTest(unittest.TestCase):
                         self.assertNotEqual(plan["originalBootSha256"][s], plan["newBootSha256"][s])
                     env.assert_untouched()
 
-    def test_tb710fu_physical_model_is_rejected_before_package_use(self) -> None:
-        # TB710FU installs but has no dual-slot backend, so preparation refuses
-        # it even when the package descriptor is otherwise well formed.
-        with self._case(model="TB710FU") as env:
+    def test_unsupported_physical_model_is_rejected_before_package_use(self) -> None:
+        # A board outside the dual-slot capability table is refused even when
+        # the package descriptor is otherwise well formed.
+        with self._case(model="TB999XX") as env:
             with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
                 env.run()
             self.assertEqual(str(ctx.exception), "unsupported physical model")

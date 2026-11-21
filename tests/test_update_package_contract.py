@@ -267,11 +267,11 @@ class PackageContractTests(unittest.TestCase):
             validate_package(missing)
 
     def test_mixed_package_gates_offline_upgrade_per_model(self):
-        # TB710FU is a registered install target but has no dual-slot upgrade
-        # backend. Its presence must not suppress upgrade for the Y700 models,
-        # but it may never itself request offline-upgrade.
+        # Every shipped model, TB710FU included, has the dual-slot backend:
+        # a mixed package upgrades every selected model and may carry a
+        # TB710FU recovery manifest.
         self.assertIn("TB710FU", AUTHORIZED_MODELS)
-        self.assertNotIn("TB710FU", OFFLINE_UPGRADE_MODELS)
+        self.assertIn("TB710FU", OFFLINE_UPGRADE_MODELS)
 
         pkg = _mixed_offline_package()
         validated = validate_package(pkg)
@@ -279,33 +279,60 @@ class PackageContractTests(unittest.TestCase):
                          ["TB322FC", "TB323FU", "TB710FU"])
         self.assertEqual(validated["operations"], ["install", "offline-upgrade"])
         self.assertEqual(validated["recoveryManifests"], {})
-
         for model in ("TB322FC", "TB323FU", "TB710FU"):
             require_operation(pkg, model, "install", installer_version="0.10.0")
-        for model in ("TB322FC", "TB323FU"):
             require_operation(pkg, model, "offline-upgrade",
-                              updater_version="0.10.0")
-        with self.assertRaisesRegex(
-                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"):
-            require_operation(pkg, "TB710FU", "offline-upgrade",
                               updater_version="0.10.0")
 
         recovery = deepcopy(pkg)
         recovery["files"].append(_file_record("recovery/tb710fu.json", "manifest", 512, 55))
         recovery["recoveryManifests"] = {"TB710FU": "recovery/tb710fu.json"}
-        with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
-            validate_package(recovery)
+        self.assertEqual(
+            validate_package(recovery)["recoveryManifests"],
+            {"TB710FU": "recovery/tb710fu.json"},
+        )
 
-    def test_tb710fu_only_package_cannot_declare_offline_upgrade(self):
+        # The gate follows the capability table: a shipped model without the
+        # backend must not suppress upgrade for the others, but may never
+        # itself request offline-upgrade or carry recovery materials.
+        reduced = frozenset(OFFLINE_UPGRADE_MODELS - {"TB710FU"})
+        with patch("updates.package_contract.OFFLINE_UPGRADE_MODELS", reduced):
+            self.assertEqual(validate_package(pkg)["operations"],
+                             ["install", "offline-upgrade"])
+            require_operation(pkg, "TB710FU", "install",
+                              installer_version="0.10.0")
+            for model in ("TB322FC", "TB323FU"):
+                require_operation(pkg, model, "offline-upgrade",
+                                  updater_version="0.10.0")
+            with self.assertRaisesRegex(
+                    PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"):
+                require_operation(pkg, "TB710FU", "offline-upgrade",
+                                  updater_version="0.10.0")
+            with self.assertRaisesRegex(PackageError, "recoveryManifests are restricted"):
+                validate_package(recovery)
+
+    def test_tb710fu_only_package_declares_offline_upgrade(self):
         pkg = _mixed_offline_package(models=("TB710FU",))
-        with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
-            validate_package(pkg)
+        self.assertEqual(validate_package(pkg)["operations"],
+                         ["install", "offline-upgrade"])
+        require_operation(pkg, "TB710FU", "offline-upgrade",
+                          updater_version="0.10.0")
 
         install_only = _mixed_offline_package(models=("TB710FU",))
         install_only["operations"] = ["install"]
         self.assertEqual(validate_package(install_only)["operations"], ["install"])
         require_operation(install_only, "TB710FU", "install",
                           installer_version="0.10.0")
+
+    def test_single_model_without_backend_cannot_declare_offline_upgrade(self):
+        reduced = frozenset(OFFLINE_UPGRADE_MODELS - {"TB710FU"})
+        pkg = _mixed_offline_package(models=("TB710FU",))
+        with patch("updates.package_contract.OFFLINE_UPGRADE_MODELS", reduced):
+            with self.assertRaisesRegex(PackageError, "offline-upgrade is restricted"):
+                validate_package(pkg)
+            install_only = deepcopy(pkg)
+            install_only["operations"] = ["install"]
+            self.assertEqual(validate_package(install_only)["operations"], ["install"])
 
     def test_install_only_allowance_is_explicit_and_narrow(self):
         def custom_package():

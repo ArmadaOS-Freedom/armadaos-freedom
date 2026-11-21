@@ -30,6 +30,10 @@ VALID_JOB = "abcdef12-1234-5678-9abc-def012345678"
 ZERO_JOB = "00000000-0000-0000-0000-000000000000"
 COMPATIBLE_TB322FC = b"lenovo,elden\x00"
 COMPATIBLE_TB710FU = b"lenovo,tb710fu\x00"
+COMPATIBLE_UNKNOWN = b"lenovo,tb999xx\x00"
+# The worker gate follows the capability table; this reduced table models a
+# shipped board whose dual-slot backend flag is off.
+WITHOUT_TB710FU = frozenset(system_apply.SUPPORTED_MODELS - {"TB710FU"})
 
 
 class SystemApplyWorkerTests(unittest.TestCase):
@@ -284,17 +288,20 @@ class SystemApplyWorkerTests(unittest.TestCase):
         partial_config = write_config(
             {"stable": FULL_CHANNELS["stable"]}, self.base / "partial_cfg"
         )
+        supported = system_apply.SUPPORTED_MODELS
         cases = [
-            ("unsupported_tb710fu", COMPATIBLE_TB710FU, self.config_path, snapshot(), "stable", "TB710FU"),
-            ("channel_drift", COMPATIBLE_TB322FC, self.config_path, snapshot(channel="beta"), "stable", "differs"),
-            ("missing_selected_config", COMPATIBLE_TB322FC, partial_config, snapshot(channel="testing"), "testing", "testing"),
-            ("staged_exists", COMPATIBLE_TB322FC, self.config_path, snapshot(staged=record(commit=STAGED_COMMIT)), "stable", "staged"),
-            ("rollback_queued", COMPATIBLE_TB322FC, self.config_path, snapshot(rollback_queued=True), "stable", "rollback"),
+            ("unknown_board", COMPATIBLE_UNKNOWN, self.config_path, snapshot(), "stable", "Unsupported device", supported),
+            ("model_without_backend", COMPATIBLE_TB710FU, self.config_path, snapshot(), "stable", "TB710FU", WITHOUT_TB710FU),
+            ("channel_drift", COMPATIBLE_TB322FC, self.config_path, snapshot(channel="beta"), "stable", "differs", supported),
+            ("missing_selected_config", COMPATIBLE_TB322FC, partial_config, snapshot(channel="testing"), "testing", "testing", supported),
+            ("staged_exists", COMPATIBLE_TB322FC, self.config_path, snapshot(staged=record(commit=STAGED_COMMIT)), "stable", "staged", supported),
+            ("rollback_queued", COMPATIBLE_TB322FC, self.config_path, snapshot(rollback_queued=True), "stable", "rollback", supported),
         ]
-        for name, compat, cfg, snap_data, req_channel, err_match in cases:
+        for name, compat, cfg, snap_data, req_channel, err_match, models in cases:
             with self.subTest(case=name):
                 self.compatible_path.write_bytes(compat)
                 with patch.object(system_apply, "CONFIG_PATH", cfg), \
+                     patch.object(system_apply, "SUPPORTED_MODELS", models), \
                      patch("armada_os.snapshot", return_value=snap_data), \
                      patch.object(system_apply, "run_online_transaction") as run_tx:
                     result = system_apply.execute(req_channel, VALID_JOB)
@@ -318,15 +325,18 @@ class SystemApplyWorkerTests(unittest.TestCase):
         self.assertEqual(nonroot["phase"], "preflight")
         self.assertIn("root", nonroot["error"])
 
+        supported = system_apply.SUPPORTED_MODELS
         cases = [
-            ("unsupported_tb710fu", COMPATIBLE_TB710FU, snapshot(), "TB710FU"),
-            ("staged_exists", COMPATIBLE_TB322FC, snapshot(staged=record(commit=STAGED_COMMIT)), "staged"),
-            ("rollback_queued", COMPATIBLE_TB322FC, snapshot(rollback_queued=True), "rollback"),
+            ("unknown_board", COMPATIBLE_UNKNOWN, snapshot(), "Unsupported device", supported),
+            ("model_without_backend", COMPATIBLE_TB710FU, snapshot(), "TB710FU", WITHOUT_TB710FU),
+            ("staged_exists", COMPATIBLE_TB322FC, snapshot(staged=record(commit=STAGED_COMMIT)), "staged", supported),
+            ("rollback_queued", COMPATIBLE_TB322FC, snapshot(rollback_queued=True), "rollback", supported),
         ]
-        for name, compat, snap_data, err_match in cases:
+        for name, compat, snap_data, err_match, models in cases:
             with self.subTest(case=name):
                 self.compatible_path.write_bytes(compat)
                 with patch.object(system_apply.os, "geteuid", return_value=0), \
+                     patch.object(system_apply, "SUPPORTED_MODELS", models), \
                      patch("armada_os.snapshot", return_value=snap_data), \
                      patch.object(system_apply, "run_rollback_transaction") as rollback_tx:
                     result = system_apply.execute(
@@ -337,6 +347,28 @@ class SystemApplyWorkerTests(unittest.TestCase):
                 self.assertEqual(result["state"], "failed")
                 self.assertEqual(result["phase"], "preflight")
                 self.assertIn(err_match, result["error"])
+
+    def test_tb710fu_passes_the_apply_and_rollback_preflight(self):
+        # TB710FU has the dual-slot backend, so the worker's model gate (the
+        # capability table) admits it for both apply and rollback.
+        self.assertIn("TB710FU", system_apply.SUPPORTED_MODELS)
+        self.compatible_path.write_bytes(COMPATIBLE_TB710FU)
+        with patch("armada_os.snapshot", return_value=snapshot()), \
+             patch.object(system_apply, "run_online_transaction",
+                          return_value={"state": "awaiting_reboot"}) as run_tx:
+            result = system_apply.execute("stable", VALID_JOB)
+        self.assertEqual(result, {"state": "awaiting_reboot"})
+        run_tx.assert_called_once()
+        self.assertEqual(run_tx.call_args.kwargs["expected_channel"], "stable")
+
+        other_job = "abcdef12-1234-5678-9abc-def012345679"
+        with patch("armada_os.snapshot", return_value=snapshot()), \
+             patch.object(system_apply, "run_rollback_transaction",
+                          return_value={"state": "awaiting_reboot"}) as rollback_tx:
+            result = system_apply.execute(
+                None, other_job, rollback_checksum=TARGET_COMMIT)
+        self.assertEqual(result, {"state": "awaiting_reboot"})
+        rollback_tx.assert_called_once()
 
     def test_existing_job_directory_preserved_and_rejected(self):
         self.state_dir.mkdir(parents=True, mode=0o700)

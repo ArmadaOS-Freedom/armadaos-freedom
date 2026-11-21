@@ -309,17 +309,39 @@ class BootMaterialsIntegrationTests(unittest.TestCase):
         self.assertFalse((out / "materials.json").exists())
         self._assert_sources_unchanged(before)
 
-    def test_unmarked_tb710fu_runtime_is_not_gated(self):
+    def test_unmarked_tb710fu_runtime_is_rejected(self):
+        # TB710FU maintains both boot slots, so its runtime must carry the mirror marker like the Y700 models.
         model = "TB710FU"
         if model not in self.f.payload.cfg["profiles"]:
             self.skipTest("TB710FU profile is not configured")
+        self.assertIn(model, boot_payload.MIRROR_POLICY_MODELS)
         bad_commit = self._commit_with_unmarked_runtime(model)
         bad = self.f._call(1, target_commit=bad_commit)
         self.target_binding = bad["deployment"]
         self.target_path = Path(bad["path"])
         before = self._source_snapshot()
         out = self.f.root.parent / "materials-unmarked-tb710fu"
-        report = self._prepare(model, out)
+        with self.assertRaisesRegex(
+            boot_materials.BootMaterialsError, "ARMADA_LINUX_MIRROR_V1"
+        ):
+            self._prepare(model, out)
+        self.assertFalse((out / "materials.json").exists())
+        self._assert_sources_unchanged(before)
+
+    def test_unmarked_runtime_of_a_model_without_mirror_policy_is_not_gated(self):
+        # The gate follows MIRROR_POLICY_MODELS per model: a profile whose mirrored policy is off (an install-only
+        # profile) still prepares materials from an unmarked runtime. Every configured profile has the policy on,
+        # so one is taken out of the policy set for this case.
+        model = self.f.model
+        bad_commit = self._commit_with_unmarked_runtime(model)
+        bad = self.f._call(1, target_commit=bad_commit)
+        self.target_binding = bad["deployment"]
+        self.target_path = Path(bad["path"])
+        before = self._source_snapshot()
+        out = self.f.root.parent / "materials-unmarked-install-only"
+        policy = frozenset(boot_payload.MIRROR_POLICY_MODELS - {model})
+        with mock.patch.object(boot_payload, "MIRROR_POLICY_MODELS", policy):
+            report = self._prepare(model, out)
         self.assertEqual(report["phase"], "materials_prepared")
         runtime = Path(report["artifacts"]["runtime"]["path"]).read_bytes()
         self.assertNotIn(boot_payload.MIRROR_RUNTIME_MARKER, runtime)

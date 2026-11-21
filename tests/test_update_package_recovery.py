@@ -122,26 +122,45 @@ class BuilderRecoveryTests(unittest.TestCase):
                 self.assertEqual(by_path[f"packages/{model}/runtime/runtime.img"]["role"], "runtime")
                 self.assertEqual(by_path["common/boot/Image"]["role"], "kernel")
 
-    def test_tb710fu_recovery_materials_are_rejected(self):
-        # TB710FU has no RAM rescue backend; recovery manifests stay restricted
-        # to packages whose supported models are all upgrade-capable. The
-        # mixed known-model upgrade itself is legitimate, but recovery is
-        # rejected on both the install-only and upgrade paths.
+    def test_tb710fu_recovery_materials_are_accepted(self):
+        # TB710FU has the recovery layout (board 3) and the dual-slot backend,
+        # so its recovery materials are indexed like the Y700 models'.
+        models = ("TB322FC", "TB710FU")
+        with tempfile.TemporaryDirectory() as tmp:
+            _archive, desc = _recovery_archive(Path(tmp), models, enable=True)
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
+            self.assertEqual(desc["supportedModels"], list(models))
+            self.assertEqual(set(desc["recoveryManifests"]), set(models))
+            self.assertEqual(validate_package(desc), desc)
+            by_path = {f["path"]: f for f in desc["files"]}
+            self.assertEqual(by_path["recovery/TB710FU/recovery.dtb"]["role"], "recovery")
+            self.assertEqual(by_path["recovery/TB710FU/recovery.json"]["role"], "manifest")
+
+    def test_custom_model_recovery_materials_are_rejected(self):
+        # A custom install-only profile has no RAM rescue backend; recovery
+        # manifests stay restricted to packages whose supported models are all
+        # upgrade-capable, on both the install-only and upgrade paths.
+        custom = builder.CUSTOM_MODEL
         with tempfile.TemporaryDirectory() as tmp:
             archive = BASE._make_bundle(
                 Path(tmp),
-                models=("TB322FC", "TB710FU"),
-                mutate=make_recovery_mutate(("TB322FC", "TB710FU")),
+                models=("TB322FC", custom),
+                mutate=make_recovery_mutate(("TB322FC", custom)),
             )
             with self.assertRaisesRegex(
                 PackageError, "recoveryManifests are restricted"
             ):
-                builder.build_descriptor(archive, release_id="rel-gt")
+                builder.build_descriptor(
+                    archive, release_id="rel-third", install_models=(custom,)
+                )
             with self.assertRaisesRegex(
-                PackageError, "recoveryManifests are restricted"
+                PackageError, "(recoveryManifests|offline-upgrade) (are|is) restricted"
             ):
                 builder.build_descriptor(
-                    archive, release_id="rel-gt", enable_offline_upgrade=True
+                    archive,
+                    release_id="rel-third",
+                    enable_offline_upgrade=True,
+                    install_models=(custom,),
                 )
 
     def test_positive_noop_hook_with_enable(self):

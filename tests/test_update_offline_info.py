@@ -99,7 +99,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
         })
 
     def test_info_uses_the_verified_board_for_the_model(self):
-        for board, model in ((1, 'TB322FC'), (2, 'TB323FU')):
+        for board, model in ((1, 'TB322FC'), (2, 'TB323FU'), (3, 'TB710FU')):
             with self.subTest(board=board):
                 self.recovery.return_value = (
                     Path('/dev/armada-backup'), PART_UUID, board, 2049)
@@ -149,10 +149,16 @@ class DeviceIdentityInfoTest(unittest.TestCase):
             self.store().info()
 
     def test_info_rejects_unsupported_board_or_partuuid(self):
-        self.recovery.return_value = (Path('/dev/armada-backup'), PART_UUID, 3, 2049)
-        with self.assertRaisesRegex(offline_session.OfflineSessionError,
-                                    'TB322FC/TB323FU'):
-            self.store().info()
+        # Board 3 (TB710FU) is supported; an unregistered board id is not.
+        for board in (0, 4, 99, '3', None):
+            with self.subTest(board=board):
+                self.recovery.return_value = (
+                    Path('/dev/armada-backup'), PART_UUID, board, 2049)
+                with self.assertRaisesRegex(
+                        offline_session.OfflineSessionError,
+                        'physical offline upgrades support only '
+                        'TB322FC/TB323FU/TB710FU'):
+                    self.store().info()
         self.recovery.return_value = (Path('/dev/armada-backup'), '', 1, 2049)
         with self.assertRaisesRegex(offline_session.OfflineSessionError, 'PARTUUID'):
             self.store().info()

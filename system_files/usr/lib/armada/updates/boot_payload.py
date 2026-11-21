@@ -20,8 +20,9 @@ FDT_MIN_HEADER_BYTES = 40
 KERNEL_RELEASE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 
 # Stable byte contract emitted by the used kShim update_trial_boot gate. Only
-# the new-system mirrored policy models require it; TB710FU and read-only
-# inspection of older deployments stay outside this gate.
+# the new-system mirrored policy models (models.MIRROR_POLICY_MODELS) require
+# it; custom install-only profiles and read-only inspection of older
+# deployments stay outside this gate.
 MIRROR_RUNTIME_MARKER = b"ARMADA_LINUX_MIRROR_V1"
 
 
