@@ -6,6 +6,7 @@
   (qcom/sm8650/xiaoxin/gt/..., novatek/...) is shipped, either in the bundle or
   in system_files/usr/lib/firmware;
 - the four amplifier nodes name the board's own ACF file;
+- iris stays enabled with the shipped Lenovo-signed vpu33_4v.mbn;
 - the joined .mbn images start with an ELF header.
 
 Run: python3 tests/test_tb710fu_firmware.py
@@ -34,8 +35,8 @@ def sums():
 
 
 PATH_RE = r'"((?:qcom/sm8650/xiaoxin/gt|novatek)/[^"]+)"'
-# The video codec (iris) is not enabled, so its firmware is not shipped.
-NOT_SHIPPED = {"qcom/sm8650/xiaoxin/gt/vpu33_4v.mbn"}
+# Every board firmware path is shipped; the video codec (iris) firmware included.
+NOT_SHIPPED = set()
 # Names in the vendored board file that the patch replaces (the DSPs move to the joined .mbn).
 REPLACED = {
     "qcom/sm8650/xiaoxin/gt/adsp.mbn", "qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn",
@@ -75,8 +76,19 @@ class BundleTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue((BUNDLE / name).is_file() or (SYSTEM_FW / name).is_file(), name)
 
+    def test_iris_is_enabled_with_the_shipped_firmware(self):
+        # The board file enables iris with the unit's firmware; the patch must not disable it again.
+        text = DTS_PATCH.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\+&iris \{\n\+\tstatus = \"disabled\";")
+        board = DTS.read_text(encoding="utf-8")
+        node = re.search(r"&iris \{(.*?)\n\};", board, re.S)
+        self.assertIsNotNone(node)
+        self.assertIn('status = "okay";', node.group(1))
+        self.assertIn('firmware-name = "qcom/sm8650/xiaoxin/gt/vpu33_4v.mbn";', node.group(1))
+        self.assertIn("qcom/sm8650/xiaoxin/gt/vpu33_4v.mbn", sums())
+
     def test_dsp_images_are_joined_elf_files(self):
-        for name in ("adsp", "adsp_dtb", "cdsp", "cdsp_dtb"):
+        for name in ("adsp", "adsp_dtb", "cdsp", "cdsp_dtb", "vpu33_4v"):
             with self.subTest(name=name):
                 data = (BUNDLE / "qcom" / "sm8650" / "xiaoxin" / "gt" / f"{name}.mbn").read_bytes()
                 self.assertEqual(data[:4], b"\x7fELF")

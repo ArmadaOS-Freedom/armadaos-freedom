@@ -68,7 +68,8 @@ ArmadaOS Freedom 统一内核与 kShimC 启动菜单对小新 Pad Pro GT 的适�
 - **fastboot：** 本机从 Android 重启到 fastboot 后会崩溃进 900E 转储模式（触发条件未查清），所以安装器不使用 fastboot。
 - **音频：** 只验证了扬声器。耳机、麦克风未测试。前端必须使用 S16：24 位输入会让 ADSP 的音频处理出错。
 - **WiFi／显示的板级变通：** 部分补丁来自原移植项目的调试过程（ath12k 的 CE 轮询、DSI 控制器寄存器、PHY 时序等），按 `lenovo,tb710fu` 隔离，只在本机生效。是否都必要尚未逐项验证，后续可以继续精简。
-- **视频编解码（iris）、相机、外接显示（DP）：** 未启用。
+- **视频编解码（iris）：** 已启用（联想签名的 `vpu33_4v.mbn`，见下文固件），真机验证进行中。
+- **相机、外接显示（DP）：** 未启用。
 - **固件：** 设备专用固件随镜像提供（[`firmware/`](firmware/README.md)），见下文。
 
 ## 内核与启动
@@ -83,7 +84,7 @@ bash packages/kernel/scripts/build-kernel.sh
 
 | 部分 | 补丁 | 设备树（`dts/sm8650-lenovo-tb710fu.dts.patch`） |
 |---|---|---|
-| 板级、显示、GPU、背光 | `071x`：SY7758 跟随芯片、NT36532 面板、msm DSI 命令触发口与 ABL 控制器/PHY 状态、DSC 宽度取整、A750 不启用 IFPC | kShimC framebuffer 模板、GPU 903 MHz、ADSP/CDSP 固件路径、触摸 compatible |
+| 板级、显示、GPU、背光 | `071x`：SY7758 跟随芯片、NT36532 面板、msm DSI 命令触发口与 ABL 控制器/PHY 状态、DSC 宽度取整、A750 不启用 IFPC | kShimC framebuffer 模板、GPU 903 MHz、ADSP/CDSP 固件路径、触摸 compatible；iris 沿用板级文件的启用与固件路径 |
 | 触摸与手写笔 | `072x`：NT36532 SPI 厂商驱动（`novatek,nt36532-ts-spi`）、开机打开笔扫描 | 笔 |
 | 蓝牙与 WiFi | `073x`：DT 蓝牙地址、WCN7850 复位脉冲、ath12k 变通 | — |
 | 扬声器 | `074x`：上游 TDM 时隙辅助函数（回移植）、q6apm TDM DAI、TDM 输出端点、4 声道上混、`lenovo,tb710fu-sndcard` | 4 颗 AW882xx 与声卡 |

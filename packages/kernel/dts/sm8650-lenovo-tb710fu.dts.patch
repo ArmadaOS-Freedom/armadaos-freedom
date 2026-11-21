@@ -12,8 +12,9 @@ no longer carries __symbols__, like the other board DTBs.
 Board: the simple-framebuffer template kShimC fills with the ABL scanout,
 the 903 MHz GPU level of the vendor DTB, the unit's own ADSP/CDSP firmware
 paths, the TB710FU touchscreen compatible, and uart15 enabled. The
-original port's boot-log reservations, the video codec and another unit's
-Bluetooth address are dropped.
+original port's boot-log reservations and another unit's Bluetooth
+address are dropped. The video codec (iris) stays enabled as in the board
+file, with the unit's Lenovo-signed vpu33_4v.mbn.
 
 Touch: novatek,pen-support, as in the vendor dtbo, so the NT36532 driver
 registers the pen.
@@ -35,7 +36,7 @@ collide with another board's bare aw882xx_acf.bin.
  #include "sm8650.dtsi"
  #include "pm8550.dtsi"
  #include "pm8550b.dtsi"
-@@ -1259,4 +1262,192 @@
+@@ -1259,4 +1262,187 @@
  
  &xo_board {
  	clock-frequency = <76800000>;
@@ -68,11 +69,6 @@ collide with another board's bare aw882xx_acf.bin.
 +};
 +
 +&blackbox_b_mem {
-+	status = "disabled";
-+};
-+
-+/* the video codec is not brought up yet */
-+&iris {
 +	status = "disabled";
 +};
 +
