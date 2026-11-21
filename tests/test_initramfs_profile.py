@@ -95,6 +95,7 @@ class InitramfsProfileTest(unittest.TestCase):
             "usr/share/armada/splash/splash.asp\n"
             "usr/libexec/armada/armada-ostree-fallback\n"
             "usr/libexec/armada/armada-bound-deployment\n"
+            "var/lib/dracut/hooks/pre-mount/90-armada-diagnostic-return.sh\n"
             "usr/lib/systemd/system/ostree-prepare-root.service.d/armada-fallback.conf\n"
             "usr/lib/ostree/ostree-prepare-root\n"
             "EOF\n"
