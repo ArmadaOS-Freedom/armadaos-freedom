@@ -83,8 +83,9 @@ old BE state. PCM close performs one last retry before BE shutdown and logs a
 persistent failure while completing best-effort teardown.
 
 Validation for this review fix passed on 2026-11-21. The complete 319-patch
-series applied to a clean Linux 7.2.6 source tree with zero fuzz. The lifecycle
-harness reported 219 checks, the full kernel host source checks passed, and
+base series applied to a clean Linux 7.2.6 source tree with zero fuzz. The
+follow-up DPCM route guard is carried as patch `0751`, making 320 active kernel
+patches in the tested tree. The lifecycle harness reported 223 checks, the full kernel host source checks passed, and
 the ARM64 build compiled `soc-component.o`, `soc-pcm.o`, `q6apm.o`,
 `q6apm-dai.o` and `q6apm-lpass-dais.o`. Patch-catalogue validation is recorded
 with the repository checks. Existing device results cover normal STOP only;
@@ -94,3 +95,18 @@ Remaining limits: no UNMAP request was observed on hardware; no persistent DSP
 failure recovery was tested; one RTC wake does not establish battery standby
 power or validate every SoundWire delayed-resume path. The shared AudioReach
 code affects other Qualcomm boards, which need their own regression coverage.
+
+### DAPM route update after FE STOP failure (2026-11-22)
+
+Reviewing the Linux 7.2.6 call graph found that a DAPM mixer/mux update enters
+`snd_soc_dpcm_runtime_update()`, whose old-path shutdown continues to BE STOP,
+`hw_free` and shutdown without consulting the FE component `hw_free` result.
+The lifecycle patch now checks all FE directions for an unresolved
+`hw_free_failed` state before changing any DPCM path and returns `-EBUSY` while
+one is present. This keeps a route update from bypassing the retained-BE
+protection. The guard is covered by the extracted-C host harness: a failure on
+the second FE causes zero old/new path updates, and clearing the failure allows
+the normal two-pass update.
+
+This is source and host-harness validation only. The physical tablet has not
+been tested with injected DSP STOP failure followed by a DAPM route change.

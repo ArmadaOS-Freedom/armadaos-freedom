@@ -180,6 +180,10 @@ def classify_sources(
             soc_pcm_text,
             "static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)\n{",
         ),
+        "candidate_dpcm_runtime_update": (
+            soc_pcm_text,
+            "int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)",
+        ),
     }
     if baseline_text is not None:
         signatures.update(
@@ -401,6 +405,26 @@ def classify_sources(
         "switch (trigger)",
         label="DPCM blocks START while FE STOP remains unresolved",
     )
+
+    runtime_update = extracted["candidate_dpcm_runtime_update"][0]
+    runtime_update_guard = extract_if_block(
+        runtime_update, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+    )
+    require_order(
+        runtime_update,
+        "for_each_card_rtds(card, fe)",
+        "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
+        "ret = -EBUSY;",
+        "goto out;",
+        "/* shutdown all old paths first */",
+        "ret = soc_dpcm_fe_runtime_update(fe, 0);",
+        label="runtime routing checks failed STOP before changing BE paths",
+    )
+    require_absent(
+        runtime_update_guard,
+        "soc_dpcm_fe_runtime_update",
+        "failed STOP leaves DAPM backend paths untouched",
+    )
     return extracted
 
 
@@ -427,6 +451,7 @@ typedef uint32_t u32;
 #define HZ 1000
 #define READ_ONCE(value) (value)
 #define WRITE_ONCE(target, value) ((target) = (value))
+#define EXPORT_SYMBOL_GPL(symbol)
 #define lockdep_assert_held(lock) assert(pthread_mutex_trylock(lock) == EBUSY)
 
 static u32 cmpxchg(u32 *value, u32 expected, u32 replacement)
@@ -1226,6 +1251,29 @@ static void check_dpcm_stop_failure_recovery(void)
 	CHECK(!fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
 }
 
+static void check_dpcm_runtime_update_guard(void)
+{
+	struct device device = {};
+	struct snd_soc_pcm_runtime first = {};
+	struct snd_soc_pcm_runtime second = {};
+	struct snd_soc_pcm_runtime *rtds[] = { &first, &second };
+	struct snd_soc_card card = {
+		.dev = &device,
+		.rtds = rtds,
+		.num_rtds = 2,
+	};
+
+	first.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = false;
+	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = true;
+	simulated_runtime_update_calls = 0;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -EBUSY);
+	CHECK(simulated_runtime_update_calls == 0);
+
+	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = false;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == 0);
+	CHECK(simulated_runtime_update_calls == 4);
+}
+
 static void check_failed_pcm_prepare(void)
 {
 	struct q6apm_dai_rtd prtd = { .state = Q6APM_STREAM_RUNNING };
@@ -1253,6 +1301,7 @@ int main(void)
 	check_stop_replies();
 	check_unmap_replies();
 	check_dpcm_stop_failure_recovery();
+	check_dpcm_runtime_update_guard();
 	check_failed_pcm_prepare();
 #ifdef HAVE_BASELINE
 	check_baseline_unmap();
@@ -1282,9 +1331,19 @@ struct snd_soc_pcm_runtime {
 	struct device *dev;
 };
 
+struct snd_soc_card {
+	struct device *dev;
+	struct snd_soc_pcm_runtime **rtds;
+	int num_rtds;
+};
+
 #define SND_SOC_DPCM_UPDATE_FE 1
 #define SND_SOC_DPCM_UPDATE_NO 0
 #define SND_SOC_DPCM_STATE_HW_FREE 8
+#define for_each_card_rtds(card, rtd) \
+	for (int __i = 0; __i < (card)->num_rtds && \
+	     (((rtd) = (card)->rtds[__i]), true); __i++)
+#define for_each_pcm_streams(stream) for ((stream) = 0; (stream) < 2; (stream)++)
 
 static int simulated_component_result;
 static int simulated_whole_clean_calls;
@@ -1294,6 +1353,7 @@ static int simulated_component_retain;
 static int simulated_dai_free_calls;
 static int simulated_be_free_calls;
 static int simulated_be_shutdown_calls;
+static int simulated_runtime_update_calls;
 
 static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 				     int stream, int state)
@@ -1350,14 +1410,34 @@ static void dpcm_be_dai_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
 	simulated_be_shutdown_calls++;
 }
 
-static void snd_soc_dpcm_mutex_unlock(struct snd_soc_pcm_runtime *fe)
+static void snd_soc_dpcm_mutex_unlock(void *lockable)
 {
-	(void)fe;
+	(void)lockable;
 }
 
 static int soc_pcm_ret(struct snd_soc_pcm_runtime *fe, int ret)
 {
 	(void)fe;
+	return ret;
+}
+
+static void snd_soc_dpcm_mutex_lock(struct snd_soc_card *card)
+{
+	(void)card;
+}
+
+static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+{
+	(void)fe;
+	(void)new;
+	simulated_runtime_update_calls++;
+	return 0;
+}
+
+static int snd_soc_ret(struct device *dev, int ret, const char *fmt, ...)
+{
+	(void)dev;
+	(void)fmt;
 	return ret;
 }
 
@@ -1387,6 +1467,7 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     shutdown_retry = extract_if_block(
         shutdown, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
     )
+    runtime_update, _ = extracted["candidate_dpcm_runtime_update"]
     parts = [
         "#define HAVE_BASELINE 1" if "baseline_start" in extracted else "",
         PREAMBLE,
@@ -1405,6 +1486,7 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         candidate_callback,
         "#undef apm_callback",
         DPCM_SIM_PREAMBLE,
+        runtime_update,
         "static int simulate_dpcm_hw_free(struct snd_soc_pcm_runtime *fe, "
         "struct snd_pcm_substream *substream)\n{\n"
         "\tint stream = substream->stream;\n\tint ret;\n"

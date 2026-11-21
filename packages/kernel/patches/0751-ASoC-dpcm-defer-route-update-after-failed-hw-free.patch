@@ -1,0 +1,29 @@
+From: 181981772 <181981772@qq.com>
+Subject: [PATCH] ASoC: dpcm: defer route updates after failed FE hw_free
+
+A failed FE component hw_free leaves its DPCM backend allocated until a later
+retry or PCM close. DAPM route updates must not tear down that retained backend
+before the retry can run. Return -EBUSY while any FE direction is unresolved.
+
+Signed-off-by: 181981772 <181981772@qq.com>
+---
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -2883,9 +2883,16 @@
+ int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
+ {
+ 	struct snd_soc_pcm_runtime *fe;
+-	int ret = 0;
++	int ret = 0, stream;
+ 
+ 	snd_soc_dpcm_mutex_lock(card);
++	for_each_card_rtds(card, fe)
++		for_each_pcm_streams(stream)
++			if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
++				ret = -EBUSY;
++				goto out;
++			}
++
+ 	/* shutdown all old paths first */
+ 	for_each_card_rtds(card, fe) {
+ 		ret = soc_dpcm_fe_runtime_update(fe, 0);
