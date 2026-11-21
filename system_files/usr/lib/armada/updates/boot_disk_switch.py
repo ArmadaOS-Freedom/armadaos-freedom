@@ -16,6 +16,7 @@ from . import deployment_options, deployment_store, signature
 
 _COMPLETED_NAME = "finished-switch.json"
 _PENDING_NAME = "pending-switch.json"
+_RECOVERED_NAME = "recovered-switch.json"
 _PENDING_SCHEMA = 1
 _RECEIPT_KEYS = {'transactionId', 'planSha256', 'fromSlot', 'targetSlot'}
 _MAX_PENDING_BYTES = 4096
@@ -135,8 +136,11 @@ def _validate_receipt(receipt):
         raise BootDiskSwitchError("receipt fromSlot/targetSlot malformed")
 
 
-def _read_pending(boot, *, completed=False):
-    path = boot / "armada" / (_COMPLETED_NAME if completed else _PENDING_NAME)
+def _read_pending(boot, *, completed=False, recovered=False):
+    if completed and recovered:
+        raise BootDiskSwitchError("pending record selector is ambiguous")
+    name = _COMPLETED_NAME if completed else (_RECOVERED_NAME if recovered else _PENDING_NAME)
+    path = boot / "armada" / name
     try:
         lst = path.lstat()
     except FileNotFoundError:
@@ -497,8 +501,8 @@ def activate(root, initial, plan, *, trusted_key, receipt=None, reclaim_failed_t
             _remove_recovery_pointer(boot)
         except BootDiskSwitchError:
             pass
-        raise BootDiskSwitchUncertainError(
-            "ARMADA_BOOT activation uncertain: checkpoint failed") from checkpoint_exc
+        raise BootDiskSwitchError(
+            "ARMADA_BOOT activation failed before selector: checkpoint failed") from checkpoint_exc
     try:
         boot_disk_selector.activate_generation(boot, expected, target)
     except Exception as exc:
@@ -562,6 +566,7 @@ def confirm(root, initial, *, trusted_key):
         sysroot_path=root, current_binding=pending["newDeployment"],
         previous_binding=pending["currentDeployment"])
     _write_switch_durably(boot, _COMPLETED_NAME, pending)
+    (boot / "armada" / _RECOVERED_NAME).unlink(missing_ok=True)
     for entry in (boot / "armada").iterdir():
         if (entry.name.startswith("gen-") and _GEN_DIR_RE.fullmatch(entry.name)
                 and entry.name not in {target, expected} and entry.is_dir() and not entry.is_symlink()):
@@ -658,7 +663,7 @@ def recover_pending(root, initial, *, trusted_key):
         raise BootDiskSwitchError("recovery pointer does not match pending expected generation")
     _verified_generation(
         boot, pending["expected"], pending["model"], pending["currentDeployment"], trusted_key)
-    boot_disk_selector.ensure_root_binding(root, pending["currentDeployment"])
+    boot_disk_selector.ensure_root_binding(root, pending["currentDeployment"], create=False)
     if active == pending["target"]:
         try:
             _checkpoint_boot(boot, dry_run=True)
@@ -675,6 +680,7 @@ def recover_pending(root, initial, *, trusted_key):
     except OSError as checkpoint_exc:
         raise BootDiskSwitchError(
             "ARMADA_BOOT checkpoint failed after recovery") from checkpoint_exc
+    _write_switch_durably(boot, _RECOVERED_NAME, pending)
     if pending.get("reclaimFailedTarget") is True:
         _reclaim_failed_target(boot, pending, completed)
     _remove_recovery_pointer(boot)
@@ -686,12 +692,31 @@ def read_trial_status(context, root=Path("/sysroot")):
     """Report selector and deployment evidence without changing boot state."""
     boot = _resolve_boot(root)
     pending = _read_pending(boot)
+    recovered = _read_pending(boot, recovered=True)
     record = pending if pending is not None else _read_pending(boot, completed=True)
+    if record is None and recovered is None:
+        return {"state": "empty"}
+    selected = _read_boot_active(boot)[1]
+    if (recovered is not None and "receipt" in recovered
+            and selected == recovered["expected"]
+            and context.get("deployment") == recovered["currentDeployment"]
+            and (pending is None or pending == recovered)):
+        binding = boot / "armada" / selected / "binding.bin"
+        if boot_disk_generation.decode_binding(binding) != recovered["currentDeployment"]:
+            return {"state": "unavailable", "error": "ARMADA_BOOT selected binding changed"}
+        return {
+            "state": "available", "policy": "offline-dual",
+            "bootPolicy": "dual-boot-no-slot-control", "bootSource": "armada_boot",
+            "recordState": "rolled_back",
+            "oldDeployment": recovered["currentDeployment"],
+            "newDeployment": recovered["newDeployment"],
+            "runningDeployment": "old", "bootConfirmed": False,
+            **recovered["receipt"],
+        }
     if record is None:
         return {"state": "empty"}
     if "receipt" not in record:
         return {"state": "unavailable", "error": "ARMADA_BOOT transaction has no receipt"}
-    selected = _read_boot_active(boot)[1]
     if selected != record["target"]:
         return {"state": "unavailable", "error": "ARMADA_BOOT target is not selected"}
     actual = context.get("deployment")

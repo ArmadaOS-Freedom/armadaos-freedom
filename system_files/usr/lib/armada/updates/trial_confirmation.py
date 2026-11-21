@@ -199,6 +199,11 @@ def confirm_trial() -> dict:
                         'bootSource': 'armada_boot',
                         'deployment': initial['deployment']}
             evidence = boot_disk_switch.read_trial_status(initial, SYSROOT_PATH)
+            if evidence.get("recordState") == "confirmed":
+                try:
+                    job_retirement.retire_confirmed_disk_session(evidence, initial)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
             if (evidence.get("recordState") != "prepared" or
                     evidence.get("runningDeployment") != "new"):
                 return {"state": "not_pending", "bootSource": "armada_boot"}
@@ -211,6 +216,11 @@ def confirm_trial() -> dict:
             if not boot_disk_switch.confirm(
                     SYSROOT_PATH, initial, trusted_key=signature.DEFAULT_TRUSTED_KEY):
                 raise ConfirmationError("disk boot confirmation did not complete")
+            try:
+                confirmed = boot_disk_switch.read_trial_status(initial, SYSROOT_PATH)
+                job_retirement.retire_confirmed_disk_session(confirmed, initial)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
             return {"state": "confirmed", "bootSource": "armada_boot",
                     "transactionId": evidence["transactionId"], "deployment": initial["deployment"]}
 

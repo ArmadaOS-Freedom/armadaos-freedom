@@ -21,7 +21,7 @@ def _canon(p: Path) -> Path:
     return Path(os.path.realpath(os.fspath(p)))
 
 
-def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str) -> str:
+def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str, *, create: bool = True) -> str:
     if not isinstance(deployment, str):
         raise TypeError("deployment must be str")
     m = _DEPLOYMENT_RE.fullmatch(deployment)
@@ -55,6 +55,8 @@ def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str)
     try:
         armada_lst = armada_dir.lstat()
     except FileNotFoundError:
+        if not create:
+            raise ValueError("armada directory missing")
         try:
             os.mkdir(os.fspath(armada_dir), 0o755)
         except FileExistsError:
@@ -77,6 +79,8 @@ def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str)
         raise ValueError(f"cannot stat binding link: {exc}") from exc
 
     if link_lst is None:
+        if not create:
+            raise ValueError("binding symlink missing")
         try:
             os.symlink(expected_target_rel, os.fspath(link_path))
         except FileExistsError:
@@ -87,8 +91,9 @@ def ensure_root_binding(sysroot: Union[str, os.PathLike, Path], deployment: str)
         if os.readlink(os.fspath(link_path)) != expected_target_rel:
             raise ValueError("binding symlink has unexpected target")
 
-    _io.fsync_dir(armada_dir)
-    _io.fsync_dir(ostree_dir)
+    if create:
+        _io.fsync_dir(armada_dir)
+        _io.fsync_dir(ostree_dir)
     return f"/ostree/armada/{basename}"
 
 

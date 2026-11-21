@@ -401,7 +401,17 @@ def _mismatch(identity, reason, error=None):
 
 def _classify(receipt, trial, identity):
     outcome = _outcome(receipt)
-    if outcome in _TERMINAL_FAILURE_STATES:
+    terminal_rollback = (
+        isinstance(trial, dict) and
+        identity.get('bootSource') == 'armada_boot' and
+        trial.get('bootSource') == 'armada_boot' and
+        trial.get('state') == 'available' and
+        trial.get('recordState') == ROLLED_BACK and
+        trial.get('runningDeployment') == 'old' and
+        trial.get('bootConfirmed') is False and
+        trial.get('transactionId') == identity['transactionId'] and
+        trial.get('planSha256') == identity['planSha256'])
+    if outcome in _TERMINAL_FAILURE_STATES and not terminal_rollback:
         return _result(FAILED, identity, reason=outcome)
 
     if not isinstance(trial, dict) or trial.get('state') != 'available':

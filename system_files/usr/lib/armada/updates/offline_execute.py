@@ -423,12 +423,16 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
                     'transactionId': ctx['tx'], 'planSha256': status['planSha256'],
                     'armadaBootSwitch': switch,
                 })
-                selector_started = True
-                boot_disk_switch.activate(
-                    Path(plan['sysrootPath']), initial, switch, trusted_key=trusted_key,
-                    receipt={key: status[key] for key in
-                             ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
-                    reclaim_failed_target=True)
+                try:
+                    boot_disk_switch.activate(
+                        Path(plan['sysrootPath']), initial, switch, trusted_key=trusted_key,
+                        receipt={key: status[key] for key in
+                                 ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
+                        reclaim_failed_target=True)
+                except boot_disk_switch.BootDiskSwitchUncertainError:
+                    raise
+                else:
+                    selector_started = True
                 status.update(state='awaiting_reboot', phase='awaiting_reboot',
                               requiresReboot=True, bootWriteState='not_started')
                 system_transaction._save_json(work, 'status.json', status)

@@ -276,7 +276,10 @@ def build_descriptor(archive_path: Path, *, release_id: str,
                     overrides[record["path"]] = record
                 if roles != _REQUIRED:
                     raise PackageError(f"{model} must declare exactly the seven required roles")
-                if document.get("bootRecipe", {}).get("linuxBootSource") == "armada-boot-v1":
+                boot_recipe = document.get("bootRecipe", {})
+                if not isinstance(boot_recipe, dict):
+                    raise PackageError(f"{model}.bootRecipe must be an object")
+                if boot_recipe.get("linuxBootSource") == "armada-boot-v1":
                     disk_models.add(model)
                 models.append(model)
                 manifests[model] = manifest_path

@@ -70,6 +70,15 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         _make_deployment(self.root, _OLD_BINDING)
         _make_deployment(self.root, _NEW_BINDING)
 
+        # Stable ostree binding link for the old deployment expected by recovery.
+        armada_dir = self.root / "ostree" / "armada"
+        armada_dir.mkdir(parents=True, exist_ok=True)
+        old_basename = _OLD_BINDING.split("/", 1)[1]
+        os.symlink(
+            "../deploy/default/deploy/" + old_basename,
+            armada_dir / old_basename,
+        )
+
         # Selector symlink starts at the old generation.
         os.symlink(_OLD_GEN, self.boot / "armada" / "boot")
 
@@ -366,6 +375,27 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(self._read_selector(), _OLD_GEN)
         self.assertIsNone(self._read_pending())
 
+    def test_activate_pre_selector_checkpoint_error_leaves_selector_old(self):
+        """A checkpoint failure after dry run but before the selector switch
+        must abort with BootDiskSwitchError while selector remains old."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+
+        self.checkpoint_mock.side_effect = [None, OSError("simulated pre-selector failure")]
+
+        with self.assertRaises(boot_disk_switch.BootDiskSwitchError) as ctx:
+            boot_disk_switch.activate(
+                self.root, self.initial, plan,
+                trusted_key=self.trusted_key, receipt=receipt,
+            )
+
+        self.assertIs(type(ctx.exception), boot_disk_switch.BootDiskSwitchError)
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+
+        self.checkpoint_mock.side_effect = None
+        boot_disk_switch.ensure_ready(self.root, self.initial)
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+
     def test_activate_post_switch_checkpoint_error_is_uncertain(self):
         """If the post-switch checkpoint fails, activate must report
         BootDiskSwitchUncertainError with the selector switched and pending kept."""
@@ -484,6 +514,15 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
             )
         self.assertFalse((self.boot / "armada" / _NEW_GEN / "kernel.img").exists())
 
+        status = boot_disk_switch.read_trial_status(
+            self.initial, self.root)
+        self.assertEqual(status["state"], "available")
+        self.assertEqual(status["runningDeployment"], "old")
+        self.assertEqual(status["oldDeployment"], _OLD_BINDING)
+        self.assertEqual(status["newDeployment"], _NEW_BINDING)
+        self.assertEqual(status["transactionId"], _TID)
+        self.assertEqual(status["planSha256"], _PLAN_SHA)
+
     def test_recover_pending_retry_old_selector_pointer_absent(self):
         """Retry with old selector + pointer already absent but pending still present."""
         plan = self._make_plan()
@@ -590,6 +629,7 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         """First call fails fsyncing ostree parent; retry synchronizes both dirs."""
         ostree_dir = self.root / "ostree"
         armada_dir = ostree_dir / "armada"
+        (armada_dir / _OLD_BINDING.split("/", 1)[1]).unlink(missing_ok=True)
         if armada_dir.exists():
             armada_dir.rmdir()
 
