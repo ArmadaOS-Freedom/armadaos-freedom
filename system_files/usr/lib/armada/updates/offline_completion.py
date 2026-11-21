@@ -329,7 +329,8 @@ def execute_completion(prepared, plan, plan_sha256, status, report, ack,
         switch = plan['armadaBootSwitch']
         if (not isinstance(switch, dict) or old_digests != new_digests or
                 report.get('schemaVersion') != 1 or
-                report.get('phase') != 'armada_boot_selected' or
+                report.get('phase') not in ('armada_boot_selected',
+                                            'armada_boot_switch_intent') or
                 report.get('transactionId') != identity['transactionId'] or
                 report.get('planSha256') != identity['planSha256'] or
                 report.get('armadaBootSwitch') != switch or

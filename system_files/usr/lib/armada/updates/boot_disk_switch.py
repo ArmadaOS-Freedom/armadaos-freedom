@@ -1,12 +1,14 @@
 """Stage and switch signed ARMADA_BOOT generations under the update lock."""
 
 import base64
+import fcntl
 import json
 import os
 import re
 import secrets
 import shutil
 import stat
+import struct
 from pathlib import Path
 
 from . import _io, boot_disk_generation, boot_disk_selector, boot_payload
@@ -76,6 +78,19 @@ def _resolve_boot(root):
         return candidate
 
     raise BootDiskSwitchError("ARMADA_BOOT mount does not match boot evidence")
+
+
+# ext4 UAPI _IOW('f', 43, __u32); zero flags = normal checkpoint
+_EXT4_IOC_CHECKPOINT = 0x4004662B
+
+
+def _checkpoint_boot(boot, *, dry_run=False):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(boot, flags)
+    try:
+        fcntl.ioctl(fd, _EXT4_IOC_CHECKPOINT, struct.pack('=I', 4 if dry_run else 0))
+    finally:
+        os.close(fd)
 
 
 def _verified_generation(boot, name, model, deployment, trusted_key):
@@ -320,6 +335,11 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
     if receipt is not None:
         _validate_receipt(receipt)
         record["receipt"] = receipt
+    try:
+        _checkpoint_boot(boot, dry_run=True)
+    except OSError as checkpoint_exc:
+        raise BootDiskSwitchError(
+            "ARMADA_BOOT checkpoint unsupported or not permitted") from checkpoint_exc
     _write_switch_durably(boot, _PENDING_NAME, record)
     try:
         boot_disk_selector.activate_generation(boot, expected, target)
@@ -338,14 +358,9 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
             except Exception as resync_exc:
                 raise BootDiskSwitchUncertainError(
                     "ARMADA_BOOT activation uncertain: resync failed") from resync_exc
-            try:
-                if _read_boot_active(boot)[1] == target and _read_pending(boot) == record:
-                    return
-            except Exception as read_exc:
-                raise BootDiskSwitchUncertainError(
-                    "ARMADA_BOOT activation uncertain: reread failed") from read_exc
-        raise BootDiskSwitchUncertainError(
-            "ARMADA_BOOT activation uncertain: selector state ambiguous") from exc
+        else:
+            raise BootDiskSwitchUncertainError(
+                "ARMADA_BOOT activation uncertain: selector state ambiguous") from exc
     try:
         matched = _read_boot_active(boot)[1] == target and _read_pending(boot) == record
     except (OSError, ValueError, BootDiskSwitchError) as read_exc:
@@ -354,6 +369,11 @@ def activate(root, initial, plan, *, trusted_key, receipt=None):
     if not matched:
         raise BootDiskSwitchUncertainError(
             "ARMADA_BOOT activation uncertain: readback did not match")
+    try:
+        _checkpoint_boot(boot)
+    except OSError as checkpoint_exc:
+        raise BootDiskSwitchUncertainError(
+            "ARMADA_BOOT activation uncertain: checkpoint failed") from checkpoint_exc
 
 
 def confirm(root, initial, *, trusted_key):

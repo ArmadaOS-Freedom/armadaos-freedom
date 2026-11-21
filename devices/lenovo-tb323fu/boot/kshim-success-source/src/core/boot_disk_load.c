@@ -95,7 +95,11 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
                          const struct kshim_partition *part,
                          const uint8_t public_key[65],
                          uint32_t board,
-                         const struct kshim_disk_boot_buffers *buffers,
+                         void *dtb_scratch,
+                         size_t dtb_scratch_bytes,
+                         kshim_disk_boot_place_fn place,
+                         void *place_ctx,
+                         struct kshim_disk_boot_buffers *buffers,
                          struct kshim_disk_manifest *out_manifest,
                          void *scratch,
                          size_t scratch_bytes)
@@ -116,8 +120,7 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
     if (dev == NULL || part == NULL || public_key == NULL || buffers == NULL) {
         return KSHIM_STORAGE_CRC;
     }
-    if (buffers->kernel == NULL || buffers->initrd == NULL ||
-        buffers->dtb == NULL) {
+    if (dtb_scratch == NULL || dtb_scratch_bytes == 0 || place == NULL) {
         return KSHIM_STORAGE_CRC;
     }
     if (scratch == NULL || scratch_bytes < KSHIM_EXT4_SCRATCH_BYTES) {
@@ -155,6 +158,35 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return rc;
     }
 
+    if (verified.kernel_bytes == 0 || verified.initrd_bytes == 0 ||
+        verified.dtb_bytes == 0) {
+        return KSHIM_STORAGE_CRC;
+    }
+    if (verified.dtb_bytes > (uint64_t)dtb_scratch_bytes) {
+        return KSHIM_STORAGE_CRC;
+    }
+
+    /* Authenticate the board DTB exactly once, into dtb_scratch, before any
+     * placement decision. The bytes in dtb_scratch are the only DTB source
+     * the placement callback may rely on. */
+    rc = read_hashed(dev, part, paths->dtb, dtb_scratch,
+                     (size_t)verified.dtb_bytes,
+                     verified.dtb_sha256, scratch, scratch_bytes);
+    if (rc != 0) {
+        return rc;
+    }
+
+    /* Placement: caller fills all final buffers based on the verified DTB.
+     * No I/O or mutation of the verified DTB is permitted in the callback. */
+    rc = place(place_ctx, dtb_scratch, (size_t)verified.dtb_bytes, buffers);
+    if (rc != 0) {
+        return KSHIM_STORAGE_CRC;
+    }
+
+    if (buffers->kernel == NULL || buffers->initrd == NULL ||
+        buffers->dtb == NULL) {
+        return KSHIM_STORAGE_CRC;
+    }
     if (verified.kernel_bytes > (uint64_t)buffers->kernel_capacity) {
         return KSHIM_STORAGE_CRC;
     }
@@ -162,10 +194,6 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return KSHIM_STORAGE_CRC;
     }
     if (verified.dtb_bytes > (uint64_t)buffers->dtb_capacity) {
-        return KSHIM_STORAGE_CRC;
-    }
-    if (verified.kernel_bytes == 0 || verified.initrd_bytes == 0 ||
-        verified.dtb_bytes == 0) {
         return KSHIM_STORAGE_CRC;
     }
 
@@ -214,12 +242,8 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return rc;
     }
 
-    rc = read_hashed(dev, part, paths->dtb, buffers->dtb,
-                     (size_t)verified.dtb_bytes,
-                     verified.dtb_sha256, scratch, scratch_bytes);
-    if (rc != 0) {
-        return rc;
-    }
+    /* Copy the already-verified DTB. Do not reread from storage. */
+    memmove(buffers->dtb, dtb_scratch, (size_t)verified.dtb_bytes);
 
     *out_manifest = verified;
     return 0;

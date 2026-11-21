@@ -17,7 +17,11 @@ struct kshim_boot_native_ctx {
     const struct kshim_disk_entry *entry;
     const uint8_t *public_key;          /* points to the 65-byte array */
     uint32_t board;
-    const struct kshim_disk_boot_buffers *buffers;
+    void *dtb_scratch;
+    size_t dtb_scratch_bytes;
+    kshim_disk_boot_place_fn place;
+    void *place_ctx;
+    struct kshim_disk_boot_buffers *buffers;
     void *scratch;
     size_t scratch_bytes;
     struct kshim_disk_manifest manifest; /* filled only on full success */
@@ -33,6 +37,8 @@ static int kshim_boot_native_verify_and_read(struct kshim_boot_native_ctx *ctx,
 
     if (ctx == NULL || dev == NULL || ctx->entry == NULL ||
         ctx->public_key == NULL || ctx->buffers == NULL ||
+        ctx->dtb_scratch == NULL || ctx->dtb_scratch_bytes == 0 ||
+        ctx->place == NULL ||
         ctx->scratch == NULL || ctx->scratch_bytes == 0)
         return KSHIM_STORAGE_ARG;
 
@@ -81,9 +87,12 @@ static int kshim_boot_native_verify_and_read(struct kshim_boot_native_ctx *ctx,
             return rc;
     }
 
-    /* Signature + file reads into caller buffers. Never publish the
-     * manifest or binding until this returns success. */
+    /* Signature verify, one authenticated DTB read into dtb_scratch,
+     * placement callback, then payload reads into final buffers. Never
+     * publish the manifest or binding until this returns success. */
     rc = kshim_disk_boot_read(dev, &part, ctx->public_key, ctx->board,
+                              ctx->dtb_scratch, ctx->dtb_scratch_bytes,
+                              ctx->place, ctx->place_ctx,
                               ctx->buffers, &ctx->manifest,
                               ctx->scratch, ctx->scratch_bytes);
     if (rc != 0)
@@ -113,7 +122,11 @@ static int kshim_boot_native_reader(const struct kshim_blockdev *dev, void *opaq
 int kshim_disk_boot_native_read(const struct kshim_disk_entry *entry,
                                 const uint8_t public_key[65],
                                 uint32_t board,
-                                const struct kshim_disk_boot_buffers *buffers,
+                                void *dtb_scratch,
+                                size_t dtb_scratch_bytes,
+                                kshim_disk_boot_place_fn place,
+                                void *place_ctx,
+                                struct kshim_disk_boot_buffers *buffers,
                                 struct kshim_disk_manifest *out,
                                 struct kshim_disk_binding *out_binding,
                                 void *scratch,
@@ -123,13 +136,19 @@ int kshim_disk_boot_native_read(const struct kshim_disk_entry *entry,
     int rc;
 
     if (entry == NULL || public_key == NULL || buffers == NULL || out == NULL ||
-        out_binding == NULL || scratch == NULL || scratch_bytes == 0)
+        out_binding == NULL || dtb_scratch == NULL ||
+        dtb_scratch_bytes == 0 || place == NULL ||
+        scratch == NULL || scratch_bytes == 0)
         return KSHIM_STORAGE_ARG;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.entry = entry;
     ctx.public_key = public_key;
     ctx.board = board;
+    ctx.dtb_scratch = dtb_scratch;
+    ctx.dtb_scratch_bytes = dtb_scratch_bytes;
+    ctx.place = place;
+    ctx.place_ctx = place_ctx;
     ctx.buffers = buffers;
     ctx.scratch = scratch;
     ctx.scratch_bytes = scratch_bytes;

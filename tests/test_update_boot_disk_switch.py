@@ -79,6 +79,14 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self._resolve_patcher.start()
         self.addCleanup(self._resolve_patcher.stop)
 
+        # Patch checkpointing so tests can assert exact call order and inject
+        # failures without touching real transaction state.
+        self._checkpoint_patcher = mock.patch.object(
+            boot_disk_switch, "_checkpoint_boot",
+        )
+        self.checkpoint_mock = self._checkpoint_patcher.start()
+        self.addCleanup(self._checkpoint_patcher.stop)
+
         # Real verify_generation contains signature/manifest checks exercised by
         # integration tests; here we substitute to keep this a focused regression.
         self._verify_patcher = mock.patch.object(
@@ -146,6 +154,10 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(pending["model"], "TB322FC")
         self.assertEqual(pending["receipt"], receipt)
         self.assertEqual(self._read_selector(), _NEW_GEN)
+        self.assertEqual(
+            self.checkpoint_mock.call_args_list,
+            [mock.call(self.boot, dry_run=True), mock.call(self.boot)],
+        )
 
     def test_read_trial_status_transitions(self):
         plan = self._make_plan()
@@ -248,6 +260,45 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
                 raise OSError(5, "simulated post-rename fsync failure")
 
         with mock.patch.object(boot_disk_selector.os, "replace", side_effect=_replace):
+            boot_disk_switch.activate(
+                self.root, self.initial, plan,
+                trusted_key=self.trusted_key, receipt=receipt,
+            )
+
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+        pending = self._read_pending()
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["target"], _NEW_GEN)
+        self.assertEqual(pending["expected"], _OLD_GEN)
+
+    def test_activate_dry_run_checkpoint_error_leaves_selector_old(self):
+        """A checkpoint failure during the dry run must abort with a wrapped
+        BootDiskSwitchError before the selector is switched."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+
+        self.checkpoint_mock.side_effect = OSError("simulated dry-run failure")
+
+        with self.assertRaisesRegex(
+            boot_disk_switch.BootDiskSwitchError, "checkpoint",
+        ):
+            boot_disk_switch.activate(
+                self.root, self.initial, plan,
+                trusted_key=self.trusted_key, receipt=receipt,
+            )
+
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertIsNone(self._read_pending())
+
+    def test_activate_post_switch_checkpoint_error_is_uncertain(self):
+        """If the post-switch checkpoint fails, activate must report
+        BootDiskSwitchUncertainError with the selector switched and pending kept."""
+        plan = self._make_plan()
+        receipt = self._make_receipt()
+
+        self.checkpoint_mock.side_effect = [None, OSError("simulated post failure")]
+
+        with self.assertRaises(boot_disk_switch.BootDiskSwitchUncertainError):
             boot_disk_switch.activate(
                 self.root, self.initial, plan,
                 trusted_key=self.trusted_key, receipt=receipt,

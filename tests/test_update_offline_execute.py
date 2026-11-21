@@ -289,7 +289,7 @@ class OfflineExecuteTest(unittest.TestCase):
             report = self._json(work, "write-report.json")
             self.assertEqual(report, {
                 "schemaVersion": 1,
-                "phase": "armada_boot_selected",
+                "phase": "armada_boot_switch_intent",
                 "transactionId": tx,
                 "planSha256": plan_sha,
                 "armadaBootSwitch": plan["armadaBootSwitch"],
@@ -301,6 +301,64 @@ class OfflineExecuteTest(unittest.TestCase):
             # validated, in the raw sense — those are the non-disk path effects.
             self.assertFalse((work / "boots").exists() and
                              any((work / "boots").iterdir()))
+
+    def test_disk_path_write_report_failure_occurs_before_activate(self):
+        """Contract: an injected OSError on the pre-activate write-report
+        persists failure with bootWriteState=not_started, does not invoke
+        activate, and does not schedule a reboot."""
+        with self.fixture._case() as env:
+            _prepared, _initial_bytes, ack = self._ready(env)
+            initial = dict(env.physical, bootSource="armada_boot",
+                           actualSlot=None, inactiveSlot=None)
+            work = env.work
+            saved_status = self._json(work, "status.json")
+            saved_status.update(bootSource="armada_boot",
+                                fromSlot=None, targetSlot=None)
+            tx = saved_status["transactionId"]
+            expected = Path(work)
+            plan = {
+                "sysrootPath": str(expected / "sysroot"),
+                "armadaBootSwitch": {
+                    "fromSlot": saved_status["fromSlot"],
+                    "targetSlot": saved_status["targetSlot"],
+                    "kernel": "armada",
+                    "nextBoot": "armada",
+                },
+            }
+            ctx = {
+                "saved_status": dict(saved_status),
+                "initial": initial,
+                "plan": plan,
+                "disk": True,
+                "tx": tx,
+            }
+            fake_activate = mock.Mock()
+            real_save = system_transaction._save_json
+
+            def flaky_save(work_dir, name, document):
+                if name == "write-report.json":
+                    raise OSError("injected write-report failure")
+                return real_save(work_dir, name, document)
+
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    offline_execute, "_preflight", return_value=ctx))
+                stack.enter_context(mock.patch.object(
+                    offline_execute, "boot_disk_switch",
+                    SimpleNamespace(activate=fake_activate)))
+                stack.enter_context(mock.patch.object(
+                    offline_execute.system_transaction, "_save_json",
+                    side_effect=flaky_save))
+                with self.assertRaises(system_transaction.SystemTransactionError):
+                    offline_execute._execute_offline_update(
+                        work_dir=work, recovery_ack=ack)
+
+            fake_activate.assert_not_called()
+            on_disk_status = self._json(work, "status.json")
+            self.assertEqual(on_disk_status["state"], "failed")
+            self.assertEqual(on_disk_status["bootWriteState"], "not_started")
+            self.assertFalse(on_disk_status["requiresReboot"])
+            self.assertFalse((work / "write-report.json").exists())
 
     def test_success_models_slots_record_progress_and_single_execution(self) -> None:
         for model in ("TB322FC", "TB323FU"):

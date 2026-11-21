@@ -606,7 +606,8 @@ static int stage_disk_menu_entry(uint64_t linux_base, uint64_t manifest_address,
     ret = kshim_disk_boot_stage(runtime_fdt, fdt_totalsize(runtime_fdt),
                                 excluded, 5, descriptor,
                                 armada_disk_boot_key, (uint32_t)board,
-                                image, scratch, sizeof(scratch));
+                                image, scratch, sizeof(scratch),
+                                HandoffDtb, sizeof(HandoffDtb));
     return ret;
 }
 
