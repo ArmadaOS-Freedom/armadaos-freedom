@@ -314,11 +314,11 @@ int kshim_config_log_boot(struct kshim_config_store *s, uint32_t target,
         target_idx = 0;
     }
 
-    /* Board1: a nominal normal target=1 phase=1 status=0 duplicate that
-     * directly follows a validated diagnostic target=2 phase=4 status=0
+    /* Board1/Board2: a nominal normal target=1 phase=1 status=0 duplicate
+     * that directly follows a validated diagnostic target=2 phase=4 status=0
      * record is skipped so the handoff retains that one diagnostic record.
      * No format or slot-layout change; compare the newest live record. */
-    if (s->board_id == 1 && best >= 0 &&
+    if ((s->board_id == 1 || s->board_id == 2) && best >= 0 &&
         target == 1 && phase == 1 && status == 0) {
         const uint8_t *live = (best == 0) ? a : b;
         if (get32(live + 60) == 2 && get32(live + 64) == 4 &&

@@ -1303,7 +1303,8 @@ int kshim_main(
                         int diag_auto_return =
                             one_shot &&
                             consumed_action == KSHIM_ACTION_LINUX_DIAG &&
-                            device_info.board == DEVICE_BOARD_TB322FC;
+                            (device_info.board == DEVICE_BOARD_TB322FC ||
+                             device_info.board == DEVICE_BOARD_TB323FU);
                         status = set_disk_linux_chosen(
                             blob, sizeof(HandoffDtb), &disk_descriptor,
                             &disk_image, (uint32_t)device_info.board,

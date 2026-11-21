@@ -90,12 +90,13 @@ int kshim_settings_take_action(struct kshim_settings_session *s,uint32_t *action
     uint32_t requested=kshim_next_action_value(packed);
     if (!values_valid(&s->values)) return KSHIM_STORAGE_ARG;
     if (!requested) return 0;   /* flag-only or none: nothing to consume */
-    /* Unlocked TB322FC internal medium: convert the diagnostic request to a
+    /* TB322FC/TB323FU internal medium: convert the diagnostic request to a
      * plain Linux boot in the same verified transaction.  Other actions and
      * other media/boards keep the existing cleared-to-NONE behavior. */
     uint32_t replacement=(requested==KSHIM_ACTION_LINUX_DIAG &&
                           s->source==KSHIM_SETTINGS_INTERNAL &&
-                          s->medium[0].config.board_id==1) ?
+                          (s->medium[0].config.board_id==1 ||
+                           s->medium[0].config.board_id==2)) ?
                           KSHIM_ACTION_LINUX : KSHIM_ACTION_NONE;
     struct kshim_config_values next=s->values;
     next.next_action=kshim_next_action_pack(replacement,kshim_next_action_flags(packed));

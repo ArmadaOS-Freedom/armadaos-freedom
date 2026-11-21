@@ -105,12 +105,13 @@ diagnostic for the next reboot. The launcher consumes the request durably before
 dispatch and keeps the permanent default and last normal boot target. An absent
 or ambiguous target falls back to the regular boot selection.
 
-A one-shot TB322FC diagnostic schedules ordinary Linux for the following boot.
-The matching initramfs reboots at the dracut pre-mount checkpoint. A diagnostic
-chosen directly from the TB322FC boot menu still stops at the pre-mount shell.
-TB323FU runs with verbose diagnostic startup arguments. With logging enabled,
-the TB322FC automatic return preserves the diagnostic and ordinary handoffs in
-the two recovery-area log records.
+A one-shot TB322FC or TB323FU diagnostic schedules ordinary Linux for the
+following boot. The matching initramfs reboots at the dracut pre-mount
+checkpoint. A diagnostic chosen directly from the TB322FC boot menu still stops
+at the pre-mount shell; a TB323FU manual diagnostic instead continues using
+verbose startup arguments. With logging enabled, the automatic return
+preserves the diagnostic and ordinary handoffs in the two recovery-area log
+records.
 
 With the advertised `kshim,launcher-settings-version` capability, Linux can make
 the same request with `sudo armada-reboot-edl --next android` (also `linux`,

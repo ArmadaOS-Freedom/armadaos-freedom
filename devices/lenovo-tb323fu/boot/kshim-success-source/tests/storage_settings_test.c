@@ -143,12 +143,14 @@ static void v4_take_action_tests(void){
 }
 /* TEMP diagnostic auto-return candidate: action 4 consumed as diagnostic
  * publishes no action and latches next plain Linux while retaining flag. */
-static void diag_auto_return_tests(void){
+static void diag_auto_return_tests(uint32_t board_id){
     static struct kshim_settings_session s;
     struct kshim_blockdev i=device(&internal);
     struct kshim_config_values v={1,4,1,2, kshim_next_action_pack(KSHIM_ACTION_LINUX_DIAG, KSHIM_FLAG_NO_BOOT_LOG)};
     provision(&internal);
-    assert(kshim_settings_open(&s,&i,NULL,1,&(struct kshim_config_values){0})==KSHIM_STORAGE_EMPTY);
+    p32(internal.tail+88,board_id);
+    p32(internal.tail+4092,kshim_crc32(internal.tail,4092));
+    assert(kshim_settings_open(&s,&i,NULL,board_id,&(struct kshim_config_values){0})==KSHIM_STORAGE_EMPTY);
     assert(kshim_settings_save(&s,&v)==0);
     uint32_t action=99;internal.fail=1;
     assert(kshim_settings_take_action(&s,&action)!=0 && action==0);
@@ -160,7 +162,7 @@ static void diag_auto_return_tests(void){
            s.values.language==1 && s.values.last_target==2);
     assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_LINUX);
     assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
-    assert(kshim_settings_open(&s,&i,NULL,1,&v)==0);
+    assert(kshim_settings_open(&s,&i,NULL,board_id,&v)==0);
     assert(kshim_next_action_value(s.values.next_action)==KSHIM_ACTION_LINUX);
     assert(kshim_next_action_flags(s.values.next_action)==KSHIM_FLAG_NO_BOOT_LOG);
     assert(s.values.default_target==4 && s.values.language==1 && s.values.device_choice==1);
@@ -173,7 +175,8 @@ static void diag_auto_return_tests(void){
 int main(void){
     one_shot_tests();
     v4_take_action_tests();
-    diag_auto_return_tests();
+    diag_auto_return_tests(1);
+    diag_auto_return_tests(2);
     history_tests();
     static struct kshim_settings_session s;
     struct kshim_blockdev i=device(&internal),t=device(&tf);
