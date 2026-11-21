@@ -276,12 +276,12 @@ static void test_v4_flags(unsigned bs) {
 }
 /* TEMP Gen4 diagnostic auto-return candidate: after a diagnostic record the
  * ordinary entry preserves writes count, the handoff appends one log slot. */
-static void test_bootlog_diag_auto_return(unsigned bs) {
+static void test_bootlog_diag_auto_return(unsigned bs, uint32_t board_id) {
     fixture(bs);
     le32(descriptor()+8,3);le32(descriptor()+92,28672);
     le32(descriptor()+96,32768);le32(descriptor()+100,4096);
-    le32(descriptor()+88,1);seal(descriptor());
-    assert(kshim_config_open(&store,&dev,&part,1,scratch,sizeof(scratch))==0);
+    le32(descriptor()+88,board_id);seal(descriptor());
+    assert(kshim_config_open(&store,&dev,&part,board_id,scratch,sizeof(scratch))==0);
     assert(store.descriptor_version==3);
     unsigned w0=writes;
     assert(kshim_config_log_boot(&store,2,4,0)==KSHIM_STORAGE_OK);
@@ -297,7 +297,8 @@ static void test_bootlog_diag_auto_return(unsigned bs) {
 }
 int main(void) {
     test_one_shot_v3(512);test_one_shot_v3(4096);
-    test_bootlog_diag_auto_return(512);test_bootlog_diag_auto_return(4096);
+    test_bootlog_diag_auto_return(512,1);test_bootlog_diag_auto_return(512,2);
+    test_bootlog_diag_auto_return(4096,1);test_bootlog_diag_auto_return(4096,2);
     test_v4_flags(512);test_v4_flags(4096);
     test_last_boot_v2(512);test_last_boot_v2(4096);
     assert(fixture_crc((const unsigned char *)"123456789",9)==0xcbf43926u);
