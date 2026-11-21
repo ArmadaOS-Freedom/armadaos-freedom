@@ -357,6 +357,49 @@ def execute_completion(prepared, plan, plan_sha256, status, report, ack,
     return identity
 
 
+def resolve_execute_status(prepared, plan, plan_sha256, status, report, ack,
+                           trial, model=None):
+    """Resolve a durable execute result against live trial evidence.
+
+    Returns ``(identity, status)`` when the durable transaction documents
+    prove an executed transaction and the live trial agrees with it, or
+    ``(None, None)`` otherwise.  A status interrupted during the armada boot
+    switch is first normalized in memory to the awaiting_reboot checkpoint
+    the validator accepts; only ``state``, ``phase`` and ``requiresReboot``
+    are replaced on that copy.
+    """
+    interrupted_disk = (
+        isinstance(status, dict) and
+        status.get('bootSource') == 'armada_boot' and
+        ((status.get('state') == 'executing' and
+          status.get('phase') == 'switching_armada_boot') or
+         (status.get('state') == 'recovery_required' and
+          status.get('phase') == 'failed' and
+          status.get('failedPhase') in ('awaiting_reboot', 'switching_armada_boot'))))
+    checked_status = status
+    if interrupted_disk:
+        checked_status = dict(status)
+        checked_status['state'] = 'awaiting_reboot'
+        checked_status['phase'] = 'awaiting_reboot'
+        checked_status['requiresReboot'] = True
+    identity = execute_completion(
+        prepared, plan, plan_sha256, checked_status, report, ack, model)
+    if identity is None:
+        return None, None
+    if not interrupted_disk:
+        return identity, checked_status
+    verdict = evaluate(
+        {'state': 'awaiting_reboot', 'result': checked_status},
+        trial, identity)
+    if verdict.get('state') == CONFIRMED:
+        return identity, checked_status
+    if (verdict.get('state') == AWAITING_REBOOT and
+            verdict.get('restartEligible') is True and
+            trial.get('selectorCheckpointed') is True):
+        return identity, checked_status
+    return None, None
+
+
 def _outcome(receipt):
     if not isinstance(receipt, dict):
         return None

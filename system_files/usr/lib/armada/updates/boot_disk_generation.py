@@ -162,7 +162,7 @@ def is_offline_staged(generation: Path) -> bool:
     try:
         raw = _io.read_bounded(
             marker, len(_OFFLINE_STAGED_BYTES))
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         return False
     return raw == _OFFLINE_STAGED_BYTES
 

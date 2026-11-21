@@ -644,6 +644,7 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         gen_c.mkdir()
         (gen_a / ".offline-staged").write_bytes(b"1\n")
         (gen_b / ".offline-staged").write_bytes(b"1\n")
+        (gen_c / ".offline-staged").write_bytes(b"1\n\n")
 
         base = Path(self._tmp.name) / "offline-sessions"
         txn = base / ("d" * 32) / "transaction"

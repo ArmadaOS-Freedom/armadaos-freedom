@@ -230,39 +230,20 @@ class OfflineJobManager:
         except (OSError, ValueError, RuntimeError):
             return None
         evidence = _read_trial_evidence()
-        interrupted_disk = (
-            isinstance(status, dict) and
-            status.get('bootSource') == 'armada_boot' and
-            ((status.get('state') == 'executing' and
-              status.get('phase') == 'switching_armada_boot') or
-             (status.get('state') == 'recovery_required' and
-              status.get('phase') == 'failed' and
-              status.get('failedPhase') in ('awaiting_reboot', 'switching_armada_boot'))))
-        tentative = None
-        if interrupted_disk:
-            tentative = dict(status)
-            tentative['state'] = 'awaiting_reboot'
-            tentative['phase'] = 'awaiting_reboot'
-            tentative['requiresReboot'] = True
-            tentative['bootWriteState'] = 'not_started'
-        checked_status = tentative if tentative is not None else status
-        identity = offline_completion.execute_completion(
-            prepared, plan, _io.sha256_hex(plan_raw),
-            checked_status, report, ack, receipt.get('model'))
+        identity, status = offline_completion.resolve_execute_status(
+            prepared, plan, _io.sha256_hex(plan_raw), status, report, ack,
+            evidence, receipt.get('model'))
         if identity is None:
             return None
         verdict = offline_completion.evaluate(
-            {'state': 'awaiting_reboot', 'result': checked_status},
+            {'state': 'awaiting_reboot', 'result': status},
             evidence, identity)
         if verdict.get('state') == offline_completion.AWAITING_REBOOT:
             if verdict.get('restartEligible') is not True:
                 return None
-            if (interrupted_disk and
-                    evidence.get('selectorCheckpointed') is not True):
-                return None
         elif verdict.get('state') != offline_completion.CONFIRMED:
             return None
-        return checked_status
+        return status
 
     @staticmethod
     def _durable_prepare(session, receipt):

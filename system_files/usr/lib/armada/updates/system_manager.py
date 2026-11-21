@@ -380,9 +380,22 @@ def _valid_offline_completion(trial, model):
                 or type(receipt.get("schemaVersion")) is not int
                 or receipt["schemaVersion"] != 1
                 or receipt.get("sessionId") != session_id
-                or receipt.get("state") not in _OFFLINE_RECEIPT_STATES
                 or receipt.get("model") != model):
             return False
+        if receipt.get("state") not in _OFFLINE_RECEIPT_STATES:
+            if receipt.get("state") != "failed":
+                return False
+            if receipt.get("jobOperation") != "execute":
+                return False
+            nested = receipt.get("result")
+            if not isinstance(nested, dict):
+                return False
+            if nested.get("state") != "recovery_required":
+                return False
+            if nested.get("bootSource") != "armada_boot":
+                return False
+            if trial.get("bootSource") != "armada_boot":
+                return False
         transaction = session / "transaction"
         if transaction.parent != session or transaction.resolve(strict=True) != transaction:
             return False
@@ -396,9 +409,9 @@ def _valid_offline_completion(trial, model):
         status = _json_document(transaction / "status.json")
         report = _json_document(transaction / "write-report.json")
         ack = _json_document(session / "ack.json")
-        identity = offline_completion.execute_completion(
+        identity, _ = offline_completion.resolve_execute_status(
             prepared, plan, _io.sha256_hex(plan_raw),
-            status, report, ack, model)
+            status, report, ack, trial, model)
         if identity is None:
             return False
         if identity.get("bootSource") == "armada_boot":
