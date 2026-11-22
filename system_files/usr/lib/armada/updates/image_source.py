@@ -13,6 +13,8 @@ from .deployment_store import (
     DeploymentError,
     _binding_of,
     _gi,
+    _initialize_writable_sysroot,
+    _new_sysroot,
     _require_nonsymlink_dir,
     _validate_commit_metadata,
 )
@@ -91,12 +93,12 @@ def _run_command(command, log_path):
     return log_path
 
 
-def _pull(repo, origin_ref, work):
+def _pull(repo, pull_ref, work):
     work = Path(work)
     command = [
         "/usr/bin/bootc", "internals", "ostree-ext", "container", "image",
         "pull", "--auth-anonymous", "--ostree-digestfile", str(work / "commit"),
-        str(repo), origin_ref,
+        str(repo), pull_ref,
     ]
     return _run_command(command, work / "pull.log")
 
@@ -141,7 +143,7 @@ def _remove_stage(stage):
     return None
 
 
-def _import_verified(destination_repo, origin_ref, work, expected_commit, validate):
+def _import_verified(destination_repo, pull_ref, work, expected_commit, validate):
     work = Path(work)
     stage = work / "staging-repo"
     try:
@@ -153,7 +155,7 @@ def _import_verified(destination_repo, origin_ref, work, expected_commit, valida
             ["/usr/bin/ostree", "init", f"--repo={stage}", "--mode=bare"],
             work / "init.log",
         )
-        pull_log = _pull(stage, origin_ref, work)
+        pull_log = _pull(stage, pull_ref, work)
         digest = _read_commit(work)
         if digest != expected_commit:
             raise ImageSourceError(f"pulled commit does not match channel; log {pull_log}")
@@ -207,12 +209,23 @@ def fetch_online_image(*, channel_url, signature_url, expected_channel, model,
         "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
         f"armadaos-freedom:{expected_channel}@{oci_digest}"
     )
+    pull_ref = (
+        "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+        f"armadaos-freedom@{oci_digest}"
+    )
     try:
         root, work = _paths(sysroot_path, work_dir)
     except DeploymentError as exc:
         raise ImageSourceError(str(exc)) from exc
     Gio, GLib, OSTree = _gi()
-    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
+    try:
+        sysroot = _new_sysroot(Gio, OSTree, root)
+    except DeploymentError as exc:
+        raise ImageSourceError(str(exc)) from exc
+    try:
+        _initialize_writable_sysroot(sysroot, root)
+    except DeploymentError as exc:
+        raise ImageSourceError(str(exc)) from exc
     ok, locked = sysroot.try_lock()
     if not (ok and locked):
         raise ImageSourceError("sysroot busy: try_lock not acquired")
@@ -243,7 +256,7 @@ def fetch_online_image(*, channel_url, signature_url, expected_channel, model,
                 raise ImageSourceError(f"cannot open staging repository {stage_path}")
             _validate_repo_commit(stage_repo, stage_digest, package)
 
-        log_path = _import_verified(expected_repo, origin_ref, work, digest, _validate_stage)
+        log_path = _import_verified(expected_repo, pull_ref, work, digest, _validate_stage)
         if not sysroot.load(None):
             raise ImageSourceError("sysroot reload after pull failed")
         after = [_binding_of(dep) for dep in (sysroot.get_deployments() or [])]

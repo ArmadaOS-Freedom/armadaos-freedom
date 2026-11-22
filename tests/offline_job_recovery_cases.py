@@ -255,6 +255,96 @@ class OfflineJobRecoveryCases:
         self.assertEqual(self.receipt_bytes(sid), before)
         self.reboot.assert_not_called()
 
+    def test_armada_boot_dead_receipt_requires_proof_before_restart(self):
+        import hashlib
+
+        sid = self.interrupted_execute()
+        with self.store.session_lock(sid) as session:
+            transaction = session / 'transaction'
+            plan = json.loads((transaction / 'plan.json').read_text())
+            prepared = json.loads((transaction / 'prepared.json').read_text())
+            ack = json.loads((session / 'ack.json').read_text())
+            switch = {'model': plan['model'],
+                      'currentDeployment': plan['oldDeployment'],
+                      'newDeployment': plan['newDeployment'],
+                      'expectedBootSha256': dict(NEW_BOOT),
+                      'targetBootSha256': dict(NEW_BOOT)}
+            plan['fromSlot'] = None
+            plan['targetSlot'] = None
+            plan['armadaBootSwitch'] = switch
+            plan['newBootSha256'] = dict(ORIGINAL_BOOT)
+            system_transaction._save_json(transaction, 'plan.json', plan)
+            plan_sha = hashlib.sha256(
+                (transaction / 'plan.json').read_bytes()).hexdigest()
+            prepared['planSha256'] = plan_sha
+            system_transaction._save_json(transaction, 'prepared.json', prepared)
+            ack['planSha256'] = plan_sha
+            system_transaction._save_json(session, 'ack.json', ack)
+        self.completed_status(
+            sid,
+            report={'schemaVersion': 1, 'phase': 'armada_boot_switch_intent',
+                    'transactionId': TX, 'planSha256': plan_sha,
+                    'armadaBootSwitch': switch},
+            fromSlot=None, targetSlot=None, bootSource='armada_boot',
+            state='recovery_required', phase='failed',
+            failedPhase='awaiting_reboot', requiresReboot=False,
+            bootWriteState='not_started')
+        with self.store.session_lock(sid) as session:
+            receipt = self.store.read_receipt(session)
+            receipt['result'] = {'state': 'recovery_required',
+                                 'bootSource': 'armada_boot'}
+            receipt['state'] = 'failed'
+            self.store.update_receipt(session, receipt)
+        self.trial.return_value = self.evidence(
+            sid, bootSource='armada_boot', fromSlot=None, targetSlot=None,
+            selectorCheckpointed=False)
+        mgr = self.manager()
+        result = mgr.status(sid)
+        self.assertEqual(result['state'], 'failed')
+        with self.assertRaises(offline_session.OfflineSessionError):
+            mgr.request_restart(sid)
+        self.trial.return_value = self.evidence(
+            sid, bootSource='armada_boot', fromSlot=None, targetSlot=None,
+            selectorCheckpointed=True, planSha256='d' * 64)
+        self.assertEqual(mgr.status(sid)['state'], 'failed')
+        self.trial.return_value = self.evidence(
+            sid, bootSource='armada_boot', fromSlot=None, targetSlot=None,
+            selectorCheckpointed=True)
+        confirmed = mgr.status(sid)
+        self.assertEqual(confirmed['state'], 'awaiting_reboot')
+        self.assertTrue(confirmed['completion']['restartEligible'])
+        restarted = mgr.request_restart(sid)
+        self.assertEqual(restarted['restart']['state'], 'dispatched')
+        self.assertEqual(self.reboot.call_count, 1)
+
+        live_cases = (
+            ('prepared', {'recordState': 'prepared',
+                          'bootConfirmed': False}, 'awaiting_confirmation'),
+            ('confirmed', {'recordState': 'confirmed',
+                           'bootConfirmed': True,
+                           'finalization': {'state': 'pending'}}, 'finalizing'),
+        )
+        for name, evidence_overrides, expected in live_cases:
+            with self.subTest(case=name):
+                with self.store.session_lock(sid) as session:
+                    receipt = self.store.read_receipt(session)
+                    receipt['state'] = 'failed'
+                    receipt.pop('restart', None)
+                    receipt['result'] = {'state': 'recovery_required',
+                                         'bootSource': 'armada_boot'}
+                    self.store.update_receipt(session, receipt)
+                self.trial.return_value = self.evidence(
+                    sid, bootSource='armada_boot', fromSlot=None,
+                    targetSlot=None, selectorCheckpointed=False,
+                    runningDeployment='new', **evidence_overrides)
+                adopted = mgr.status(sid)
+                self.assertEqual(adopted['state'], 'awaiting_reboot')
+                self.assertEqual(adopted['completion']['state'], expected)
+                self.assertFalse(adopted['completion']['restartEligible'])
+                with self.assertRaises(offline_session.OfflineSessionError):
+                    mgr.request_restart(sid)
+        self.assertEqual(self.reboot.call_count, 1)
+
     def test_completion_pointer_is_keyed_by_transaction(self):
         first = self.submitted_session(TX)
         second = self.submitted_session(OTHER_TX)

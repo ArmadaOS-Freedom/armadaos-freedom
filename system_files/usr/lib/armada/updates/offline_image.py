@@ -7,6 +7,15 @@ only ``/root/ostree/repo`` using ``btrfs restore`` without mounting or loop
 devices, and delegates commit verification and pull-local import to
 ``import_offline_repository``.  Archive assembly, gzip expansion, deployment,
 and activation are separate responsibilities.
+
+If ``btrfs restore`` reports a ``zstd frame incomplete`` diagnostic in the
+first 8192 bytes of its log (a known bug affecting certain valid images with
+OSTree compressed inline objects), a fallback path is attempted: the image is
+mounted read-only via a private mount namespace (``unshare --mount``) into a
+fresh ``work/image-mount`` directory, and ``/root/ostree/repo`` is copied with
+``cp -a`` into a separate ``work/content-mounted`` staging directory before
+import.  The original partial ``btrfs restore`` output is left untouched and
+never used by the fallback.  All other ``btrfs restore`` failures fail closed.
 """
 import os
 from pathlib import Path
@@ -24,6 +33,79 @@ from .package_media import _open_regular, _sha256_stream
 from .signature import DEFAULT_TRUSTED_KEY
 
 _RESTORE_REGEX = r"^/(|root(|/ostree(|/repo(|/.*))))$"
+_ZSTD_INCOMPLETE = b"ERROR: zstd frame incomplete"
+_ZSTD_SCAN_BYTES = 8192
+_MOUNTED_CONTENT = "content-mounted"
+_MOUNTED_IMAGE = "image-mount"
+_MOUNTED_LOG = "extract-mounted.log"
+_MOUNT_SCRIPT = r"""set -eu
+image=$1
+mountpoint=$2
+content_dir=$3
+/usr/bin/mount -n -t btrfs -o ro,rescue=nologreplay,loop,subvolid=5,nodev,nosuid,noexec "$image" "$mountpoint"
+cleanup() {
+    /usr/bin/umount -n "$mountpoint" 2>/dev/null || true
+}
+trap cleanup EXIT
+for d in "$mountpoint/root" "$mountpoint/root/ostree" "$mountpoint/root/ostree/repo"; do
+    if [ -L "$d" ]; then
+        echo "unexpected symlink in image: $d" >&2
+        exit 1
+    fi
+    if [ ! -d "$d" ]; then
+        echo "missing directory in image: $d" >&2
+        exit 1
+    fi
+done
+/usr/bin/cp -a -- "$mountpoint/root/ostree/repo" "$content_dir/root/ostree/repo"
+/usr/bin/umount -n "$mountpoint"
+trap - EXIT
+"""
+
+
+def _log_reports_zstd_incomplete(log_path):
+    try:
+        with open(log_path, "rb") as handle:
+            head = handle.read(_ZSTD_SCAN_BYTES)
+    except OSError:
+        return False
+    return _ZSTD_INCOMPLETE in head
+
+
+def _mount_extract_repo(image, work, content_dir):
+    mountpoint = work / _MOUNTED_IMAGE
+    try:
+        mountpoint.mkdir(mode=0o700, exist_ok=False)
+    except OSError as exc:
+        raise OfflineSourceError(
+            f"cannot create mount directory {mountpoint}: {exc}"
+        ) from exc
+    try:
+        (content_dir / "root" / "ostree").mkdir(mode=0o700, parents=True, exist_ok=False)
+    except OSError as exc:
+        raise OfflineSourceError(
+            f"cannot create mounted staging directory {content_dir}: {exc}"
+        ) from exc
+    try:
+        return _run_command(
+            [
+                "/usr/bin/unshare",
+                "--mount",
+                "--propagation",
+                "private",
+                "--",
+                "/usr/bin/bash",
+                "-ec",
+                _MOUNT_SCRIPT,
+                "btrfs-mount-extract",
+                str(image),
+                str(mountpoint),
+                str(content_dir),
+            ],
+            work / _MOUNTED_LOG,
+        )
+    except ImageSourceError as exc:
+        raise OfflineSourceError(str(exc)) from exc
 
 
 def _same_stat(a, b):
@@ -180,14 +262,18 @@ def import_offline_image(
             work / "extract.log",
         )
     except ImageSourceError as exc:
-        raise OfflineSourceError(str(exc)) from exc
+        if not _log_reports_zstd_incomplete(work / "extract.log"):
+            raise OfflineSourceError(str(exc)) from exc
+        _verify_image_identity(image, st_verified)
+        content_dir = work / _MOUNTED_CONTENT
+        extract_log = _mount_extract_repo(image, work, content_dir)
 
     _verify_image_identity(image, st_verified)
 
-    staged_repo = work / "content" / "root" / "ostree" / "repo"
+    staged_repo = content_dir / "root" / "ostree" / "repo"
     try:
         _require_nonsymlink_dir(
-            work, "content", "root", "ostree", "repo"
+            work, content_dir.name, "root", "ostree", "repo"
         )
     except DeploymentError as exc:
         raise OfflineSourceError(

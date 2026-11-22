@@ -1,7 +1,7 @@
 """Baseline checks for the version of the unified-package updater.
 
 The initial all-model package replaces the pre-unification 0.8.0 updater
-artifact, so the installed updater reports 0.8.1. These tests pin that
+artifact, so the installed updater reports 0.8.2. These tests pin that
 behaviour through the modules that expose or forward the version, not through
 source text, and keep the installer baseline at 0.8.0 out of scope.
 """
@@ -23,7 +23,7 @@ from updates import (  # noqa: E402
     system_transaction,
 )
 
-EXPECTED_UPDATER_VERSION = "0.8.1"
+EXPECTED_UPDATER_VERSION = "0.8.2"
 
 _FORWARDING_SITES = (
     (offline_prepare, "prepare_offline_update"),

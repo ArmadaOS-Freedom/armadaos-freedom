@@ -6,6 +6,8 @@ from .deployment_store import (
     DeploymentError,
     _binding_of,
     _gi,
+    _initialize_writable_sysroot,
+    _new_sysroot,
     _require_nonsymlink_dir,
 )
 from .image_source import (
@@ -107,8 +109,12 @@ def import_offline_repository(
     except Exception as exc:
         raise OfflineSourceError(f"cannot initialize OSTree bindings: {exc}") from exc
 
-    sysroot = OSTree.Sysroot.new(Gio.File.new_for_path(str(root)))
     try:
+        sysroot = _new_sysroot(Gio, OSTree, root)
+    except DeploymentError as exc:
+        raise OfflineSourceError(str(exc)) from exc
+    try:
+        _initialize_writable_sysroot(sysroot, root)
         ok, locked = sysroot.try_lock()
     except Exception as exc:
         raise OfflineSourceError(f"sysroot lock failed: {exc}") from exc

@@ -7,7 +7,44 @@ The offline RPC `info` result and every system-update status/apply result carry
 that exact `bootPolicy` string, so clients cannot mistake this deployment for
 legacy single-slot readiness.
 
-## Transaction (online update and explicit rollback)
+## ARMADA_BOOT installations
+
+On TB322FC and TB323FU, each physical Android Boot image retains its own
+Android kernel and ramdisk alongside the Freedom launcher and its Linux entry
+descriptors. Both the normal and diagnostic Linux entries load their kernel,
+initramfs and signed board DTB from the 1 GiB ext4 `ARMADA_BOOT` partition. A
+running deployment identifies this path with `bootSource=armada_boot`.
+
+Online and offline Linux updates authenticate the target OSTree commit and
+stage a signed boot generation on `ARMADA_BOOT`. Once preparation succeeds,
+activation writes the pending record and switches the Linux selector. After
+reboot, the confirmation service checks the running deployment and graphical
+session, promotes the deployment, and retains the previous deployment and
+boot generation for rollback. Rollback selects that retained, verified
+generation using the same activation and confirmation sequence.
+
+For this layout, `fromSlot` and `targetSlot` are `null`. A prepared reboot
+reports `bootWriteState=not_started` and `slotControlState=not_issued` because
+those fields track raw Android Boot writes and Android slot control. Both
+Android boot images, Android slot selection and user partitions are preserved.
+The updater changes the Linux deployment and boot files on `ARMADA_BOOT`.
+
+## Recovering an unconfirmed update
+
+On ARMADA_BOOT installations, if a prepared update does not reach a usable
+graphical Linux session, recovery requires a boot launcher capable of selecting
+the previous signed boot generation and a retained previous build. Entry is
+through the launcher's Advanced boot menu; recovery uses the retained signed
+payload on `ARMADA_BOOT` and shares the Linux data partition. It does not
+change either Android boot slot or Android partitions.
+
+## Existing embedded-boot layouts
+
+The remaining sections describe installations that embed Linux boot material
+in both raw Android Boot images. They document that layout's transaction and
+recovery protocol.
+
+### Transaction (online update and explicit rollback)
 
 1. Read-only preflight observes the physical slots, the per-slot boot sources
    and their authenticated per-slot material.  Observation is evidence only;
@@ -47,7 +84,7 @@ legacy single-slot readiness.
    No Android slot selection, slot-success marking, retry/priority or UFS
    boot-LUN change, or Android BCB write is issued.
 
-### Power-loss boundary and limits
+#### Power-loss boundary and limits
 
 The durability boundary is the journal record, not a single partition write.
 A `pwrite`/`fsync`/readback of one boot partition is not claimed to be atomic
@@ -66,7 +103,7 @@ mirrored images are unusable at once, the transaction reports the failure and
 stops.  An extra selector, stale prepared record, or boot-control fallback is
 never synthesized to escape that limit.
 
-## Boot
+### Boot
 
 The Android bootloader keeps owning slot selection and raw boot state.  Linux
 only reads the boot witness and the running deployment.
@@ -85,7 +122,7 @@ line is blank, a comment, or one `key = value` assignment (a bare value or a
 string quoted on the same line); arrays, `;`, brace blocks, other operators
 and empty values make the whole source unsupported.
 
-## Confirmation
+### Confirmation
 
 Confirmation accepts evidence from **either** physical slot when the running
 deployment equals the mirrored deployment and that slot's boot partition hash
@@ -96,7 +133,7 @@ equals the corresponding recorded hash.  It then:
 * keeps the previous deployment retained and pinned as the rollback target;
 * writes a finalization receipt with `firmwareSlotControl=not_issued`.
 
-## Rollback
+### Rollback
 
 An explicit rollback repacks **both** physical slots from the retained previous
 OSTree deployment, using the same non-running-then-commit-then-running order
@@ -104,7 +141,7 @@ and the same v2 trial record for the previous deployment.  Confirmation of that
 record commits the previous deployment as the default and retains the newer
 one.  There is no slot selection anywhere in the flow.
 
-## Read-only dependencies that remain
+### Read-only dependencies that remain
 
 * `physical_slots.inspect_physical_slots()` reports the observed boot witness
   slot and the controller-selected slot separately, together with the real
@@ -121,7 +158,7 @@ one.  There is no slot selection anywhere in the flow.
 * The boot-time interpretation of the trial record (attempt accounting) is
   handled by the kShim built from this tree. It accounts for attempts on either physical slot without changing Android slot state.
 
-## Runtime compatibility marker
+### Runtime compatibility marker
 
 The kShim runtime of every mirrored-policy model (TB322FC, TB323FU and
 TB710FU) retains the exact literal
@@ -133,7 +170,7 @@ authentication or boot claim.  It does not apply to custom install-only
 profiles or to TF-card packages, and legacy deployments remain readable
 through the existing read-only inspection paths.
 
-## What an internal Linux update preserves for Android
+### What an internal Linux update preserves for Android
 
 The source is the installed Boot and its companion partitions on each physical slot, not a stock Android package or an earlier backup. BootTool checks the Android base kernel again inside the rebuilt candidate. On the supported GBL route, it compares the signed boot metadata bytes with that slot's installed bytes. Before opening either boot target for writing, Linux independently requires the candidate metadata digest to equal that slot's authenticated metadata digest. On the AOSP route, only an already recognized project signing chain is eligible: the changed boot payload requires a new matching signed digest. An unknown or mixed chain is rejected; there is no fallback from GBL to AOSP.
 

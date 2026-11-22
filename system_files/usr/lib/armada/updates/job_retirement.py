@@ -385,6 +385,55 @@ def _manifest_paths(manifest):
     return set(paths)
 
 
+def _retire_confirmed_offline_bounds(bounds, base=None):
+    """Retire the dead fixed files of a session proven by *bounds*.
+
+    Shared by the legacy record-driven API and the disk-session API.  The
+    caller has already validated the identity bounds; this resolves the
+    session through its own per-transaction pending pointer without scanning,
+    proves the complete execute chain and unlinks only the fixed bulky files
+    and the signed payload.  ``False`` covers every unproven or failed case.
+    """
+    try:
+        from . import offline_completion, offline_execute, offline_session
+    except ImportError:
+        return False
+    try:
+        if base is None:
+            store = offline_session.OfflineSessionStore()
+        else:
+            store = offline_session.OfflineSessionStore(base=base)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    try:
+        base_path = offline_session._check_dir(Path(store.base))
+        pointer_path = offline_completion.completion_pointer(
+            base_path, bounds['transactionId'])
+        if (pointer_path is None or
+                pointer_path.parent !=
+                base_path / offline_completion.POINTER_DIRECTORY):
+            return False
+        offline_session._check_dir(pointer_path.parent)
+        raw = offline_execute._read_bounded(
+            pointer_path, _OFFLINE_POINTER_MAX, 'completion pointer')
+        pointer = _io.strict_loads(raw.decode('ascii'))
+        session_id = offline_completion.pointer_session(
+            pointer, bounds['transactionId'])
+        if session_id is None:
+            return False
+        with store.session_lock(session_id) as session:
+            receipt = store.read_receipt(session)
+            targets = _offline_proof(session, receipt, bounds)
+            if targets is None:
+                return False
+            payload = _payload_target(store, session, receipt)
+            if payload is not None:
+                targets.append(payload)
+            return _retire_offline_files(session, targets)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _offline_proof(session, receipt, bounds):
     """Return the exact files that may be unlinked once the session is proven.
 
@@ -428,6 +477,15 @@ def _offline_proof(session, receipt, bounds):
                 'fromSlot', 'targetSlot'):
         if identity.get(key) != bounds[key]:
             return None
+    if (identity.get('bootSource') != bounds.get('bootSource') or
+            bounds.get('bootSource') not in (None, 'armada_boot')):
+        return None
+    bounds_model = bounds.get('model')
+    if bounds_model is not None:
+        if type(bounds_model) is not str or not bounds_model:
+            return None
+        if receipt.get('model') != bounds_model:
+            return None
 
     manifest_sha256 = prepared.get('recoveryManifestSha256')
     if (not _sha256(manifest_sha256) or
@@ -444,6 +502,8 @@ def _offline_proof(session, receipt, bounds):
     members = _manifest_paths(manifest)
     if members is None:
         return None
+    if bounds.get('bootSource') == 'armada_boot':
+        return []
 
     targets = []
     for name in _OFFLINE_MATERIAL_FILES:
@@ -553,6 +613,39 @@ def _retire_offline_files(session, targets):
         os.close(session_fd)
 
 
+def retire_confirmed_disk_session(evidence, initial, *, base=None):
+    """Retire a confirmed offline session after validating disk identity."""
+    from . import offline_completion, offline_prepare
+
+    if not isinstance(evidence, dict) or not isinstance(initial, dict):
+        return False
+    status = evidence
+    if not isinstance(status, dict) or status.get('state') != 'available':
+        return False
+    if (status.get('recordState') != 'confirmed' or
+            status.get('runningDeployment') != 'new' or
+            status.get('bootConfirmed') is not True or
+            status.get('finalization') != {'state': 'complete'}):
+        return False
+    if (initial.get('bootSource') != 'armada_boot' or
+            not isinstance(initial.get('model'), str)):
+        return False
+    bounds = offline_completion.session_identity(evidence)
+    if bounds is None or bounds.get('bootSource') != 'armada_boot':
+        return False
+    if initial.get('deployment') != bounds.get('newDeployment') or \
+            bounds.get('oldDeployment') == bounds.get('newDeployment'):
+        return False
+    try:
+        layout = offline_prepare._read_recovery_for_disk(initial).layout
+        bounds['model'] = initial['model']
+        bounds['installationUuid'] = str(uuid.UUID(bytes=layout.installation_uuid))
+        bounds['recoveryPartUuid'] = str(uuid.UUID(bytes=layout.partition_uuid))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return _retire_confirmed_offline_bounds(bounds, base)
+
+
 def retire_confirmed_offline_session(record, *, base=None):
     """Remove the dead payload and fixed bulky files of a confirmed session.
 
@@ -570,41 +663,4 @@ def retire_confirmed_offline_session(record, *, base=None):
     bounds = _record_bounds(record)
     if bounds is None:
         return False
-    try:
-        from . import offline_completion, offline_execute, offline_session
-    except ImportError:
-        return False
-    try:
-        if base is None:
-            store = offline_session.OfflineSessionStore()
-        else:
-            store = offline_session.OfflineSessionStore(base=base)
-    except (OSError, ValueError, RuntimeError):
-        return False
-    try:
-        base_path = offline_session._check_dir(Path(store.base))
-        pointer_path = offline_completion.completion_pointer(
-            base_path, bounds['transactionId'])
-        if (pointer_path is None or
-                pointer_path.parent !=
-                base_path / offline_completion.POINTER_DIRECTORY):
-            return False
-        offline_session._check_dir(pointer_path.parent)
-        raw = offline_execute._read_bounded(
-            pointer_path, _OFFLINE_POINTER_MAX, 'completion pointer')
-        pointer = _io.strict_loads(raw.decode('ascii'))
-        session_id = offline_completion.pointer_session(
-            pointer, bounds['transactionId'])
-        if session_id is None:
-            return False
-        with store.session_lock(session_id) as session:
-            receipt = store.read_receipt(session)
-            targets = _offline_proof(session, receipt, bounds)
-            if targets is None:
-                return False
-            payload = _payload_target(store, session, receipt)
-            if payload is not None:
-                targets.append(payload)
-            return _retire_offline_files(session, targets)
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return False
+    return _retire_confirmed_offline_bounds(bounds, base)

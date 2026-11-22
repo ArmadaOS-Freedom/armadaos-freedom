@@ -214,6 +214,17 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                     self.assertEqual(len(matches), 1)
                     self.assertEqual(by_path[shared_path]["role"], role)
 
+    def test_malformed_boot_recipe_rejected(self):
+        def null_boot_recipe(bundle, docs, members):
+            docs[models[0]]["bootRecipe"] = None
+
+        models = ("TB322FC",)
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(Path(tmp), models=models,
+                                        mutate=null_boot_recipe)
+            with self.assertRaisesRegex(PackageError, "bootRecipe"):
+                build_descriptor(archive, release_id="rel-null-recipe")
+
     def test_valid_split_matches_whole_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)

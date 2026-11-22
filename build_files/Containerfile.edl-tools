@@ -23,6 +23,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         gzip \
         xz \
         skopeo \
+        openssl \
         coreutils \
         findutils \
         rpm \
@@ -37,6 +38,7 @@ RUN for tool in \
         bootc \
         git \
         skopeo \
+        openssl \
         rpm \
         dtc \
         lsinitrd \

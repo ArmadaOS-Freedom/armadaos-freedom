@@ -35,16 +35,53 @@ static const struct kshim_board_paths kshim_board_table[] = {
     },
 };
 
-#define KSHIM_KERNEL_PATH       "/armada/boot/kernel.img"
-#define KSHIM_INITRD_PATH       "/armada/boot/initramfs.img"
+static const struct kshim_board_paths kshim_board_table_recovery[] = {
+    {
+        KSHIM_BOARD_TB322FC,
+        "/armada/recovery/TB322FC/manifest.bin",
+        "/armada/recovery/TB322FC/manifest.sig",
+        "/armada/recovery/TB322FC/board.dtb",
+    },
+    {
+        KSHIM_BOARD_TB323FU,
+        "/armada/recovery/TB323FU/manifest.bin",
+        "/armada/recovery/TB323FU/manifest.sig",
+        "/armada/recovery/TB323FU/board.dtb",
+    },
+};
 
-static const struct kshim_board_paths *kshim_board_lookup(uint32_t board)
+#define KSHIM_KERNEL_PATH          "/armada/boot/kernel.img"
+#define KSHIM_INITRD_PATH          "/armada/boot/initramfs.img"
+#define KSHIM_KERNEL_RECOVERY_PATH  "/armada/recovery/kernel.img"
+#define KSHIM_INITRD_RECOVERY_PATH  "/armada/recovery/initramfs.img"
+
+struct kshim_boot_dir_paths {
+    const char *kernel;
+    const char *initrd;
+};
+
+static const struct kshim_boot_dir_paths kshim_boot_dir_normal = {
+    KSHIM_KERNEL_PATH,
+    KSHIM_INITRD_PATH,
+};
+
+static const struct kshim_boot_dir_paths kshim_boot_dir_recovery = {
+    KSHIM_KERNEL_RECOVERY_PATH,
+    KSHIM_INITRD_RECOVERY_PATH,
+};
+
+static const struct kshim_board_paths *kshim_board_lookup(uint32_t board, bool recovery)
 {
+    const struct kshim_board_paths *table =
+        recovery ? kshim_board_table_recovery : kshim_board_table;
+    size_t count = recovery
+        ? sizeof(kshim_board_table_recovery) / sizeof(kshim_board_table_recovery[0])
+        : sizeof(kshim_board_table) / sizeof(kshim_board_table[0]);
     size_t i;
 
-    for (i = 0; i < sizeof(kshim_board_table) / sizeof(kshim_board_table[0]); i++) {
-        if (kshim_board_table[i].board == board) {
-            return &kshim_board_table[i];
+    for (i = 0; i < count; i++) {
+        if (table[i].board == board) {
+            return &table[i];
         }
     }
     return NULL;
@@ -95,7 +132,12 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
                          const struct kshim_partition *part,
                          const uint8_t public_key[65],
                          uint32_t board,
-                         const struct kshim_disk_boot_buffers *buffers,
+                         bool recovery,
+                         void *dtb_scratch,
+                         size_t dtb_scratch_bytes,
+                         kshim_disk_boot_place_fn place,
+                         void *place_ctx,
+                         struct kshim_disk_boot_buffers *buffers,
                          struct kshim_disk_manifest *out_manifest,
                          void *scratch,
                          size_t scratch_bytes)
@@ -106,6 +148,7 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
     size_t manifest_actual = 0;
     struct kshim_disk_manifest verified;
     const struct kshim_board_paths *paths;
+    const struct kshim_boot_dir_paths *dir;
     int rc;
 
     if (out_manifest == NULL) {
@@ -116,18 +159,19 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
     if (dev == NULL || part == NULL || public_key == NULL || buffers == NULL) {
         return KSHIM_STORAGE_CRC;
     }
-    if (buffers->kernel == NULL || buffers->initrd == NULL ||
-        buffers->dtb == NULL) {
+    if (dtb_scratch == NULL || dtb_scratch_bytes == 0 || place == NULL) {
         return KSHIM_STORAGE_CRC;
     }
     if (scratch == NULL || scratch_bytes < KSHIM_EXT4_SCRATCH_BYTES) {
         return KSHIM_STORAGE_CRC;
     }
 
-    paths = kshim_board_lookup(board);
+    paths = kshim_board_lookup(board, recovery);
     if (paths == NULL) {
         return KSHIM_STORAGE_CRC;
     }
+
+    dir = recovery ? &kshim_boot_dir_recovery : &kshim_boot_dir_normal;
 
     rc = kshim_ext4_read_file(dev, part, paths->manifest,
                               manifest_raw, sizeof(manifest_raw),
@@ -155,6 +199,35 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return rc;
     }
 
+    if (verified.kernel_bytes == 0 || verified.initrd_bytes == 0 ||
+        verified.dtb_bytes == 0) {
+        return KSHIM_STORAGE_CRC;
+    }
+    if (verified.dtb_bytes > (uint64_t)dtb_scratch_bytes) {
+        return KSHIM_STORAGE_CRC;
+    }
+
+    /* Authenticate the board DTB exactly once, into dtb_scratch, before any
+     * placement decision. The bytes in dtb_scratch are the only DTB source
+     * the placement callback may rely on. */
+    rc = read_hashed(dev, part, paths->dtb, dtb_scratch,
+                     (size_t)verified.dtb_bytes,
+                     verified.dtb_sha256, scratch, scratch_bytes);
+    if (rc != 0) {
+        return rc;
+    }
+
+    /* Placement: caller fills all final buffers based on the verified DTB.
+     * No I/O or mutation of the verified DTB is permitted in the callback. */
+    rc = place(place_ctx, dtb_scratch, (size_t)verified.dtb_bytes, buffers);
+    if (rc != 0) {
+        return KSHIM_STORAGE_CRC;
+    }
+
+    if (buffers->kernel == NULL || buffers->initrd == NULL ||
+        buffers->dtb == NULL) {
+        return KSHIM_STORAGE_CRC;
+    }
     if (verified.kernel_bytes > (uint64_t)buffers->kernel_capacity) {
         return KSHIM_STORAGE_CRC;
     }
@@ -162,10 +235,6 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         return KSHIM_STORAGE_CRC;
     }
     if (verified.dtb_bytes > (uint64_t)buffers->dtb_capacity) {
-        return KSHIM_STORAGE_CRC;
-    }
-    if (verified.kernel_bytes == 0 || verified.initrd_bytes == 0 ||
-        verified.dtb_bytes == 0) {
         return KSHIM_STORAGE_CRC;
     }
 
@@ -200,26 +269,22 @@ int kshim_disk_boot_read(const struct kshim_blockdev *dev,
         }
     }
 
-    rc = read_hashed(dev, part, KSHIM_KERNEL_PATH, buffers->kernel,
+    rc = read_hashed(dev, part, dir->kernel, buffers->kernel,
                      (size_t)verified.kernel_bytes,
                      verified.kernel_sha256, scratch, scratch_bytes);
     if (rc != 0) {
         return rc;
     }
 
-    rc = read_hashed(dev, part, KSHIM_INITRD_PATH, buffers->initrd,
+    rc = read_hashed(dev, part, dir->initrd, buffers->initrd,
                      (size_t)verified.initrd_bytes,
                      verified.initrd_sha256, scratch, scratch_bytes);
     if (rc != 0) {
         return rc;
     }
 
-    rc = read_hashed(dev, part, paths->dtb, buffers->dtb,
-                     (size_t)verified.dtb_bytes,
-                     verified.dtb_sha256, scratch, scratch_bytes);
-    if (rc != 0) {
-        return rc;
-    }
+    /* Copy the already-verified DTB. Do not reread from storage. */
+    memmove(buffers->dtb, dtb_scratch, (size_t)verified.dtb_bytes);
 
     *out_manifest = verified;
     return 0;

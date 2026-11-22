@@ -3,7 +3,8 @@ import json
 import re
 import subprocess
 
-from updates.client import UpdateClient, is_busy_error
+# armada_os.py — extend existing updates.client import
+from updates.client import UpdateClient, is_busy_error, system_reboot_ready
 from updates.models import OFFLINE_UPGRADE_MODELS
 
 UPDATE = "/usr/libexec/armada/armada-update"
@@ -274,13 +275,10 @@ def execute(operation, checksum=None):
     if not state["rollback_allowed"]:
         raise RuntimeError("The previous bound deployment is unavailable")
     print("Selecting the previous OS deployment", flush=True)
+# armada_os.py — replace final execute rollback guard conditions
     result = UpdateClient().run("system", "rollback", checksum=checksum)
     if (isinstance(result, dict) and result.get("component") == "system"
-            and result.get("state") == "awaiting_reboot"
-            and result.get("requiresReboot") is True
-            and result.get("bootWriteState") == "written"
-            and result.get("bootPolicy") == "dual-boot-no-slot-control"
-            and result.get("slotControlState") == "not_issued"
+            and system_reboot_ready(result)
             and result.get("newDeployment") == binding):
         return {"message": "Rollback ready. Restart to apply."}
     raw_details = (result.get("phase"), result.get("error")) if isinstance(result, dict) else ()

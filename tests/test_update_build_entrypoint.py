@@ -129,7 +129,7 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         # artifact: a 0.8.0 updater may not consume it, while the installer
         # minimum stays unchanged.
         self.assertEqual(document["minimumInstallerVersion"], "0.8.0")
-        self.assertEqual(document["minimumUpdaterVersion"], "0.8.1")
+        self.assertEqual(document["minimumUpdaterVersion"], "0.8.2")
         self.assertEqual(
             document["minimumUpdaterVersion"], system_manager.UPDATER_VERSION
         )

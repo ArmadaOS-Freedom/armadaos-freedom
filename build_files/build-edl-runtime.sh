@@ -14,6 +14,8 @@ readonly KSHIMC_REPO="https://github.com/sunflower2333/kShimC"
 readonly KSHIMC_COMMIT="82ce6eaa10c36e64cfd3f16799172d854f9a955b"
 readonly LIBFDT_ENV_SHA256="132cb14b8f0b323e5701d4bfcb0ebba4b1f35726bfdfa6739f18ad638d20e582"
 readonly RUNTIME_BYTES=4194304
+readonly BEARSSL_REPO="https://www.bearssl.org/git/BearSSL"
+readonly BEARSSL_COMMIT="7bea48e5e850ab4cafbe68d3765cdaba13a86d6f"
 
 usage() {
     cat <<'EOF'
@@ -229,6 +231,36 @@ fetch_pinned "$CRDK_REPO" "$CRDK_COMMIT" "$runtime/lib/CrDK"
 fetch_pinned "$PICOLIBC_REPO" "$PICOLIBC_COMMIT" "$runtime/lib/picolibc"
 fetch_pinned "$LVGL_REPO" "$LVGL_COMMIT" "$runtime/third_party/lvgl"
 
+if [[ -n "${selected_model_set[TB322FC]:-}" || -n "${selected_model_set[TB323FU]:-}" ]]; then
+    note "fetching pinned BearSSL and generating disk boot key header"
+    fetch_pinned "$BEARSSL_REPO" "$BEARSSL_COMMIT" "$work_dir/dependency-sources/bearssl"
+    bearssl="$work_dir/dependency-sources/bearssl"
+    disk_boot_key="$work_dir/armada_disk_boot_key.h"
+    pub="$source_dir/system_files/etc/pki/containers/armadaos-freedom.pub"
+    python3 - "$pub" "$disk_boot_key" <<'PY'
+import subprocess
+import sys
+
+pub, out = sys.argv[1], sys.argv[2]
+der = subprocess.run(
+    ["openssl", "pkey", "-pubin", "-in", pub, "-outform", "DER"],
+    check=True, capture_output=True,
+).stdout
+prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+assert len(der) == 91, f"unexpected SPKI length {len(der)}"
+assert der.startswith(prefix), "unexpected SPKI prefix"
+assert der[26] == 0x04, f"unexpected point encoding {der[26]:#x}"
+key = der[26:]
+assert len(key) == 65 and key[0] == 0x04
+body = ",\n    ".join(f"0x{b:02x}" for b in key)
+with open(out, "w", encoding="ascii") as f:
+    f.write("#pragma once\n#include <stdint.h>\n\n")
+    f.write("static const uint8_t armada_disk_boot_key[65] = {\n    ")
+    f.write(body)
+    f.write("\n};\n")
+PY
+fi
+
 libfdt_source="$work_dir/dependency-sources/kShimC"
 note "restoring libfdt from the pinned kShimC dependency source"
 mkdir -p -- "$(dirname -- "$libfdt_source")"
@@ -292,6 +324,11 @@ build_profile() {
         || die "the devices config helper could not resolve runtimeCmakeArgs for $model"
     if [[ -n "$arg_output" ]]; then
         mapfile -t profile_args <<< "$arg_output"
+    fi
+
+    if [[ "$model" == "TB322FC" || "$model" == "TB323FU" ]]; then
+        profile_args+=("-DKSHIM_DISK_BOOT_BEARSSL=$bearssl")
+        profile_args+=("-DKSHIM_DISK_BOOT_KEY_HEADER=$disk_boot_key")
     fi
 
     cmake -S "$runtime" -B "$build_dir" -G Ninja \

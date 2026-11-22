@@ -122,7 +122,24 @@ def _check_booted(booted, osname, checksum, serial):
         raise BootContextError('booted serial does not match deployment')
 
 
-def decode_boot_context(witness, cmdline, booted):
+def _validate_disk_ostree_binding(tokens, osname, checksum, serial):
+    """Require the exact disk-armada ostree= pointer; reject anything else."""
+    if osname != 'default':
+        raise BootContextError('disk boot requires osname "default"')
+    if not isinstance(checksum, str) or len(checksum) != 64:
+        raise BootContextError('disk boot requires a 64-hex checksum')
+    if any(c not in '0123456789abcdef' for c in checksum):
+        raise BootContextError('disk boot requires a lowercase 64-hex checksum')
+    expected = f'ostree=/ostree/armada/{checksum}.{serial}'
+    pointers = [t for t in tokens if t.startswith('ostree=')]
+    if len(pointers) != 1:
+        raise BootContextError('disk boot requires exactly one ostree= pointer')
+    if pointers[0] != expected:
+        raise BootContextError('disk boot ostree= pointer does not match deployment')
+    return expected
+
+
+def decode_boot_context(witness, cmdline, booted, *, boot_source=None):
     """Validate raw firmware boot evidence and return the boot context."""
     if not isinstance(cmdline, str):
         raise BootContextError('cmdline must be a string')
@@ -134,26 +151,60 @@ def decode_boot_context(witness, cmdline, booted):
         raise BootContextError('cmdline is not valid UTF-8') from error
     if len(encoded_cmdline) > CMDLINE_MAX:
         raise BootContextError('cmdline exceeds the 64KiB limit')
-    witness_slot = _decode_witness(witness)
+    disk_mode = boot_source == 'armada_boot'
+    if boot_source is not None and not disk_mode:
+        raise BootContextError(f'unknown boot source {boot_source!r}')
+    if disk_mode:
+        witness_slot = None
+    else:
+        witness_slot = _decode_witness(witness)
     tokens = _tokenize(cmdline)
     _reject_bare_and_duplicates(tokens)
     osname, checksum, serial = _deployment_binding(tokens)
-    _ostree_binding(tokens, osname)
+    if disk_mode:
+        _validate_disk_ostree_binding(tokens, osname, checksum, serial)
+    else:
+        _ostree_binding(tokens, osname)
     _check_booted(booted, osname, checksum, serial)
-    actual = 'a' if witness_slot == 0 else 'b'
-    inactive = 'b' if actual == 'a' else 'a'
-    return {
+    if disk_mode:
+        actual = None
+        inactive = None
+    else:
+        actual = 'a' if witness_slot == 0 else 'b'
+        inactive = 'b' if actual == 'a' else 'a'
+    result = {
         'state': 'available',
         'actualSlot': actual,
         'inactiveSlot': inactive,
         'deployment': f'{osname}/{checksum}.{serial}',
     }
+    if disk_mode:
+        result['bootSource'] = 'armada_boot'
+    return result
 
 
-def read_boot_context(booted, witness_path=WITNESS_PATH, cmdline_path=CMDLINE_PATH):
+BOOT_SOURCE_PATH = WITNESS_PATH.with_name('armada,boot-source')
+
+
+def read_boot_context(booted, witness_path=WITNESS_PATH, cmdline_path=CMDLINE_PATH,
+                      *, boot_source_path=BOOT_SOURCE_PATH):
     """Read and decode boot context evidence from the running system."""
+    boot_source = None
     try:
-        witness = _read_regular(witness_path, WITNESS_BYTES)
+        source = _read_regular(boot_source_path, 16)
+    except FileNotFoundError:
+        source = None
+    except OSError as error:
+        raise BootContextError(f'cannot read boot source: {error}') from error
+    if source is not None:
+        if source != b'armada_boot\x00':
+            raise BootContextError('boot source marker is not exactly armada_boot')
+        boot_source = 'armada_boot'
+    try:
+        if boot_source is None:
+            witness = _read_regular(witness_path, WITNESS_BYTES)
+        else:
+            witness = None
         raw = _read_regular(cmdline_path, CMDLINE_MAX)
     except OSError as error:
         raise BootContextError(f'cannot read boot evidence: {error}') from error
@@ -164,7 +215,7 @@ def read_boot_context(booted, witness_path=WITNESS_PATH, cmdline_path=CMDLINE_PA
     if '\x00' in cmdline:
         raise BootContextError('cmdline contains a NUL byte')
     try:
-        return decode_boot_context(witness, cmdline, booted)
+        return decode_boot_context(witness, cmdline, booted, boot_source=boot_source)
     except BootContextError:
         raise
     except (ValueError, struct.error) as error:
