@@ -6,11 +6,13 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
+from updates import package_contract
 from updates.package_contract import (
     AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, require_operation,
     validate_package,
@@ -71,6 +73,32 @@ def _write_stored_zip(path: Path, members: dict[str, bytes]) -> Path:
             info.external_attr = 0o100644 << 16
             zf.writestr(info, payload)
     return path
+
+
+def _without_upgrade_backend(model: str):
+    """Patch the derived upgrade table as if ``model`` had no dual-slot backend.
+
+    Every shipped model now has the backend, so the per-model gate for a
+    shipped install-only model is exercised by removing one from the table the
+    builder and the package contract both consume.
+    """
+    reduced = frozenset(OFFLINE_UPGRADE_MODELS - {model})
+    patches = (
+        mock.patch.object(package_contract, "OFFLINE_UPGRADE_MODELS", reduced),
+        mock.patch.object(_BUILDER, "OFFLINE_UPGRADE_MODELS", reduced),
+    )
+
+    class _Both:
+        def __enter__(self):
+            for patch in patches:
+                patch.start()
+
+        def __exit__(self, *exc):
+            for patch in reversed(patches):
+                patch.stop()
+            return False
+
+    return _Both()
 
 
 def _split_to_manifest(archive_path: Path, out_dir: Path, part_bytes: int = 256) -> tuple[Path, dict]:
@@ -376,9 +404,11 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                 self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
                 self.assertEqual(validate_package(desc), desc)
 
-    def test_tb710fu_is_install_only_even_with_offline_capable_bundle(self):
-        # TB710FU installs but the offline updater rejects it before any slot
-        # work, so its package must never advertise upgrade.
+    def test_tb710fu_alone_declares_offline_upgrade(self):
+        # TB710FU has the native dual-slot backend: a TB710FU-only package
+        # may advertise upgrade, and the per-model gate accepts it.
+        self.assertIn("TB710FU", OFFLINE_UPGRADE_MODELS)
+
         def offline_capable(bundle, docs, members):
             bundle["offlineUpgrade"] = True
 
@@ -386,11 +416,61 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             archive = self._make_bundle(
                 Path(tmp), models=("TB710FU",), mutate=offline_capable
             )
+            # Without the explicit request the package stays install-only.
             desc = build_descriptor(archive, release_id="rel-gt")
             self.assertEqual(desc["supportedModels"], ["TB710FU"])
             self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(validate_package(desc), desc)
+
+            desc = build_descriptor(
+                archive, release_id="rel-gt", enable_offline_upgrade=True
+            )
+            self.assertEqual(desc["supportedModels"], ["TB710FU"])
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
             self.assertEqual(desc["recoveryManifests"], {})
             self.assertEqual(validate_package(desc), desc)
+            require_operation(desc, "TB710FU", "offline-upgrade",
+                              updater_version="0.10.0")
+
+    def test_custom_only_package_cannot_declare_offline_upgrade(self):
+        # A package whose only model is a custom install-only profile never
+        # advertises upgrade, even from an offline-capable bundle.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self._make_bundle(
+                Path(tmp), models=(CUSTOM_MODEL,), mutate=offline_capable
+            )
+            desc = build_descriptor(
+                archive, release_id="rel-third", install_models=(CUSTOM_MODEL,)
+            )
+            self.assertEqual(desc["supportedModels"], [CUSTOM_MODEL])
+            self.assertEqual(desc["operations"], ["install"])
+            self.assertEqual(desc["recoveryManifests"], {})
+            with self.assertRaisesRegex(
+                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
+            ):
+                build_descriptor(
+                    archive,
+                    release_id="rel-third",
+                    enable_offline_upgrade=True,
+                    install_models=(CUSTOM_MODEL,),
+                )
+
+    def test_shipped_model_without_backend_cannot_declare_offline_upgrade(self):
+        # The builder gate follows the capability table: a shipped model whose
+        # backend flag is off cannot claim upgrade on its own.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                _without_upgrade_backend("TB710FU"):
+            archive = self._make_bundle(
+                Path(tmp), models=("TB710FU",), mutate=offline_capable
+            )
+            desc = build_descriptor(archive, release_id="rel-gt")
+            self.assertEqual(desc["operations"], ["install"])
             with self.assertRaisesRegex(
                 PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
             ):
@@ -398,10 +478,7 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                     archive, release_id="rel-gt", enable_offline_upgrade=True
                 )
 
-    def test_mixed_tb710fu_package_upgrades_only_the_dual_slot_models(self):
-        # A package-level operations list may declare upgrade even though
-        # TB710FU is bundled; the installer gate rejects the request for that
-        # model before any slot work, so TB710FU must not suppress the claim.
+    def test_mixed_tb710fu_package_upgrades_every_selected_model(self):
         def offline_capable(bundle, docs, members):
             bundle["offlineUpgrade"] = True
 
@@ -415,6 +492,29 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             self.assertEqual(desc["supportedModels"], ["TB322FC", "TB710FU"])
             self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
             self.assertEqual(validate_package(desc), desc)
+            for model in ("TB322FC", "TB710FU"):
+                require_operation(desc, model, "install",
+                                  installer_version="0.10.0")
+                require_operation(desc, model, "offline-upgrade",
+                                  updater_version="0.10.0")
+
+    def test_mixed_package_gates_upgrade_per_model_from_the_table(self):
+        # A package-level operations list may declare upgrade while a bundled
+        # shipped model has no backend; the per-model gate rejects the request
+        # for that model before any slot work, so it must not suppress the
+        # claim for the dual-slot models.
+        def offline_capable(bundle, docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                _without_upgrade_backend("TB710FU"):
+            archive = self._make_bundle(
+                Path(tmp), models=("TB322FC", "TB710FU"), mutate=offline_capable
+            )
+            desc = build_descriptor(
+                archive, release_id="rel-mixed", enable_offline_upgrade=True
+            )
+            self.assertEqual(desc["operations"], ["install", "offline-upgrade"])
             require_operation(desc, "TB322FC", "offline-upgrade",
                               updater_version="0.10.0")
             require_operation(desc, "TB710FU", "install",
@@ -440,8 +540,8 @@ class UpdatePackageBuilderTests(unittest.TestCase):
                 )
 
     def test_configured_default_selection_is_install_only(self):
-        # The devices config also registers TB710FU. Without an explicit
-        # upgrade request the universal package stays install-only.
+        # Without an explicit upgrade request the universal package built
+        # from the full devices config stays install-only.
         models = tuple(json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
         self.assertEqual(set(models), set(AUTHORIZED_MODELS))
 
@@ -460,10 +560,10 @@ class UpdatePackageBuilderTests(unittest.TestCase):
 
     def test_full_configuration_descriptor_declares_install_and_upgrade(self):
         # The universal package is the single release artifact: every
-        # registered model installs, both Y700 models upgrade, and TB710FU
-        # fails the operation gate before execution.
+        # registered model installs and every registered model upgrades.
         models = tuple(json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
         self.assertEqual(set(models), set(AUTHORIZED_MODELS))
+        self.assertEqual(set(models), set(OFFLINE_UPGRADE_MODELS))
 
         def offline_capable(bundle, docs, members):
             bundle["offlineUpgrade"] = True
@@ -483,13 +583,8 @@ class UpdatePackageBuilderTests(unittest.TestCase):
             for model in models:
                 require_operation(desc, model, "install",
                                   installer_version="0.10.0")
-            for model in sorted(OFFLINE_UPGRADE_MODELS):
+            for model in models:
                 require_operation(desc, model, "offline-upgrade",
-                                  updater_version="0.10.0")
-            with self.assertRaisesRegex(
-                PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
-            ):
-                require_operation(desc, "TB710FU", "offline-upgrade",
                                   updater_version="0.10.0")
 
 

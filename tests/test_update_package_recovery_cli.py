@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 import test_update_package_recovery as fixtures  # noqa: E402
 
 CLI = ROOT / "build_files/make-universal-update-descriptor.py"
-MODEL_SETS = (("TB322FC", "TB323FU"),)
+MODEL_SETS = (("TB322FC", "TB323FU"), ("TB322FC", "TB323FU", "TB710FU"))
 
 
 class UpdateDescriptorCliTests(unittest.TestCase):
@@ -86,7 +86,7 @@ class UpdateDescriptorCliTests(unittest.TestCase):
             self.assertEqual(document["supportedModels"], ["TB322FC", "THIRD"])
             self.assertEqual(document["operations"], ["install"])
 
-    def test_tb710fu_archive_is_install_only(self):
+    def test_tb710fu_archive_upgrades_on_explicit_request(self):
         def capable(bundle, model_docs, members):
             bundle["offlineUpgrade"] = True
 
@@ -102,13 +102,41 @@ class UpdateDescriptorCliTests(unittest.TestCase):
             self.assertEqual(document["supportedModels"], ["TB710FU"])
             self.assertEqual(document["operations"], ["install"])
 
+            upgrade = directory / "upgrade.json"
+            result = self._make(archive, upgrade, offline=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(upgrade.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], ["TB710FU"])
+            self.assertEqual(document["operations"], ["install", "offline-upgrade"])
+            fixtures.builder.require_operation(
+                document, "TB710FU", "offline-upgrade", updater_version="0.10.0"
+            )
+
+    def test_custom_only_archive_rejects_explicit_upgrade(self):
+        def capable(bundle, model_docs, members):
+            bundle["offlineUpgrade"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            archive = fixtures.BASE._make_bundle(
+                directory, models=("THIRD",), mutate=capable
+            )
+            install_only = directory / "install-only.json"
+            result = self._make(archive, install_only, install_models=("THIRD",))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(install_only.read_text(encoding="utf-8"))
+            self.assertEqual(document["supportedModels"], ["THIRD"])
+            self.assertEqual(document["operations"], ["install"])
+
             rejected = directory / "rejected.json"
-            result = self._make(archive, rejected, offline=True)
+            result = self._make(
+                archive, rejected, offline=True, install_models=("THIRD",)
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(rejected.exists())
             self.assertIn("offline-upgrade is restricted", result.stderr)
 
-    def test_mixed_tb710fu_bundle_upgrades_only_the_dual_slot_models(self):
+    def test_mixed_tb710fu_bundle_upgrades_every_model(self):
         def capable(bundle, model_docs, members):
             bundle["offlineUpgrade"] = True
 
@@ -136,18 +164,12 @@ class UpdateDescriptorCliTests(unittest.TestCase):
             document = json.loads(upgrade.read_text(encoding="utf-8"))
             self.assertEqual(document["supportedModels"], list(models))
             self.assertEqual(document["operations"], ["install", "offline-upgrade"])
-            fixtures.builder.require_operation(
-                document, "TB322FC", "offline-upgrade", updater_version="0.10.0"
-            )
             for model in models:
                 fixtures.builder.require_operation(
                     document, model, "install", installer_version="0.10.0"
                 )
-            with self.assertRaisesRegex(
-                fixtures.PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"
-            ):
                 fixtures.builder.require_operation(
-                    document, "TB710FU", "offline-upgrade", updater_version="0.10.0"
+                    document, model, "offline-upgrade", updater_version="0.10.0"
                 )
 
     def test_legacy_archive_rejects_explicit_upgrade(self):

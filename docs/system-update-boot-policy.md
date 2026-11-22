@@ -123,14 +123,15 @@ one.  There is no slot selection anywhere in the flow.
 
 ## Runtime compatibility marker
 
-The TB322FC/TB323FU kShim runtime retains the exact literal
+The kShim runtime of every mirrored-policy model (TB322FC, TB323FU and
+TB710FU) retains the exact literal
 `ARMADA_LINUX_MIRROR_V1` in its used update gate.  Boot materials, boot
 candidate preparation and the EDL package builder reject a target runtime
 without that literal before accepting or packaging the deployment, including
 rollback and older signed packages.  The check is byte presence only, not an
-authentication or boot claim.  It does not apply to TB710FU or to TF-card
-packages, and legacy deployments remain readable through the existing
-read-only inspection paths.
+authentication or boot claim.  It does not apply to custom install-only
+profiles or to TF-card packages, and legacy deployments remain readable
+through the existing read-only inspection paths.
 
 ## What an internal Linux update preserves for Android
 
@@ -138,4 +139,4 @@ The source is the installed Boot and its companion partitions on each physical s
 
 The Boot writer targets only the two boot extents; the Linux deployment and the project's trial journal have their own writes. Installing Android partitions, resetting the bootloader, or restoring stock firmware is not part of a Linux update. Matching Android data and signature evidence is necessary but cannot prove the Android boot handoff or touchscreen works on hardware.
 
-The automatic boot-image sync service and OSTree finalization hook do not run the older single-slot writer or the ABL ESP writer on an identified internal TB322FC/TB323FU boot. They check the board and root medium before consulting the older boot-method setting. This rule also covers the boot-time snapshot and does not require a pending update. A recognized internal boot can therefore restart without a second writer rewriting the verified Boot pair.
+The automatic boot-image sync service and OSTree finalization hook do not run the older single-slot writer or the ABL ESP writer on an identified internal TB322FC/TB323FU/TB710FU boot. They check the board and root medium before consulting the older boot-method setting. This rule also covers the boot-time snapshot and does not require a pending update. A recognized internal boot can therefore restart without a second writer rewriting the verified Boot pair.
