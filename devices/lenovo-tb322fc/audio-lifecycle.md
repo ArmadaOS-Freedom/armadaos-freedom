@@ -107,11 +107,18 @@ one is present. This keeps a route update from bypassing the retained-BE
 protection. It records the deferred route change and replays the current DAPM
 graph after FE cleanup succeeds, or after close disconnects the FE graph.
 Failures in either the old-path or new-path update retain the pending marker so
-a later retry repeats the old/new-path update. Partial BE STOP is transactional:
-the patch snapshots each processed link's state and START/PAUSE references,
-then restores the earlier links if a later BE STOP fails. Retained links can
-reconnect to a BE restored to START or PAUSED without repeating BE startup or
-incrementing its user count.
+a later retry repeats the old/new-path update. Each DPCM link carries a
+`route_stop_done` marker, so a retry completes the exact old-link teardown
+without decrementing a shared BE reference twice. The retry path first forces
+all retained old links through the normal shutdown path, then rebuilds the
+current DAPM graph. `dpcm_add_paths()` records whether each operation created a
+new link or reused a retained link; if a later connection fails, only links
+created by that operation are removed and reused links are restored to their
+previous state. A retained BE is restarted during reconnection only when its
+FE is already START or PAUSED. If that restart was performed by the failed
+transaction, rollback stops it again; a failed rollback leaves the link and
+pending route attached for the next retry. Ordinary application STOP keeps its
+existing best-effort behavior and does not use route-update rollback.
 If the final shared graph STOP acknowledgement is lost, a shared graph
 uncertainty flag rejects new START references until a STOP retry confirms the
 graph state.
@@ -121,7 +128,7 @@ operation, matching its upstream use. Delayed FE cleanup retries all components
 with the current substream instead of relying on the component-wide mark, which
 another playback or capture stream may overwrite or clear. The extracted-C
 host harness executes the production route and component functions. It covers
-two-substream mark overwrite and capture recovery, STOP rollback across shared,
+two-substream mark overwrite and capture recovery, STOP failure recovery across shared,
 exclusive and PAUSED BEs, failed rollback START, retained START/PAUSED link
 reconnection, FE recovery deferral, new-path startup failure, DAPM path-query
 failure and retry.

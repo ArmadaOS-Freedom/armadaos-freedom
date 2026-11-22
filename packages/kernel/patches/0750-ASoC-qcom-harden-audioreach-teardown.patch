@@ -8,9 +8,11 @@ capture frontend during component hw_free and serialize the transition
 with read requeue. Keep fragment ownership in close and reprepare.
 
 Serialize shared graph START and STOP and keep the last reference on
-failure. Abort PCM playback and LPASS reprepare when STOP fails. Reject
-PCM START in either direction after failed reprepare until another
-prepare succeeds, and do not queue playback buffers in the meantime.
+failure. Report the final graph STOP error from the LPASS DAI trigger and
+clear its started state only after success. Abort PCM playback and LPASS
+reprepare when STOP fails. Reject PCM START in either direction after
+failed reprepare until another prepare succeeds, and do not queue playback
+buffers in the meantime.
 
 Match STOP and UNMAP basic responses by opcode and transaction token.
 Publish the DSP status through a completion, independent of the legacy
@@ -256,7 +258,31 @@ diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6ap
 index 11da559..717c8d4 100644
 --- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
 +++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
-@@ -252,9 +252,10 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+@@ -189,6 +189,23 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
+ 				dai_data->is_port_started[dai->id] = true;
+ 		}
+ 		break;
++	case SNDRV_PCM_TRIGGER_STOP:
++		if (!dai_data->is_port_started[dai->id])
++			break;
++
++		if (!dai_data->graph[dai->id]) {
++			dev_err(dai->dev, "No graph for APM port %d\n", dai->id);
++			return -EINVAL;
++		}
++
++		ret = q6apm_graph_stop(dai_data->graph[dai->id]);
++		if (ret < 0) {
++			dev_err(dai->dev, "Failed to stop APM port %d\n", dai->id);
++			break;
++		}
++
++		dai_data->is_port_started[dai->id] = false;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -252,9 +269,10 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
  	}
  
  	if (dai_data->is_port_started[dai->id]) {

@@ -1342,4 +1342,4 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch`
   source: armada
   upstream: local
-  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures. Roll back partial BE STOP transactions to their snapshotted START/PAUSED state and reconnect retained active links without another startup or user reference.
+  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures. Track route-update STOP completion per DPCM link, force old-path teardown before replay, and record new versus reused links in dpcm_add_paths(). On a connection failure, remove only links created by that operation and restore reused links; restart a retained BE only when its FE is START or PAUSED, and keep ordinary PCM STOP best-effort.
