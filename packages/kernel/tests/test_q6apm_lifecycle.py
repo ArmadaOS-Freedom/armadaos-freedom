@@ -90,11 +90,13 @@ def extract_if_block(function: str, condition: str) -> str:
 
 def require_order(function: str, *needles: str, label: str) -> None:
     positions = []
+    search_start = 0
     for needle in needles:
-        position = function.find(needle)
+        position = function.find(needle, search_start)
         if position < 0:
             raise ValueError(f"{label}: source is missing {needle!r}")
         positions.append(position)
+        search_start = position + len(needle)
     if positions != sorted(positions):
         raise ValueError(f"{label}: source operations are out of order")
 
@@ -120,6 +122,7 @@ def classify_sources(
     dai_text: str,
     soc_pcm_text: str,
     soc_component_text: str,
+    soc_compress_text: str,
     baseline_text: str | None,
 ) -> dict[str, tuple[str, int]]:
     signatures = {
@@ -164,6 +167,10 @@ def classify_sources(
             soc_component_text,
             "int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,",
         ),
+        "candidate_component_hw_params": (
+            soc_component_text,
+            "int snd_soc_pcm_component_hw_params(struct snd_pcm_substream *substream,",
+        ),
         "candidate_dpcm_hw_free": (
             soc_pcm_text,
             "static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)",
@@ -183,6 +190,30 @@ def classify_sources(
         "candidate_dpcm_trigger": (
             soc_pcm_text,
             "static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)\n{",
+        ),
+        "candidate_dpcm_be_connect": (
+            soc_pcm_text,
+            "static int dpcm_be_connect(struct snd_soc_pcm_runtime *fe,",
+        ),
+        "candidate_dpcm_add_paths": (
+            soc_pcm_text,
+            "int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,",
+        ),
+        "candidate_dpcm_be_dai_trigger": (
+            soc_pcm_text,
+            "int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,",
+        ),
+        "candidate_dpcm_stop_restore": (
+            soc_pcm_text,
+            "static int dpcm_be_dai_stop_restore(struct snd_soc_pcm_runtime *be,",
+        ),
+        "candidate_dpcm_stop_rollback": (
+            soc_pcm_text,
+            "static void dpcm_be_dai_stop_rollback(struct snd_soc_pcm_runtime *fe,",
+        ),
+        "candidate_dpcm_stop_commit": (
+            soc_pcm_text,
+            "static void dpcm_be_dai_stop_commit(struct snd_soc_pcm_runtime *fe, int stream)",
         ),
         "candidate_dpcm_runtime_update": (
             soc_pcm_text,
@@ -207,6 +238,10 @@ def classify_sources(
         "candidate_retry_pending_routes": (
             soc_pcm_text,
             "static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card)\n{",
+        ),
+        "candidate_soc_compr_open_fe": (
+            soc_compress_text,
+            "static int soc_compr_open_fe(struct snd_compr_stream *cstream)",
         ),
     }
     if baseline_text is not None:
@@ -245,6 +280,11 @@ def classify_sources(
         "candidate shared graph lock field",
     )
     require_once(
+        candidate_header,
+        "\tbool start_uncertain;",
+        "candidate shared graph uncertainty state",
+    )
+    require_once(
         candidate_text,
         "\tmutex_init(&graph->start_stop_lock);",
         "candidate shared graph lock initialization",
@@ -259,6 +299,16 @@ def classify_sources(
         "mutex_unlock(&ar_graph->start_stop_lock);",
         "candidate START unlock",
     )
+    require_order(
+        candidate_start,
+        "mutex_lock(&ar_graph->start_stop_lock);",
+        "if (ar_graph->start_uncertain && ar_graph->start_count)",
+        "ret = -EIO;",
+        "if (ar_graph->start_count == 0)",
+        "ar_graph->start_uncertain = false;",
+        "ar_graph->start_count++;",
+        label="uncertain shared graph blocks START until STOP is reconciled",
+    )
     require_once(candidate_stop, "if (ar_graph->start_count > 1)", "candidate STOP")
     require_once(
         candidate_stop,
@@ -272,7 +322,9 @@ def classify_sources(
     )
     require_once(
         candidate_stop,
-        "if (!ret)\n\t\tar_graph->start_count--;",
+        "if (!ret) {\n\t\tar_graph->start_count--;\n"
+        "\t\tar_graph->start_uncertain = false;\n\t} else {\n"
+        "\t\tar_graph->start_uncertain = true;\n\t}",
         "candidate STOP successful commit",
     )
     if "--ar_graph->start_count" in candidate_stop:
@@ -314,7 +366,7 @@ def classify_sources(
     clean = extracted["candidate_soc_pcm_hw_clean"][0]
     require_order(
         clean,
-        "ret = soc_pcm_hw_clean_components(substream, rollback, retain_failed);",
+        "ret = soc_pcm_hw_clean_components(substream, rollback);",
         "if (ret < 0 && stop_on_component_error)",
         "return ret;",
         "soc_pcm_hw_clean_dais(rtd, substream, rollback);",
@@ -322,17 +374,33 @@ def classify_sources(
     )
     require_once(
         extracted["candidate_soc_pcm_clean_components"][0],
-        "return snd_soc_pcm_component_hw_free(substream, rollback, retain_failed);",
+        "return snd_soc_pcm_component_hw_free(substream, rollback);",
         "component cleanup helper",
     )
     component_hw_free = extracted["candidate_component_hw_free"][0]
+    component_hw_params = extracted["candidate_component_hw_params"][0]
+    require_once(
+        component_hw_params,
+        "soc_component_mark_push(component, substream, hw_params);",
+        "component hw_params records its substream",
+    )
+    require_absent(
+        soc_pcm_text,
+        "retain_failed",
+        "DPCM recovery no longer depends on a persistent component mark",
+    )
+    require_absent(
+        soc_component_text,
+        "retain_failed",
+        "component cleanup no longer depends on a persistent mark",
+    )
     require_order(
         component_hw_free,
         "ret = 0;",
         "ret = component->driver->hw_free(component, substream);",
-        "if (ret >= 0 || !retain_failed)",
+        "soc_component_ret(component, ret);",
         "soc_component_mark_pop(component, hw_params);",
-        label="failed component marks remain available for recovery retry",
+        label="component marks are always popped after a cleanup attempt",
     )
     require_once(
         extracted["candidate_soc_pcm_clean_dais"][0],
@@ -343,7 +411,7 @@ def classify_sources(
     hw_free = extracted["candidate_dpcm_hw_free"][0]
     require_order(
         hw_free,
-        "ret = soc_pcm_hw_clean(fe, substream, 0, true, true);",
+        "ret = soc_pcm_hw_clean(fe, substream, 0, true);",
         "if (ret < 0)",
         "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);",
         "goto out;",
@@ -370,7 +438,7 @@ def classify_sources(
     require_order(
         hw_params,
         "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
-        "ret = soc_pcm_hw_clean_components(substream, 1, true);",
+        "ret = soc_pcm_hw_clean_components(substream, 0);",
         "if (ret < 0)",
         "soc_pcm_hw_clean_dais(fe, substream, 0);",
         "dpcm_be_dai_hw_free(fe, stream);",
@@ -393,15 +461,15 @@ def classify_sources(
     )
     require_once(
         hw_params_recovery,
-        "ret = soc_pcm_hw_clean_components(substream, 1, true);",
-        "hw_params component-only recovery attempt",
+        "ret = soc_pcm_hw_clean_components(substream, 0);",
+        "hw_params recovery replays components without an unwind mark",
     )
 
     shutdown = extracted["candidate_dpcm_shutdown"][0]
     require_order(
         shutdown,
         "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
-        "ret = soc_pcm_hw_clean_components(substream, 1, false);",
+        "ret = soc_pcm_hw_clean_components(substream, 0);",
         "dev_err(fe->dev,",
         "soc_pcm_hw_clean_dais(fe, substream, 0);",
         "dpcm_be_dai_hw_free(fe, stream);",
@@ -413,7 +481,7 @@ def classify_sources(
     )
     require_order(
         shutdown_recovery,
-        "ret = soc_pcm_hw_clean_components(substream, 1, false);",
+        "ret = soc_pcm_hw_clean_components(substream, 0);",
         "soc_pcm_hw_clean_dais(fe, substream, 0);",
         "dpcm_be_dai_hw_free(fe, stream);",
         "WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);",
@@ -428,6 +496,97 @@ def classify_sources(
         "goto out;",
         "switch (trigger)",
         label="DPCM blocks START while FE STOP remains unresolved",
+    )
+    trigger_restore = extracted["candidate_dpcm_stop_restore"][0]
+    trigger_rollback = extracted["candidate_dpcm_stop_rollback"][0]
+    trigger_commit = extracted["candidate_dpcm_stop_commit"][0]
+    be_trigger = extracted["candidate_dpcm_be_dai_trigger"][0]
+    be_connect = extracted["candidate_dpcm_be_connect"][0]
+    add_paths = extracted["candidate_dpcm_add_paths"][0]
+    require_order(
+        trigger_restore,
+        "if (be->dpcm[stream].state == snapshot->state)",
+        "switch (snapshot->state)",
+        "case SND_SOC_DPCM_STATE_START:",
+        "SNDRV_PCM_TRIGGER_PAUSE_RELEASE",
+        "SNDRV_PCM_TRIGGER_START",
+        "case SND_SOC_DPCM_STATE_PAUSED:",
+        "SNDRV_PCM_TRIGGER_PAUSE_PUSH",
+        "be->dpcm[stream].be_start = snapshot->be_start;",
+        "be->dpcm[stream].be_pause = snapshot->be_pause;",
+        label="STOP restore reconstructs START and PAUSED hardware states",
+    )
+    require_order(
+        trigger_rollback,
+        "if (dpcm == last)",
+        "break;",
+        "if (!dpcm->stop_snapshot.active)",
+        "ret = dpcm_be_dai_stop_restore(be, stream,",
+        "&dpcm->stop_snapshot);",
+        "if (ret)",
+        "dpcm->stop_snapshot.active = false;",
+        "fe->dpcm[stream].fe_pause = fe_pause;",
+        label="STOP rollback replays only snapshotted prior backends",
+    )
+    require_once(
+        trigger_commit,
+        "dpcm->stop_snapshot.active = false;",
+        "successful STOP discards every transaction snapshot",
+    )
+    require_order(
+        be_trigger,
+        "case SNDRV_PCM_TRIGGER_STOP:",
+        "dpcm->stop_snapshot.state = be->dpcm[stream].state;",
+        "dpcm->stop_snapshot.be_start =\n"
+        "\t\t\t\tbe->dpcm[stream].be_start;",
+        "dpcm->stop_snapshot.be_pause =\n"
+        "\t\t\t\tbe->dpcm[stream].be_pause;",
+        "dpcm->stop_snapshot.active = true;",
+        "if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_START)\n"
+        "\t\t\t\tbe->dpcm[stream].be_start--;",
+        "pause_stop_transition = false;",
+        "ret = soc_pcm_trigger(be_substream, SNDRV_PCM_TRIGGER_STOP);",
+        "if (ret) {",
+        "dpcm->stop_snapshot.active = false;",
+        "if (cmd == SNDRV_PCM_TRIGGER_STOP)",
+        "dpcm_be_dai_stop_rollback(fe, stream, dpcm, fe_pause);",
+        "dpcm_be_dai_stop_commit(fe, stream);",
+        label="BE STOP snapshots state and rolls back only on transaction failure",
+    )
+    require_order(
+        be_connect,
+        "for_each_dpcm_be(fe, stream, dpcm)",
+        "if (dpcm->be == be)",
+        "if (dpcm->state != SND_SOC_DPCM_LINK_STATE_FREE)",
+        "if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_STOP)",
+        "ret = soc_pcm_trigger(be_substream,",
+        "if (ret)",
+        "return snd_soc_ret(be->dev, ret,",
+        "be->dpcm[stream].state != SND_SOC_DPCM_STATE_START",
+        "be->dpcm[stream].state != SND_SOC_DPCM_STATE_PAUSED",
+        "dpcm->state = SND_SOC_DPCM_LINK_STATE_NEW;",
+        "dpcm_set_be_update_state(be, stream, SND_SOC_DPCM_UPDATE_NO);",
+        label="retained START and PAUSED routes reconnect without new startup",
+    )
+    require_absent(
+        be_connect,
+        "dpcm_be_dai_startup(",
+        "retained route reconnect does not start the BE again",
+    )
+    require_order(
+        add_paths,
+        "err = dpcm_be_connect(fe, be, stream);",
+        "if (err < 0)",
+        "return err;",
+        label="path discovery propagates retained-BE reconnect failures",
+    )
+    compr_open_fe = extracted["candidate_soc_compr_open_fe"][0]
+    require_order(
+        compr_open_fe,
+        "ret = dpcm_add_paths(fe, stream, &list);",
+        "if (ret < 0)",
+        "goto out;",
+        label="compress open propagates path-connect failures",
     )
 
     runtime_update = extracted["candidate_dpcm_runtime_update"][0]
@@ -473,10 +632,13 @@ def classify_sources(
     )
     require_order(
         fe_runtime_update,
+        "if (new) {",
+        "count = dpcm_add_paths(fe, stream, &list);",
+        "if (count < 0) {",
+        "ret = count;",
+        "goto out;",
         "ret = dpcm_run_update(fe, stream, new);",
-        "dpcm_path_put(&list);",
-        "if (ret < 0)",
-        "return ret;",
+        "out:\n\t\tdpcm_path_put(&list);\n\t\tif (ret < 0)\n\t\t\treturn ret;",
         label="FE route update propagates BE startup and shutdown failures",
     )
     require_order(
@@ -646,6 +808,7 @@ struct apm_cmd_shared_mem_unmap_regions {
 
 struct audioreach_graph {
 	pthread_mutex_t start_stop_lock;
+	bool start_uncertain;
 	int start_count;
 };
 
@@ -672,8 +835,17 @@ struct snd_pcm_runtime {
 	void *private_data;
 };
 
+struct snd_pcm {
+	int nonatomic;
+};
+
+struct snd_pcm_hw_params;
+struct snd_soc_pcm_runtime;
+
 struct snd_pcm_substream {
 	struct snd_pcm_runtime *runtime;
+	struct snd_pcm *pcm;
+	struct snd_soc_pcm_runtime *fe;
 	int stream;
 };
 
@@ -996,10 +1168,35 @@ static void check_start_stop_sequences(void)
 	dsp_running = 1;
 	CHECK(candidate_graph_stop(&graph) == -EINVAL);
 	CHECK(shared.start_count == 1);
+	CHECK(shared.start_uncertain);
 	CHECK(stop_calls == 1);
+	/* Another owner cannot mistake the retained reference for a running DSP. */
+	CHECK(candidate_graph_start(&graph) == -EIO);
+	CHECK(shared.start_count == 1);
+	CHECK(start_calls == 0);
 	CHECK(candidate_graph_stop(&graph) == 0);
 	CHECK(shared.start_count == 0);
+	CHECK(!shared.start_uncertain);
 	CHECK(stop_calls == 2);
+
+	/* A missing STOP acknowledgement may follow a real DSP STOP. */
+	shared.start_count = 1;
+	stops[0] = -ETIMEDOUT;
+	stops[1] = 0;
+	reset_graph_commands(stops, 2, starts, 1);
+	dsp_running = 1;
+	CHECK(candidate_graph_stop(&graph) == -ETIMEDOUT);
+	CHECK(!dsp_running);
+	CHECK(candidate_graph_start(&graph) == -EIO);
+	CHECK(shared.start_count == 1);
+	CHECK(!dsp_running);
+	CHECK(candidate_graph_stop(&graph) == 0);
+	CHECK(shared.start_count == 0);
+	CHECK(!shared.start_uncertain);
+	CHECK(candidate_graph_start(&graph) == 0);
+	CHECK(shared.start_count == 1);
+	CHECK(start_calls == 1);
+	CHECK(dsp_running);
 
 	/* count=0 remains a no-op. */
 	shared.start_count = 0;
@@ -1308,8 +1505,7 @@ static void check_dpcm_stop_failure_recovery(void)
 	CHECK(ret == -ETIMEDOUT);
 	CHECK(fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
 	CHECK(simulated_component_clean_calls == 1);
-	CHECK(simulated_component_rollback == 1);
-	CHECK(simulated_component_retain);
+	CHECK(simulated_component_rollback == 0);
 	CHECK(simulated_dai_free_calls == 0);
 	CHECK(simulated_be_free_calls == 0);
 	CHECK(simulated_whole_clean_calls == 1);
@@ -1320,13 +1516,13 @@ static void check_dpcm_stop_failure_recovery(void)
 	CHECK(ret == 0);
 	CHECK(!fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed);
 	CHECK(fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].state == SND_SOC_DPCM_STATE_HW_FREE);
-	CHECK(simulated_component_rollback == 1);
-	CHECK(simulated_component_retain);
+	CHECK(simulated_component_rollback == 0);
+	CHECK(simulated_component_clean_calls == 2);
 	CHECK(simulated_dai_free_calls == 1);
 	CHECK(simulated_be_free_calls == 1);
 	CHECK(simulated_whole_clean_calls == 1);
 
-	/* Close drops the retained mark and finishes teardown despite STOP failure. */
+	/* Close retries teardown and finishes despite another STOP failure. */
 	fe.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = true;
 	simulated_component_result = -ETIMEDOUT;
 	simulated_component_clean_calls = 0;
@@ -1335,8 +1531,7 @@ static void check_dpcm_stop_failure_recovery(void)
 	simulated_be_shutdown_calls = 0;
 	simulate_dpcm_shutdown_recovery(&fe, &substream);
 	CHECK(simulated_component_clean_calls == 1);
-	CHECK(simulated_component_rollback == 1);
-	CHECK(!simulated_component_retain);
+	CHECK(simulated_component_rollback == 0);
 	CHECK(simulated_dai_free_calls == 1);
 	CHECK(simulated_be_free_calls == 1);
 	CHECK(simulated_be_shutdown_calls == 1);
@@ -1507,6 +1702,296 @@ static void check_dpcm_stop_failure_route_retry(void)
 	CHECK(simulated_disconnect_calls == 1);
 }
 
+static void check_dpcm_route_connect_failure_stays_pending(void)
+{
+	const int stream = SNDRV_PCM_STREAM_CAPTURE;
+	struct device device = {};
+	struct snd_soc_dai_link link = {
+		.name = "connect-retry",
+		.dynamic = true,
+	};
+	struct snd_soc_pcm_runtime fe = {
+		.dai_link = &link,
+		.dev = &device,
+	};
+	struct snd_soc_pcm_runtime *rtds[] = { &fe };
+	struct snd_soc_card card = {
+		.dev = &device,
+		.rtds = rtds,
+		.num_rtds = 1,
+	};
+
+	fe.card = &card;
+	fe.dpcm[stream].route_wanted = true;
+	simulated_active_stream = stream;
+	simulated_path_get_result = 1;
+	simulated_path_get_calls = 0;
+	simulated_runtime_update_calls = 0;
+	simulated_add_paths_result = -EIO;
+	simulated_startup_result = 0;
+	simulated_clear_pending_calls = 0;
+	simulated_disconnect_calls = 0;
+
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -EIO);
+	CHECK(card.dpcm_route_update_pending);
+	CHECK(simulated_path_get_calls == 2);
+	CHECK(simulated_runtime_update_calls == 2);
+	CHECK(simulated_runtime_update_order[0] == 0);
+	CHECK(simulated_runtime_update_order[1] == 1);
+	CHECK(!fe.dpcm[stream].route_connected);
+	CHECK(simulated_clear_pending_calls == 0);
+	CHECK(simulated_disconnect_calls == 0);
+
+	simulated_add_paths_result = 1;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == 0);
+	CHECK(!card.dpcm_route_update_pending);
+	CHECK(fe.dpcm[stream].route_connected);
+	CHECK(simulated_clear_pending_calls == 1);
+}
+
+static void check_dpcm_stop_ref_rollback(void)
+{
+	const int stream = SNDRV_PCM_STREAM_CAPTURE;
+	struct device device = {};
+	struct snd_soc_card card = {
+		.dev = &device,
+		.component_chaining = true,
+		.pcm_mutex_locked = true,
+	};
+	struct snd_soc_dai_link exclusive_link = { .name = "exclusive-BE" };
+	struct snd_soc_dai_link shared_link = { .name = "shared-BE" };
+	struct snd_soc_dai_link failed_link = { .name = "failed-BE" };
+	struct snd_soc_pcm_runtime fe = { .dev = &device, .card = &card };
+	struct snd_soc_pcm_runtime exclusive = {
+		.dev = &device,
+		.dai_link = &exclusive_link,
+	};
+	struct snd_soc_pcm_runtime shared = {
+		.dev = &device,
+		.dai_link = &shared_link,
+	};
+	struct snd_soc_pcm_runtime failed = {
+		.dev = &device,
+		.dai_link = &failed_link,
+	};
+	struct snd_soc_dpcm links[] = {
+		{ .be = &exclusive },
+		{ .be = &shared },
+		{ .be = &failed },
+	};
+	struct snd_pcm_substream exclusive_substream = {
+		.pcm = &(struct snd_pcm){ .nonatomic = 1 },
+		.stream = stream,
+		.fe = &exclusive,
+	};
+	struct snd_pcm_substream shared_substream = {
+		.pcm = &(struct snd_pcm){ .nonatomic = 1 },
+		.stream = stream,
+		.fe = &shared,
+	};
+	struct snd_pcm_substream failed_substream = {
+		.pcm = &(struct snd_pcm){ .nonatomic = 1 },
+		.stream = stream,
+		.fe = &failed,
+	};
+
+	exclusive.be_substreams[stream] = &exclusive_substream;
+	shared.be_substreams[stream] = &shared_substream;
+	failed.be_substreams[stream] = &failed_substream;
+	fe.num_be_links[stream] = 3;
+	for (int i = 0; i < 3; i++)
+		fe.be_links[stream][i] = &links[i];
+
+	exclusive.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	exclusive.dpcm[stream].be_start = 1;
+	exclusive.dpcm[stream].stop_result = 0;
+	exclusive.dpcm[stream].start_result = 0;
+	shared.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	shared.dpcm[stream].be_start = 2;
+	failed.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	failed.dpcm[stream].be_start = 1;
+	failed.dpcm[stream].stop_result = -EIO;
+	failed.dpcm[stream].observe_be = &shared;
+	simulated_trigger_calls = 0;
+
+	CHECK(candidate_dpcm_be_dai_trigger(
+		      &fe, stream, SNDRV_PCM_TRIGGER_STOP) == -EIO);
+
+	/* The exclusive path restarts after its successful STOP. */
+	CHECK(exclusive.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(exclusive.dpcm[stream].be_start == 1);
+
+	/* Before B fails, shared A has only consumed this FE's reference. */
+	CHECK(failed.dpcm[stream].observed_be_start == 1);
+	CHECK(shared.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(shared.dpcm[stream].be_start == 2);
+
+	/* B restores its own failed structural STOP before global rollback. */
+	CHECK(failed.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(failed.dpcm[stream].be_start == 1);
+	CHECK(simulated_trigger_calls == 3);
+	CHECK(!exclusive.dpcm[stream].stream_locked);
+	CHECK(!shared.dpcm[stream].stream_locked);
+	CHECK(!failed.dpcm[stream].stream_locked);
+	CHECK(!links[0].stop_snapshot.active);
+	CHECK(!links[1].stop_snapshot.active);
+	CHECK(!links[2].stop_snapshot.active);
+
+	/* A rollback START failure leaves that BE stopped for a route retry. */
+	exclusive.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	exclusive.dpcm[stream].be_start = 1;
+	exclusive.dpcm[stream].start_result = -EIO;
+	shared.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	shared.dpcm[stream].be_start = 2;
+	failed.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	failed.dpcm[stream].be_start = 1;
+	simulated_trigger_calls = 0;
+
+	CHECK(candidate_dpcm_be_dai_trigger(
+		      &fe, stream, SNDRV_PCM_TRIGGER_STOP) == -EIO);
+	CHECK(exclusive.dpcm[stream].state == SND_SOC_DPCM_STATE_STOP);
+	CHECK(exclusive.dpcm[stream].be_start == 0);
+	CHECK(shared.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(shared.dpcm[stream].be_start == 2);
+	CHECK(failed.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(failed.dpcm[stream].be_start == 1);
+	CHECK(simulated_trigger_calls == 3);
+	CHECK(!links[0].stop_snapshot.active);
+	CHECK(!links[1].stop_snapshot.active);
+	CHECK(!links[2].stop_snapshot.active);
+
+	/* The retained FREE route retries START without adding a BE user. */
+	links[0].state = SND_SOC_DPCM_LINK_STATE_FREE;
+	exclusive.dpcm[stream].users = 0;
+	simulated_update_no_calls = 0;
+	simulated_update_no_state = -1;
+	simulated_trigger_calls = 0;
+	CHECK(candidate_dpcm_be_connect(&fe, &exclusive, stream) == -EIO);
+	CHECK(exclusive.dpcm[stream].state == SND_SOC_DPCM_STATE_STOP);
+	CHECK(exclusive.dpcm[stream].be_start == 0);
+	CHECK(links[0].state == SND_SOC_DPCM_LINK_STATE_FREE);
+	CHECK(exclusive.dpcm[stream].users == 0);
+	CHECK(simulated_update_no_calls == 0);
+
+	exclusive.dpcm[stream].start_result = 0;
+	simulated_trigger_calls = 0;
+	CHECK(candidate_dpcm_be_connect(&fe, &exclusive, stream) == 0);
+	CHECK(exclusive.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(exclusive.dpcm[stream].be_start == 1);
+	CHECK(links[0].state == SND_SOC_DPCM_LINK_STATE_NEW);
+	CHECK(exclusive.dpcm[stream].users == 0);
+	CHECK(simulated_trigger_calls == 1);
+	CHECK(simulated_update_no_calls == 1);
+	CHECK(simulated_update_no_state == SND_SOC_DPCM_UPDATE_NO);
+}
+
+static void check_dpcm_stop_snapshot_paused_rollback(void)
+{
+	const int stream = SNDRV_PCM_STREAM_CAPTURE;
+	struct device device = {};
+	struct snd_soc_card card = {
+		.dev = &device,
+		.component_chaining = true,
+		.pcm_mutex_locked = true,
+	};
+	struct snd_soc_dai_link paused_link = { .name = "paused-BE" };
+	struct snd_soc_dai_link failed_link = { .name = "failed-BE" };
+	struct snd_soc_pcm_runtime fe = {
+		.dai_link = &failed_link,
+		.dev = &device,
+		.card = &card,
+	};
+	struct snd_soc_pcm_runtime paused = {
+		.dev = &device,
+		.dai_link = &paused_link,
+	};
+	struct snd_soc_pcm_runtime failed = {
+		.dev = &device,
+		.dai_link = &failed_link,
+	};
+	struct snd_soc_dpcm links[] = {
+		{ .be = &paused },
+		{ .be = &failed },
+	};
+	struct snd_pcm_substream paused_substream = {
+		.pcm = &(struct snd_pcm){ .nonatomic = 1 },
+		.stream = stream,
+		.fe = &paused,
+	};
+	struct snd_pcm_substream failed_substream = {
+		.pcm = &(struct snd_pcm){ .nonatomic = 1 },
+		.stream = stream,
+		.fe = &failed,
+	};
+
+	paused.be_substreams[stream] = &paused_substream;
+	failed.be_substreams[stream] = &failed_substream;
+	fe.num_be_links[stream] = 2;
+	for (int i = 0; i < 2; i++)
+		fe.be_links[stream][i] = &links[i];
+
+	paused.dpcm[stream].state = SND_SOC_DPCM_STATE_PAUSED;
+	paused.dpcm[stream].be_start = 0;
+	paused.dpcm[stream].be_pause = 1;
+	failed.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	failed.dpcm[stream].be_start = 1;
+	failed.dpcm[stream].stop_result = -EIO;
+	fe.dpcm[stream].fe_pause = true;
+	simulated_trigger_calls = 0;
+
+	CHECK(candidate_dpcm_be_dai_trigger(
+		      &fe, stream, SNDRV_PCM_TRIGGER_STOP) == -EIO);
+	CHECK(paused.dpcm[stream].state == SND_SOC_DPCM_STATE_PAUSED);
+	CHECK(paused.dpcm[stream].be_start == 0);
+	CHECK(paused.dpcm[stream].be_pause == 1);
+	CHECK(failed.dpcm[stream].state == SND_SOC_DPCM_STATE_START);
+	CHECK(failed.dpcm[stream].be_start == 1);
+	CHECK(fe.dpcm[stream].fe_pause);
+	CHECK(!links[0].stop_snapshot.active);
+	CHECK(!links[1].stop_snapshot.active);
+	/* STOP, failed STOP, START, then PAUSE_PUSH while reconstructing. */
+	CHECK(simulated_trigger_calls == 4);
+
+	paused.dpcm[stream].state = SND_SOC_DPCM_STATE_PAUSED;
+	paused.dpcm[stream].be_start = 0;
+	paused.dpcm[stream].be_pause = 1;
+	failed.dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+	failed.dpcm[stream].be_start = 1;
+	failed.dpcm[stream].stop_result = 0;
+	fe.dpcm[stream].fe_pause = true;
+	simulated_trigger_calls = 0;
+
+	CHECK(candidate_dpcm_be_dai_trigger(
+		      &fe, stream, SNDRV_PCM_TRIGGER_STOP) == 0);
+	CHECK(paused.dpcm[stream].state == SND_SOC_DPCM_STATE_STOP);
+	CHECK(paused.dpcm[stream].be_start == 0);
+	CHECK(paused.dpcm[stream].be_pause == 0);
+	CHECK(failed.dpcm[stream].state == SND_SOC_DPCM_STATE_STOP);
+	CHECK(failed.dpcm[stream].be_start == 0);
+	CHECK(!fe.dpcm[stream].fe_pause);
+	CHECK(!links[0].stop_snapshot.active);
+	CHECK(!links[1].stop_snapshot.active);
+	CHECK(simulated_trigger_calls == 2);
+
+	/* Reconnect a retained PAUSED BE without retriggering or re-counting it. */
+	links[0].state = SND_SOC_DPCM_LINK_STATE_FREE;
+	paused.dpcm[stream].state = SND_SOC_DPCM_STATE_PAUSED;
+	paused.dpcm[stream].be_start = 0;
+	paused.dpcm[stream].be_pause = 1;
+	paused.dpcm[stream].users = 2;
+	simulated_update_no_calls = 0;
+	simulated_trigger_calls = 0;
+	CHECK(candidate_dpcm_be_connect(&fe, &paused, stream) == 0);
+	CHECK(paused.dpcm[stream].state == SND_SOC_DPCM_STATE_PAUSED);
+	CHECK(paused.dpcm[stream].be_start == 0);
+	CHECK(paused.dpcm[stream].be_pause == 1);
+	CHECK(paused.dpcm[stream].users == 2);
+	CHECK(links[0].state == SND_SOC_DPCM_LINK_STATE_NEW);
+	CHECK(simulated_trigger_calls == 0);
+	CHECK(simulated_update_no_calls == 1);
+	CHECK(simulated_update_no_state == SND_SOC_DPCM_UPDATE_NO);
+}
+
 static void check_failed_pcm_prepare(void)
 {
 	struct q6apm_dai_rtd prtd = { .state = Q6APM_STREAM_RUNNING };
@@ -1527,6 +2012,146 @@ static void check_failed_pcm_prepare(void)
 	}
 }
 
+static void check_component_recovery_replays_without_mark(void)
+{
+	struct snd_soc_component_driver driver = {
+		.hw_params = simulate_component_hw_params,
+		.hw_free = simulate_component_hw_free,
+	};
+	struct snd_soc_component first = { .driver = &driver };
+	struct snd_soc_component failed = { .driver = &driver };
+	struct snd_soc_component *components[] = { &first, &failed };
+	struct snd_soc_dai_link link = { .name = "mark-FE" };
+	struct snd_soc_pcm_runtime fe = {
+		.dai_link = &link,
+		.components = components,
+		.num_components = 2,
+	};
+	struct snd_pcm_substream playback = {
+		.stream = SNDRV_PCM_STREAM_PLAYBACK,
+		.fe = &fe,
+	};
+	struct snd_pcm_substream capture = {
+		.stream = SNDRV_PCM_STREAM_CAPTURE,
+		.fe = &fe,
+	};
+
+	CHECK(snd_soc_pcm_component_hw_params(&capture, NULL) == 0);
+	CHECK(first.mark_hw_params == &capture);
+	CHECK(failed.mark_hw_params == &capture);
+
+	/* Playback overlap overwrites the single upstream unwind mark. */
+	CHECK(snd_soc_pcm_component_hw_params(&playback, NULL) == 0);
+	CHECK(first.mark_hw_params == &playback);
+	CHECK(failed.mark_hw_params == &playback);
+
+	/*
+	 * The first capture cleanup fails after playback overwrote the mark.
+	 * It still clears the mark; DPCM state must drive the later recovery.
+	 */
+	failed.hw_free_result[SNDRV_PCM_STREAM_CAPTURE] = -ETIMEDOUT;
+	CHECK(snd_soc_pcm_component_hw_free(&capture, 0) == -ETIMEDOUT);
+	CHECK(first.mark_hw_params == NULL);
+	CHECK(failed.mark_hw_params == NULL);
+	CHECK(first.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 1);
+	CHECK(failed.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 1);
+
+	/* Playback cleanup repeats safely even though its mark is already gone. */
+	CHECK(snd_soc_pcm_component_hw_free(&playback, 0) == 0);
+	CHECK(first.mark_hw_params == NULL);
+	CHECK(failed.mark_hw_params == NULL);
+
+	/*
+	 * rollback=0 repeats every component even though both marks are gone.
+	 * This is the recovery mode used by both delayed DPCM cleanup paths.
+	 */
+	failed.hw_free_result[SNDRV_PCM_STREAM_CAPTURE] = 0;
+	CHECK(snd_soc_pcm_component_hw_free(&capture, 0) == 0);
+	CHECK(first.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 2);
+	CHECK(failed.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 2);
+
+	/* A marked rollback would skip the absent component, so recovery uses zero. */
+	CHECK(snd_soc_pcm_component_hw_free(&capture, 1) == 0);
+	CHECK(first.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 2);
+	CHECK(failed.hw_free_calls[SNDRV_PCM_STREAM_CAPTURE] == 2);
+	CHECK(first.hw_params_calls[SNDRV_PCM_STREAM_CAPTURE] == 1);
+	CHECK(failed.hw_params_calls[SNDRV_PCM_STREAM_CAPTURE] == 1);
+	CHECK(first.hw_params_calls[SNDRV_PCM_STREAM_PLAYBACK] == 1);
+	CHECK(failed.hw_params_calls[SNDRV_PCM_STREAM_PLAYBACK] == 1);
+	CHECK(first.hw_free_calls[SNDRV_PCM_STREAM_PLAYBACK] == 1);
+	CHECK(failed.hw_free_calls[SNDRV_PCM_STREAM_PLAYBACK] == 1);
+}
+
+static void check_dpcm_close_replays_pending_routes(void)
+{
+	struct device device = {};
+	struct snd_soc_dai_link dynamic_link = {
+		.name = "close-retry",
+		.dynamic = true,
+	};
+	struct snd_soc_pcm_runtime fe = {
+		.dai_link = &dynamic_link,
+		.dev = &device,
+	};
+	struct snd_soc_pcm_runtime retained_fe = {
+		.dai_link = &dynamic_link,
+		.dev = &device,
+	};
+	struct snd_soc_pcm_runtime *rtds[] = { &fe, &retained_fe };
+	struct snd_soc_card card = {
+		.dev = &device,
+		.rtds = rtds,
+		.num_rtds = 2,
+	};
+	struct snd_pcm_substream substream = {
+		.stream = SNDRV_PCM_STREAM_CAPTURE,
+		.fe = &fe,
+	};
+	struct fake_dpcm_runtime *path =
+		&fe.dpcm[SNDRV_PCM_STREAM_CAPTURE];
+	struct fake_dpcm_runtime *retained_path =
+		&retained_fe.dpcm[SNDRV_PCM_STREAM_CAPTURE];
+
+	fe.card = &card;
+	retained_fe.card = &card;
+	path->hw_free_failed = true;
+	path->route_connected = true;
+	path->route_wanted = false;
+	retained_path->route_connected = true;
+	retained_path->route_wanted = false;
+	card.dpcm_route_update_pending = true;
+
+	simulated_component_result = -ETIMEDOUT;
+	simulated_be_trigger_result = 0;
+	simulated_be_trigger_calls = 0;
+	simulated_be_free_calls = 0;
+	simulated_be_shutdown_calls = 0;
+	simulated_clear_pending_calls = 0;
+	simulated_disconnect_calls = 0;
+	simulated_dpcm_cleanup_calls = 0;
+	simulated_runtime_update_calls = 0;
+	simulated_path_get_calls = 0;
+
+	CHECK(dpcm_fe_dai_close(&substream) == -ETIMEDOUT);
+	CHECK(simulated_dpcm_cleanup_calls == 1);
+	CHECK(!card.dpcm_route_update_pending);
+	CHECK(path->state == SND_SOC_DPCM_STATE_CLOSE);
+	CHECK(!path->hw_free_failed);
+	CHECK(!path->route_connected);
+	CHECK(!retained_path->route_connected);
+	CHECK(simulated_path_get_calls == 4);
+	CHECK(simulated_runtime_update_calls == 4);
+	CHECK(simulated_runtime_update_order[0] == 0);
+	CHECK(simulated_runtime_update_order[1] == 0);
+	CHECK(simulated_runtime_update_order[2] == 1);
+	CHECK(simulated_runtime_update_order[3] == 1);
+	CHECK(simulated_be_trigger_calls == 1);
+	CHECK(simulated_be_free_calls == 2);
+	CHECK(simulated_be_shutdown_calls == 2);
+	CHECK(simulated_clear_pending_calls == 1);
+	CHECK(simulated_disconnect_calls == 1);
+}
+
 int main(void)
 {
 	check_start_stop_sequences();
@@ -1536,6 +2161,11 @@ int main(void)
 	check_dpcm_stop_failure_recovery();
 	check_dpcm_runtime_update_guard();
 	check_dpcm_stop_failure_route_retry();
+	check_dpcm_route_connect_failure_stays_pending();
+	check_dpcm_stop_ref_rollback();
+	check_dpcm_stop_snapshot_paused_rollback();
+	check_component_recovery_replays_without_mark();
+	check_dpcm_close_replays_pending_routes();
 	check_failed_pcm_prepare();
 #ifdef HAVE_BASELINE
 	check_baseline_unmap();
@@ -1560,6 +2190,23 @@ struct snd_soc_dapm_widget_list {
 	int unused;
 };
 
+struct snd_soc_component_driver {
+	int (*hw_params)(struct snd_soc_component *component,
+			 struct snd_pcm_substream *substream,
+			 void *params);
+	int (*hw_free)(struct snd_soc_component *component,
+		       struct snd_pcm_substream *substream);
+};
+
+struct snd_soc_component {
+	const struct snd_soc_component_driver *driver;
+	struct snd_pcm_substream *mark_hw_params;
+	int hw_params_result[2];
+	int hw_free_result[2];
+	int hw_params_calls[2];
+	int hw_free_calls[2];
+};
+
 struct fake_dpcm_runtime {
 	bool hw_free_failed;
 	int state;
@@ -1567,12 +2214,48 @@ struct fake_dpcm_runtime {
 	bool route_wanted;
 	bool link_free;
 	int pending_state;
+	int be_start;
+	int be_pause;
+	int users;
+	bool fe_pause;
+	int stop_result;
+	int start_result;
+	int pause_result;
+	bool stream_locked;
+	struct snd_soc_pcm_runtime *observe_be;
+	int observed_be_start;
+	int be_clients;
+	int fe_clients;
 };
+
+struct snd_soc_dpcm;
 
 struct snd_soc_pcm_runtime {
 	struct fake_dpcm_runtime dpcm[2];
 	struct snd_soc_dai_link *dai_link;
 	struct device *dev;
+	struct snd_soc_card *card;
+	struct snd_soc_component **components;
+	int num_components;
+	struct snd_soc_dpcm *be_links[2][8];
+	int num_be_links[2];
+	struct snd_pcm_substream *be_substreams[2];
+};
+
+struct snd_soc_dpcm_stop_snapshot {
+	int state;
+	int be_start;
+	int be_pause;
+	bool active;
+};
+
+struct snd_soc_dpcm {
+	struct snd_soc_pcm_runtime *fe;
+	struct snd_soc_pcm_runtime *be;
+	int state;
+	struct snd_soc_dpcm_stop_snapshot stop_snapshot;
+	int list_be;
+	int list_fe;
 };
 
 struct snd_soc_card {
@@ -1581,26 +2264,72 @@ struct snd_soc_card {
 	int num_rtds;
 	bool dpcm_route_update_pending;
 	bool pcm_mutex_locked;
+	bool component_chaining;
 };
 
+#define SND_SOC_DPCM_STATE_NEW 0
+#define SND_SOC_DPCM_STATE_OPEN 6
+#define SND_SOC_DPCM_STATE_HW_PARAMS 7
 #define SND_SOC_DPCM_UPDATE_FE 1
 #define SND_SOC_DPCM_UPDATE_BE 2
 #define SND_SOC_DPCM_UPDATE_NO 0
+#define SND_SOC_DPCM_STATE_PREPARE 1
+#define SND_SOC_DPCM_STATE_START 2
+#define SND_SOC_DPCM_STATE_STOP 3
+#define SND_SOC_DPCM_STATE_PAUSED 4
+#define SND_SOC_DPCM_STATE_SUSPEND 5
 #define SND_SOC_DPCM_STATE_HW_FREE 8
+#define SND_SOC_DPCM_STATE_CLOSE 9
+#define SND_SOC_DPCM_LINK_STATE_NEW 0
 #define SND_SOC_DPCM_LINK_STATE_FREE 2
 #define SND_SOC_DAPM_STREAM_NOP 0
+#define SND_SOC_DAPM_STREAM_STOP 0
 #define dev_dbg(dev, ...) do { (void)(dev); if (0) fprintf(stderr, __VA_ARGS__); } while (0)
 #define dev_err(dev, ...) do { (void)(dev); if (0) fprintf(stderr, __VA_ARGS__); } while (0)
+#define snd_soc_substream_to_rtd(substream) ((substream)->fe)
 #define for_each_card_rtds(card, rtd) \
 	for (int __i = 0; __i < (card)->num_rtds && \
 	     (((rtd) = (card)->rtds[__i]), true); __i++)
 #define for_each_pcm_streams(stream) for ((stream) = 0; (stream) < 2; (stream)++)
+#define for_each_rtd_components(rtd, i, component) \
+	for ((i) = 0; (i) < (rtd)->num_components && \
+	     (((component) = (rtd)->components[i]), true); (i)++)
+#define for_each_dpcm_be(fe, stream, dpcm) \
+	for (int __dpcm_i = 0; __dpcm_i < (fe)->num_be_links[stream] && \
+	     (((dpcm) = (fe)->be_links[stream][__dpcm_i]), true); __dpcm_i++)
+#define snd_soc_dpcm_get_substream(be, stream) ((be)->be_substreams[stream])
+#define snd_pcm_stream_lock_irqsave_nested(substream, flags) \
+	do { \
+		(substream)->fe->dpcm[(substream)->stream].stream_locked = true; \
+		(flags) = 0; \
+	} while (0)
+#define snd_pcm_stream_unlock_irqrestore(substream, flags) \
+	do { \
+		(substream)->fe->dpcm[(substream)->stream].stream_locked = false; \
+		(void)(flags); \
+	} while (0)
+#define snd_pcm_stream_lock_irq(substream) \
+	do { (substream)->fe->dpcm[(substream)->stream].stream_locked = true; } while (0)
+#define snd_pcm_stream_unlock_irq(substream) \
+	do { (substream)->fe->dpcm[(substream)->stream].stream_locked = false; } while (0)
+#define kzalloc_obj(type) calloc(1, sizeof(type))
+#define list_add(node, head) \
+	do { \
+		(void)(node); \
+		(void)(head); \
+	} while (0)
+
+#define soc_component_mark_push(component, substream, target) \
+	((component)->mark_##target = (substream))
+#define soc_component_mark_match(component, substream, target) \
+	((component)->mark_##target == (substream))
+#define soc_component_mark_pop(component, target) \
+	((component)->mark_##target = NULL)
 
 static int simulated_component_result;
 static int simulated_whole_clean_calls;
 static int simulated_component_clean_calls;
 static int simulated_component_rollback;
-static int simulated_component_retain;
 static int simulated_dai_free_calls;
 static int simulated_be_free_calls;
 static int simulated_be_shutdown_calls;
@@ -1612,9 +2341,40 @@ static int simulated_clear_pending_calls;
 static int simulated_disconnect_calls;
 static int simulated_startup_result;
 static int simulated_path_get_result = 1;
+static int simulated_add_paths_result = 1;
 static int simulated_path_get_calls;
 static int simulated_active_stream = SNDRV_PCM_STREAM_CAPTURE;
+static int simulated_dpcm_cleanup_calls;
+static int simulated_trigger_calls;
+static int simulated_update_no_calls;
+static int simulated_update_no_state = -1;
 static struct snd_soc_dapm_widget_list simulated_path_list;
+
+static int simulate_component_hw_params(struct snd_soc_component *component,
+					struct snd_pcm_substream *substream,
+					void *params)
+{
+	int stream = substream->stream;
+
+	(void)params;
+	component->hw_params_calls[stream]++;
+	return component->hw_params_result[stream];
+}
+
+static int simulate_component_hw_free(struct snd_soc_component *component,
+				      struct snd_pcm_substream *substream)
+{
+	int stream = substream->stream;
+
+	component->hw_free_calls[stream]++;
+	return component->hw_free_result[stream];
+}
+
+static int soc_component_ret(struct snd_soc_component *component, int ret)
+{
+	(void)component;
+	return ret;
+}
 
 static void *snd_soc_rtd_to_cpu(struct snd_soc_pcm_runtime *fe, int index)
 {
@@ -1645,6 +2405,57 @@ static bool snd_soc_dai_stream_active(void *dai, int stream)
 {
 	(void)dai;
 	return stream == simulated_active_stream;
+}
+
+static bool snd_soc_dpcm_can_be_update(struct snd_soc_pcm_runtime *fe,
+				       struct snd_soc_pcm_runtime *be,
+				       int stream)
+{
+	(void)fe;
+	(void)be;
+	(void)stream;
+	return true;
+}
+
+static const char *dpcm_state_string(int state)
+{
+	(void)state;
+	return "not-running";
+}
+
+static int soc_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct fake_dpcm_runtime *dpcm = &substream->fe->dpcm[substream->stream];
+
+	CHECK(dpcm->stream_locked);
+	simulated_trigger_calls++;
+	if (cmd == SNDRV_PCM_TRIGGER_STOP && dpcm->observe_be)
+		dpcm->observed_be_start =
+			dpcm->observe_be->dpcm[substream->stream].be_start;
+	if (cmd == SNDRV_PCM_TRIGGER_STOP)
+		return dpcm->stop_result;
+	if (cmd == SNDRV_PCM_TRIGGER_START)
+		return dpcm->start_result;
+	if (cmd == SNDRV_PCM_TRIGGER_PAUSE_PUSH ||
+	    cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE)
+		return dpcm->pause_result;
+	return 0;
+}
+
+static void dpcm_set_be_update_state(struct snd_soc_pcm_runtime *be,
+				     int stream, int state)
+{
+	(void)be;
+	(void)stream;
+	simulated_update_no_state = state;
+	if (state == SND_SOC_DPCM_UPDATE_NO)
+		simulated_update_no_calls++;
+}
+
+static void dpcm_create_debugfs_state(struct snd_soc_dpcm *dpcm, int stream)
+{
+	(void)dpcm;
+	(void)stream;
 }
 
 static int dpcm_path_get(struct snd_soc_pcm_runtime *fe, int stream,
@@ -1690,6 +2501,8 @@ static int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
 		    sizeof(simulated_runtime_update_order[0])));
 	simulated_runtime_update_order[simulated_runtime_update_calls] = 1;
 	simulated_runtime_update_calls++;
+	if (simulated_add_paths_result < 0)
+		return simulated_add_paths_result;
 	if (!dpcm->route_wanted || dpcm->route_connected)
 		return 0;
 	dpcm->route_connected = true;
@@ -1697,22 +2510,47 @@ static int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
 	return 1;
 }
 
-static void snd_soc_dpcm_mutex_lock(struct snd_soc_card *card)
+static void simulated_dpcm_mutex_lock_card(struct snd_soc_card *card)
 {
 	assert(!card->pcm_mutex_locked);
 	card->pcm_mutex_locked = true;
 }
 
-static void snd_soc_dpcm_mutex_unlock(void *lockable)
+static void simulated_dpcm_mutex_unlock_card(struct snd_soc_card *card)
 {
-	struct snd_soc_card *card = lockable;
+	assert(card->pcm_mutex_locked);
 	card->pcm_mutex_locked = false;
 }
 
-static void snd_soc_dpcm_mutex_assert_held(struct snd_soc_card *card)
+static void simulated_dpcm_mutex_assert_card(struct snd_soc_card *card)
 {
 	assert(card->pcm_mutex_locked);
 }
+
+static void simulated_dpcm_mutex_lock_rtd(struct snd_soc_pcm_runtime *rtd)
+{
+	simulated_dpcm_mutex_lock_card(rtd->card);
+}
+
+static void simulated_dpcm_mutex_unlock_rtd(struct snd_soc_pcm_runtime *rtd)
+{
+	simulated_dpcm_mutex_unlock_card(rtd->card);
+}
+
+static void simulated_dpcm_mutex_assert_rtd(struct snd_soc_pcm_runtime *rtd)
+{
+	simulated_dpcm_mutex_assert_card(rtd->card);
+}
+
+#define snd_soc_dpcm_mutex_lock(x) _Generic((x), \
+	struct snd_soc_card *: simulated_dpcm_mutex_lock_card, \
+	struct snd_soc_pcm_runtime *: simulated_dpcm_mutex_lock_rtd)(x)
+#define snd_soc_dpcm_mutex_unlock(x) _Generic((x), \
+	struct snd_soc_card *: simulated_dpcm_mutex_unlock_card, \
+	struct snd_soc_pcm_runtime *: simulated_dpcm_mutex_unlock_rtd)(x)
+#define snd_soc_dpcm_mutex_assert_held(x) _Generic((x), \
+	struct snd_soc_card *: simulated_dpcm_mutex_assert_card, \
+	struct snd_soc_pcm_runtime *: simulated_dpcm_mutex_assert_rtd)(x)
 
 static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 				     int stream, int state)
@@ -1724,25 +2562,22 @@ static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 
 static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *fe,
 			    struct snd_pcm_substream *substream,
-			    int rollback, bool stop_on_component_error,
-			    bool retain_failed)
+			    int rollback, bool stop_on_component_error)
 {
 	(void)fe;
 	(void)substream;
 	(void)rollback;
 	(void)stop_on_component_error;
-	(void)retain_failed;
 	simulated_whole_clean_calls++;
 	return simulated_component_result;
 }
 
 static int soc_pcm_hw_clean_components(struct snd_pcm_substream *substream,
-				       int rollback, bool retain_failed)
+				       int rollback)
 {
 	(void)substream;
 	simulated_component_clean_calls++;
 	simulated_component_rollback = rollback;
-	simulated_component_retain = retain_failed;
 	return simulated_component_result;
 }
 
@@ -1767,6 +2602,13 @@ static void dpcm_be_dai_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
 	(void)fe;
 	(void)stream;
 	simulated_be_shutdown_calls++;
+}
+
+static void __soc_pcm_close(struct snd_soc_pcm_runtime *fe,
+			    struct snd_pcm_substream *substream)
+{
+	(void)fe;
+	(void)substream;
 }
 
 static int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,
@@ -1846,7 +2688,7 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     hw_params, _ = extracted["candidate_dpcm_hw_params"]
     shutdown, _ = extracted["candidate_dpcm_shutdown"]
     hw_free_core_start = hw_free.find(
-        "ret = soc_pcm_hw_clean(fe, substream, 0, true, true);"
+        "ret = soc_pcm_hw_clean(fe, substream, 0, true);"
     )
     hw_free_core_end = hw_free.find("\nout:", hw_free_core_start)
     if hw_free_core_start < 0 or hw_free_core_end < 0:
@@ -1861,6 +2703,7 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     runtime_update, _ = extracted["candidate_dpcm_runtime_update"]
     runtime_update_locked, _ = extracted["candidate_dpcm_runtime_update_locked"]
     retry_pending_routes, _ = extracted["candidate_retry_pending_routes"]
+    close, _ = extracted["candidate_dpcm_close"]
     parts = [
         "#define HAVE_BASELINE 1" if "baseline_start" in extracted else "",
         PREAMBLE,
@@ -1883,17 +2726,33 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         "static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card);\n",
         extracted["candidate_dpcm_run_update_shutdown"][0],
         extracted["candidate_dpcm_run_update"][0],
-		extracted["candidate_soc_dpcm_fe_runtime_update"][0],
+        extracted["candidate_soc_dpcm_fe_runtime_update"][0],
+        "#define dpcm_be_connect candidate_dpcm_be_connect",
+        extracted["candidate_dpcm_be_connect"][0],
+        "#undef dpcm_be_connect",
+        "#define dpcm_be_dai_stop_restore candidate_dpcm_be_dai_stop_restore",
+        extracted["candidate_dpcm_stop_restore"][0],
+        "#define dpcm_be_dai_stop_rollback candidate_dpcm_be_dai_stop_rollback",
+        extracted["candidate_dpcm_stop_rollback"][0],
+        "#define dpcm_be_dai_stop_commit candidate_dpcm_be_dai_stop_commit",
+        extracted["candidate_dpcm_stop_commit"][0],
+        "#define dpcm_be_dai_trigger candidate_dpcm_be_dai_trigger",
+        extracted["candidate_dpcm_be_dai_trigger"][0],
+        "#undef dpcm_be_dai_trigger",
+        "#undef dpcm_be_dai_stop_commit",
+        "#undef dpcm_be_dai_stop_rollback",
+        "#undef dpcm_be_dai_stop_restore",
         runtime_update_locked,
         runtime_update,
         retry_pending_routes,
+        extracted["candidate_component_hw_params"][0],
+        extracted["candidate_component_hw_free"][0],
         "static int simulate_dpcm_hw_free(struct snd_soc_pcm_runtime *fe, "
         "struct snd_pcm_substream *substream)\n{\n"
         "\tint stream = substream->stream;\n\tint ret;\n"
         + hw_free_core
         + "\nout:\n"
         "\tdpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);\n"
-        "\tsnd_soc_dpcm_mutex_unlock(fe);\n"
         "\treturn soc_pcm_ret(fe, ret);\n}\n",
         "static int simulate_dpcm_hw_params_recovery(struct snd_soc_pcm_runtime *fe, "
         "struct snd_pcm_substream *substream)\n{\n"
@@ -1905,6 +2764,15 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         "\tint stream = substream->stream;\n\tint ret = 0;\n"
         + shutdown_retry
         + "\tdpcm_be_dai_shutdown(fe, stream);\n}\n",
+        shutdown,
+        "static void simulate_dpcm_fe_dai_cleanup("
+        "struct snd_pcm_substream *fe_substream)\n{\n"
+        "\tsnd_soc_dpcm_mutex_assert_held(snd_soc_substream_to_rtd(fe_substream));\n"
+        "\tfe_substream->fe->dpcm[fe_substream->stream].route_connected = false;\n"
+        "\tsimulated_dpcm_cleanup_calls++;\n}\n",
+        "#define dpcm_fe_dai_cleanup simulate_dpcm_fe_dai_cleanup",
+        close,
+        "#undef dpcm_fe_dai_cleanup",
     ]
     if "baseline_start" in extracted:
         baseline_start, _ = extracted["baseline_start"]
@@ -1931,8 +2799,9 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
     return "\n".join(parts)
 
 
-def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def read_source(path: Path) -> tuple[str, str]:
+    data = path.read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
 def resolve_q6apm_c(path: Path, label: str) -> Path:
@@ -1950,7 +2819,7 @@ def main() -> int:
     parser.add_argument(
         "kernel_source_tree",
         type=Path,
-        help="candidate Linux kernel source tree, or its direct q6apm.c path",
+        help="candidate Linux kernel source tree",
     )
     parser.add_argument(
         "--work",
@@ -1966,38 +2835,55 @@ def main() -> int:
     parser.add_argument("--cc", default="cc")
     args = parser.parse_args()
 
+    if not args.kernel_source_tree.is_dir():
+        raise SystemExit(
+            "candidate must be a Linux kernel source tree; "
+            "--baseline may still point to a direct q6apm.c path"
+        )
+
     candidate = resolve_q6apm_c(args.kernel_source_tree, "candidate")
     candidate_header = candidate.with_name(Q6APM_H_REL.name)
     candidate_dai = candidate.with_name(Q6APM_DAI_NAME)
-    if args.kernel_source_tree.is_dir():
-        candidate_soc_pcm = args.kernel_source_tree / "sound/soc/soc-pcm.c"
-        candidate_soc_component = args.kernel_source_tree / "sound/soc/soc-component.c"
-    else:
-        raise SystemExit(
-            "DPCM teardown validation requires a kernel source tree; pass the "
-            "tree directory instead of a direct q6apm.c path"
-        )
+    candidate_soc_pcm = (args.kernel_source_tree / "sound/soc/soc-pcm.c").resolve()
+    candidate_soc_component = (
+        args.kernel_source_tree / "sound/soc/soc-component.c"
+    ).resolve()
+    candidate_soc_compress = (
+        args.kernel_source_tree / "sound/soc/soc-compress.c"
+    ).resolve()
     if not candidate_header.is_file():
         raise SystemExit(f"candidate header not found at {candidate_header}")
     if not candidate_soc_pcm.is_file():
         raise SystemExit(f"candidate DPCM source not found at {candidate_soc_pcm}")
     if not candidate_soc_component.is_file():
         raise SystemExit(f"candidate component source not found at {candidate_soc_component}")
+    if not candidate_soc_compress.is_file():
+        raise SystemExit(f"candidate compress source not found at {candidate_soc_compress}")
     baseline = (
         resolve_q6apm_c(args.baseline, "baseline") if args.baseline else None
     )
-    candidate_text = candidate.read_text(encoding="utf-8")
-    candidate_header_text = candidate_header.read_text(encoding="utf-8")
-    dai_text = candidate_dai.read_text(encoding="utf-8")
-    soc_pcm_text = candidate_soc_pcm.read_text(encoding="utf-8")
-    soc_component_text = candidate_soc_component.read_text(encoding="utf-8")
-    baseline_text = baseline.read_text(encoding="utf-8") if baseline else None
+    candidate_text, candidate_sha = read_source(candidate)
+    candidate_header_text, candidate_header_sha = read_source(candidate_header)
+    dai_text, candidate_dai_sha = read_source(candidate_dai)
+    soc_pcm_text, candidate_soc_pcm_sha = read_source(candidate_soc_pcm)
+    soc_component_text, candidate_soc_component_sha = read_source(
+        candidate_soc_component
+    )
+    soc_compress_text, candidate_soc_compress_sha = read_source(
+        candidate_soc_compress
+    )
+    if baseline:
+        baseline_text, baseline_sha = read_source(baseline)
+    else:
+        baseline_text = None
+        baseline_sha = None
     extracted = classify_sources(
         candidate_text,
         candidate_header_text,
         dai_text,
         soc_pcm_text,
         soc_component_text,
+        soc_compress_text,
         baseline_text,
     )
     harness = build_harness(extracted)
@@ -2005,7 +2891,7 @@ def main() -> int:
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     source = work / "source_regression.c"
-    binary = work / "source_regression"
+    binary = (work / "source_regression").resolve()
     source.write_text(harness, encoding="utf-8")
     compile_cmd = [
         args.cc,
@@ -2028,7 +2914,9 @@ def main() -> int:
         sys.stderr.write(f"\nGenerated harness: {source}\n")
         return compiled.returncode
     try:
-        tested = subprocess.run([str(binary)], text=True, capture_output=True, timeout=15)
+        tested = subprocess.run(
+            [str(binary.resolve())], text=True, capture_output=True, timeout=15
+        )
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"AudioReach lifecycle harness timed out: {binary}\n")
         return 1
@@ -2039,14 +2927,16 @@ def main() -> int:
 
     report = {
         "candidate": str(candidate),
-        "candidate_sha256": digest(candidate),
+        "candidate_sha256": candidate_sha,
         "candidate_header": str(candidate_header),
-        "candidate_header_sha256": digest(candidate_header),
-        "candidate_soc_pcm": str(candidate_soc_pcm.resolve()),
-        "candidate_soc_pcm_sha256": digest(candidate_soc_pcm),
-        "candidate_soc_component": str(candidate_soc_component.resolve()),
-        "candidate_soc_component_sha256": digest(candidate_soc_component),
-        "candidate_dai_sha256": digest(candidate_dai),
+        "candidate_header_sha256": candidate_header_sha,
+        "candidate_soc_pcm": str(candidate_soc_pcm),
+        "candidate_soc_pcm_sha256": candidate_soc_pcm_sha,
+        "candidate_soc_component": str(candidate_soc_component),
+        "candidate_soc_component_sha256": candidate_soc_component_sha,
+        "candidate_soc_compress": str(candidate_soc_compress),
+        "candidate_soc_compress_sha256": candidate_soc_compress_sha,
+        "candidate_dai_sha256": candidate_dai_sha,
         "baseline_negative_controls": baseline is not None,
         "extracted": {
             name: {
@@ -2061,7 +2951,7 @@ def main() -> int:
         report.update(
             {
                 "baseline": str(baseline),
-                "baseline_sha256": digest(baseline),
+                "baseline_sha256": baseline_sha,
             }
         )
     print(

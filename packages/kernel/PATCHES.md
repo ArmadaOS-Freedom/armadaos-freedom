@@ -1338,8 +1338,8 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0750-ASoC-qcom-harden-audioreach-teardown.patch`
   source: armada
   upstream: local
-  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Propagate capture FE hw_free errors through DPCM, preserve BE resources and failed component marks, retry cleanup before reconfiguration, and make a final best-effort retry at close. Shared AudioReach code; persistent DSP failure still limits callback lifetime guarantees after final teardown.
+  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Propagate capture FE hw_free errors through DPCM and retain BE resources until cleanup succeeds. Keep the component-wide hw_params mark operation-scoped; delayed recovery retries all FE components for the current substream. Shared AudioReach code; persistent DSP failure still limits callback lifetime guarantees after final teardown.
 - `patches/0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch`
   source: armada
   upstream: local
-  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures.
+  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures. Roll back partial BE STOP transactions to their snapshotted START/PAUSED state and reconnect retained active links without another startup or user reference.

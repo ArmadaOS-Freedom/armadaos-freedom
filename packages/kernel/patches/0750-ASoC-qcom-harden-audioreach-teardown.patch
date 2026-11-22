@@ -20,11 +20,16 @@ matching successful response, so a late reply cannot finish a later
 UNMAP or clear its mapping.
 
 Propagate capture FE hw_free failure through DPCM so the backend stays open
-for a failed attempt and the FE cannot be reused. Retain only failed component
-hw_params marks, retry those components before the next hw_params releases
-old DAI/BE state, and retry them once more before close shuts down the backend.
-Persistent STOP failure is reported while ALSA close completes best-effort
-resource release. Callback lifetime after final port teardown is unchanged.
+for a failed attempt and the FE cannot be reused. Keep component hw_params
+marks operation-scoped, and retry all FE components for the same substream
+before the next hw_params releases old DAI/BE state and before close shuts
+down the backend. Persistent STOP failure is reported while ALSA close
+completes best-effort resource release. Callback lifetime after final port
+teardown is unchanged.
+
+If the final shared graph STOP reply is lost, reject new shared START
+references until a STOP retry confirms the graph is stopped. This avoids
+reporting START success when hardware may already be stopped.
 
 Signed-off-by: 181981772 <181981772@qq.com>
 ---
@@ -394,7 +399,7 @@ index 8af5514..c3f0376 100644
  }
  
  int q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int graph_id)
-@@ -827,31 +883,49 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
+@@ -827,31 +883,60 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
  int q6apm_graph_start(struct q6apm_graph *graph)
  {
  	struct audioreach_graph *ar_graph = graph->ar_graph;
@@ -402,14 +407,22 @@ index 8af5514..c3f0376 100644
 +	int ret = 0;
 +
 +	mutex_lock(&ar_graph->start_stop_lock);
++	if (ar_graph->start_uncertain && ar_graph->start_count) {
++		ret = -EIO;
++		goto unlock;
++	}
  
  	if (ar_graph->start_count == 0) {
  		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
- 		if (ret)
+-		if (ret)
++		if (ret) {
++			ar_graph->start_uncertain = true;
 -			return ret;
 +			goto unlock;
++		}
  	}
  
++	ar_graph->start_uncertain = false;
  	ar_graph->start_count++;
  
 -	return 0;
@@ -442,8 +455,12 @@ index 8af5514..c3f0376 100644
 +	}
 +
 +	ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
-+	if (!ret)
++	if (!ret) {
 +		ar_graph->start_count--;
++		ar_graph->start_uncertain = false;
++	} else {
++		ar_graph->start_uncertain = true;
++	}
  
 -	return audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
 +unlock:
@@ -524,12 +541,13 @@ index 9092359..bd91b25 100644
  
  	struct mutex cmd_lock;
  	struct mutex lock;
-@@ -86,6 +94,8 @@ struct audioreach_graph {
+@@ -86,6 +94,9 @@ struct audioreach_graph {
  	struct audioreach_graph_info *info;
  	uint32_t id;
  	int state;
 +	/* Serialize graph START and STOP. */
 +	struct mutex start_stop_lock;
++	bool start_uncertain;
  	int start_count;
  	/* Cached Graph data */
  	void *graph;
@@ -541,7 +559,7 @@ index 4b7d795..163765f 100644
 -void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
 -				   int rollback);
 +int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
-+				   int rollback, bool retain_failed);
++				  int rollback);
 diff --git a/include/sound/soc-dpcm.h b/include/sound/soc-dpcm.h
 index af24665..683d7c4 100644
 --- a/include/sound/soc-dpcm.h
@@ -556,7 +574,7 @@ index 2ce2451..69ee865 100644
 -void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
 -				   int rollback)
 +int snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
-+				   int rollback, bool retain_failed)
++				  int rollback)
 @@ -1123 +1123 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
 -	int i, ret;
 +	int i, ret, err = 0;
@@ -569,12 +587,11 @@ index 2ce2451..69ee865 100644
 +				if (!err)
 +					err = ret;
 +			}
-@@ -1135,2 +1139,3 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
+@@ -1135,2 +1139,2 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
 -		/* remove marked substream */
 -		soc_component_mark_pop(component, hw_params);
-+		/* Keep failed marks for a precise cleanup retry when requested. */
-+		if (ret >= 0 || !retain_failed)
-+			soc_component_mark_pop(component, hw_params);
++		/* Marks only track rollback within the current hw_params operation. */
++		soc_component_mark_pop(component, hw_params);
 @@ -1137,0 +1143,2 @@ void snd_soc_pcm_component_hw_free(struct snd_pcm_substream *substream,
 +
 +	return err;
@@ -586,9 +603,9 @@ index 0e49290..081a5d7 100644
 -static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
 -			    struct snd_pcm_substream *substream, int rollback)
 +static int soc_pcm_hw_clean_components(struct snd_pcm_substream *substream,
-+					 int rollback, bool retain_failed)
++				       int rollback)
 +{
-+	return snd_soc_pcm_component_hw_free(substream, rollback, retain_failed);
++	return snd_soc_pcm_component_hw_free(substream, rollback);
 +}
 +
 +static void soc_pcm_hw_clean_dais(struct snd_soc_pcm_runtime *rtd,
@@ -601,14 +618,14 @@ index 0e49290..081a5d7 100644
 +
 +static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
 +			    struct snd_pcm_substream *substream, int rollback,
-+			    bool stop_on_component_error, bool retain_failed)
++			    bool stop_on_component_error)
 +{
 +	struct snd_soc_dai *dai;
 +	int i, ret;
 +
 @@ -1153 +1171,3 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
 -	snd_soc_pcm_component_hw_free(substream, rollback);
-+	ret = soc_pcm_hw_clean_components(substream, rollback, retain_failed);
++	ret = soc_pcm_hw_clean_components(substream, rollback);
 +	if (ret < 0 && stop_on_component_error)
 +		return ret;
 @@ -1156,3 +1176 @@ static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *rtd,
@@ -621,16 +638,17 @@ index 0e49290..081a5d7 100644
 +	return stop_on_component_error ? ret : 0;
 @@ -1169 +1187 @@ static int __soc_pcm_hw_free(struct snd_soc_pcm_runtime *rtd,
 -	return soc_pcm_hw_clean(rtd, substream, 0);
-+	return soc_pcm_hw_clean(rtd, substream, 0, false, false);
++	return soc_pcm_hw_clean(rtd, substream, 0, false);
 @@ -1285 +1303 @@ out:
 -		soc_pcm_hw_clean(rtd, substream, 1);
-+		soc_pcm_hw_clean(rtd, substream, 1, false, false);
-@@ -2105,0 +2124 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
++		soc_pcm_hw_clean(rtd, substream, 1, false);
+@@ -2105,0 +2124,2 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
 +	int ret = 0;
-@@ -2109,0 +2129,11 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
++
+@@ -2109,0 +2130,11 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
 +	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
 +		/* Retry only FE components; DAPM and link cleanup already ran. */
-+		ret = soc_pcm_hw_clean_components(substream, 1, false);
++		ret = soc_pcm_hw_clean_components(substream, 0);
 +		if (ret < 0)
 +			dev_err(fe->dev,
 +				"FE hw_free retry failed (%d); forcing best-effort close\n",
@@ -642,25 +660,26 @@ index 0e49290..081a5d7 100644
 @@ -2124 +2154 @@ static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)
 -	return 0;
 +	return soc_pcm_ret(fe, ret);
-@@ -2171,0 +2202 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
+@@ -2171,0 +2203,2 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
 +	int ret;
-@@ -2179 +2210,6 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
++
+@@ -2179 +2212,6 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
 -	soc_pcm_hw_clean(fe, substream, 0);
-+	ret = soc_pcm_hw_clean(fe, substream, 0, true, true);
++	ret = soc_pcm_hw_clean(fe, substream, 0, true);
 +	if (ret < 0) {
 +		WRITE_ONCE(fe->dpcm[stream].hw_free_failed, true);
 +		goto out;
 +	}
 +	WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);
-@@ -2185,0 +2222 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
+@@ -2185,0 +2224 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
 +out:
-@@ -2189 +2226 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
+@@ -2189 +2228 @@ static int dpcm_fe_dai_hw_free(struct snd_pcm_substream *substream)
 -	return 0;
 +	return soc_pcm_ret(fe, ret);
-@@ -2277,0 +2315,11 @@ static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,
+@@ -2277,0 +2317,11 @@ static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,
 +	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
 +		/* Retry only failed FE components; do not repeat DAPM/link cleanup. */
-+		ret = soc_pcm_hw_clean_components(substream, 1, true);
++		ret = soc_pcm_hw_clean_components(substream, 0);
 +		if (ret < 0)
 +			goto out;
 +
@@ -669,7 +688,7 @@ index 0e49290..081a5d7 100644
 +		fe->dpcm[stream].state = SND_SOC_DPCM_STATE_HW_FREE;
 +		WRITE_ONCE(fe->dpcm[stream].hw_free_failed, false);
 +	}
-@@ -2513,0 +2562,8 @@ static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)
+@@ -2513,0 +2564,8 @@ static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)
 +	if (READ_ONCE(fe->dpcm[stream].hw_free_failed) &&
 +	    (cmd == SNDRV_PCM_TRIGGER_START ||
 +	     cmd == SNDRV_PCM_TRIGGER_RESUME ||
@@ -678,7 +697,7 @@ index 0e49290..081a5d7 100644
 +		ret = -EIO;
 +		goto out;
 +	}
-@@ -2638,0 +2695,4 @@ static int dpcm_fe_dai_prepare(struct snd_pcm_substream *substream)
+@@ -2638,0 +2697,4 @@ static int dpcm_fe_dai_prepare(struct snd_pcm_substream *substream)
 +	if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
 +		ret = -EIO;
 +		goto out;

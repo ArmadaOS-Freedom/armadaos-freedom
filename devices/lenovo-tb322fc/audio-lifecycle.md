@@ -107,26 +107,43 @@ one is present. This keeps a route update from bypassing the retained-BE
 protection. It records the deferred route change and replays the current DAPM
 graph after FE cleanup succeeds, or after close disconnects the FE graph.
 Failures in either the old-path or new-path update retain the pending marker so
-a later retry repeats the old/new-path update. The extracted-C host harness
-executes the production route-update functions and verifies a DSP STOP timeout
-leaves the old BE connected and allocated, then retries STOP before disconnecting
-it and bringing up the new route. It also covers FE recovery deferral,
-new-path startup failure, DAPM path-query failure and retry.
+a later retry repeats the old/new-path update. Partial BE STOP is transactional:
+the patch snapshots each processed link's state and START/PAUSE references,
+then restores the earlier links if a later BE STOP fails. Retained links can
+reconnect to a BE restored to START or PAUSED without repeating BE startup or
+incrementing its user count.
+If the final shared graph STOP acknowledgement is lost, a shared graph
+uncertainty flag rejects new START references until a STOP retry confirms the
+graph state.
+
+Patch `0750` keeps the component `hw_params` mark scoped to the locked
+operation, matching its upstream use. Delayed FE cleanup retries all components
+with the current substream instead of relying on the component-wide mark, which
+another playback or capture stream may overwrite or clear. The extracted-C
+host harness executes the production route and component functions. It covers
+two-substream mark overwrite and capture recovery, STOP rollback across shared,
+exclusive and PAUSED BEs, failed rollback START, retained START/PAUSED link
+reconnection, FE recovery deferral, new-path startup failure, DAPM path-query
+failure and retry.
 
 Validation on 2026-11-22 started from a fresh extraction of the cached official
 Linux 7.2.6 archive (SHA-256
 `039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606`). All 320
 kernel patches applied with strict `-F0` checking, and the complete
-`KERNEL_HOST_CHECKS_ONLY=1` run passed, including 299 AudioReach lifecycle
-checks and patch-catalogue tests 4/4. With the repository ARM64 config merged,
-`soc-pcm.o`, `soc-core.o`, `q6apm.o`, `q6apm-dai.o` and `q6apm-lpass-dais.o`
-compiled successfully. Patch `0752` passed `checkpatch.pl --strict` with no
-errors or warnings.
+`KERNEL_HOST_CHECKS_ONLY=1` run passed, including 462 AudioReach lifecycle
+checks and patch-catalogue tests 4/4. The harness includes retained
+PAUSED-route reconnection and a lost final STOP acknowledgement followed by
+START rejection and successful STOP recovery. Both `0750` and `0752` pass
+`checkpatch.pl --strict` with no errors, warnings or checks.
+With the repository ARM64 config merged, `soc-component.o`, `soc-pcm.o`,
+`soc-compress.o`, `q6apm.o`, `q6apm-dai.o` and `q6apm-lpass-dais.o` compiled
+successfully.
 
 This is source, host-harness and compile validation only. The physical tablet
-has not been tested with injected DSP STOP failure followed by a DAPM route
-change. PR #159 remains open at remote head `a281f9b0`, so its CI and review
-results do not cover these local uncommitted changes or the 299-check harness.
-The remote `mesa-x86` job failed before compilation because
+has normal capture lifecycle validation, but no injected DSP STOP failure
+followed by a DAPM route change has been tested on hardware. The latest PR CI
+run was for an earlier head and therefore does not cover these review fixes.
+CI for the submitted revision is recorded after the push. The remote
+`mesa-x86` job in the earlier run failed before compilation because
 `archive.archlinux.org` timed out while syncing package databases; the other
 reported CI jobs passed or were skipped.
