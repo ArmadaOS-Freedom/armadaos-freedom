@@ -1,0 +1,25 @@
+{
+  "channel": "testing",
+  "kind": "freedom-channel",
+  "minimumUpdaterVersion": "0.8.2",
+  "ociDigest": "sha256:d6cae41325ee0adafab869c9d06c5867331be4db18539eea57b53ad74363a511",
+  "ostreeCommit": "6890b27f54abfeea3d7dac4a38e236c5b4b8549cca751e6ea7f4feabcc32f1ad",
+  "packageDescriptor": {
+    "bytes": 387514,
+    "sha256": "fa3ec3e09043ca69ce134259a89c41173c3134d9cfe980bf56813acb8826c54d",
+    "signatureUrl": "https://github.com/ArmadaOS-Freedom/armadaos-freedom/releases/download/20261122.8a01bc5/ArmadaOS-Freedom-20261122.8a01bc5.zip.update.json.sig",
+    "url": "https://github.com/ArmadaOS-Freedom/armadaos-freedom/releases/download/20261122.8a01bc5/ArmadaOS-Freedom-20261122.8a01bc5.zip.update.json"
+  },
+  "product": "armadaos-freedom",
+  "publishedAt": "2026-11-22T11:50:03Z",
+  "releaseId": "20261122.8a01bc5",
+  "schemaVersion": 1,
+  "sourceRevision": "8a01bc5ab0ccd5695d627fb523b62c2e7bc732c5",
+  "supportedModels": [
+    "TB322FC",
+    "TB323FU",
+    "TB710FU"
+  ],
+  "version": "20261122.8a01bc5",
+  "withdrawn": false
+}
