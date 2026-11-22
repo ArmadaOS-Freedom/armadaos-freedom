@@ -7,8 +7,8 @@
 //       -o "$TASK_OUTPUT/gamescope-fifo-test"
 //   "$TASK_OUTPUT/gamescope-fifo-test"
 //
-// $GAMESCOPE_SOURCE is the checkout with the applied 0037 patch; the include
-// above resolves Utils/CommitQueue.h from that source tree.
+// $GAMESCOPE_SOURCE is the checkout with the applied 0037 patch; the FIFO
+// selector is now provided by the 3.17 tree that the include resolves against.
 
 #include <cassert>
 #include <cstdint>
@@ -28,6 +28,10 @@ struct FixtureEntry
 	bool fifo;
 	bool done;
 	bool abandoned;
+	struct
+	{
+		uint32_t flags = 0;
+	} present_timing;
 };
 
 using Entry = std::shared_ptr<FixtureEntry>;

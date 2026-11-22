@@ -18,16 +18,17 @@ readonly GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 # Models the shipped package contract accepts for installation. Any other
 # profile registered in the devices config is packaged install-only and is
 # passed to the descriptor builder as an explicit install model. Keep this
-# list in sync with
-# system_files/usr/lib/armada/updates/package_contract.py.
+# list in sync with the capability table in
+# system_files/usr/lib/armada/updates/models.py (AUTHORIZED_MODELS).
 readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
 # Models whose installed systems have the physical dual-slot backend the
 # offline upgrade drives. The descriptor carries one package-level operations
 # list: upgrade is advertised when at least one selected model is in this set
-# and every selected profile is a shipped contract model. A selected TB710FU
-# or custom model still installs, but its own upgrade request is rejected.
-# Keep this list in sync with package_contract.py OFFLINE_UPGRADE_MODELS.
-readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU"
+# and every selected profile is a shipped contract model. Every shipped model
+# currently has the backend; a selected custom model still installs, but makes
+# the whole package install-only. Keep this list in sync with the
+# offline_upgrade flags in models.py (OFFLINE_UPGRADE_MODELS).
+readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU TB710FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -682,11 +683,11 @@ if ((upgrade_enabled)); then
     descriptor_identity="unsigned install and upgrade identity"
     descriptor_scope_en="This single package installs every listed model. Its descriptor declares first
 installation for all of them and a normal-Linux offline upgrade for the selected
-models that have the dual-slot backend (the Lenovo Legion Y700 models). That
+models that have the dual-slot backend. That
 upgrade keeps user data and both boot slots and runs from an installed system;
 memory-rescue tools are not part of this package. An upgrade request for any
 other listed model is rejected."
-    descriptor_scope_zh="本单一部署包安装上方全部机型：描述文件为全部所列机型声明首次安装，并仅为具备双启动槽的选中机型（Lenovo Legion Y700）声明正常 Linux 离线升级。该升级保留用户数据及两个启动槽，在已安装系统中执行，本包不包含内存救援工具。对其他所列机型的升级请求会被拒绝。"
+    descriptor_scope_zh="本单一部署包安装上方全部机型：描述文件为全部所列机型声明首次安装，并仅为具备双启动槽后端的选中机型声明正常 Linux 离线升级。该升级保留用户数据及两个启动槽，在已安装系统中执行，本包不包含内存救援工具。对其他所列机型的升级请求会被拒绝。"
 else
     descriptor_identity="unsigned install-only identity"
     descriptor_scope_en="This single package installs every listed model, but its descriptor declares

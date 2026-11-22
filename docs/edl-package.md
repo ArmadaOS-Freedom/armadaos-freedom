@@ -49,10 +49,10 @@ The recipe takes these four positional arguments and forwards no model or
 configuration options, so it packages one artifact containing every profile
 registered in `build_files/edl-devices.json`. That single package installs all
 of them, including `TB710FU`, and its descriptor also declares
-`offline-upgrade` for the selected models with the dual-slot backend (the
-Lenovo Legion Y700 models). It writes the package to `output/edl/<version>/`
-and uses a fresh `_build-edl.*` work directory under the checkout, which is
-ignored by Git.
+`offline-upgrade` for the selected models with the dual-slot backend (every
+shipped model: TB322FC, TB323FU and TB710FU). It writes the package to
+`output/edl/<version>/` and uses a fresh `_build-edl.*` work directory under
+the checkout, which is ignored by Git.
 
 To package a subset, or to use another configuration file, call the wrapper
 directly with the same four values:
@@ -440,12 +440,16 @@ Updater 0.8.1 and older cannot upgrade using this release, either online or
 offline. This release provides no bridge for such installations; do not use
 overwrite if Linux data must be preserved.
 
-Offline upgrade is currently supported only on the Lenovo Legion Y700 Gen 4
-(TB322FC) and Gen 5 (TB323FU). The Lenovo Xiaoxin Pad Pro GT (TB710FU) is part
-of the same all-profile package for installation, but its update slot backend
-is not implemented yet; being listed in the package is not offline-upgrade
-support for that model, and an upgrade request naming it is rejected before
-any slot work.
+Offline upgrade is supported on every shipped model: the Lenovo Legion Y700
+Gen 4 (TB322FC) and Gen 5 (TB323FU) and the Lenovo Xiaoxin Pad Pro GT
+(TB710FU). TB710FU uses a mirrored dual-slot policy without a GBL
+envelope: an update rebuilds `boot_a` and `boot_b` from each slot's own
+verified boot material, re-signs only the boot image with the AOSP test key
+the device already trusts (AospPreserved), and both slots boot the same Linux
+deployment. Android keeps its slot selection and its own vbmeta, recovery and
+vbmeta_system partitions. A TB710FU system installed from a package without
+this backend cannot upgrade in place; it needs a fresh installation from a
+package that includes it.
 
 Recovery manifests describe the RAM rescue path and are not a prerequisite here:
 this package ships no rescue artifacts, and the object may be absent or partial.

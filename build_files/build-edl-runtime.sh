@@ -345,7 +345,9 @@ build_profile() {
     [[ -f "$binary" ]] || die "missing binary: $binary"
     size="$(stat -c %s -- "$binary")"
     [[ "$size" == "$RUNTIME_BYTES" ]] || die "$binary is $size bytes, expected $RUNTIME_BYTES"
-    if [[ "$model" == TB322FC || "$model" == TB323FU ]]; then
+    # Mirrored-policy models: keep in sync with the mirrored_boot flags in
+    # system_files/usr/lib/armada/updates/models.py (MIRROR_POLICY_MODELS).
+    if [[ "$model" == TB322FC || "$model" == TB323FU || "$model" == TB710FU ]]; then
         grep -aqF 'ARMADA_LINUX_MIRROR_V1' "$binary" \
             || die "$binary is missing the ARMADA_LINUX_MIRROR_V1 runtime contract marker"
     fi

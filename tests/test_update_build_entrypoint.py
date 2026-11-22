@@ -38,7 +38,7 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
             "--output", "/output/$zip_name.update.json",
         ]
 
-    def _run_descriptor(self, models, extra_args):
+    def _run_descriptor(self, models, extra_args, *, expect_success=True):
         # Exercise only the real descriptor CLI invocation, not the image build.
         directory = Path(tempfile.mkdtemp(dir=self.temporary_directory.name))
         archive = self.fixture._make_bundle(
@@ -78,6 +78,14 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
             timeout=60,
             env=environment,
         )
+        if not expect_success:
+            self.assertNotEqual(
+                result.returncode, 0, msg=result.stdout + result.stderr
+            )
+            self.assertFalse(
+                (split_dir / f"{archive.name}.update.json").exists()
+            )
+            return result
         self.assertEqual(
             result.returncode, 0, msg=result.stdout + result.stderr
         )
@@ -108,11 +116,11 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         )
 
     def test_full_configuration_descriptor_declares_install_and_upgrade(self):
-        # The single universal package covers every registered model. The
-        # descriptor advertises upgrade for the Y700 models but the operation
-        # gate rejects a TB710FU upgrade before execution.
+        # The single universal package covers every registered model, and
+        # every registered model (TB710FU included) has the dual-slot backend.
         models = tuple(json.loads(
             fixture.CONFIG_PATH.read_text(encoding="utf-8"))["profiles"])
+        self.assertEqual(set(models), set(fixture.OFFLINE_UPGRADE_MODELS))
         document = self._run_descriptor(models, ("--offline-upgrade",))
         self.assertEqual(document["operations"], ["install", "offline-upgrade"])
         self.assertEqual(document["recoveryManifests"], {})
@@ -130,20 +138,16 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         for model in models:
             fixture.require_operation(document, model, "install",
                                       installer_version="0.10.0")
-        for model in sorted(fixture.OFFLINE_UPGRADE_MODELS):
-            # The installed unified runtime accepts the eligible Y700 upgrade.
+        for model in models:
+            # The installed unified runtime accepts every model's upgrade.
             fixture.require_operation(document, model, "offline-upgrade",
                                       updater_version=system_manager.UPDATER_VERSION)
-        for model in sorted(fixture.OFFLINE_UPGRADE_MODELS):
+        for model in models:
             # The pre-unification 0.8.0 updater is too old for this package.
             with self.assertRaisesRegex(
                     fixture.PackageError, "older than minimumUpdaterVersion"):
                 fixture.require_operation(document, model, "offline-upgrade",
                                           updater_version="0.8.0")
-        with self.assertRaisesRegex(
-                fixture.PackageError, r"(?i)(offline-upgrade|dual-slot|upgrade)"):
-            fixture.require_operation(document, "TB710FU", "offline-upgrade",
-                                      updater_version=system_manager.UPDATER_VERSION)
 
     def test_explicit_install_only_full_selection_still_valid(self):
         models = ("TB322FC", "TB323FU", "TB710FU")
@@ -174,6 +178,16 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
             ),
             document,
         )
+
+
+    def test_custom_model_cannot_request_offline_upgrade(self):
+        # A custom install-only profile keeps the whole package install-only.
+        result = self._run_descriptor(
+            ("TB322FC", fixture.CUSTOM_MODEL),
+            ("--install-model", fixture.CUSTOM_MODEL, "--offline-upgrade"),
+            expect_success=False,
+        )
+        self.assertRegex(result.stderr, r"(?i)offline-upgrade is restricted")
 
 
 class BuildRecipeProfileTests(unittest.TestCase):
