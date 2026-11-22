@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 [Unit]
-Description=Apply the provisioned Bluetooth address on TB323FU
+Description=Initialize and apply the Bluetooth address on TB323FU
 Before=bluetooth.service
-ConditionPathExists=/etc/tb323fu/bt-address
 
 [Service]
 Type=oneshot
