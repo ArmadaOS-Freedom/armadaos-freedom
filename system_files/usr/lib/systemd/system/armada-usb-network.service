@@ -7,7 +7,7 @@ After=sys-kernel-config.mount systemd-modules-load.service NetworkManager.servic
 Type=oneshot
 RemainAfterExit=yes
 # Only where the device profile allows it and the Freedom Control switch is on, and
-# never while USB file transfer owns the controller (its gadget carries the link then).
+# never while USB file transfer owns the controller.
 ExecCondition=/usr/libexec/armada/usb-network enabled
 ExecCondition=/usr/bin/test ! -e /sys/kernel/config/usb_gadget/armada-mtp
 ExecStart=/usr/libexec/armada/usb-network start
