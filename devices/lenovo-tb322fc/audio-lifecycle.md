@@ -148,9 +148,20 @@ successfully.
 
 This is source, host-harness and compile validation only. The physical tablet
 has normal capture lifecycle validation, but no injected DSP STOP failure
-followed by a DAPM route change has been tested on hardware. The latest PR CI
-run was for an earlier head and therefore does not cover these review fixes.
-CI for the submitted revision is recorded after the push. The remote
-`mesa-x86` job in the earlier run failed before compilation because
-`archive.archlinux.org` timed out while syncing package databases; the other
-reported CI jobs passed or were skipped.
+followed by a DAPM route change has been tested on hardware.
+
+### Review-fix revision (2026-11-23)
+
+Commit `5f48ca27` (`fix(audio): address DPCM recovery review findings`) was
+pushed to PR #159. The extracted-C production harness passed 575 checks against
+the Linux 7.2.6 candidate tree. Both `0750` and `0752` passed
+`checkpatch.pl --strict` with zero errors, warnings or checks. The worktree is
+clean and the remote PR head matches this commit.
+
+For this revision, automatic unit tests, kernel host source checks, kShimC host
+tests, root/disposable-container tests, shell tests, patch catalogue, package
+resolution and CodeRabbit review all passed. The x86_64 package matrix was
+skipped by workflow configuration. The ARM64 container-image job was still
+running when this record was written; no failure had been reported. The
+physical device has not been re-tested with injected DSP STOP failure and DAPM
+route changes.
