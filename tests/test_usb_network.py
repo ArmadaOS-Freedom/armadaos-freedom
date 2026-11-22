@@ -42,8 +42,6 @@ class HelperTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.gadget = os.path.join(self.tmp.name, "armada-mtp")
-        os.makedirs(os.path.join(self.gadget, "configs", "c.1"))
-        os.makedirs(os.path.join(self.gadget, "functions"))
 
         self.config = os.path.join(self.tmp.name, "etc", "usb-network.conf")
         # A fake systemctl on PATH logs every call; is-active answers from MTP_ACTIVE
@@ -100,6 +98,7 @@ class HelperTest(unittest.TestCase):
             os.environ,
             ARMADA_DEVICE_ENV=env_script,
             ARMADA_USB_NETWORK_CONFIG=self.config,
+            ARMADA_MTP_GADGET=self.gadget,
             MTP_ACTIVE="1" if mtp_active else "0",
             MTP_STATE=mtp_state,
             MTP_QUERY_FAIL="1" if mtp_query_fail else "0",
@@ -132,17 +131,17 @@ class HelperTest(unittest.TestCase):
 
     def test_switch_is_on_without_a_config(self):
         self.assertEqual(self.run_helper("enabled").returncode, 0)
-        self.assertEqual(self.run_helper("state").stdout, "enabled=1\nsupported=1\n")
+        self.assertEqual(self.run_helper("state").stdout, "enabled=1\nsupported=1\npaused=0\n")
 
     def test_switch_off_disables_the_link(self):
         self.write_switch("enabled=0\n")
         self.assertNotEqual(self.run_helper("enabled").returncode, 0)
-        self.assertEqual(self.run_helper("state").stdout, "enabled=0\nsupported=1\n")
+        self.assertEqual(self.run_helper("state").stdout, "enabled=0\nsupported=1\npaused=0\n")
         self.write_switch("enabled=1\n")
         self.assertEqual(self.run_helper("enabled").returncode, 0)
 
     def test_state_reports_an_unsupported_profile(self):
-        self.assertEqual(self.run_helper("state", usb_network="0").stdout, "enabled=1\nsupported=0\n")
+        self.assertEqual(self.run_helper("state", usb_network="0").stdout, "enabled=1\nsupported=0\npaused=0\n")
 
     def test_set_off_saves_and_stops_the_link(self):
         self.assertEqual(self.run_helper("set", "off").returncode, 0)
@@ -165,60 +164,29 @@ class HelperTest(unittest.TestCase):
             ],
         )
 
-    def test_set_rebuilds_the_mtp_gadget_while_file_transfer_is_on(self):
-        self.assertEqual(self.run_helper("set", "off", mtp_active=True).returncode, 0)
-        self.assertEqual(
-            self.systemctl_calls(),
-            [
-                "reset-failed armada-mtp.service",
-                "stop armada-usb-ssh.socket armada-usb-network.service",
-                "restart armada-mtp.service",
-            ],
-        )
-        if os.path.exists(self.calls):
-            os.remove(self.calls)
-        self.assertEqual(
-            self.run_helper("set", "on", mtp_active=True, sshd_state="inactive").returncode, 0
-        )
-        # ssh_resume now queues the deferred resume unit; the socket itself is
-        # started by ssh-start inside that unit, not by set_switch.
-        self.assertEqual(
-            self.systemctl_calls(),
-            [
-                "reset-failed armada-mtp.service",
-                "restart armada-mtp.service",
-                "--no-block start armada-usb-ssh-resume.service",
-            ],
-        )
-
-    def test_set_switch_treats_mtp_activating_and_reloading_as_on(self):
-        # A switch change during MTP activation/reload must land in the recreated
-        # gadget, so it takes the reset/restart branch.
-        for state in ("activating", "reloading"):
+    def test_set_is_rejected_while_mtp_runs_or_exists(self):
+        for state in ("active", "activating", "reloading", "deactivating"):
             for switch in ("on", "off"):
                 with self.subTest(state=state, switch=switch):
+                    self.write_switch("enabled=1\n")
                     if os.path.exists(self.calls):
                         os.remove(self.calls)
-                    result = self.run_helper("set", switch, mtp_state=state)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    calls = self.systemctl_calls()
-                    self.assertIn("restart armada-mtp.service", calls)
-                    self.assertNotIn("start armada-usb-network.service", calls)
-                    if switch == "on":
-                        self.assertIn("--no-block start armada-usb-ssh-resume.service", calls)
-                    else:
-                        self.assertIn("stop armada-usb-ssh.socket armada-usb-network.service", calls)
-                        self.assertNotIn("--no-block start armada-usb-ssh-resume.service", calls)
-
-    def test_set_switch_treats_mtp_deactivating_as_off(self):
-        # A deliberate MTP stop is not resurrected; the standalone link is used.
-        self.assertEqual(
-            self.run_helper("set", "on", mtp_state="deactivating").returncode, 0
-        )
-        calls = self.systemctl_calls()
-        self.assertIn("start armada-usb-network.service", calls)
-        self.assertNotIn("restart armada-mtp.service", calls)
-        self.assertNotIn("--no-block start armada-usb-ssh-resume.service", calls)
+                    proc = self.run_helper("set", switch, mtp_state=state)
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(self.systemctl_calls(), [])
+                    with open(self.config, encoding="utf-8") as handle:
+                        self.assertEqual(handle.read(), "enabled=1\n")
+        os.makedirs(os.path.join(self.gadget, "functions"))
+        for switch in ("on", "off"):
+            with self.subTest(gadget_present=True, switch=switch):
+                self.write_switch("enabled=0\n")
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
+                proc = self.run_helper("set", switch, mtp_state="inactive")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(self.systemctl_calls(), [])
+                with open(self.config, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "enabled=0\n")
 
     def test_set_switch_fails_when_mtp_state_unreadable(self):
         proc = self.run_helper("set", "on", mtp_query_fail=True)
@@ -345,59 +313,56 @@ class HelperTest(unittest.TestCase):
         self.assertNotEqual(self.run_helper("enabled", usb_network="").returncode, 0)
         self.assertNotEqual(self.run_helper("enabled", usb_network="0").returncode, 0)
 
-    def test_attach_and_detach_the_network_function(self):
-        link = os.path.join(self.gadget, "configs", "c.1", "ncm.usb0")
-        function = os.path.join(self.gadget, "functions", "ncm.usb0")
-
-        self.assertEqual(self.run_helper("attach", self.gadget, usb_network="1").returncode, 0)
-        self.assertTrue(os.path.isdir(function))
-        self.assertEqual(os.readlink(link), function)
-
-        # Attaching twice is harmless.
-        self.assertEqual(self.run_helper("attach", self.gadget, usb_network="1").returncode, 0)
-
-        self.assertEqual(self.run_helper("detach", self.gadget, usb_network="1").returncode, 0)
-        self.assertFalse(os.path.lexists(link))
-        self.assertFalse(os.path.exists(function))
-
-    def test_attach_does_nothing_without_the_profile_flag(self):
-        self.assertEqual(self.run_helper("attach", self.gadget, usb_network="").returncode, 0)
-        self.assertEqual(os.listdir(os.path.join(self.gadget, "functions")), [])
-        self.assertEqual(os.listdir(os.path.join(self.gadget, "configs", "c.1")), [])
-
-    def test_attach_does_nothing_with_the_switch_off(self):
-        self.write_switch("enabled=0\n")
-        self.assertEqual(self.run_helper("attach", self.gadget).returncode, 0)
-        self.assertEqual(os.listdir(os.path.join(self.gadget, "functions")), [])
-
-    def test_attach_sets_iad_triplet(self):
-        # Windows UsbNcm needs the IAD device triplet on the combined gadget.
-        self.assertEqual(self.run_helper("attach", self.gadget).returncode, 0)
-        for name, want in (
-            ("bDeviceClass", "0xEF"),
-            ("bDeviceSubClass", "0x02"),
-            ("bDeviceProtocol", "0x01"),
-        ):
-            with open(os.path.join(self.gadget, name), encoding="utf-8") as handle:
-                self.assertEqual(handle.read(), want, name)
-
-    def test_attach_leaves_descriptors_untouched_when_not_enabled(self):
-        # MTP-only gadget keeps its committed identity; nothing is written.
-        cases = (
-            ("switch off", {"usb_network": "1"}, "enabled=0\n"),
-            ("unsupported", {"usb_network": "0"}, "enabled=1\n"),
+    def test_runtime_pauses_while_the_mtp_gadget_exists(self):
+        os.makedirs(os.path.join(self.gadget, "functions"))
+        self.assertEqual(
+            self.run_helper("state", mtp_active=True).stdout,
+            "enabled=0\nsupported=1\npaused=1\n",
         )
-        for label, kwargs, switch in cases:
-            with self.subTest(label):
-                self.write_switch(switch)
-                for name in ("bDeviceClass", "bDeviceSubClass", "bDeviceProtocol"):
-                    with open(os.path.join(self.gadget, name), "w", encoding="utf-8") as handle:
-                        handle.write("0x00")
-                self.assertEqual(self.run_helper("attach", self.gadget, **kwargs).returncode, 0)
-                for name in ("bDeviceClass", "bDeviceSubClass", "bDeviceProtocol"):
-                    with open(os.path.join(self.gadget, name), encoding="utf-8") as handle:
-                        self.assertEqual(handle.read(), "0x00", name)
-                self.assertEqual(os.listdir(os.path.join(self.gadget, "functions")), [])
+        self.assertNotEqual(self.run_helper("enabled", mtp_active=True).returncode, 0)
+        for command in ("resume", "ssh-resume", "ssh-start"):
+            with self.subTest(command=command):
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
+                proc = self.run_helper(command, mtp_active=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.systemctl_calls(), [])
+
+    def test_resume_after_mtp_uses_the_persisted_preference(self):
+        cases = [
+            ("explicit enabled=1", "enabled=1\n", False),
+            ("explicit enabled=0", "enabled=0\n", True),
+            ("missing preference (default on)", None, False),
+        ]
+        start_calls = [
+            "reset-failed armada-usb-network.service",
+            "--no-block start armada-usb-network.service",
+        ]
+        for label, config_text, explicitly_off in cases:
+            with self.subTest(label=label):
+                if config_text is None:
+                    if os.path.exists(self.config):
+                        os.remove(self.config)
+                else:
+                    self.write_switch(config_text)
+                os.makedirs(self.gadget, exist_ok=True)
+                self.assertEqual(self.run_helper("resume").returncode, 0)
+                self.assertEqual(self.systemctl_calls(), [])
+                os.rmdir(self.gadget)
+                expected_state = (
+                    "enabled=0\nsupported=1\npaused=0\n"
+                    if explicitly_off
+                    else "enabled=1\nsupported=1\npaused=0\n"
+                )
+                self.assertEqual(self.run_helper("state").stdout, expected_state)
+                self.assertEqual(
+                    self.run_helper("resume", mtp_state="deactivating").returncode, 0
+                )
+                self.assertEqual(
+                    self.systemctl_calls(), [] if explicitly_off else start_calls
+                )
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
 
     def test_unknown_command(self):
         self.assertEqual(self.run_helper("bogus").returncode, 2)
@@ -492,9 +457,10 @@ class UnitTest(unittest.TestCase):
         text = raw("armada-mtp.service.d", "50-usb-network.conf")
         lines = [line for line in text.splitlines() if line and not line.startswith("#")]
         start_pre = [line for line in lines if line.startswith("ExecStartPre=")]
-        self.assertEqual(len(start_pre), 2)
-        self.assertIn("systemctl stop armada-usb-network.service", start_pre[0])
-        self.assertIn("usb-network attach", start_pre[1])
+        self.assertEqual(
+            start_pre,
+            ["ExecStartPre=+/usr/bin/systemctl stop armada-usb-ssh.socket armada-usb-network.service"],
+        )
         self.assertEqual([l for l in lines if l.startswith("ExecStop=")], [])
         stop_post = [l[len("ExecStopPost="):] for l in lines if l.startswith("ExecStopPost=")]
         self.assertEqual(
@@ -521,14 +487,10 @@ class UnitTest(unittest.TestCase):
         os.chmod(env_script, 0o755)
         env = dict(os.environ, ARMADA_DEVICE_ENV=env_script, ARMADA_USB_NETWORK_CONFIG=os.path.join(tmp.name, "usb-network.conf"))
 
-        attach = subprocess.run(
-            ["bash", HELPER, "attach", gadget], env=env, capture_output=True, text=True, check=False
-        )
-        self.assertEqual(attach.returncode, 0, attach.stderr)
         function = os.path.join(gadget, "functions", "ncm.usb0")
         link = os.path.join(config_dir, "ncm.usb0")
-        self.assertTrue(os.path.isdir(function))
-        self.assertEqual(os.readlink(link), function)
+        os.makedirs(function)
+        os.symlink(function, link)
 
         text = raw("armada-mtp.service.d", "50-usb-network.conf")
         lines = [line for line in text.splitlines() if line and not line.startswith("#")]
@@ -552,10 +514,6 @@ class UnitTest(unittest.TestCase):
         os.rmdir(config_dir)
         os.rmdir(os.path.join(gadget, "configs"))
         os.rmdir(os.path.join(gadget, "functions"))
-        # attach() writes these as regular files in this fake gadget; real
-        # configfs attributes are managed by the kernel and never unlinked.
-        for name in ("bDeviceClass", "bDeviceSubClass", "bDeviceProtocol"):
-            os.remove(os.path.join(gadget, name))
         os.rmdir(gadget)
 
     def test_sshd_drop_in_restores_the_socket(self):

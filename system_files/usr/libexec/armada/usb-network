@@ -3,18 +3,22 @@
 # on it. It runs where the device profile allows it (ARMADA_USB_NETWORK=1, the default) and
 # the user switch in Freedom Control is on (/etc/armada/usb-network.conf; on when missing).
 #
-# The link lives in one of two gadgets, never both, because the device has one USB device
-# controller:
-#   - its own gadget (armada-usb-network.service) while USB file transfer is off;
-#   - the MTP gadget (armada-mtp.service drop-in) while USB file transfer is on, as an
-#     MTP + network composite device.
-# NetworkManager addresses usb0 through armada-usb.nmconnection in either case.
+# The link lives in its own gadget (armada-usb-network.service). While USB file transfer
+# (MTP) is on, the MTP gadget owns the single USB device controller exclusively and the
+# standalone link stays down until the MTP gadget disappears again. NetworkManager
+# addresses usb0 through armada-usb.nmconnection whenever the link runs.
 set -euo pipefail
 
 gadget=/sys/kernel/config/usb_gadget/armada-usb-network
 config="$gadget/configs/c.1"
 function_name=ncm.usb0
 switch_config=${ARMADA_USB_NETWORK_CONFIG:-/etc/armada/usb-network.conf}
+mtp_gadget=${ARMADA_MTP_GADGET:-/sys/kernel/config/usb_gadget/armada-mtp}
+
+# The MTP gadget owns the controller; the standalone link must not touch it.
+mtp_present() {
+    [[ -e "$mtp_gadget" ]]
+}
 
 # The device profile allows the link.
 supported() {
@@ -30,7 +34,7 @@ switched_on() {
 }
 
 enabled() {
-    supported && switched_on
+    ! mtp_present && supported && switched_on
 }
 
 # Stable device serial derived from the machine id, same convention as mtp-gadget.
@@ -104,21 +108,8 @@ start() {
     printf '%s' "$udc" > "$gadget/UDC"
 }
 
-# Adds the network function to another gadget's c.1 before that gadget is bound.
-# Switches the combined device to the IAD triplet so Windows binds UsbNcm; skipped
-# when the link is disabled so a MTP-only gadget keeps its identity.
-attach() {
-    local other=$1
-    enabled || return 0
-    mkdir -p "$other/functions/$function_name"
-    [[ -L "$other/configs/c.1/$function_name" ]] \
-        || ln -s "$other/functions/$function_name" "$other/configs/c.1/$function_name"
-    printf '0xEF' > "$other/bDeviceClass"
-    printf '0x02' > "$other/bDeviceSubClass"
-    printf '0x01' > "$other/bDeviceProtocol"
-}
-
-# Removes it again after the other gadget is unbound, so its teardown can remove c.1.
+# Removes the network function from a composite gadget of a previous version, after
+# that gadget is unbound, so its teardown can remove c.1.
 detach() {
     local other=$1
     [[ ! -L "$other/configs/c.1/$function_name" ]] || rm "$other/configs/c.1/$function_name" || :
@@ -135,8 +126,8 @@ resume() {
 }
 
 # The Freedom Control switch: saves the choice, then brings the link up or down at once.
-# While USB file transfer is on, the link lives in the MTP gadget, which is restarted so it
-# is rebuilt with or without the network function.
+# While USB file transfer owns the controller, the switch cannot be changed: the MTP
+# gadget is left running, untouched.
 set_switch() {
     local value
     case "${1:-}" in
@@ -144,6 +135,19 @@ set_switch() {
         off) value=0 ;;
         *) printf 'usage: %s set {on|off}\n' "$0" >&2; exit 2 ;;
     esac
+
+    local mtp_state mtp=0
+    mtp_state="$(systemctl show -p ActiveState --value armada-mtp.service)" || return 1
+    case "$mtp_state" in
+        active|activating|reloading|deactivating) mtp=1 ;;
+        inactive|failed) mtp=0 ;;
+        *) printf 'armada-usb-network: cannot read armada-mtp.service state: %s\n' "$mtp_state" >&2; exit 1 ;;
+    esac
+    if ((mtp)) || mtp_present; then
+        printf 'armada-usb-network: the USB SSH switch cannot be changed while USB file transfer is on\n' >&2
+        exit 1
+    fi
+
     mkdir -p "$(dirname "$switch_config")"
     local tmp
     tmp="$(mktemp "$switch_config.XXXXXX")"
@@ -151,37 +155,26 @@ set_switch() {
     chmod 0644 "$tmp"
     mv -f "$tmp" "$switch_config"
 
-    local mtp=0 mtp_state
-    mtp_state="$(systemctl show -p ActiveState --value armada-mtp.service)" || return 1
-    case "$mtp_state" in
-        active|activating|reloading) mtp=1 ;;
-        inactive|failed|deactivating) mtp=0 ;;
-        *) printf 'armada-usb-network: cannot read armada-mtp.service state: %s\n' "$mtp_state" >&2; exit 1 ;;
-    esac
-    if ((mtp)); then
-        systemctl reset-failed armada-mtp.service
-    fi
     if [[ "$value" == 0 ]]; then
         systemctl stop armada-usb-ssh.socket armada-usb-network.service
-        ((mtp)) && systemctl restart armada-mtp.service
         return 0
     fi
     supported || return 0
-    if ((mtp)); then
-        systemctl restart armada-mtp.service
-        ssh_resume
-    else
-        systemctl reset-failed armada-usb-network.service || :
-        systemctl start armada-usb-network.service
-    fi
+    systemctl reset-failed armada-usb-network.service || :
+    systemctl start armada-usb-network.service
 }
 
-# Prints the switch and whether the profile allows the link, for Freedom Control.
+# Prints the switch, whether the profile allows the link, and whether MTP holds the
+# controller (and therefore the link is paused), for Freedom Control.
 state() {
-    local on=0 allowed=0
+    local on=0 allowed=0 paused=0
     switched_on && on=1
     supported && allowed=1
-    printf 'enabled=%s\nsupported=%s\n' "$on" "$allowed"
+    if mtp_present; then
+        on=0
+        paused=1
+    fi
+    printf 'enabled=%s\nsupported=%s\npaused=%s\n' "$on" "$allowed" "$paused"
 }
 
 # Wait for sshd's stop or restart transaction before checking whether USB SSH
@@ -209,7 +202,6 @@ case "${1:-}" in
     enabled) enabled ;;
     start) start ;;
     stop) teardown ;;
-    attach) attach "${2:?gadget path}" ;;
     detach) detach "${2:?gadget path}" ;;
     resume) resume ;;
     ssh-resume) ssh_resume ;;
@@ -217,7 +209,7 @@ case "${1:-}" in
     set) set_switch "${2:-}" ;;
     state) state ;;
     *)
-        printf 'usage: %s {enabled|start|stop|attach GADGET|detach GADGET|resume|ssh-resume|ssh-start|set on|off|state}\n' "$0" >&2
+        printf 'usage: %s {enabled|start|stop|detach GADGET|resume|ssh-resume|ssh-start|set on|off|state}\n' "$0" >&2
         exit 2
         ;;
 esac
