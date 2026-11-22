@@ -409,6 +409,12 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/1021-wifi-ath12k-convert-scan-timeout-to-wiphy-delayed-work.patch`
   source: https://lkml.iu.edu/2609.1/17957.html
   upstream: https://lkml.iu.edu/2609.1/17957.html
+- `patches/1030-media-iris-send-the-stream-POC-type.patch`
+  source: https://github.com/armada-os/armada/blob/b35cabd277ff98c40a1ac4057c55384722de7600/packages/kernel/patches/1030-media-iris-send-the-stream-POC-type.patch
+  upstream: local
+- `patches/1031-media-iris-stop-AV1-tier-overwriting-HEVC-tier.patch`
+  source: https://github.com/armada-os/armada/blob/b35cabd277ff98c40a1ac4057c55384722de7600/packages/kernel/patches/1031-media-iris-stop-AV1-tier-overwriting-HEVC-tier.patch
+  upstream: local
 - `patches/0500-ROCKNIX-set-boot-fanspeed.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0500-ROCKNIX-set-boot-fanspeed.patch
   upstream: unknown
@@ -857,7 +863,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Extracts only the `cci0`, `cci1`, and `camss` nodes under `&soc` with one indentation normalization; it closes the labels the board DTS references and does not imply camera support.
 - `dts/sm8750-lenovo-elden.dts.patch`
   source: armada
-  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`. The panel node also reports rotation 270 for the fixed landscape-right startup profile.
+  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`. The panel node also reports rotation 270 for the fixed landscape-right startup profile. Iris additionally selects the signed firmware from the same device's Android vendor_a (ZUXOS_1.5.10.259_260611_PRC), SHA-256 9f6352d526f39bc3f25b6d670ba9f4a18ebd9dea57e043683b70a301e22ee6c7.
 - `patches/0147-power-sequencing-qcom-wcn-add-wcn7861-pmu.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/blob/6f97250ead155fc3b980856323e99a4623dae73d/drivers/power/sequencing/pwrseq-qcom-wcn.c
   upstream: unknown
