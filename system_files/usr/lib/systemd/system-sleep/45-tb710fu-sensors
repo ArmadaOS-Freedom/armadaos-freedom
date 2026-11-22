@@ -13,10 +13,12 @@ log() { echo "45-tb710fu-sensors: $*" >&2; }
 
 case "$1" in
 pre)
-	# activating also covers a pending Restart= (sub-state auto-restart).
+	# activating also covers a pending Restart= (sub-state auto-restart). A
+	# start job still waiting for its ordering (After=tb710fu-hexagonrpcd)
+	# leaves the unit inactive: count it too, the stop below cancels it.
 	case "$(systemctl show -P ActiveState "$unit")" in
 	active|activating|reloading) ;;
-	*) exit 0 ;;
+	*) [ -n "$(systemctl list-jobs --no-legend "$unit" 2>/dev/null)" ] || exit 0 ;;
 	esac
 	# Without the marker resume would not start it again: keep it running.
 	if ! { mkdir -p "${marker%/*}" && : >"$marker"; }; then
