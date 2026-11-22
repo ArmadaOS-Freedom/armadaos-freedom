@@ -1342,4 +1342,4 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch`
   source: armada
   upstream: local
-  notes: Return -EBUSY from DAPM DPCM route updates while any FE direction still has an unresolved hw_free failure, so old BE paths cannot be released before FE cleanup is retried.
+  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures.

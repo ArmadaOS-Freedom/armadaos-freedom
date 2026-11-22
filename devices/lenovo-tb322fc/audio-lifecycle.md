@@ -67,13 +67,9 @@ standby-power measurement.
 
 The kernel host lifecycle harness executes extracted candidate C functions
 and covers delayed and duplicate replies, token/opcode mismatches, DSP errors,
-mapping ownership and both PCM START guards. The PR review fix passed 320/320
-patch applications and the full kernel host source checks in a clean Linux
-7.2.6 tree; the AudioReach harness reported 191 checks. Patch-catalogue tests
-passed 4/4. These local source checks stop before kernel compilation. At head
-`076d2af5`, Linked issue, patch catalogue, unit tests, kernel host source
-checks, CodeRabbit and the ARM container-image job passed; the x86_64 package
-matrix item was skipped. No human review decision is recorded.
+mapping ownership and both PCM START guards. PR CI at `a281f9b0` reports the
+previously recorded 223 harness checks; the current local route-recovery
+extension reports 299 checks.
 
 ### STOP failure recovery review fix (2026-11-21)
 
@@ -108,9 +104,29 @@ Reviewing the Linux 7.2.6 call graph found that a DAPM mixer/mux update enters
 Patch `0752` now checks all FE directions for an unresolved
 `hw_free_failed` state before changing any DPCM path and returns `-EBUSY` while
 one is present. This keeps a route update from bypassing the retained-BE
-protection. The guard is covered by the extracted-C host harness: a failure on
-the second FE causes zero old/new path updates, and clearing the failure allows
-the normal two-pass update.
+protection. It records the deferred route change and replays the current DAPM
+graph after FE cleanup succeeds, or after close disconnects the FE graph.
+Failures in either the old-path or new-path update retain the pending marker so
+a later retry repeats the old/new-path update. The extracted-C host harness
+executes the production route-update functions and verifies a DSP STOP timeout
+leaves the old BE connected and allocated, then retries STOP before disconnecting
+it and bringing up the new route. It also covers FE recovery deferral,
+new-path startup failure, DAPM path-query failure and retry.
 
-This is source and host-harness validation only. The physical tablet has not
-been tested with injected DSP STOP failure followed by a DAPM route change.
+Validation on 2026-11-22 started from a fresh extraction of the cached official
+Linux 7.2.6 archive (SHA-256
+`039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606`). All 320
+kernel patches applied with strict `-F0` checking, and the complete
+`KERNEL_HOST_CHECKS_ONLY=1` run passed, including 299 AudioReach lifecycle
+checks and patch-catalogue tests 4/4. With the repository ARM64 config merged,
+`soc-pcm.o`, `soc-core.o`, `q6apm.o`, `q6apm-dai.o` and `q6apm-lpass-dais.o`
+compiled successfully. Patch `0752` passed `checkpatch.pl --strict` with no
+errors or warnings.
+
+This is source, host-harness and compile validation only. The physical tablet
+has not been tested with injected DSP STOP failure followed by a DAPM route
+change. PR #159 remains open at remote head `a281f9b0`, so its CI and review
+results do not cover these local uncommitted changes or the 299-check harness.
+The remote `mesa-x86` job failed before compilation because
+`archive.archlinux.org` timed out while syncing package databases; the other
+reported CI jobs passed or were skipped.

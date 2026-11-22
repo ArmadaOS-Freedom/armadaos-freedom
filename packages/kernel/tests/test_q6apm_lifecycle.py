@@ -176,6 +176,10 @@ def classify_sources(
             soc_pcm_text,
             "static int dpcm_fe_dai_shutdown(struct snd_pcm_substream *substream)",
         ),
+        "candidate_dpcm_close": (
+            soc_pcm_text,
+            "static int dpcm_fe_dai_close(struct snd_pcm_substream *fe_substream)",
+        ),
         "candidate_dpcm_trigger": (
             soc_pcm_text,
             "static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)\n{",
@@ -183,6 +187,26 @@ def classify_sources(
         "candidate_dpcm_runtime_update": (
             soc_pcm_text,
             "int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)",
+        ),
+        "candidate_dpcm_runtime_update_locked": (
+            soc_pcm_text,
+            "static int snd_soc_dpcm_runtime_update_locked(struct snd_soc_card *card)",
+        ),
+        "candidate_dpcm_run_update_shutdown": (
+            soc_pcm_text,
+            "static int dpcm_run_update_shutdown(struct snd_soc_pcm_runtime *fe, int stream)",
+        ),
+        "candidate_dpcm_run_update": (
+            soc_pcm_text,
+            "static int dpcm_run_update(struct snd_soc_pcm_runtime *fe, int stream, int new)",
+        ),
+        "candidate_soc_dpcm_fe_runtime_update": (
+            soc_pcm_text,
+            "static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)",
+        ),
+        "candidate_retry_pending_routes": (
+            soc_pcm_text,
+            "static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card)\n{",
         ),
     }
     if baseline_text is not None:
@@ -407,15 +431,20 @@ def classify_sources(
     )
 
     runtime_update = extracted["candidate_dpcm_runtime_update"][0]
+    runtime_update_locked = extracted["candidate_dpcm_runtime_update_locked"][0]
+    retry_pending_routes = extracted["candidate_retry_pending_routes"][0]
+    run_update_shutdown = extracted["candidate_dpcm_run_update_shutdown"][0]
+    run_update = extracted["candidate_dpcm_run_update"][0]
+    fe_runtime_update = extracted["candidate_soc_dpcm_fe_runtime_update"][0]
     runtime_update_guard = extract_if_block(
-        runtime_update, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
+        runtime_update_locked, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
     )
     require_order(
-        runtime_update,
+        runtime_update_locked,
         "for_each_card_rtds(card, fe)",
         "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))",
-        "ret = -EBUSY;",
-        "goto out;",
+        "WRITE_ONCE(card->dpcm_route_update_pending, true);",
+        "return -EBUSY;",
         "/* shutdown all old paths first */",
         "ret = soc_dpcm_fe_runtime_update(fe, 0);",
         label="runtime routing checks failed STOP before changing BE paths",
@@ -424,6 +453,65 @@ def classify_sources(
         runtime_update_guard,
         "soc_dpcm_fe_runtime_update",
         "failed STOP leaves DAPM backend paths untouched",
+    )
+    require_order(
+        run_update_shutdown,
+        "err = dpcm_be_dai_trigger(fe, stream, SNDRV_PCM_TRIGGER_STOP);",
+        "if (err)",
+        "return soc_pcm_ret(fe, err);",
+        "dpcm_be_dai_hw_free(fe, stream);",
+        label="failed old-route STOP retains backend allocations",
+    )
+    require_order(
+        run_update,
+        "ret = dpcm_run_update_shutdown(fe, stream);",
+        "if (ret < 0 && !new)",
+        "return ret;",
+        "dpcm_clear_pending_state(fe, stream);",
+        "dpcm_be_disconnect(fe, stream);",
+        label="failed prune keeps the BE link attached for retry",
+    )
+    require_order(
+        fe_runtime_update,
+        "ret = dpcm_run_update(fe, stream, new);",
+        "dpcm_path_put(&list);",
+        "if (ret < 0)",
+        "return ret;",
+        label="FE route update propagates BE startup and shutdown failures",
+    )
+    require_order(
+        runtime_update_locked,
+        "/* shutdown all old paths first */",
+        "ret = soc_dpcm_fe_runtime_update(fe, 0);",
+        "/* bring new paths up */",
+        "ret = soc_dpcm_fe_runtime_update(fe, 1);",
+        "WRITE_ONCE(card->dpcm_route_update_pending, false);",
+        label="old paths are shut down before the new DAPM graph is applied",
+    )
+    require_order(
+        retry_pending_routes,
+        "snd_soc_dpcm_mutex_assert_held(card);",
+        "if (!READ_ONCE(card->dpcm_route_update_pending))",
+        "snd_soc_dpcm_runtime_update_locked(card);",
+        label="deferred route retries stay under the card PCM mutex",
+    )
+    require_order(
+        runtime_update,
+        "snd_soc_dpcm_mutex_lock(card);",
+        "snd_soc_dpcm_runtime_update_locked(card);",
+        "snd_soc_dpcm_mutex_unlock(card);",
+        label="public DPCM route update owns the PCM mutex",
+    )
+    require_order(
+        extracted["candidate_dpcm_hw_params"][0],
+        "snd_soc_dpcm_retry_pending_route_update(fe->card);",
+        "snd_soc_dpcm_mutex_unlock(fe);",
+        label="successful hw_params retries deferred routes under the PCM lock",
+    )
+    require_once(
+        extracted["candidate_dpcm_close"][0],
+        "snd_soc_dpcm_retry_pending_route_update(fe->card);",
+        "close retries deferred routes after cleanup",
     )
     return extracted
 
@@ -960,9 +1048,13 @@ static void check_concurrent_start_during_stop(void)
 	CHECK(pthread_mutex_lock(&control_lock) == 0);
 	CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
 	deadline.tv_sec += 2;
-	while (!stop_entered)
-		CHECK(pthread_cond_timedwait(&stop_entered_cond, &control_lock,
-					     &deadline) == 0);
+	while (!stop_entered) {
+		int wait_ret = pthread_cond_timedwait(&stop_entered_cond,
+						      &control_lock,
+						      &deadline);
+
+		CHECK(wait_ret == 0);
+	}
 	CHECK(pthread_mutex_unlock(&control_lock) == 0);
 
 	/* STOP is still waiting for its DSP response.  START must wait for the
@@ -1254,6 +1346,10 @@ static void check_dpcm_stop_failure_recovery(void)
 static void check_dpcm_runtime_update_guard(void)
 {
 	struct device device = {};
+	struct snd_soc_dai_link dynamic_link = {
+		.name = "dynamic-link",
+		.dynamic = true,
+	};
 	struct snd_soc_pcm_runtime first = {};
 	struct snd_soc_pcm_runtime second = {};
 	struct snd_soc_pcm_runtime *rtds[] = { &first, &second };
@@ -1262,16 +1358,153 @@ static void check_dpcm_runtime_update_guard(void)
 		.rtds = rtds,
 		.num_rtds = 2,
 	};
+	struct snd_soc_card other_card = {};
+	first.dai_link = &dynamic_link;
+	first.dev = &device;
+	second.dai_link = &dynamic_link;
+	second.dev = &device;
 
 	first.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = false;
 	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = true;
 	simulated_runtime_update_calls = 0;
 	CHECK(snd_soc_dpcm_runtime_update(&card) == -EBUSY);
 	CHECK(simulated_runtime_update_calls == 0);
+	CHECK(card.dpcm_route_update_pending);
 
 	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].hw_free_failed = false;
-	CHECK(snd_soc_dpcm_runtime_update(&card) == 0);
+	snd_soc_dpcm_mutex_lock(&card);
+	snd_soc_dpcm_retry_pending_route_update(&card);
+	CHECK(!card.dpcm_route_update_pending);
+	CHECK(card.pcm_mutex_locked);
+	CHECK(!other_card.pcm_mutex_locked);
+	snd_soc_dpcm_mutex_unlock(&card);
 	CHECK(simulated_runtime_update_calls == 4);
+
+	card.dpcm_route_update_pending = true;
+	second.dpcm[SNDRV_PCM_STREAM_PLAYBACK].hw_free_failed = true;
+	simulated_runtime_update_calls = 0;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -EBUSY);
+	CHECK(simulated_runtime_update_calls == 0);
+	CHECK(card.dpcm_route_update_pending);
+	second.dpcm[SNDRV_PCM_STREAM_PLAYBACK].hw_free_failed = false;
+
+	simulated_runtime_update_calls = 0;
+	first.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_connected = true;
+	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_wanted = true;
+	second.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_connected = false;
+	simulated_startup_result = -EIO;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -EIO);
+	CHECK(card.dpcm_route_update_pending);
+	CHECK(simulated_runtime_update_calls == 4);
+	CHECK(simulated_runtime_update_order[0] == 0);
+	CHECK(simulated_runtime_update_order[1] == 0);
+	CHECK(simulated_runtime_update_order[2] == 1);
+	CHECK(simulated_runtime_update_order[3] == 1);
+	CHECK(!first.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_connected);
+	CHECK(!second.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_connected);
+	simulated_startup_result = 0;
+	simulated_runtime_update_calls = 0;
+	snd_soc_dpcm_mutex_lock(&card);
+	snd_soc_dpcm_retry_pending_route_update(&card);
+	CHECK(!card.dpcm_route_update_pending);
+	snd_soc_dpcm_mutex_unlock(&card);
+	CHECK(simulated_runtime_update_calls == 4);
+	CHECK(simulated_runtime_update_order[0] == 0);
+	CHECK(simulated_runtime_update_order[1] == 0);
+	CHECK(simulated_runtime_update_order[2] == 1);
+	CHECK(simulated_runtime_update_order[3] == 1);
+	CHECK(second.dpcm[SNDRV_PCM_STREAM_CAPTURE].route_connected);
+
+	card.dpcm_route_update_pending = true;
+	simulated_path_get_result = -ENOMEM;
+	simulated_path_get_calls = 0;
+	simulated_be_free_calls = 0;
+	simulated_be_shutdown_calls = 0;
+	simulated_runtime_update_calls = 0;
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -ENOMEM);
+	CHECK(card.dpcm_route_update_pending);
+	CHECK(simulated_path_get_calls == 1);
+	CHECK(simulated_runtime_update_calls == 0);
+	CHECK(simulated_be_free_calls == 0);
+	CHECK(simulated_be_shutdown_calls == 0);
+	simulated_path_get_result = 1;
+	simulated_runtime_update_calls = 0;
+	snd_soc_dpcm_mutex_lock(&card);
+	snd_soc_dpcm_retry_pending_route_update(&card);
+	CHECK(!card.dpcm_route_update_pending);
+	snd_soc_dpcm_mutex_unlock(&card);
+	CHECK(simulated_runtime_update_calls == 4);
+}
+
+static void check_dpcm_stop_failure_route_retry(void)
+{
+	struct device device = {};
+	struct snd_soc_dai_link dynamic_link = {
+		.name = "dynamic-link",
+		.dynamic = true,
+	};
+	struct snd_soc_pcm_runtime old_fe = {
+		.dai_link = &dynamic_link,
+		.dev = &device,
+	};
+	struct snd_soc_pcm_runtime new_fe = {
+		.dai_link = &dynamic_link,
+		.dev = &device,
+	};
+	struct snd_soc_pcm_runtime *rtds[] = { &old_fe, &new_fe };
+	struct snd_soc_card card = {
+		.dev = &device,
+		.rtds = rtds,
+		.num_rtds = 2,
+	};
+	struct fake_dpcm_runtime *old_path =
+		&old_fe.dpcm[SNDRV_PCM_STREAM_CAPTURE];
+	struct fake_dpcm_runtime *new_path =
+		&new_fe.dpcm[SNDRV_PCM_STREAM_CAPTURE];
+
+	old_path->route_connected = true;
+	new_path->route_wanted = true;
+	simulated_be_trigger_result = -ETIMEDOUT;
+	simulated_be_trigger_calls = 0;
+	simulated_be_free_calls = 0;
+	simulated_be_shutdown_calls = 0;
+	simulated_clear_pending_calls = 0;
+	simulated_disconnect_calls = 0;
+	simulated_runtime_update_calls = 0;
+
+	CHECK(snd_soc_dpcm_runtime_update(&card) == -ETIMEDOUT);
+	CHECK(card.dpcm_route_update_pending);
+	CHECK(old_path->route_connected);
+	CHECK(old_path->link_free);
+	CHECK(!new_path->route_connected);
+	CHECK(simulated_be_trigger_calls == 1);
+	CHECK(simulated_be_free_calls == 0);
+	CHECK(simulated_be_shutdown_calls == 0);
+	CHECK(simulated_clear_pending_calls == 0);
+	CHECK(simulated_disconnect_calls == 0);
+	/* A later FE must not overwrite the first FE's shutdown failure. */
+	CHECK(simulated_runtime_update_calls == 1);
+
+	/* Retry prunes the retained old link again, then adds the new path. */
+	simulated_be_trigger_result = 0;
+	simulated_runtime_update_calls = 0;
+	snd_soc_dpcm_mutex_lock(&card);
+	snd_soc_dpcm_retry_pending_route_update(&card);
+	CHECK(!card.dpcm_route_update_pending);
+	snd_soc_dpcm_mutex_unlock(&card);
+	CHECK(simulated_runtime_update_calls == 4);
+	CHECK(simulated_runtime_update_order[0] == 0);
+	CHECK(simulated_runtime_update_order[1] == 0);
+	CHECK(simulated_runtime_update_order[2] == 1);
+	CHECK(simulated_runtime_update_order[3] == 1);
+	CHECK(!old_path->route_connected);
+	CHECK(!old_path->link_free);
+	CHECK(new_path->route_connected);
+	CHECK(simulated_be_trigger_calls == 2);
+	CHECK(simulated_be_free_calls == 1);
+	CHECK(simulated_be_shutdown_calls == 1);
+	CHECK(simulated_clear_pending_calls == 2);
+	CHECK(simulated_disconnect_calls == 1);
 }
 
 static void check_failed_pcm_prepare(void)
@@ -1302,6 +1535,7 @@ int main(void)
 	check_unmap_replies();
 	check_dpcm_stop_failure_recovery();
 	check_dpcm_runtime_update_guard();
+	check_dpcm_stop_failure_route_retry();
 	check_failed_pcm_prepare();
 #ifdef HAVE_BASELINE
 	check_baseline_unmap();
@@ -1318,11 +1552,21 @@ int main(void)
 DPCM_SIM_PREAMBLE = r'''
 struct snd_soc_dai_link {
 	const char *name;
+	bool dynamic;
+	int num_cpus;
+};
+
+struct snd_soc_dapm_widget_list {
+	int unused;
 };
 
 struct fake_dpcm_runtime {
 	bool hw_free_failed;
 	int state;
+	bool route_connected;
+	bool route_wanted;
+	bool link_free;
+	int pending_state;
 };
 
 struct snd_soc_pcm_runtime {
@@ -1335,11 +1579,18 @@ struct snd_soc_card {
 	struct device *dev;
 	struct snd_soc_pcm_runtime **rtds;
 	int num_rtds;
+	bool dpcm_route_update_pending;
+	bool pcm_mutex_locked;
 };
 
 #define SND_SOC_DPCM_UPDATE_FE 1
+#define SND_SOC_DPCM_UPDATE_BE 2
 #define SND_SOC_DPCM_UPDATE_NO 0
 #define SND_SOC_DPCM_STATE_HW_FREE 8
+#define SND_SOC_DPCM_LINK_STATE_FREE 2
+#define SND_SOC_DAPM_STREAM_NOP 0
+#define dev_dbg(dev, ...) do { (void)(dev); if (0) fprintf(stderr, __VA_ARGS__); } while (0)
+#define dev_err(dev, ...) do { (void)(dev); if (0) fprintf(stderr, __VA_ARGS__); } while (0)
 #define for_each_card_rtds(card, rtd) \
 	for (int __i = 0; __i < (card)->num_rtds && \
 	     (((rtd) = (card)->rtds[__i]), true); __i++)
@@ -1354,13 +1605,121 @@ static int simulated_dai_free_calls;
 static int simulated_be_free_calls;
 static int simulated_be_shutdown_calls;
 static int simulated_runtime_update_calls;
+static int simulated_runtime_update_order[32];
+static int simulated_be_trigger_result;
+static int simulated_be_trigger_calls;
+static int simulated_clear_pending_calls;
+static int simulated_disconnect_calls;
+static int simulated_startup_result;
+static int simulated_path_get_result = 1;
+static int simulated_path_get_calls;
+static int simulated_active_stream = SNDRV_PCM_STREAM_CAPTURE;
+static struct snd_soc_dapm_widget_list simulated_path_list;
+
+static void *snd_soc_rtd_to_cpu(struct snd_soc_pcm_runtime *fe, int index)
+{
+	(void)index;
+	return fe;
+}
+
+static void *snd_soc_rtd_to_codec(struct snd_soc_pcm_runtime *fe, int index)
+{
+	(void)index;
+	return fe;
+}
+
+static bool snd_soc_dai_stream_valid(void *dai, int stream)
+{
+	(void)dai;
+	(void)stream;
+	return true;
+}
+
+static bool snd_soc_dai_active(void *dai)
+{
+	(void)dai;
+	return true;
+}
+
+static bool snd_soc_dai_stream_active(void *dai, int stream)
+{
+	(void)dai;
+	return stream == simulated_active_stream;
+}
+
+static int dpcm_path_get(struct snd_soc_pcm_runtime *fe, int stream,
+			 struct snd_soc_dapm_widget_list **list)
+{
+	(void)fe;
+	(void)stream;
+	*list = &simulated_path_list;
+	simulated_path_get_calls++;
+	return simulated_path_get_result;
+}
+
+static void dpcm_path_put(struct snd_soc_dapm_widget_list **list)
+{
+	*list = NULL;
+}
+
+static int dpcm_prune_paths(struct snd_soc_pcm_runtime *fe, int stream,
+			    struct snd_soc_dapm_widget_list **list)
+{
+	struct fake_dpcm_runtime *dpcm = &fe->dpcm[stream];
+
+	(void)list;
+	CHECK(simulated_runtime_update_calls <
+	      (int)(sizeof(simulated_runtime_update_order) /
+		    sizeof(simulated_runtime_update_order[0])));
+	simulated_runtime_update_order[simulated_runtime_update_calls] = 0;
+	simulated_runtime_update_calls++;
+	if (!dpcm->route_connected || dpcm->route_wanted)
+		return 0;
+	dpcm->link_free = true;
+	return 1;
+}
+
+static int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
+			  struct snd_soc_dapm_widget_list **list)
+{
+	struct fake_dpcm_runtime *dpcm = &fe->dpcm[stream];
+
+	(void)list;
+	CHECK(simulated_runtime_update_calls <
+	      (int)(sizeof(simulated_runtime_update_order) /
+		    sizeof(simulated_runtime_update_order[0])));
+	simulated_runtime_update_order[simulated_runtime_update_calls] = 1;
+	simulated_runtime_update_calls++;
+	if (!dpcm->route_wanted || dpcm->route_connected)
+		return 0;
+	dpcm->route_connected = true;
+	dpcm->link_free = false;
+	return 1;
+}
+
+static void snd_soc_dpcm_mutex_lock(struct snd_soc_card *card)
+{
+	assert(!card->pcm_mutex_locked);
+	card->pcm_mutex_locked = true;
+}
+
+static void snd_soc_dpcm_mutex_unlock(void *lockable)
+{
+	struct snd_soc_card *card = lockable;
+	card->pcm_mutex_locked = false;
+}
+
+static void snd_soc_dpcm_mutex_assert_held(struct snd_soc_card *card)
+{
+	assert(card->pcm_mutex_locked);
+}
 
 static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 				     int stream, int state)
 {
 	(void)fe;
 	(void)stream;
-	(void)state;
+	fe->dpcm[stream].pending_state = state;
 }
 
 static int soc_pcm_hw_clean(struct snd_soc_pcm_runtime *fe,
@@ -1410,28 +1769,60 @@ static void dpcm_be_dai_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
 	simulated_be_shutdown_calls++;
 }
 
-static void snd_soc_dpcm_mutex_unlock(void *lockable)
+static int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,
+			       int cmd)
 {
-	(void)lockable;
+	(void)fe;
+	(void)stream;
+	(void)cmd;
+	simulated_be_trigger_calls++;
+	return simulated_be_trigger_result;
+}
+
+static int dpcm_run_update_startup(struct snd_soc_pcm_runtime *fe, int stream)
+{
+	if (simulated_startup_result < 0)
+		fe->dpcm[stream].link_free = true;
+	return simulated_startup_result;
+}
+
+static void dpcm_clear_pending_state(struct snd_soc_pcm_runtime *fe, int stream)
+{
+	(void)fe;
+	(void)stream;
+	simulated_clear_pending_calls++;
+}
+
+static void dpcm_be_disconnect(struct snd_soc_pcm_runtime *fe, int stream)
+{
+	if (fe->dpcm[stream].link_free) {
+		fe->dpcm[stream].route_connected = false;
+		fe->dpcm[stream].link_free = false;
+		simulated_disconnect_calls++;
+	}
+}
+
+static const char *snd_pcm_direction_name(int stream)
+{
+	static const char *directions[] = { "playback", "capture" };
+	CHECK(stream >= SNDRV_PCM_STREAM_PLAYBACK &&
+	      stream <= SNDRV_PCM_STREAM_CAPTURE);
+	CHECK(directions[stream] != NULL);
+	return "capture";
+}
+
+static void dpcm_dapm_stream_event(struct snd_soc_pcm_runtime *fe,
+				   int stream, int event)
+{
+	(void)fe;
+	(void)stream;
+	(void)event;
 }
 
 static int soc_pcm_ret(struct snd_soc_pcm_runtime *fe, int ret)
 {
 	(void)fe;
 	return ret;
-}
-
-static void snd_soc_dpcm_mutex_lock(struct snd_soc_card *card)
-{
-	(void)card;
-}
-
-static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
-{
-	(void)fe;
-	(void)new;
-	simulated_runtime_update_calls++;
-	return 0;
 }
 
 static int snd_soc_ret(struct device *dev, int ret, const char *fmt, ...)
@@ -1468,6 +1859,8 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         shutdown, "if (READ_ONCE(fe->dpcm[stream].hw_free_failed))"
     )
     runtime_update, _ = extracted["candidate_dpcm_runtime_update"]
+    runtime_update_locked, _ = extracted["candidate_dpcm_runtime_update_locked"]
+    retry_pending_routes, _ = extracted["candidate_retry_pending_routes"]
     parts = [
         "#define HAVE_BASELINE 1" if "baseline_start" in extracted else "",
         PREAMBLE,
@@ -1486,7 +1879,14 @@ def build_harness(extracted: dict[str, tuple[str, int]]) -> str:
         candidate_callback,
         "#undef apm_callback",
         DPCM_SIM_PREAMBLE,
+        "static int snd_soc_dpcm_runtime_update_locked(struct snd_soc_card *card);\n",
+        "static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card);\n",
+        extracted["candidate_dpcm_run_update_shutdown"][0],
+        extracted["candidate_dpcm_run_update"][0],
+		extracted["candidate_soc_dpcm_fe_runtime_update"][0],
+        runtime_update_locked,
         runtime_update,
+        retry_pending_routes,
         "static int simulate_dpcm_hw_free(struct snd_soc_pcm_runtime *fe, "
         "struct snd_pcm_substream *substream)\n{\n"
         "\tint stream = substream->stream;\n\tint ret;\n"

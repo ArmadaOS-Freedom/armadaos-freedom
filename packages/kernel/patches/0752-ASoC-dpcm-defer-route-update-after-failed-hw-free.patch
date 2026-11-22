@@ -1,29 +1,204 @@
 From: 181981772 <181981772@qq.com>
-Subject: [PATCH] ASoC: dpcm: defer route updates after failed FE hw_free
+Subject: [PATCH] ASoC: dpcm: replay deferred routes after FE recovery
 
-A failed FE component hw_free leaves its DPCM backend allocated until a later
-retry or PCM close. DAPM route updates must not tear down that retained backend
-before the retry can run. Return -EBUSY while any FE direction is unresolved.
+Do not let a DAPM route update tear down a DPCM backend retained after a
+failed FE hw_free. Remember deferred route changes and replay the current
+DAPM paths after FE reconfiguration succeeds or close disconnects the FE.
+Propagate DPCM startup and shutdown errors so partial route updates stay
+pending until a complete retry succeeds.
 
 Signed-off-by: 181981772 <181981772@qq.com>
 ---
+diff --git a/include/sound/soc.h b/include/sound/soc.h
+index 10ad80f..614128b 100644
+--- a/include/sound/soc.h
++++ b/include/sound/soc.h
+@@ -998,6 +998,8 @@ struct snd_soc_card {
+ 
+ 	/* Mutex for PCM operations */
+ 	struct mutex pcm_mutex;
++	/* A DAPM route change is waiting for FE cleanup to finish. */
++	bool dpcm_route_update_pending;
+ 
+ 	int (*probe)(struct snd_soc_card *card);
+ 	int (*late_probe)(struct snd_soc_card *card);
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index 44f9bb4..b06b39e 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -2452,6 +2452,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
+ 	mutex_init(&card->mutex);
+ 	mutex_init(&card->dapm_mutex);
+ 	mutex_init(&card->pcm_mutex);
++	card->dpcm_route_update_pending = false;
+ 
+ 	guard(mutex)(&client_mutex);
+ 
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index 081a5d7..5d16a70 100644
 --- a/sound/soc/soc-pcm.c
 +++ b/sound/soc/soc-pcm.c
-@@ -2883,9 +2883,16 @@
- int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
+@@ -38,6 +38,8 @@ static inline int _soc_pcm_ret(struct snd_soc_pcm_runtime *rtd,
+ 			   "at %s() on %s\n", func, rtd->dai_link->name);
+ }
+ 
++static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card);
++
+ /* is the current PCM operation for this FE ? */
+ #if 0
+ static int snd_soc_dpcm_can_fe_update(struct snd_soc_pcm_runtime *fe, int stream)
+@@ -2343,6 +2345,8 @@ static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,
+ 
+ out:
+ 	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
++	if (ret >= 0 && !READ_ONCE(fe->dpcm[stream].hw_free_failed))
++		snd_soc_dpcm_retry_pending_route_update(fe->card);
+ 	snd_soc_dpcm_mutex_unlock(fe);
+ 
+ 	return soc_pcm_ret(fe, ret);
+@@ -2729,6 +2733,8 @@ static int dpcm_run_update_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
+ 		snd_pcm_direction_name(stream), fe->dai_link->name);
+ 
+ 	err = dpcm_be_dai_trigger(fe, stream, SNDRV_PCM_TRIGGER_STOP);
++	if (err)
++		return soc_pcm_ret(fe, err);
+ 
+ 	dpcm_be_dai_hw_free(fe, stream);
+ 
+@@ -2813,11 +2819,31 @@ disconnect:
+ 	return soc_pcm_ret(fe, ret);
+ }
+ 
++static int dpcm_run_update(struct snd_soc_pcm_runtime *fe, int stream, int new)
++{
++	int ret;
++
++	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_BE);
++	if (new)
++		ret = dpcm_run_update_startup(fe, stream);
++	else
++		ret = dpcm_run_update_shutdown(fe, stream);
++	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
++
++	/* Keep pruned links connected when STOP failed so a later retry can finish. */
++	if (ret < 0 && !new)
++		return ret;
++
++	dpcm_clear_pending_state(fe, stream);
++	dpcm_be_disconnect(fe, stream);
++	return ret;
++}
++
+ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ {
+ 	struct snd_soc_dapm_widget_list *list;
+ 	int stream;
+-	int count, paths;
++	int count, paths, ret = 0;
+ 
+ 	if (!fe->dai_link->dynamic)
+ 		return 0;
+@@ -2860,18 +2886,12 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ 		else
+ 			count = dpcm_prune_paths(fe, stream, &list);
+ 		if (count) {
+-			dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_BE);
+-			if (new)
+-				dpcm_run_update_startup(fe, stream);
+-			else
+-				dpcm_run_update_shutdown(fe, stream);
+-			dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
+-
+-			dpcm_clear_pending_state(fe, stream);
+-			dpcm_be_disconnect(fe, stream);
++			ret = dpcm_run_update(fe, stream, new);
+ 		}
+ 
+ 		dpcm_path_put(&list);
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	return 0;
+@@ -2880,33 +2900,66 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ /* Called by DAPM mixer/mux changes to update audio routing between PCMs and
+  * any DAI links.
+  */
+-int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
++static int snd_soc_dpcm_runtime_update_locked(struct snd_soc_card *card)
  {
  	struct snd_soc_pcm_runtime *fe;
 -	int ret = 0;
 +	int ret = 0, stream;
- 
- 	snd_soc_dpcm_mutex_lock(card);
++
++	snd_soc_dpcm_mutex_assert_held(card);
 +	for_each_card_rtds(card, fe)
 +		for_each_pcm_streams(stream)
 +			if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
-+				ret = -EBUSY;
-+				goto out;
++				WRITE_ONCE(card->dpcm_route_update_pending, true);
++				return -EBUSY;
 +			}
-+
+ 
+-	snd_soc_dpcm_mutex_lock(card);
  	/* shutdown all old paths first */
  	for_each_card_rtds(card, fe) {
  		ret = soc_dpcm_fe_runtime_update(fe, 0);
+ 		if (ret)
+-			goto out;
++			goto defer;
+ 	}
+ 
+ 	/* bring new paths up */
+ 	for_each_card_rtds(card, fe) {
+ 		ret = soc_dpcm_fe_runtime_update(fe, 1);
+ 		if (ret)
+-			goto out;
++			goto defer;
+ 	}
+ 
+-out:
++	WRITE_ONCE(card->dpcm_route_update_pending, false);
++	return 0;
++defer:
++	/* A partial update needs a later full retry from the current DAPM graph. */
++	WRITE_ONCE(card->dpcm_route_update_pending, true);
++	return ret;
++}
++
++int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
++{
++	int ret;
++
++	snd_soc_dpcm_mutex_lock(card);
++	ret = snd_soc_dpcm_runtime_update_locked(card);
+ 	snd_soc_dpcm_mutex_unlock(card);
+ 
+-	return snd_soc_ret(card->dev, ret, "%s() failed\n", __func__);
++	return snd_soc_ret(card->dev, ret, "%s() failed\n", __func__);
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_dpcm_runtime_update);
+ 
++static void snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card)
++{
++	int ret;
++
++	snd_soc_dpcm_mutex_assert_held(card);
++	if (!READ_ONCE(card->dpcm_route_update_pending))
++		return;
++
++	ret = snd_soc_dpcm_runtime_update_locked(card);
++	if (ret && ret != -EBUSY)
++		dev_err(card->dev, "deferred DPCM route update failed (%d)\n", ret);
++}
++
+ static void dpcm_fe_dai_cleanup(struct snd_pcm_substream *fe_substream)
+ {
+ 	struct snd_soc_pcm_runtime *fe = snd_soc_substream_to_rtd(fe_substream);
+@@ -2931,6 +2986,7 @@ static int dpcm_fe_dai_close(struct snd_pcm_substream *fe_substream)
+ 	ret = dpcm_fe_dai_shutdown(fe_substream);
+ 
+ 	dpcm_fe_dai_cleanup(fe_substream);
++	snd_soc_dpcm_retry_pending_route_update(fe->card);
+ 
+ 	snd_soc_dpcm_mutex_unlock(fe);
+ 	return ret;
