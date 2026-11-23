@@ -312,6 +312,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0208d-Input-aw86927-add-support-for-Awinic-AW86937.patch
 0208e-Input-aw86927-handle-the-AW8693X-play-and-boost-regi.patch
 0208f-Input-aw86927-stop-playback-over-suspend-and-on-shut.patch
+0208g-Input-aw86927-retry-playback-after-failed-suspend.patch
 0209-leds-rgb-add-aw22127-driver.patch
 0210-drm-msm-snapshot-sspp-rec-blocks.patch
 0211-clk-qcom-kaanapali-fix-pcie-rscc-enable-bits.patch

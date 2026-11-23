@@ -1116,6 +1116,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
   upstream: https://lore.kernel.org/all/20261117052112.32527-7-xiaqinghuan@mail.ustc.edu.cn/
   notes: Stops ongoing playback when the device suspends and on shutdown to avoid stuck haptics.
+- `patches/0208g-Input-aw86927-retry-playback-after-failed-suspend.patch`
+  source: armada
+  upstream: local
+  notes: aw86927: record level while suspended, retry schedule on suspend error, clear stale level on resume
 - `patches/0209-leds-rgb-add-aw22127-driver.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0048)
   upstream: unknown
