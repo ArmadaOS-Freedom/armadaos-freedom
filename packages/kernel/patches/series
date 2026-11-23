@@ -308,6 +308,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0207-thermal-step-wise-release-cleared-trip-vote.patch
 0208-input-aw86927-accept-aw86937.patch
 0209-leds-rgb-add-aw22127-driver.patch
+0209a-arm64-dts-qcom-kaanapali-gcc-cx-domain.patch
 0210-drm-msm-snapshot-sspp-rec-blocks.patch
 0211-clk-qcom-kaanapali-fix-pcie-rscc-enable-bits.patch
 0212-clk-qcom-kaanapali-force-pcie-pipe-memory.patch
