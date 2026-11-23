@@ -1,5 +1,6 @@
 """Real-filesystem tests for private offline session storage."""
 
+import base64
 import json
 import os
 import sys
@@ -17,10 +18,11 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import test_update_channel_release as release  # noqa: E402
 import test_update_package_contract as fixture  # noqa: E402
-from updates import offline_session, trial_record  # noqa: E402
+from updates import offline_prepare, offline_session, trial_record  # noqa: E402
 from updates.package_contract import validate_package  # noqa: E402
 
 _MIB = 1024 * 1024
+_DEPLOYMENT = "stateroot/%s.1" % ("a" * 64)
 
 # OfflineSessionStore refuses to open private storage unless the process owns
 # it as root; mirror that production check so the suite skips instead of
@@ -46,7 +48,7 @@ class OfflineSessionStoreTest(unittest.TestCase):
     def _inspect(self, model="TB322FC"):
         return lambda: {
             "model": model, "actualSlot": "a", "inactiveSlot": "b",
-            "deployment": "stable", "recoveryPartUuid": "00000000-0000",
+            "deployment": _DEPLOYMENT, "recoveryPartUuid": "00000000-0000",
         }
 
     def _signed_package(self, data=None, signer=None):
@@ -595,6 +597,113 @@ class OfflineSessionStoreTest(unittest.TestCase):
         (tx / "status.json").write_text(json.dumps({"state": "complete"}))
         with self.assertRaises(offline_session.OfflineSessionError):
             store.export(sid, "boot/recovery.img", 0, 4)
+
+    def _signed_capsule_package(self, data=None):
+        data = data if data is not None else os.urandom(4096)
+        pkg = release._upgrade_package_dict()
+        pkg["minimumInstallerVersion"] = "0.8.0"
+        pkg["minimumUpdaterVersion"] = "0.8.0"
+        pkg["armadaBootCapsules"] = {
+            "TB322FC": {
+                "board.dtb": base64.b64encode(b"d").decode("ascii"),
+                "manifest.bin": base64.b64encode(b"m" * 160).decode("ascii"),
+                "manifest.sig": base64.b64encode(b"s" * 8).decode("ascii"),
+            }
+        }
+        for record in pkg["files"]:
+            if record["role"] == "linux-root":
+                record["bytes"] = len(data)
+                record["sha256"] = sha256(data).hexdigest()
+                record["expandedBytes"] = len(data) * 2
+                record["expandedSha256"] = sha256(data + b"x").hexdigest()
+        doc = json.dumps(validate_package(pkg), sort_keys=True, separators=(",", ":")).encode()
+        return doc, release._sign_bytes(doc, self.priv_key), data
+
+    @staticmethod
+    def _armada_boot_inspect():
+        return lambda: {
+            "model": "TB322FC", "actualSlot": None, "inactiveSlot": None,
+            "deployment": _DEPLOYMENT, "recoveryPartUuid": "00000000-0000",
+            "bootSource": "armada_boot",
+        }
+
+    @staticmethod
+    def _recovery_journal():
+        return SimpleNamespace(layout=SimpleNamespace(descriptor_version=3))
+
+    def test_preflight_armada_boot_capsule_is_read_only(self):
+        doc, sig, _data = self._signed_capsule_package()
+        base = self.tmp / "preflight-capsule" / "offline"
+        store = self._store(base)
+        store._inspect = self._armada_boot_inspect()
+        with mock.patch.object(
+                offline_prepare,
+                "_read_recovery_for_disk",
+                return_value=self._recovery_journal()):
+            result = store.preflight(doc, sig)
+        self.assertEqual(result["phase"], "preflight_passed")
+        self.assertEqual(result["bootWriteState"], "not_started")
+        self.assertEqual(result["recoveryDescriptorVersion"], 3)
+        self.assertNotIn("sessionId", result)
+        self.assertFalse(base.exists())
+
+    def test_preflight_rejects_capsule_package_on_legacy_device(self):
+        doc, sig, _data = self._signed_capsule_package()
+        base = self.tmp / "preflight-legacy-capsule" / "offline"
+        store = self._store(base)
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError,
+                "requires an existing ARMADA_BOOT"):
+            store.preflight(doc, sig)
+        self.assertFalse(base.exists())
+
+    def test_preflight_rejects_armada_boot_package_without_capsule(self):
+        doc, sig, _data = self._signed_package()
+        base = self.tmp / "preflight-missing-capsule" / "offline"
+        store = self._store(base)
+        store._inspect = self._armada_boot_inspect()
+        with self.assertRaisesRegex(
+                offline_session.OfflineSessionError,
+                "lacks ARMADA_BOOT"):
+            store.preflight(doc, sig)
+        self.assertFalse(base.exists())
+
+    def test_preflight_of_bound_session_credits_payload_without_lock(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "preflight-bound" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        store.seal(sid)
+        before = {path.relative_to(base) for path in base.rglob("*")}
+        with mock.patch.object(
+                offline_session.system_transaction,
+                "_check_recovery",
+                return_value=self._recovery_journal()):
+            result = store.preflight(doc, sig, sid)
+        after = {path.relative_to(base) for path in base.rglob("*")}
+        self.assertEqual(result["sessionId"], sid)
+        self.assertEqual(result["phase"], "preflight_passed")
+        self.assertEqual(before, after)
+
+    def test_preflight_rejects_session_for_another_package(self):
+        doc, sig, data = self._signed_package()
+        other_doc, other_sig, _other = self._signed_package()
+        base = self.tmp / "preflight-other-package" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        store.seal(sid)
+        with mock.patch.object(
+                offline_session.system_transaction,
+                "_check_recovery",
+                return_value=self._recovery_journal()):
+            with self.assertRaisesRegex(
+                    offline_session.OfflineSessionError,
+                    "different package document"):
+                store.preflight(other_doc, other_sig, sid)
 
 
 if __name__ == "__main__":

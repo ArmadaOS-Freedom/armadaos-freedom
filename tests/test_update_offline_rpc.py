@@ -29,6 +29,7 @@ def _manager() -> mock.MagicMock:
     mgr.status.return_value = {'sessionId': SID, 'state': 'uploaded'}
     mgr.store.upload.return_value = {'offset': 9}
     mgr.store.seal.return_value = {'sessionId': SID, 'state': 'uploaded'}
+    mgr.store.preflight.return_value = {'phase': 'preflight_passed'}
     mgr.submit_prepare.return_value = {'sessionId': SID, 'state': 'prepare_queued'}
     mgr.submit_execute.return_value = {'sessionId': SID, 'state': 'execute_queued'}
     mgr.request_restart.return_value = {
@@ -79,7 +80,8 @@ class OfflineRpcTests(unittest.TestCase):
         self.assertEqual([r['id'] for r in out], list(range(1, 9)))
         self.assertTrue(all(r['ok'] for r in out))
         self.assertEqual(out[0]['result'], {
-            'schemaVersion': 1, 'bootPolicy': 'dual-boot-no-slot-control'})
+            'schemaVersion': 1, 'bootPolicy': 'dual-boot-no-slot-control',
+            'capabilities': ['preflight-session-v1']})
         self.assertEqual(out[7]['result'], {'data': _b64(b'recovery-bytes')})
         mgr.store.info.assert_called_once_with()
         mgr.store.begin.assert_called_once_with(b'doc', b'sig')
@@ -109,8 +111,75 @@ class OfflineRpcTests(unittest.TestCase):
         rc, out = _run_lines(mgr, (json.dumps(request) + '\n').encode('utf-8'))
         self.assertEqual(rc, 0)
         self.assertTrue(out[0]['ok'])
-        self.assertEqual(out[0]['result'], result)
+        self.assertEqual(out[0]['result'], dict(
+            result, capabilities=['preflight-session-v1']))
         mgr.store.info.assert_called_once_with()
+
+    def test_info_advertises_the_preflight_session_capability_and_keeps_every_field(self):
+        mgr = _manager()
+        stored = {'schemaVersion': 1, 'updaterVersion': '0.8.0',
+                  'model': 'TB323FU', 'capabilities': ['something-else']}
+        mgr.store.info.return_value = stored
+        request = {'protocolVersion': 1, 'id': 1, 'method': 'info', 'params': {}}
+        rc, out = _run_lines(mgr, (json.dumps(request) + '\n').encode('utf-8'))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0]['ok'])
+        self.assertEqual(out[0]['result'], {
+            'schemaVersion': 1, 'updaterVersion': '0.8.0', 'model': 'TB323FU',
+            'capabilities': ['preflight-session-v1']})
+        # The store's own mapping is not rewritten by serving info.
+        self.assertEqual(stored, {'schemaVersion': 1, 'updaterVersion': '0.8.0',
+                                  'model': 'TB323FU',
+                                  'capabilities': ['something-else']})
+
+    def test_preflight_keeps_the_document_only_shape_and_accepts_a_session(self):
+        mgr = _manager()
+        requests = [
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': SID}},
+        ]
+        rc, out = _run_lines(
+            mgr, b''.join((json.dumps(r) + '\n').encode('utf-8') for r in requests))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(r['ok'] for r in out))
+        self.assertEqual(
+            [{'phase': 'preflight_passed'}, {'phase': 'preflight_passed'}],
+            [r['result'] for r in out])
+        self.assertEqual(
+            [call.args for call in mgr.store.preflight.call_args_list],
+            [(b'doc', b'sig'), (b'doc', b'sig', SID)])
+        self.assertEqual(mgr.store.begin.call_count, 0)
+
+    def test_preflight_rejects_unknown_keys_and_malformed_sessions(self):
+        mgr = _manager()
+        bad = [
+            # signature stays mandatory even with a session id
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'sessionId': SID}},
+            # any other extra key is still rejected
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'offset': 0}},
+            # sessionId is validated as 32 lowercase hex characters
+            {'protocolVersion': 1, 'id': 3, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': 'BAD'}},
+            {'protocolVersion': 1, 'id': 4, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': SID.upper()}},
+        ]
+        rc, out = _run_lines(
+            mgr, b''.join((json.dumps(r) + '\n').encode('utf-8') for r in bad))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), len(bad))
+        for response in out:
+            self.assertFalse(response['ok'])
+            self.assertEqual(response['error']['code'], 'invalid_request')
+        _assert_no_calls(mgr)
 
     def test_restart_to_verify_passes_only_the_session_id(self):
         mgr = _manager()

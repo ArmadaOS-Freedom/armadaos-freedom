@@ -55,6 +55,13 @@ _RECLAIM_SCAN_LIMIT = 16
 _RECLAIM_CURSOR = 'reclaim-cursor.json'
 _RECLAIM_CURSOR_MAX = 4096
 _RECLAIMABLE_STATES = frozenset({'uploading', 'up_to_date'})
+# Receipt states in which a read-only preflight may reuse an existing session's
+# payload: nothing is executing, interrupted or failed, so prepare can still
+# resume from exactly the bytes this session already stores.
+_PREFLIGHT_SESSION_STATES = frozenset({
+    'uploading', 'uploaded', 'prepare_queued', 'preparing', 'prepared',
+    'up_to_date',
+})
 
 
 class OfflineSessionError(RuntimeError):
@@ -593,6 +600,171 @@ class OfflineSessionStore:
         if size > receipt['payload']['bytes']:
             raise OfflineSessionError('stored payload exceeds signed payload size')
         return size
+
+    @staticmethod
+    def _nearest_existing_dir(path, label):
+        """Nearest existing canonical directory holding ``path``, read-only.
+
+        A session is created only by begin/prepare, so preflight must attribute
+        storage to an ancestor that exists now. Every component is inspected
+        without following links and nothing is created, locked or written.
+        """
+        path = Path(path)
+        if not path.is_absolute():
+            raise OfflineSessionError('%s must be an absolute path' % label)
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            candidate = current / part
+            try:
+                entry = os.lstat(candidate)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise OfflineSessionError(
+                    'cannot inspect %s: %s' % (label, exc)) from exc
+            if stat.S_ISLNK(entry.st_mode):
+                raise OfflineSessionError('%s has a symlinked path segment' % label)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise OfflineSessionError(
+                    '%s has a non-directory path segment' % label)
+            current = candidate
+        try:
+            if current.resolve(strict=True) != current:
+                raise OfflineSessionError('%s is not canonical' % label)
+        except OSError as exc:
+            raise OfflineSessionError('cannot resolve %s: %s' % (label, exc)) from exc
+        return current
+
+    def _preflight_stored_bytes(self, session, document, signature_b64,
+                                physical, channel, payload_path, size, digest):
+        """Return the payload bytes already stored by exactly this session.
+
+        Strictly read-only: no session lock (which would create ``.lock``), no
+        receipt update, no job and no write of any kind. Only the protected
+        directory named by the caller's session id is inspected, so bytes of
+        another session, package or device are never credited.
+        """
+        try:
+            stored_document = offline_execute._read_bounded(
+                session / 'package.json', _DOCUMENT_MAX,
+                'session package document')
+            stored_signature = offline_execute._read_bounded(
+                session / 'package.sig', _SIGNATURE_MAX,
+                'session package signature')
+            receipt = self.read_receipt(session)
+        except ValueError as exc:
+            raise OfflineSessionError(
+                'cannot read the protected session: %s' % exc) from exc
+        if stored_document != document:
+            raise OfflineSessionError(
+                'session belongs to a different package document')
+        if stored_signature != signature_b64:
+            raise OfflineSessionError(
+                'session belongs to a different package signature')
+        if receipt.get('physical') != physical:
+            raise OfflineSessionError('session belongs to a different device state')
+        if receipt.get('model') != physical.get('model'):
+            raise OfflineSessionError('session belongs to a different device model')
+        if receipt.get('channel') != channel:
+            raise OfflineSessionError('session was created for a different channel')
+        if receipt.get('jobInterrupted') or receipt.get('attentionRequired'):
+            raise OfflineSessionError(
+                'interrupted session cannot be preflighted read-only')
+        state = receipt.get('state')
+        if state not in _PREFLIGHT_SESSION_STATES:
+            raise OfflineSessionError(
+                'session state %r cannot be preflighted read-only' % (state,))
+        payload = receipt.get('payload')
+        if not isinstance(payload, dict):
+            raise OfflineSessionError('session receipt has no payload record')
+        if (payload.get('path') != payload_path or
+                payload.get('bytes') != size or
+                payload.get('sha256') != digest):
+            raise OfflineSessionError(
+                'session payload does not match the signed descriptor')
+        return self._received(session, receipt)
+
+    def preflight(self, document: bytes, signature_b64: bytes, sessionId=None):
+        """Read-only readiness check: no session, no staging, no device write.
+
+        The result shape is fixed: ``schemaVersion``, ``phase``,
+        ``bootWriteState``, ``model``, ``actualSlot``, ``selectedSlot``,
+        ``currentDeployment``, ``recoveryPartUuid``,
+        ``recoveryDescriptorVersion``, ``recoveryMigrationRequired`` and
+        ``channel``. When the caller names an existing session, ``sessionId``
+        is echoed as well.
+
+        ``sessionId`` only selects one existing protected session by name. With
+        it, the receipt, its package document/signature and the regular payload
+        already stored there are bound to the authenticated package and the
+        current device, and only those validated bytes are credited against the
+        upload-space requirement. Nothing is created, written, locked or
+        started; the authoritative expansion/import checks remain in prepare.
+        """
+        if type(document) is not bytes or not 0 < len(document) <= _DOCUMENT_MAX:
+            raise ValueError('document must be nonempty bytes of at most 2 MiB')
+        if type(signature_b64) is not bytes or not 0 < len(signature_b64) <= _SIGNATURE_MAX:
+            raise ValueError('signature must be nonempty bytes of at most 16 KiB')
+        if sessionId is not None and (
+                type(sessionId) is not str or not _SESSION_ID.fullmatch(sessionId)):
+            raise ValueError(
+                'sessionId must be exactly 32 lowercase hexadecimal characters')
+        physical = self._info_physical()
+        channel = self._channel_info()
+        package = package_contract.load_package(
+            document, signature_b64, trusted_key=self.trusted_key)
+        package_contract.require_operation(
+            package, physical['model'], 'offline-upgrade',
+            updater_version=self.updater_version)
+        parts, size, digest, _expanded_size, _expanded_sha = \
+            offline_payload._select_payload_entry(package)
+        disk = physical.get('bootSource') == 'armada_boot'
+        has_capsule = physical['model'] in package.get('armadaBootCapsules', {})
+        if disk and not has_capsule:
+            raise OfflineSessionError(
+                'signed package lacks ARMADA_BOOT materials for model')
+        if has_capsule and not disk:
+            raise OfflineSessionError(
+                'this package requires an existing ARMADA_BOOT installation')
+        # Read the journal with the same read-only rules prepare uses, so a
+        # legacy descriptor is reported before any upload is promised.
+        from . import offline_prepare
+        if disk:
+            journal = offline_prepare._read_recovery_for_disk(physical)
+        else:
+            journal = system_transaction._check_recovery(
+                physical, system_transaction._binding(physical['deployment']))
+        descriptor_version = journal.layout.descriptor_version
+        stored_bytes = 0
+        if sessionId is not None:
+            session = self.resolve_session(sessionId)
+            stored_bytes = self._preflight_stored_bytes(
+                session, document, signature_b64, physical, channel,
+                '/'.join(parts), size, digest)
+            upload_dir = session
+        else:
+            upload_dir = self._nearest_existing_dir(self.base, 'session base')
+        required = max(size - stored_bytes, 0)
+        if required and _available(upload_dir) < required:
+            raise OfflineSessionError(
+                'insufficient free space for compressed payload')
+        result = {
+            'schemaVersion': 1,
+            'phase': 'preflight_passed',
+            'bootWriteState': 'not_started',
+            'model': physical['model'],
+            'actualSlot': physical.get('actualSlot'),
+            'selectedSlot': physical.get('selectedSlot', physical.get('actualSlot')),
+            'currentDeployment': physical['deployment'],
+            'recoveryPartUuid': physical['recoveryPartUuid'],
+            'recoveryDescriptorVersion': descriptor_version,
+            'recoveryMigrationRequired': (
+                descriptor_version != trial_record.DESCRIPTOR_MIN_VERSION),
+            'channel': channel,
+        }
+        if sessionId is not None:
+            result['sessionId'] = sessionId
+        return result
 
     def status(self, sessionId):
         with self.session_lock(sessionId) as session:

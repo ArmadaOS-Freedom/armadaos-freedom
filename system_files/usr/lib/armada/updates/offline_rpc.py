@@ -22,6 +22,7 @@ _WORKER_OK = frozenset({'prepared', 'up_to_date', 'awaiting_reboot'})
 _REQUEST_KEYS = frozenset({'protocolVersion', 'id', 'method', 'params'})
 _SESSION_HEX = frozenset('0123456789abcdef')
 _METHOD_PARAMS = {
+    'preflight': frozenset({'document', 'signature'}),
     'info': frozenset(),
     'begin': frozenset({'document', 'signature'}),
     'status': frozenset({'sessionId'}),
@@ -36,9 +37,18 @@ _METHOD_PARAMS = {
     'recovery_boot_upload': frozenset({'sessionId', 'slot', 'offset', 'data'}),
     'recovery_boot_seal': frozenset({'sessionId'}),
 }
+# Only preflight may additionally name one existing session. Every other key
+# on every method stays mandatory, and any other extra key is still rejected.
+_METHOD_OPTIONAL_PARAMS = {
+    'preflight': frozenset({'sessionId'}),
+}
+# Reported by this exact service, not inferred from a version string: a client
+# may gate the optional preflight session id on this only. It is truthful
+# because the optional parameter and its forwarder below are already present.
+_CAPABILITIES = ('preflight-session-v1',)
 _NORMAL_METHODS = frozenset({
-    'info', 'begin', 'status', 'upload', 'seal', 'prepare', 'execute', 'export',
-    'restart_to_verify',
+    'preflight', 'info', 'begin', 'status', 'upload', 'seal', 'prepare',
+    'execute', 'export', 'restart_to_verify',
 })
 
 
@@ -81,7 +91,22 @@ def _session_id(params):
 
 
 def _op_info(manager, _params):
-    return manager.store.info()
+    # Copy before adding: the store may hand back the mapping it keeps
+    # internally, and advertising this endpoint's capabilities must never
+    # rewrite the stored device info.
+    info = dict(manager.store.info())
+    info['capabilities'] = list(_CAPABILITIES)
+    return info
+
+
+def _op_preflight(manager, params):
+    document = _b64(params['document'], _DOCUMENT_MAX, 'document')
+    signature = _b64(params['signature'], _SIGNATURE_MAX, 'signature')
+    if 'sessionId' not in params:
+        return manager.store.preflight(document, signature)
+    # The optional session id only selects one existing protected session; it
+    # is validated before any store work exactly like every other session id.
+    return manager.store.preflight(document, signature, _session_id(params))
 
 
 def _op_begin(manager, params):
@@ -167,6 +192,7 @@ def _op_export(manager, params):
 
 
 _OPERATIONS = {
+    'preflight': _op_preflight,
     'info': _op_info,
     'begin': _op_begin,
     'status': _op_status,
@@ -189,7 +215,9 @@ def _dispatch(manager, method, params, *, allowed_methods=None):
     expected = _METHOD_PARAMS.get(method)
     if expected is None:
         raise _Invalid('unknown method')
-    if frozenset(params) != expected:
+    optional = _METHOD_OPTIONAL_PARAMS.get(method, frozenset())
+    supplied = frozenset(params)
+    if not expected <= supplied or supplied - expected - optional:
         raise _Invalid('unexpected or missing method parameters')
     offered = _NORMAL_METHODS if allowed_methods is None else allowed_methods
     if method not in offered:
