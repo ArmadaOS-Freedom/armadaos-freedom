@@ -52,8 +52,16 @@ UPDATES_DIR = 'usr/lib/armada/updates'
 # exists, wins over it.  The bundle never writes /etc.
 TRUST_KEY_PATH = 'usr/share/armada/updates/armadaos-freedom.pub'
 HOST_TRUST_KEY_PATH = 'etc/pki/containers/armadaos-freedom.pub'
+ETC_EXTENSIONS = 'etc/extensions'
 RUN_EXTENSIONS = 'run/extensions'
 UPDATE_SERVICE_PATH = 'usr/share/dbus-1/system-services/org.armada.Updates.service'
+EXTENSION_SEARCH_PATHS = (
+    ETC_EXTENSIONS + '/' + EXTENSION_NAME,
+    RUN_EXTENSIONS + '/' + EXTENSION_NAME,
+    'var/lib/extensions/' + EXTENSION_NAME,
+    'usr/local/lib/extensions/' + EXTENSION_NAME,
+    'usr/lib/extensions/' + EXTENSION_NAME,
+)
 
 CORE_MODULES = (
     # armada_os imports updates.client at module load time.
@@ -102,7 +110,7 @@ DEPENDENCIES = (
     ('dtc', ('/usr/bin/dtc',)),
 )
 SYSEXT_PATHS = ('/usr/bin/systemd-sysext', '/bin/systemd-sysext')
-OS_RELEASE_PATHS = ('usr/lib/os-release', 'etc/os-release')
+OS_RELEASE_PATHS = ('etc/os-release', 'usr/lib/os-release')
 SYSEXT_TIMEOUT_SECONDS = 180
 
 MAX_BUNDLE_BYTES = 512 * 1024 * 1024
@@ -279,7 +287,7 @@ def _missing_runtime(base):
     """
     missing = [relative for relative in REQUIRED_FILES
                if not _is_regular(_p(base, relative))]
-    if TRUST_KEY_PATH in missing and _is_regular(_p(base, HOST_TRUST_KEY_PATH)):
+    if TRUST_KEY_PATH in missing and _is_host_key(_p(base, HOST_TRUST_KEY_PATH)):
         missing.remove(TRUST_KEY_PATH)
     return missing
 
@@ -287,6 +295,18 @@ def _missing_runtime(base):
 def _is_regular(path):
     if path.is_symlink():
         return False
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def _host_key_exists(path):
+    return path.is_symlink() or path.exists()
+
+
+def _is_host_key(path):
+    """Follow the host policy path exactly as the updater runtime does."""
     try:
         return stat.S_ISREG(path.stat().st_mode)
     except OSError:
@@ -301,10 +321,19 @@ def _extension_dir(base):
     return _p(base, RUN_EXTENSIONS + '/' + EXTENSION_NAME)
 
 
+def _effective_extension_dir(base):
+    """Return the extension directory systemd resolves first, if any."""
+    for relative in EXTENSION_SEARCH_PATHS:
+        candidate = _p(base, relative)
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return None
+
+
 def _runtime_root(base):
     """Root that actually holds the updater runtime for reading its files."""
-    extension = _extension_dir(base)
-    if _extension_active(base) and extension.is_dir() and not extension.is_symlink():
+    extension = _effective_extension_dir(base)
+    if extension is not None:
         return extension
     return Path(base)
 
@@ -327,7 +356,7 @@ def _verify_runtime(base, specs):
     shipped files are the ones the bundle describes.
     """
     problems = []
-    host_key = _is_regular(_p(base, HOST_TRUST_KEY_PATH))
+    host_key = _is_host_key(_p(base, HOST_TRUST_KEY_PATH))
     for relative in sorted(specs):
         spec = specs[relative]
         if relative == TRUST_KEY_PATH and host_key:
@@ -363,13 +392,41 @@ def _read_bytes(path, limit):
         return None
 
 
+def _read_host_key(path, limit):
+    """Read the host key through symlinks, matching runtime key loading."""
+    try:
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        chunks = []
+        total = 0
+        while total < info.st_size:
+            chunk = os.read(fd, min(_CHUNK, info.st_size - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total != info.st_size:
+            return None
+        return b''.join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
 def _trust_anchor(base):
     """Return (relative path, source) for the trusted key in effect.
 
     The host /etc policy wins whenever it exists; the key shipped inside the
     extension is only a fallback for hosts that never had one.
     """
-    if _is_regular(_p(base, HOST_TRUST_KEY_PATH)):
+    if _host_key_exists(_p(base, HOST_TRUST_KEY_PATH)):
         return HOST_TRUST_KEY_PATH, 'etc'
     if _is_regular(_p(base, TRUST_KEY_PATH)):
         return TRUST_KEY_PATH, 'packaged'
@@ -380,12 +437,16 @@ def _trust_files_differ(host_root, bundled_root):
     """True when both key files exist and hold different bytes."""
     host = _p(host_root, HOST_TRUST_KEY_PATH)
     bundled = _p(bundled_root, TRUST_KEY_PATH)
-    if not _is_regular(host) or not _is_regular(bundled):
+    if not _host_key_exists(host):
         return False
-    host_pem = _read_bytes(host, MAX_TEXT_BYTES)
+    if not _is_host_key(host):
+        return True
+    if not _is_regular(bundled):
+        return False
+    host_pem = _read_host_key(host, MAX_TEXT_BYTES)
     bundled_pem = _read_bytes(bundled, MAX_TEXT_BYTES)
     if host_pem is None or bundled_pem is None:
-        return False
+        return True
     return host_pem != bundled_pem
 
 
@@ -393,14 +454,16 @@ def _host_key_mismatch(base, specs):
     """True when the host /etc key differs from the key the bundle ships."""
     spec = specs.get(TRUST_KEY_PATH)
     host = _p(base, HOST_TRUST_KEY_PATH)
-    if spec is None or not _is_regular(host):
+    if spec is None or not _host_key_exists(host):
         return False
+    if not _is_host_key(host):
+        return True
     try:
         if host.stat().st_size != spec['bytes']:
             return True
         return _sha256_file(host) != spec['sha256']
     except OSError:
-        return False
+        return True
 
 
 def _extension_usable(directory):
@@ -623,6 +686,7 @@ def _parse_manifest(raw):
 def _scan_archive(stream):
     stream.seek(0)
     members = {}
+    payload_bytes = 0
     manifest = None
     with tarfile.open(fileobj=stream, mode='r:*') as archive:
         for member in archive:
@@ -648,6 +712,10 @@ def _scan_archive(stream):
                 if not 0 <= member.size <= MAX_MEMBER_BYTES:
                     raise BootstrapError('archive_member_rejected',
                                          'archive member size is out of bounds: %s' % name)
+                payload_bytes += member.size
+                if payload_bytes > MAX_BUNDLE_BYTES:
+                    raise BootstrapError('archive_member_rejected',
+                                         'bundle payload is too large')
             members[name] = member.size
             if len(members) > MAX_MEMBERS:
                 raise BootstrapError('archive_member_rejected', 'archive has too many members')
@@ -681,6 +749,9 @@ def _validate_manifest(manifest, members):
                                  'manifest digest is malformed: %s' % path)
         if entry.get('mode') not in _MODES:
             raise BootstrapError('manifest_invalid', 'manifest mode is unsupported: %s' % path)
+        if path == ENTRY_PATH and entry['mode'] != '0755':
+            raise BootstrapError('manifest_invalid',
+                                 'manifest entry point must be executable')
         specs[path] = entry
 
     payload = set(members) - {'manifest.json'}
@@ -837,6 +908,34 @@ def _new_backup(extensions):
     raise BootstrapError('stage_failed', 'cannot reserve a backup path')
 
 
+@contextlib.contextmanager
+def _install_lock(final):
+    """Serialize every mutation of one extension path across processes."""
+    import fcntl
+
+    lock_path = final.parent / ('.' + EXTENSION_NAME + '.lock')
+    flags = (os.O_RDWR | os.O_CREAT
+             | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise BootstrapError('stage_failed',
+                             'cannot open the extension lock: %s' % error)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise BootstrapError('stage_failed',
+                                 'cannot lock the extension path: %s' % error)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def _install_extension(stage, final):
     """Move the staged tree into place, keeping the old extension on failure."""
     backup = None
@@ -931,42 +1030,6 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
         specs = _validate_manifest(manifest, members)
 
         version = manifest['version']
-        runtime = _runtime_root(base)
-        current = _read_updater_version(runtime)
-        comparison = _version_compare(current, version)
-        if comparison is not None and comparison > 0:
-            raise BootstrapError('newer_runtime_present',
-                                 'installed updater %s is newer than bundle %s; '
-                                 'the existing runtime is left untouched'
-                                 % (current, version))
-        if _host_key_mismatch(base, specs):
-            raise BootstrapError('trust_conflict',
-                                 'the host trust anchor %s differs from the bundled key '
-                                 '%s; existing trust policy is kept and nothing is installed'
-                                 % (HOST_TRUST_KEY_PATH, TRUST_KEY_PATH))
-        if comparison == 0:
-            # The same version string is not proof of the same runtime: only
-            # reuse an installation whose files still match the manifest.
-            problems = _verify_runtime(runtime, specs)
-            if not problems:
-                return {
-                    'schemaVersion': SCHEMA_VERSION,
-                    'ok': True,
-                    'command': COMMAND_INSTALL,
-                    'state': 'reused',
-                    'bundle': BUNDLE_NAME,
-                    'version': current,
-                    'extension': EXTENSION_NAME,
-                    'path': None,
-                    'replaced': False,
-                    'previousVersion': current,
-                    'files': len(specs),
-                    'sha256': expected_sha256,
-                    'verified': True,
-                    'sysextRefreshed': False,
-                    'entry': str(_p(base, ENTRY_PATH)),
-                }
-
         sysext = _find(base, SYSEXT_PATHS)
         if sysext is None:
             raise BootstrapError('missing-systemd-sysext',
@@ -982,74 +1045,156 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
         if final.is_symlink():
             raise BootstrapError('extension_conflict',
                                  'extension path must not be a symlink: %s' % final)
-        stage = _new_stage(extensions)
+        with _install_lock(final):
+            effective = _effective_extension_dir(base)
+            if effective is not None and effective != final:
+                raise BootstrapError(
+                    'extension_conflict',
+                    'higher-priority extension path shadows the managed target: %s'
+                    % effective)
+            runtime = _runtime_root(base)
+            current = _read_updater_version(runtime)
+            comparison = _version_compare(current, version)
+            if comparison is not None and comparison > 0:
+                raise BootstrapError('newer_runtime_present',
+                                     'installed updater %s is newer than bundle %s; '
+                                     'the existing runtime is left untouched'
+                                     % (current, version))
+            if _host_key_mismatch(base, specs):
+                raise BootstrapError('trust_conflict',
+                                     'the host trust anchor %s differs from the bundled key '
+                                     '%s; existing trust policy is kept and nothing is installed'
+                                     % (HOST_TRUST_KEY_PATH, TRUST_KEY_PATH))
+            if comparison == 0:
+                # The same version string is not proof of the same runtime: only
+                # reuse an installation whose files still match the manifest.
+                problems = _verify_runtime(runtime, specs)
+                if not problems:
+                    return {
+                        'schemaVersion': SCHEMA_VERSION,
+                        'ok': True,
+                        'command': COMMAND_INSTALL,
+                        'state': 'reused',
+                        'bundle': BUNDLE_NAME,
+                        'version': current,
+                        'extension': EXTENSION_NAME,
+                        'path': None,
+                        'replaced': False,
+                        'previousVersion': current,
+                        'files': len(specs),
+                        'sha256': expected_sha256,
+                        'verified': True,
+                        'sysextRefreshed': False,
+                        'entry': str(_p(base, ENTRY_PATH)),
+                    }
 
-        try:
-            _extract(snapshot, stage, specs)
-            if _missing_runtime(stage):
-                raise BootstrapError('manifest_mismatch',
-                                     'staged extension is missing required runtime files')
-            staged_version = _read_updater_version(stage)
-            if staged_version != version:
-                raise BootstrapError('manifest_mismatch',
-                                     'staged updater version does not match the manifest')
-            release_path = stage / EXTENSION_RELEASE
-            _mkdirs(release_path.parent)
-            _write_file(release_path, release, 0o644)
-            _fsync_dir(release_path.parent)
-            _fsync_dir(stage)
-        except BaseException:
-            shutil.rmtree(stage, ignore_errors=True)
-            raise
+            previous_active = _extension_active(base)
+            stage = _new_stage(extensions)
 
-        try:
-            backup, replaced = _install_extension(stage, final)
-        except OSError as error:
-            shutil.rmtree(stage, ignore_errors=True)
-            raise BootstrapError('stage_failed',
-                                 'cannot activate the staged extension: %s' % error)
-        except BaseException:
-            shutil.rmtree(stage, ignore_errors=True)
-            raise
-        previous = current if replaced else None
-        try:
-            if not _refresh(runner, sysext):
-                raise BootstrapError('sysext_failed', 'systemd-sysext refresh failed')
-            if base == Path('/') and not _extension_active(base):
-                raise BootstrapError('verify_failed',
-                                     'systemd-sysext did not merge the updater extension')
-            merged_version = _read_updater_version(final)
-            if merged_version != version:
-                raise BootstrapError('verify_failed',
-                                     'merged updater version is %r, expected %r'
-                                     % (merged_version, version))
-            if _missing_runtime(final):
-                raise BootstrapError('verify_failed',
-                                     'merged updater runtime is incomplete')
-        except BaseException:
-            _restore(final, stage, backup)
-            _refresh(runner, sysext)
-            raise
+            try:
+                _extract(snapshot, stage, specs)
+                if _missing_runtime(stage):
+                    raise BootstrapError('manifest_mismatch',
+                                         'staged extension is missing required runtime files')
+                staged_version = _read_updater_version(stage)
+                if staged_version != version:
+                    raise BootstrapError('manifest_mismatch',
+                                         'staged updater version does not match the manifest')
+                release_path = stage / EXTENSION_RELEASE
+                _mkdirs(release_path.parent)
+                _write_file(release_path, release, 0o644)
+                _fsync_dir(release_path.parent)
+                _fsync_dir(stage)
+            except BaseException:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise
 
-        if backup is not None:
-            shutil.rmtree(backup, ignore_errors=True)
-        _fsync_dir(extensions)
-        return {
-            'schemaVersion': SCHEMA_VERSION,
-            'ok': True,
-            'command': COMMAND_INSTALL,
-            'state': 'installed',
-            'bundle': BUNDLE_NAME,
-            'version': version,
-            'extension': EXTENSION_NAME,
-            'path': str(final),
-            'replaced': replaced,
-            'previousVersion': previous,
-            'files': len(specs),
-            'sha256': expected_sha256,
-            'sysextRefreshed': True,
-            'entry': str(_p(base, ENTRY_PATH)),
-        }
+            try:
+                backup, replaced = _install_extension(stage, final)
+            except OSError as error:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise BootstrapError('stage_failed',
+                                     'cannot activate the staged extension: %s' % error)
+            except BaseException:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise
+            previous = current if replaced else None
+            try:
+                if not _refresh(runner, sysext):
+                    raise BootstrapError('sysext_failed', 'systemd-sysext refresh failed')
+                if base == Path('/') and not _extension_active(base):
+                    raise BootstrapError('verify_failed',
+                                         'systemd-sysext did not merge the updater extension')
+                effective = _effective_extension_dir(base)
+                if effective != final:
+                    raise BootstrapError(
+                        'verify_failed',
+                        'the effective updater extension is %s, expected %s'
+                        % (effective, final))
+                merged_version = _read_updater_version(effective)
+                if merged_version != version:
+                    raise BootstrapError('verify_failed',
+                                         'merged updater version is %r, expected %r'
+                                         % (merged_version, version))
+                problems = _verify_runtime(effective, specs)
+                if problems:
+                    raise BootstrapError(
+                        'verify_failed',
+                        'merged updater runtime does not match the bundle: %s'
+                        % ', '.join(problems))
+            except BaseException as activation_error:
+                recovery_errors = []
+                try:
+                    _restore(final, stage, backup)
+                except BaseException as error:
+                    recovery_errors.append('restore: %s' % error)
+                try:
+                    if not _refresh(runner, sysext):
+                        recovery_errors.append('systemd-sysext refresh returned failure')
+                except BaseException as error:
+                    recovery_errors.append('systemd-sysext refresh: %s' % error)
+                if not recovery_errors and previous_active:
+                    try:
+                        if not _extension_active(base):
+                            recovery_errors.append(
+                                'the previous updater extension is not active')
+                        restored = _read_updater_version(final)
+                        if previous is not None and restored != previous:
+                            recovery_errors.append(
+                                'restored updater version is %r, expected %r'
+                                % (restored, previous))
+                    except BaseException as error:
+                        recovery_errors.append('rollback verification: %s' % error)
+                if recovery_errors:
+                    activation_label = '%s: %s' % (
+                        getattr(activation_error, 'code',
+                                type(activation_error).__name__),
+                        activation_error)
+                    raise BootstrapError(
+                        'recovery_failed',
+                        'activation failed (%s); rollback recovery failed (%s)'
+                        % (activation_label, '; '.join(recovery_errors))) from activation_error
+                raise
+
+            if backup is not None:
+                shutil.rmtree(backup, ignore_errors=True)
+            _fsync_dir(extensions)
+            return {
+                'schemaVersion': SCHEMA_VERSION,
+                'ok': True,
+                'command': COMMAND_INSTALL,
+                'state': 'installed',
+                'bundle': BUNDLE_NAME,
+                'version': version,
+                'extension': EXTENSION_NAME,
+                'path': str(final),
+                'replaced': replaced,
+                'previousVersion': previous,
+                'files': len(specs),
+                'sha256': expected_sha256,
+                'sysextRefreshed': True,
+                'entry': str(_p(base, ENTRY_PATH)),
+            }
 
 
 # --------------------------------------------------------------------------

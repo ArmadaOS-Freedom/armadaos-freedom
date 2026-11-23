@@ -25,6 +25,7 @@ from pathlib import Path
 import stat
 import sys
 import tarfile
+import tempfile
 
 BUNDLE_NAME = 'armada-offline-updater'
 BUNDLE_VERSION = '0.8.2'
@@ -484,9 +485,21 @@ def _write_output(output, payload, gzipped):
             stream.write(payload)
         payload = buffer.getvalue()
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name('.' + output.name + '.tmp')
+    fd, temporary_name = tempfile.mkstemp(
+        prefix='.' + output.name + '.', suffix='.tmp', dir=output.parent)
+    temporary = Path(temporary_name)
     try:
-        with temporary.open('xb') as stream:
+        os.chmod(temporary, 0o644)
+        stream = os.fdopen(fd, 'wb')
+    except BaseException:
+        os.close(fd)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        with stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())

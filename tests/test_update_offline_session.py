@@ -687,6 +687,63 @@ class OfflineSessionStoreTest(unittest.TestCase):
         self.assertEqual(result["phase"], "preflight_passed")
         self.assertEqual(before, after)
 
+    def test_preflight_accepts_lightweight_identity_for_full_stored_report(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "preflight-full-identity" / "offline"
+        store = self._store(base)
+        full = {
+            "schemaVersion": 1,
+            "phase": "physical_slots_checked",
+            "model": "TB322FC",
+            "actualSlot": "a",
+            "inactiveSlot": "b",
+            "deployment": _DEPLOYMENT,
+            "recoveryPartUuid": "00000000-0000",
+            "selectedSlot": "a",
+            "bootableSlots": {"a": True, "b": True},
+            "ufsController": "/sys/devices/controller.ufs",
+            "luns": [{"lun": 0, "blockSize": 4096}],
+        }
+        lightweight = {
+            key: full[key] for key in
+            ("model", "actualSlot", "inactiveSlot", "deployment",
+             "recoveryPartUuid")
+        }
+        store._inspect = lambda: dict(full)
+        store._info_reader = lambda: dict(lightweight)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        store.seal(sid)
+        with mock.patch.object(
+                offline_session.system_transaction,
+                "_check_recovery",
+                return_value=self._recovery_journal()):
+            result = store.preflight(doc, sig, sid)
+        self.assertEqual(result["sessionId"], sid)
+        self.assertEqual(result["phase"], "preflight_passed")
+
+    def test_preflight_rejects_lightweight_identity_drift(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "preflight-identity-drift" / "offline"
+        store = self._store(base)
+        receipt = store.begin(doc, sig)
+        sid = receipt["sessionId"]
+        store.upload(sid, 0, data)
+        store.seal(sid)
+        changed = dict(
+            self._inspect()(),
+            deployment="stateroot/" + ("b" * 64) + ".1")
+        store._info_reader = lambda: changed
+        with mock.patch.object(
+                offline_session.system_transaction,
+                "_check_recovery",
+                return_value=self._recovery_journal()):
+            with self.assertRaisesRegex(
+                    offline_session.OfflineSessionError,
+                    "different device state"):
+                store.preflight(doc, sig, sid)
+
     def test_preflight_rejects_session_for_another_package(self):
         doc, sig, data = self._signed_package()
         other_doc, other_sig, _other = self._signed_package()

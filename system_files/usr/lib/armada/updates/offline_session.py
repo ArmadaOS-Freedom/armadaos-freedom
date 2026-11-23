@@ -238,6 +238,19 @@ class OfflineSessionStore:
             raise OfflineSessionError('device identity reports unknown boot source')
         return physical
 
+    @staticmethod
+    def _stored_identity(physical):
+        """Project both full and lightweight reports onto shared identity."""
+        if not isinstance(physical, dict):
+            return None
+        result = {
+            field: physical.get(field) for field in
+            ('model', 'actualSlot', 'inactiveSlot', 'deployment',
+             'recoveryPartUuid')
+        }
+        result['bootSource'] = physical.get('bootSource')
+        return result
+
     def _info_physical(self):
         """Identity for read-only info; mutation paths keep the full precheck."""
         if self._info_reader is not None:
@@ -661,7 +674,7 @@ class OfflineSessionStore:
         if stored_signature != signature_b64:
             raise OfflineSessionError(
                 'session belongs to a different package signature')
-        if receipt.get('physical') != physical:
+        if self._stored_identity(receipt.get('physical')) != self._stored_identity(physical):
             raise OfflineSessionError('session belongs to a different device state')
         if receipt.get('model') != physical.get('model'):
             raise OfflineSessionError('session belongs to a different device model')
