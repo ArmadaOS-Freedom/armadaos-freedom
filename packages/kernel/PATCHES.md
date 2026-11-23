@@ -1100,6 +1100,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0048)
   upstream: unknown
   notes: Adds the AW22127 RGB LED controller driver and its LED-class registration. New driver plus its config symbol only; no existing LED driver is modified.
+- `patches/0209a-arm64-dts-qcom-kaanapali-gcc-cx-domain.patch`
+  source: https://github.com/torvalds/linux/commit/9339897ad7eded77adf834e032482f7609911448
+  upstream: https://patch.msgid.link/20260924-qcom-tie-cx-to-gcc-v5-28-38732033e5b5@oss.qualcomm.com
+  notes: GCC GDSCs backed by RPMh CX, adds missing DT parent to propagate consumer votes; Kaanapali only.
 - `patches/0210-drm-msm-snapshot-sspp-rec-blocks.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0052)
   upstream: unknown
