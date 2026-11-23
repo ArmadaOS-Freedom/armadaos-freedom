@@ -1028,6 +1028,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
   notes: Kernel-side idle refresh from the pinned tree's legacy 0110, layered on the 0190 vertical-front-porch switch: the committed mode and its vtotal are untouched while the running DSI video interface's VFP is stretched from the mode's own refresh rate, and the INTFs are flushed outside a commit; the vtotal is restored and latched before system suspend and on encoder disable. `idle_refresh_enable()` returns before arming the base mode, encoder pointer, notifiers or work unless `lenovo,baldur`, and every other machine stays on the existing path. Author and licence terms are kept; this is a rebase, not a byte-for-byte import.
+- `patches/0191a-drm-msm-dpu-baldur-idle-refresh-timeouts.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/pull/62
+  upstream: local
+  notes: Floors idle refresh timeouts at three slow frames on flush and five slow frames for the watchdog; other encoders remain unchanged.
 - `patches/0192-usb-baldur-runtime-pm.patch`
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
