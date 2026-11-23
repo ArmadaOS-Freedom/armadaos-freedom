@@ -290,6 +290,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0189-Bluetooth-qca-baldur-brahma.patch
 0190-drm-msm-baldur-vfp-switch.patch
 0191-drm-msm-baldur-idle-refresh.patch
+0191a-drm-msm-dpu-baldur-idle-refresh-timeouts.patch
 0192-usb-baldur-runtime-pm.patch
 0193-drm-msm-baldur-new-state-bandwidth.patch
 0194-wifi-ath12k-baldur-rx-panic.patch
