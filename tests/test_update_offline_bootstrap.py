@@ -50,6 +50,16 @@ class BundleOutputTests(unittest.TestCase):
             ]
             self.assertEqual(generated, [])
 
+    def test_runtime_version_reads_package_constant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / builder.UPDATES_DIR / "offline_session.py"
+            package = root / builder.UPDATES_DIR / "__init__.py"
+            session.parent.mkdir(parents=True)
+            session.write_text("_UPDATER_VERSION = UPDATER_VERSION\n")
+            package.write_text("UPDATER_VERSION = '0.8.2'\n")
+            self.assertEqual(builder._runtime_version(root), "0.8.2")
+
 
 @unittest.skipUnless(os.name == "posix", "bootstrap installs a Linux extension")
 class BootstrapTests(unittest.TestCase):
@@ -69,7 +79,7 @@ class BootstrapTests(unittest.TestCase):
         path.chmod(mode)
         return path
 
-    def _bundle(self, version=None):
+    def _bundle(self, version=None, imported_version=False):
         version = version or self.VERSION
         entries = {}
         for relative in bootstrap.REQUIRED_FILES:
@@ -77,12 +87,18 @@ class BootstrapTests(unittest.TestCase):
                 data = b"#!/bin/sh\nexit 0\n"
                 mode = 0o755
             elif relative == bootstrap.UPDATES_DIR + "/offline_session.py":
-                data = ("_UPDATER_VERSION = %r\n" % version).encode()
+                if imported_version:
+                    data = b"_UPDATER_VERSION = UPDATER_VERSION\n"
+                else:
+                    data = ("_UPDATER_VERSION = %r\n" % version).encode()
                 mode = 0o644
             else:
                 data = ("payload:" + relative + "\n").encode()
                 mode = 0o644
             entries[relative] = (data, mode)
+        if imported_version:
+            entries[bootstrap.UPDATES_DIR + "/__init__.py"] = (
+                ("UPDATER_VERSION = %r\n" % version).encode(), 0o644)
         files = [
             {
                 "path": relative,
@@ -236,6 +252,21 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap._effective_extension_dir(self.root), final)
         self.assertEqual(
             bootstrap._read_updater_version(final), self.VERSION)
+
+    def test_install_accepts_imported_version_layout(self):
+        self._prepare_root()
+        bundle, digest = self._bundle(imported_version=True)
+        with mock.patch.object(bootstrap, "_is_root", return_value=True):
+            result = bootstrap.install(
+                bundle, digest, root=self.root,
+                runner=self._runner(0))
+        self.assertEqual(result["state"], "installed")
+        final = (
+            self.root / bootstrap.RUN_EXTENSIONS / bootstrap.EXTENSION_NAME)
+        self.assertEqual(
+            bootstrap._read_updater_version(final), self.VERSION)
+        self.assertTrue(
+            (final / bootstrap.UPDATES_DIR / "__init__.py").is_file())
 
     def test_rollback_refresh_success_keeps_original_activation_error(self):
         self._prepare_root()
