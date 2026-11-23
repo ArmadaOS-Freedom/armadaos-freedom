@@ -937,9 +937,9 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   upstream: unknown
   notes: Gen5 Kaanapali dispcc display-artifact fix, imported byte-for-byte as original `patches/0009`.
 - `patches/0169-arm64-dts-qcom-kaanapali-add-the-second-DSI-controll.patch`
-  source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
-  upstream: unknown
-  notes: Gen5 Kaanapali second DSI controller devicetree node, imported byte-for-byte as original `patches/0019`.
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261120-molokai-soc-v3-8-403d763685d9@yahoo.com/
+  notes: Gen5 Kaanapali second DSI controller devicetree node, updated to the upstream Venkat Yadlapati version with authorship preserved; adds DISPCC DSI1 byte / pixel PLL inputs now wired and existing DSI1 controller/PHY and links, no change to panel timing.
 - `patches/0170-drm-panel-nt36523-add-DSC-and-the-Lenovo-TB323FU-CSO.patch`
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
