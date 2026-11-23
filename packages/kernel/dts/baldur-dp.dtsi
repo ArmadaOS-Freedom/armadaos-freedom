@@ -29,8 +29,8 @@
 		 <0>,
 		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
 		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
-		 <0>,
-		 <0>;
+		 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>;
 };
 
 &mdss {
