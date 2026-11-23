@@ -313,6 +313,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0210-drm-msm-snapshot-sspp-rec-blocks.patch
 0211-clk-qcom-kaanapali-fix-pcie-rscc-enable-bits.patch
 0212-clk-qcom-kaanapali-force-pcie-pipe-memory.patch
+0212a-clk-qcom-kaanapali-force-ufs-axi-memory.patch
 0213-clk-qcom-branch-clear-enable-on-failure.patch
 0214-pci-qcom-baldur-disable-slot-hotplug-capabilities.patch
 0215-phy-qcom-qmp-combo-add-kaanapali-usb3-dp.patch
