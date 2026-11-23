@@ -1096,10 +1096,34 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/torvalds/linux/commit/ec0d89150a9381d591344a9f6f5428655c227a7f
   upstream: https://github.com/torvalds/linux/commit/ec0d89150a9381d591344a9f6f5428655c227a7f
   notes: Verbatim upstream backport. Releases the step-wise governor's vote when a trip point is cleared, so the governor no longer holds a stale cooling state. Fixes a vote leak only; cooling maps and thermal policy are unchanged.
-- `patches/0208-input-aw86927-accept-aw86937.patch`
-  source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0038)
-  upstream: unknown
-  notes: Extends the AW86927 haptic driver's chip-ID matching so the AW86937 variant also probes. Chip-ID handling only; no haptic waveform, gain or timing changes.
+- `patches/0208a-Input-aw86927-fix-the-7-V-boost-reference-for-AW8693.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-2-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Corrects the boost reference voltage used for AW86938 so the 7 V setting maps to the right register value.
+- `patches/0208b-Input-aw86927-widen-the-AW86938-boost-mode-mask.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-3-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Widens the AW86938 boost mode mask so all relevant mode bits are preserved when updating the register.
+- `patches/0208c-dt-bindings-input-awinic-aw86927-document-the-AW8693.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-4-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Documents the AW86937 variant in the awinic,aw86927 devicetree binding.
+- `patches/0208d-Input-aw86927-add-support-for-Awinic-AW86937.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-5-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Adds AW86937 device support, including its compatible string and variant-specific parameters.
+- `patches/0208e-Input-aw86927-handle-the-AW8693X-play-and-boost-regi.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-6-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Handles the AW8693X play and boost register layout differences during playback setup.
+- `patches/0208f-Input-aw86927-stop-playback-over-suspend-and-on-shut.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-7-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Stops ongoing playback when the device suspends and on shutdown to avoid stuck haptics.
+- `patches/0208g-Input-aw86927-retry-playback-after-failed-suspend.patch`
+  source: armada
+  upstream: local
+  notes: aw86927: record level while suspended, retry schedule on suspend error, clear stale level on resume
 - `patches/0209-leds-rgb-add-aw22127-driver.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0048)
   upstream: unknown
