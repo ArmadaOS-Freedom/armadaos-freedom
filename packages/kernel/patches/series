@@ -306,7 +306,12 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0205-drm-msm-defer-ring-and-vm-free-with-rcu.patch
 0206-drm-msm-adreno-release-autosuspend-on-cleanup.patch
 0207-thermal-step-wise-release-cleared-trip-vote.patch
-0208-input-aw86927-accept-aw86937.patch
+0208a-Input-aw86927-fix-the-7-V-boost-reference-for-AW8693.patch
+0208b-Input-aw86927-widen-the-AW86938-boost-mode-mask.patch
+0208c-dt-bindings-input-awinic-aw86927-document-the-AW8693.patch
+0208d-Input-aw86927-add-support-for-Awinic-AW86937.patch
+0208e-Input-aw86927-handle-the-AW8693X-play-and-boost-regi.patch
+0208f-Input-aw86927-stop-playback-over-suspend-and-on-shut.patch
 0209-leds-rgb-add-aw22127-driver.patch
 0210-drm-msm-snapshot-sspp-rec-blocks.patch
 0211-clk-qcom-kaanapali-fix-pcie-rscc-enable-bits.patch
