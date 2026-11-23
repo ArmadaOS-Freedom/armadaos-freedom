@@ -323,6 +323,11 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0219-drm-msm-dp-reset-sink-link-capabilities.patch
 0220-drm-msm-dp-baldur-balance-plugged-runtime-pm.patch
 0221-drm-msm-dp-baldur-retrain-after-quick-replug.patch
+0221a-usb-typec-fsa4480-keep-usb2-in-dp-only.patch
+0221b-arm64-dts-qcom-kaanapali-qmp-dp-mode-switch.patch
+0221c-usb-dwc3-qcom-restore-utmi-pipe-clock.patch
+0221d-dt-bindings-usb-qcom-dwc3-mode-switch.patch
+0221e-usb-dwc3-qcom-dp-only-utmi-pipe-clock.patch
 0222-arm64-dts-qcom-kaanapali-describe-ufs-mcq.patch
 0223-Bluetooth-qca-baldur-preserve-configured-address.patch
 0224-drm-msm-dpu-sm8850-inline-rotation.patch

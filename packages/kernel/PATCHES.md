@@ -1160,6 +1160,26 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0057)
   upstream: unknown
   notes: Retrains the DP link after a quick replug on Baldur, where the previous link state can still look valid. Baldur only; no change to link-training parameters or timeouts for other boards.
+- `patches/0221a-usb-typec-fsa4480-keep-usb2-in-dp-only.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/blob/c3d5afb/kernel/patches/0134-usb-typec-mux-fsa4480-keep-the-USB-2.0-switch-on-in-.patch
+  upstream: https://lore.kernel.org/all/20261022165143.1327-1-26rote@gmail.com/
+  notes: FSA4480 typec mux keeps the USB 2.0 switch enabled in DP-only mode.
+- `patches/0221b-arm64-dts-qcom-kaanapali-qmp-dp-mode-switch.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/blob/c3d5afb/kernel/patches/0138-arm64-dts-qcom-kaanapali-Mark-the-USB3-DP-PHY-as-a-T.patch
+  upstream: local
+  notes: Kaanapali DTS marks the USB3/DP PHY as a Type-C mode switch for QMP DP mode switching.
+- `patches/0221c-usb-dwc3-qcom-restore-utmi-pipe-clock.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261027-dwc3-utmi-resume-v1-1-ca9f0aa65783@gmail.com/
+  notes: Restores the lost QSCRATCH UTMI/PIPE clock configuration on USB resume.
+- `patches/0221d-dt-bindings-usb-qcom-dwc3-mode-switch.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261119124558.1548-1-26rote@gmail.com/
+  notes: Adds DT binding documentation for the Qualcomm DWC3 mode-switch property.
+- `patches/0221e-usb-dwc3-qcom-dp-only-utmi-pipe-clock.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261119124558.1548-1-26rote@gmail.com/
+  notes: DWC3 QCOM mode mux preserves USB2 while the physical PIPE clock can stop in DP-only mode.
 - `patches/0222-arm64-dts-qcom-kaanapali-describe-ufs-mcq.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0119)
   upstream: unknown
