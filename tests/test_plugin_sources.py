@@ -452,6 +452,11 @@ class PluginSourceTests(unittest.TestCase):
         )
         (self.source / CONFIG_RELATIVE).write_text(production, encoding="utf-8")
         self._publish_r17()
+        self.github.publish(
+            "ArmadaOS-Freedom/decky-uu-accelerator",
+            "v0.4",
+            {"uu-accelerator-v0.4.zip": _plugin_zip("uu-accelerator", "0.4")},
+        )
         self._seed_legacy_lock()
         self.github.offline.add(LSFG_REPOSITORY)
         self._resolve()
@@ -463,8 +468,8 @@ class PluginSourceTests(unittest.TestCase):
         lock = self._lock()
         self.assertEqual(
             [entry["name"] for entry in lock],
-            ["DeckyClash"],
-            "lock must list only DeckyClash after the LSFG release is removed",
+            ["DeckyClash", "UU加速器"],
+            "lock must list only public bundled release plugins after the LSFG release is removed",
         )
         for entry in lock:
             self.assertEqual(set(entry), LOCK_KEYS)
@@ -473,7 +478,7 @@ class PluginSourceTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry["name"] for entry in report["plugins"]],
-            ["DeckyClash", "Freedom Control", "Armada Store"],
+            ["DeckyClash", "UU加速器", "Freedom Control", "Armada Store"],
         )
         self._validate()
 

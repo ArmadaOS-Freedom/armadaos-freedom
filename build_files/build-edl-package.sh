@@ -18,16 +18,17 @@ readonly GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 # Models the shipped package contract accepts for installation. Any other
 # profile registered in the devices config is packaged install-only and is
 # passed to the descriptor builder as an explicit install model. Keep this
-# list in sync with
-# system_files/usr/lib/armada/updates/package_contract.py.
+# list in sync with the capability table in
+# system_files/usr/lib/armada/updates/models.py (AUTHORIZED_MODELS).
 readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
 # Models whose installed systems have the physical dual-slot backend the
 # offline upgrade drives. The descriptor carries one package-level operations
 # list: upgrade is advertised when at least one selected model is in this set
-# and every selected profile is a shipped contract model. A selected TB710FU
-# or custom model still installs, but its own upgrade request is rejected.
-# Keep this list in sync with package_contract.py OFFLINE_UPGRADE_MODELS.
-readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU"
+# and every selected profile is a shipped contract model. Every shipped model
+# currently has the backend; a selected custom model still installs, but makes
+# the whole package install-only. Keep this list in sync with the
+# offline_upgrade flags in models.py (OFFLINE_UPGRADE_MODELS).
+readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU TB710FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -555,7 +556,25 @@ elif ((${#install_only_models[@]} > 0)); then
 else
     note "producing the install-only raw EDL package for ${selected_models[*]} (no selected model has the dual-slot upgrade backend)"
 fi
+disk_signer_mounts=()
+if [[ "${ARMADA_BOOT_FILES:-}" == "1" ]] && ((upgrade_enabled)); then
+    if [[ -z "${COSIGN_PRIVATE_KEY:-}" || -z "${COSIGN_PASSWORD:-}" ]]; then
+        echo "ARMADA_BOOT_FILES=1 with upgrade_eligible_models requires COSIGN_PRIVATE_KEY and COSIGN_PASSWORD" >&2
+        exit 1
+    fi
+    cosign_path="$(command -v cosign || true)"
+    if [[ -z "$cosign_path" || ! -x "$cosign_path" || ! -f "$cosign_path" ]]; then
+        echo "ARMADA_BOOT_FILES=1 requires an executable cosign on PATH" >&2
+        exit 1
+    fi
+    cosign_path="$(realpath "$cosign_path")"
+    disk_signer_mounts+=(-v "${cosign_path}:/run/armada-cosign:ro")
+    disk_signer_mounts+=(-e COSIGN_PRIVATE_KEY -e COSIGN_PASSWORD)
+    producer_args+=(--disk-boot-cosign /run/armada-cosign)
+fi
+
 run_container "$TASK_PREFIX-producer-$run_id" \
+    "${disk_signer_mounts[@]}" \
     --cpus 4 \
     --memory 6g \
     --network none \
@@ -624,6 +643,9 @@ descriptor_args=(
 )
 if ((upgrade_enabled)); then
     descriptor_args+=(--offline-upgrade)
+    if ((${#disk_signer_mounts[@]})); then
+        descriptor_args+=(--minimum-installer-version 0.9.19 --minimum-updater-version 0.8.2)
+    fi
 else
     for model_id in "${install_only_models[@]}"; do
         descriptor_args+=(--install-model "$model_id")
@@ -661,11 +683,11 @@ if ((upgrade_enabled)); then
     descriptor_identity="unsigned install and upgrade identity"
     descriptor_scope_en="This single package installs every listed model. Its descriptor declares first
 installation for all of them and a normal-Linux offline upgrade for the selected
-models that have the dual-slot backend (the Lenovo Legion Y700 models). That
+models that have the dual-slot backend. That
 upgrade keeps user data and both boot slots and runs from an installed system;
 memory-rescue tools are not part of this package. An upgrade request for any
 other listed model is rejected."
-    descriptor_scope_zh="本单一部署包安装上方全部机型：描述文件为全部所列机型声明首次安装，并仅为具备双启动槽的选中机型（Lenovo Legion Y700）声明正常 Linux 离线升级。该升级保留用户数据及两个启动槽，在已安装系统中执行，本包不包含内存救援工具。对其他所列机型的升级请求会被拒绝。"
+    descriptor_scope_zh="本单一部署包安装上方全部机型：描述文件为全部所列机型声明首次安装，并仅为具备双启动槽后端的选中机型声明正常 Linux 离线升级。该升级保留用户数据及两个启动槽，在已安装系统中执行，本包不包含内存救援工具。对其他所列机型的升级请求会被拒绝。"
 else
     descriptor_identity="unsigned install-only identity"
     descriptor_scope_en="This single package installs every listed model, but its descriptor declares

@@ -179,6 +179,33 @@ class TrialConfirmationTest(unittest.TestCase):
                 self.promote_mock.assert_called_with(**self._promotion_kwargs(seeded))
                 self.assertEqual(store.load(self.fx.fd, self.fx.part, 1).record, confirmed)
 
+    def test_broken_disk_boot_trial_confirmation_marker_rolls_back(self) -> None:
+        """Marker present (one zero byte), no graphical readiness/legacy fallback:
+        recover_pending returns True -> rolled_back before any wait or promote."""
+        boot_source = Path(self.fx.path.parent) / "armada,boot-source"
+        boot_source.write_bytes(b"armada_boot\0")
+        marker = boot_source.with_name("armada,boot-recovery")
+        marker.write_bytes(b"\0")
+        recover_mock = mock.Mock(return_value=True)
+        status_mock = mock.Mock()
+        inspect_mock = mock.Mock(return_value={
+            "bootSource": "armada_boot", "deployment": "default/" + "a" * 64 + ".0"})
+        with (
+            mock.patch.object(tc.boot_context, "BOOT_SOURCE_PATH", boot_source),
+            mock.patch.object(tc.physical_slots, "inspect_physical_slots", inspect_mock),
+            mock.patch.object(tc.boot_disk_switch, "recover_pending", recover_mock),
+            mock.patch.object(tc.boot_disk_switch, "read_trial_status", status_mock),
+        ):
+            result = tc.confirm_trial()
+        self.assertEqual(result["state"], "rolled_back")
+        self.assertEqual(result["bootSource"], "armada_boot")
+        self.assertEqual(result["deployment"], inspect_mock.return_value["deployment"])
+        recover_mock.assert_called_once()
+        self.assertNotIn(True, self.open_calls)
+        self.sleep_mock.assert_not_called()
+        status_mock.assert_not_called()
+        self.promote_mock.assert_not_called()
+
     def test_non_pending_states_skip_probes_and_writable_open(self) -> None:
         self.assertEqual(tc.confirm_trial(), {"state": "not_pending", "recordState": None})
         self.promote_mock.assert_not_called()

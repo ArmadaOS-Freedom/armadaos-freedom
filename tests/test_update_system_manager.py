@@ -342,7 +342,8 @@ class OfflineCompletionStatusTests(unittest.TestCase):
         )
 
     def write_documents(self, status_overrides=None, receipt_state="executing",
-                        report_overrides=None):
+                        report_overrides=None, plan_overrides=None,
+                        receipt_overrides=None):
         plan = {
             "schemaVersion": 1, "operation": "offline-upgrade",
             "policy": "offline-dual", "transactionId": OFFLINE_TX,
@@ -351,6 +352,7 @@ class OfflineCompletionStatusTests(unittest.TestCase):
             "originalBootSha256": dict(OFFLINE_ORIGINAL),
             "newBootSha256": dict(OFFLINE_NEW_BOOT),
         }
+        plan.update(plan_overrides or {})
         raw = system_transaction._save_json(
             self.transaction, "plan.json", plan)
         digest = hashlib.sha256(raw).hexdigest()
@@ -390,10 +392,12 @@ class OfflineCompletionStatusTests(unittest.TestCase):
         report.update(report_overrides or {})
         system_transaction._save_json(
             self.transaction, "write-report.json", report)
-        system_transaction._save_json(self.session, "receipt.json", {
+        receipt = {
             "schemaVersion": 1, "sessionId": OFFLINE_SESSION_ID,
             "state": receipt_state, "model": OFFLINE_MODEL,
-        })
+        }
+        receipt.update(receipt_overrides or {})
+        system_transaction._save_json(self.session, "receipt.json", receipt)
         system_transaction._save_json(self.session, "ack.json", {
             "schemaVersion": 1, "operation": "offline-upgrade",
             "transactionId": OFFLINE_TX, "planSha256": digest,
@@ -430,6 +434,59 @@ class OfflineCompletionStatusTests(unittest.TestCase):
         self.assertEqual(result["pendingTransactionId"], OFFLINE_TX)
         self.assertEqual(result["pendingFromSlot"], "a")
         self.assertEqual(result["pendingTargetSlot"], "b")
+
+    def test_recovery_required_with_armada_boot_intent_needs_trusted_proof(
+            self):
+        switch = {
+            "model": OFFLINE_MODEL,
+            "currentDeployment": OFFLINE_OLD,
+            "newDeployment": OFFLINE_NEW,
+            "expected": "seed",
+            "target": "gen-" + "1" * 32,
+        }
+        self.write_documents(
+            receipt_state="failed",
+            receipt_overrides={
+                "jobOperation": "execute",
+                "result": {"state": "recovery_required",
+                           "bootSource": "armada_boot"},
+            },
+            plan_overrides={
+                "fromSlot": None, "targetSlot": None,
+                "newBootSha256": dict(OFFLINE_ORIGINAL),
+                "armadaBootSwitch": switch,
+            },
+            status_overrides={
+                "bootSource": "armada_boot", "fromSlot": None,
+                "targetSlot": None, "state": "recovery_required",
+                "phase": "failed", "failedPhase": "awaiting_reboot",
+                "bootWriteState": "not_started", "requiresReboot": False,
+            },
+        )
+        status_path = self.transaction / "status.json"
+        original_status = status_path.read_bytes()
+        system_transaction._save_json(self.transaction, "write-report.json", {
+            "schemaVersion": 1, "phase": "armada_boot_switch_intent",
+            "transactionId": OFFLINE_TX, "planSha256": self.digest,
+            "armadaBootSwitch": switch,
+        })
+        trial = self.trial(bootSource="armada_boot", fromSlot=None,
+                           targetSlot=None, selectorCheckpointed=True)
+
+        result = self.status(trial)
+        self.assertEqual(result["state"], "awaiting_reboot")
+        self.assertTrue(result["requiresReboot"])
+        self.assertEqual(
+            self.status(self.trial(
+                bootSource="armada_boot", fromSlot=None, targetSlot=None,
+                selectorCheckpointed=False))["state"], "pending_conflict")
+        self.assertEqual(
+            self.status(self.trial(
+                bootSource="armada_boot", fromSlot=None, targetSlot=None,
+                selectorCheckpointed=True, planSha256="d" * 64))["state"],
+            "pending_conflict")
+        self.assertEqual(
+            (self.transaction / "status.json").read_bytes(), original_status)
 
     def test_plan_document_is_read_once_for_parsing_and_hashing(self):
         reads = []

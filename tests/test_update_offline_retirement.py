@@ -401,6 +401,74 @@ class OfflineRetirementTest(unittest.TestCase):
             return jr.retire_confirmed_offline_session(
                 self.record if record is None else record, base=self.base)
 
+    def test_retire_confirmed_disk_session_removes_only_payload(self):
+        from updates import offline_prepare
+        plan = json.loads((self.transaction / "plan.json").read_text())
+        switch = {
+            "expected": "armada_boot",
+            "target": NEW_DEPLOYMENT,
+            "currentDeployment": OLD_DEPLOYMENT,
+            "newDeployment": NEW_DEPLOYMENT,
+            "model": MODEL,
+        }
+        plan["fromSlot"] = None
+        plan["targetSlot"] = None
+        plan["armadaBootSwitch"] = switch
+        for slot in ("a", "b"):
+            plan["originalBootSha256"][slot] = plan["newBootSha256"][slot]
+        self._write_json(self.transaction, "plan.json", plan)
+        self.rewrite_manifest(fromSlot=None)
+
+        status = json.loads((self.transaction / "status.json").read_text())
+        status.update(fromSlot=None, targetSlot=None,
+                      bootSource="armada_boot", bootWriteState="not_started")
+        self._write_json(self.transaction, "status.json", status)
+
+        plan_sha = _sha((self.transaction / "plan.json").read_bytes())
+        report = {
+            "schemaVersion": 1,
+            "phase": "armada_boot_switch_intent",
+            "transactionId": TX,
+            "planSha256": plan_sha,
+            "armadaBootSwitch": switch,
+        }
+        self._write_json(self.transaction, "write-report.json", report)
+
+        initial = dict(PHYSICAL, bootSource="armada_boot",
+                       deployment=NEW_DEPLOYMENT)
+        evidence = {
+            "state": "available",
+            "bootSource": "armada_boot",
+            "recordState": "confirmed",
+            "runningDeployment": "new",
+            "bootConfirmed": True,
+            "finalization": {"state": "complete"},
+            "fromSlot": None,
+            "targetSlot": None,
+            "transactionId": TX,
+            "planSha256": plan_sha,
+            "oldDeployment": OLD_DEPLOYMENT,
+            "newDeployment": NEW_DEPLOYMENT,
+        }
+        snapshot = mock.Mock()
+        snapshot.layout.installation_uuid = uuid.UUID(INSTALLATION).bytes
+        snapshot.layout.partition_uuid = uuid.UUID(PARTITION).bytes
+
+        self.record = make_record(plan_sha256=bytes.fromhex(plan_sha))
+        before = self.preserve()
+        with mock.patch.object(
+                offline_prepare, "_read_recovery_for_disk",
+                return_value=snapshot), \
+                mock.patch.object(
+                    offline_session.package_contract, "load_package",
+                    return_value=self.package):
+            result = jr.retire_confirmed_disk_session(
+                evidence, initial, base=self.base)
+
+        self.assertTrue(result)
+        self.assertFalse(self.payload.is_file())
+        self.assert_preserved(before)
+
     def preserve(self):
         snapshot = {}
         for name in COMPACT_DOCUMENTS + RECOVERY_FILES + KEPT_FILES:

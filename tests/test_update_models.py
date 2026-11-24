@@ -62,8 +62,8 @@ EXPECTED_CAPABILITIES = {
         (b"lenovo,tb710fu",),
         (b"qcom,sm8650",),
         3,
-        False,
-        False,
+        True,
+        True,
         False,
     ),
 }
@@ -136,9 +136,11 @@ class ModelCapabilityTableTests(unittest.TestCase):
         self.assertIsInstance(models.GBL_MODELS, frozenset)
         self.assertEqual(models.AUTHORIZED_MODELS, frozenset(MODEL_NAMES))
         self.assertEqual(
-            models.OFFLINE_UPGRADE_MODELS, frozenset(("TB322FC", "TB323FU")))
+            models.OFFLINE_UPGRADE_MODELS,
+            frozenset(("TB322FC", "TB323FU", "TB710FU")))
         self.assertEqual(
-            models.MIRROR_POLICY_MODELS, frozenset(("TB322FC", "TB323FU")))
+            models.MIRROR_POLICY_MODELS,
+            frozenset(("TB322FC", "TB323FU", "TB710FU")))
         self.assertEqual(models.GBL_MODELS, frozenset(("TB323FU",)))
         for name, capability in models.MODELS.items():
             with self.subTest(model=name):
@@ -201,14 +203,14 @@ class ModelCapabilityTableTests(unittest.TestCase):
                 self.assertEqual((socs, board_id),
                                  (capability.soc_compatible, capability.board_id))
 
-    def test_tb710fu_has_recovery_layout_but_no_upgrade_backend_yet(self):
+    def test_tb710fu_is_a_mirrored_dual_slot_upgrade_model_without_gbl(self):
         capability = models.MODELS["TB710FU"]
         self.assertEqual(capability.board_id, 3)
-        self.assertFalse(capability.offline_upgrade)
-        self.assertFalse(capability.mirrored_boot)
+        self.assertTrue(capability.offline_upgrade)
+        self.assertTrue(capability.mirrored_boot)
         self.assertFalse(capability.gbl_envelope)
-        self.assertNotIn("TB710FU", models.OFFLINE_UPGRADE_MODELS)
-        self.assertNotIn("TB710FU", models.MIRROR_POLICY_MODELS)
+        self.assertIn("TB710FU", models.OFFLINE_UPGRADE_MODELS)
+        self.assertIn("TB710FU", models.MIRROR_POLICY_MODELS)
         self.assertNotIn("TB710FU", models.GBL_MODELS)
         self.assertEqual(models.BOARD_MODELS[3], "TB710FU")
         self.assertIn((b"lenovo,tb710fu", (b"qcom,sm8650",), 3),
@@ -370,6 +372,7 @@ class RecoveryAliasResolutionTests(unittest.TestCase):
             "tb323fu with sm8750": (b"lenovo,tb323fu", b"qcom,sm8750"),
             "elden with sm8850": (b"lenovo,elden", b"qcom,sm8850"),
             "soc without a known alias": (b"qcom,sm8850",),
+            "tb710fu with sm8750": (b"lenovo,tb710fu", b"qcom,sm8750"),
         }
         for name, tokens in cases.items():
             with self.subTest(case=name):
@@ -391,7 +394,7 @@ class RecoveryAliasResolutionTests(unittest.TestCase):
             self._locate()
 
     def test_unregistered_model_alias_is_rejected(self):
-        self._write_compatible(b"lenovo,tb710fu", b"qcom,sm8650")
+        self._write_compatible(b"lenovo,tb999xx", b"qcom,sm8650")
         with self.assertRaises(RecoveryLayoutError):
             self._locate()
 

@@ -1,0 +1,57 @@
+Subject: [PATCH] Input: aw86927 - replay the current request after a failed suspend
+
+The memless effect timer can send its final stop while the suspend
+callback is draining work. Keep the latest requested magnitude while
+blocking new work. If the synchronous stop fails, queue the recorded
+request after clearing the suspend flag so that a stop can be retried.
+Discard requests recorded during a successful sleep before reopening
+the input path on resume.
+
+diff --git a/drivers/input/misc/aw86927.c b/drivers/input/misc/aw86927.c
+index b5745dc..f668247 100644
+--- a/drivers/input/misc/aw86927.c
++++ b/drivers/input/misc/aw86927.c
+@@ -367,14 +367,16 @@ static int aw86927_haptics_play(struct input_dev *dev, void *data, struct ff_eff
+ 	struct aw86927_data *haptics = input_get_drvdata(dev);
+ 	int level;
+ 
+-	/* The chip is powered down; a queued event would only fail. */
+-	if (haptics->suspended)
+-		return 0;
+-
+ 	level = effect->u.rumble.strong_magnitude;
+ 	if (!level)
+ 		level = effect->u.rumble.weak_magnitude;
+ 
++	/* Record latest desired level even while suspended. */
++	if (haptics->suspended) {
++		WRITE_ONCE(haptics->level, level);
++		return 0;
++	}
++
+ 	/* If level does not change, don't restart playback */
+ 	if (READ_ONCE(haptics->level) == level)
+ 		return 0;
+@@ -942,10 +944,12 @@ static int aw86927_suspend(struct device *dev)
+ 	err = aw86927_stop(haptics);
+ 
+ 	scoped_guard(spinlock_irq, &haptics->input_dev->event_lock) {
+-		if (err)
++		if (err) {
+ 			haptics->suspended = false;
+-		else
++			schedule_work(&haptics->play_work);
++		} else {
+ 			WRITE_ONCE(haptics->level, 0);
++		}
+ 	}
+ 
+ 	return err;
+@@ -957,6 +961,7 @@ static int aw86927_resume(struct device *dev)
+ 
+ 	guard(mutex)(&haptics->input_dev->mutex);
+ 	guard(spinlock_irq)(&haptics->input_dev->event_lock);
++	WRITE_ONCE(haptics->level, 0);
+ 	haptics->suspended = false;
+ 
+ 	return 0;

@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parent.parent
 SYSTEM = REPO / 'system_files'
 HELPER = SYSTEM / 'usr/libexec/tb710fu/tb710fu-sensors-prepare'
 DAEMON_UNIT = SYSTEM / 'usr/lib/systemd/system/tb710fu-hexagonrpcd.service'
+PREPARE_UNIT = SYSTEM / 'usr/lib/systemd/system/tb710fu-sensors-prepare.service'
 GENERATOR = SYSTEM / 'usr/lib/systemd/system-generators/tb710fu-sensors-generator'
 SLEEP_HOOK = SYSTEM / 'usr/lib/systemd/system-sleep/45-tb710fu-sensors'
 RULE = SYSTEM / 'usr/lib/udev/rules.d/81-armada-tb710fu-sensors.rules'
@@ -134,7 +135,13 @@ FAKE_DUMP_EROFS = textwrap.dedent('''\
         sys.exit('wrong offset ' + offset)
     target = os.path.join(os.environ['FAKE_VENDOR'], path.lstrip('/'))
     if '--cat' in args:
-        sys.stdout.buffer.write(open(target, 'rb').read())
+        data = open(target, 'rb').read()
+        if os.environ.get('FAKE_EROFS_PARTIAL'):
+            # Like the real tool: part of the file, an error, exit status 0.
+            sys.stdout.buffer.write(data[:len(data) // 2])
+            print('<E> erofs: failed to read data of file', file=sys.stderr)
+            sys.exit(0)
+        sys.stdout.buffer.write(data)
     elif '--ls' in args:
         print('Path : ' + path)
         print('       NID TYPE  FILENAME')
@@ -374,6 +381,42 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('checksum mismatch', result.stderr)
 
+    def test_backup_metadata_used_when_primary_tables_are_out_of_range(self):
+        # Primary copy of slot 0 with valid checksums but an extent table
+        # that points past the tables: liblp rejects it and uses the backup.
+        base = 12288
+        data = bytearray(self.super.read_bytes())
+        struct.pack_into('<I', data, base + 92 + 4, 1000)
+        header = bytearray(data[base:base + 256])
+        header[12:44] = bytes(32)
+        data[base + 12:base + 44] = hashlib.sha256(bytes(header)).digest()
+        self.super.write_bytes(bytes(data))
+        self.assert_ok(self.run_helper())
+        self.assertEqual((self.state / 'fw/sensors/sns_reg.conf').read_text(), 'reg config')
+
+    def test_tables_out_of_range_in_both_copies_refused(self):
+        data = bytearray(self.super.read_bytes())
+        for base in (12288, 12288 + 3 * 65536):
+            struct.pack_into('<I', data, base + 92 + 4, 1000)
+            header = bytearray(data[base:base + 256])
+            header[12:44] = bytes(32)
+            data[base + 12:base + 44] = hashlib.sha256(bytes(header)).digest()
+        self.super.write_bytes(bytes(data))
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('table 1 invalid', result.stderr)
+
+    def test_partial_vendor_read_rejected(self):
+        self.assert_ok(self.run_helper())
+        before = (self.state / 'fw/sensors/config/lanai_bmi3x0_0.json').read_text()
+        (self.vendor / 'etc/sensors/config/lanai_bmi3x0_0.json').write_text('{"accel":2222}')
+        result = self.run_helper(FAKE_EROFS_PARTIAL='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('failed to read data', result.stderr)
+        self.assertEqual(
+            (self.state / 'fw/sensors/config/lanai_bmi3x0_0.json').read_text(), before)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ['fw', 'registry'])
+
     def test_vendor_must_be_erofs(self):
         with open(self.super, 'r+b') as f:
             f.seek(VENDOR_SECTOR * SECTOR + 1024)
@@ -466,6 +509,10 @@ class RealToolsTest(HelperTest):
     def test_partial_registry_dump_rejected(self):
         pass
 
+    @unittest.skip('needs the fake dump.erofs that fails part-way')
+    def test_partial_vendor_read_rejected(self):
+        pass
+
     def test_failed_extraction_keeps_previous_files(self):
         self.assert_ok(self.run_helper())
         os.remove(self.vendor / 'etc/sensors/sns_reg_config')
@@ -483,14 +530,20 @@ def unit_values(path, key):
 
 class IntegrationTest(unittest.TestCase):
     def test_units(self):
-        self.assertFalse((SYSTEM / 'usr/lib/systemd/system/tb710fu-sensors-prepare.service').exists())
-        self.assertEqual(unit_values(DAEMON_UNIT, 'ConditionFirmware'),
-                         ['device-tree-compatible(lenovo,tb710fu)'])
-        # Staging runs before every start, outside the sandbox, so Restart=
-        # retries a failed staging together with the daemon.
+        for unit in (DAEMON_UNIT, PREPARE_UNIT):
+            self.assertEqual(unit_values(unit, 'ConditionFirmware'),
+                             ['device-tree-compatible(lenovo,tb710fu)'])
+        # DevicePolicy= covers the daemon's whole control group, ExecStartPre=+
+        # included, so staging runs in a unit of its own. Starting it from
+        # ExecStartPre= waits for it and fails the start when it fails, so
+        # Restart= retries a failed staging together with the daemon.
         self.assertEqual(unit_values(DAEMON_UNIT, 'ExecStartPre'),
-                         ['+/usr/libexec/tb710fu/tb710fu-sensors-prepare'])
+                         ['+/usr/bin/systemctl start tb710fu-sensors-prepare.service'])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'DevicePolicy'), ['closed'])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'DeviceAllow'),
+                         ['/dev/fastrpc-adsp-secure rw'])
         self.assertEqual(unit_values(DAEMON_UNIT, 'Requires'), [])
+        self.assertEqual(unit_values(DAEMON_UNIT, 'Wants'), [])
         self.assertEqual(unit_values(DAEMON_UNIT, 'Restart'), ['always'])
         self.assertEqual(unit_values(DAEMON_UNIT, 'RestartMaxDelaySec'), ['60'])
         self.assertEqual(unit_values(DAEMON_UNIT, 'StartLimitIntervalSec'), ['0'])
@@ -503,9 +556,22 @@ class IntegrationTest(unittest.TestCase):
                          ['/var/lib/tb710fu-sensors/registry'])
         self.assertIn('dev-fastrpc\\x2dadsp\\x2dsecure.device',
                       unit_values(DAEMON_UNIT, 'BindsTo'))
-        wants = ' '.join(unit_values(DAEMON_UNIT, 'Wants'))
+        # The staging unit: runs the helper on every start, with no device
+        # policy, after the partitions it reads.
+        self.assertEqual(unit_values(PREPARE_UNIT, 'Type'), ['oneshot'])
+        self.assertEqual(unit_values(PREPARE_UNIT, 'ExecStart'),
+                         ['/usr/libexec/tb710fu/tb710fu-sensors-prepare'])
+        for key in ('RemainAfterExit', 'DevicePolicy', 'DeviceAllow', 'PrivateDevices'):
+            self.assertEqual(unit_values(PREPARE_UNIT, key), [], key)
+        wants = ' '.join(unit_values(PREPARE_UNIT, 'Wants'))
+        after = ' '.join(unit_values(PREPARE_UNIT, 'After'))
         for label in ('boot_a', 'boot_b', 'dsp_a', 'dsp_b', 'super', 'persist'):
             self.assertIn('dev-disk-by\\x2dpartlabel-%s.device' % label, wants)
+            self.assertIn('dev-disk-by\\x2dpartlabel-%s.device' % label, after)
+        # Ordered after the daemon, the start from its ExecStartPre= would deadlock.
+        for key in ('After', 'Before', 'Requires', 'BindsTo', 'PartOf'):
+            self.assertNotIn('tb710fu-hexagonrpcd', ' '.join(unit_values(PREPARE_UNIT, key)))
+        self.assertNotIn('[Install]', PREPARE_UNIT.read_text())
         # Started by udev on the board only, not enabled on every device.
         self.assertNotIn('[Install]', DAEMON_UNIT.read_text())
         for path in (HELPER, GENERATOR, SLEEP_HOOK):
@@ -548,7 +614,8 @@ class IntegrationTest(unittest.TestCase):
                      'After=tb710fu-hexagonrpcd.service', 'TimeoutStopSec=3'):
             self.assertIn(line + '\n', dropin)
 
-    def run_sleep_hook(self, compatible, phases, state, start_ok=True, run_dir=None):
+    def run_sleep_hook(self, compatible, phases, state, start_ok=True, run_dir=None,
+                       queued=False):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp / 'compatible').write_bytes(compatible)
@@ -560,9 +627,10 @@ class IntegrationTest(unittest.TestCase):
                 echo "$*" >>"%s"
                 case "$1" in
                 show) echo %s ;;
+                list-jobs) [ %s = yes ] && echo "42 iio-sensor-proxy.service start waiting" ;;
                 start) [ %s = yes ] ;;
                 esac
-            ''') % (log, state, 'yes' if start_ok else 'no'))
+            ''') % (log, state, 'yes' if queued else 'no', 'yes' if start_ok else 'no'))
             fake.chmod(0o755)
             run = run_dir(tmp) if run_dir else tmp / 'run'
             env = dict(os.environ, TB710FU_DT_COMPATIBLE=str(tmp / 'compatible'),
@@ -585,8 +653,14 @@ class IntegrationTest(unittest.TestCase):
         # A pending Restart= shows as activating: stop it and resume it.
         self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'activating'),
                          ([show, stop, start], False))
+        jobs = 'list-jobs --no-legend iio-sensor-proxy.service'
         self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'inactive'),
-                         ([show], False))
+                         ([show, jobs], False))
+        # A start still waiting for hexagonrpcd: cancel it, start it on resume.
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre'], 'inactive', queued=True),
+                         ([show, jobs, stop], True))
+        self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'inactive', queued=True),
+                         ([show, jobs, stop, start], False))
         # Rejected start: the marker stays for the next resume.
         self.assertEqual(self.run_sleep_hook(TB710FU, ['pre', 'post'], 'active', start_ok=False),
                          ([show, stop, start], True))

@@ -54,8 +54,6 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
   source: armada
 - `patches/0026-upscale-use-sgsr-for-sdr-fsr-requests.patch`
   source: armada
-- `patches/0027-steamcompmgr-elapsed-time-fps-limiter.patch`
-  source: armada
 
 - `patches/0028-drm-collect-refresh-rates-without-edid.patch`
   source: armadaos-freedom (TB323FU adaptation)
@@ -66,6 +64,9 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
   PR: https://github.com/armada-os/armada/pull/665
   Original 0028 renumbered to 0033 only; body unchanged. Scope: an edge swipe must start at the edge.
 
+- `patches/0032-steamcompmgr-use-the-exact-rate-for-refresh-only-requests.patch`
+  source: https://github.com/armada-os/armada/blob/4b8294632bd5e66ef057cc69b8f5c19fa6a2e0a8/packages/gamescope/patches/0032-steamcompmgr-use-the-exact-rate-for-refresh-only-requests.patch
+
 - `patches/0034-edid-clamp-synthetic-pixel-clock-above-the-dtd-limit.patch`
   source: https://github.com/enij90/armada-tb321fu/commit/8d4b5530ab8afbc41d35e6577fa91e77ee872c3a
   notes: Rebased to the PR665 + Y705 tree; the two production hunks are only relocated, and the Y700 mode-list test expectation is adapted. EDID DTD metadata clamps pixel clocks above 655.35 MHz while preserving geometry; the actual scanout modes remain the kernel modes. This does NOT fix physical 165 Hz, change panel clocks, or fix the 90 Hz physical corruption. No new tests or physical fixes are claimed.
@@ -75,13 +76,9 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
   source: armada
   The connector heuristic only mapped i2c to the internal connector and usb to the external one. An SPI digitizer (TB322FC: input -> spi -> spi_master -> platform) matched neither, so touch stayed unassociated and skipped the connector's orientation transform. spi is now handled like i2c. No angle is hardcoded; calibration, DPI, kernel, UI, Steam arguments and the USB path are unchanged. Not built or device-tested here.
 
-- `patches/0036-improve-frame-pacing.patch`
-  source: https://github.com/mydanyi/armada-danyi-build/blob/ec6055d92099c616ff76cad8d34cd60514d9b036/packages/gamescope/patches/0028-improve-frame-pacing.patch
-  notes: Valve PR #2417 frame pacing: wake steamcompmgr after host event reads, avoid scheduling the same refresh twice, and keep nested refresh overrides on their own schedule. Includes the VBlankSchedule tests.
-
 - `patches/0037-fifo-display-identity-hud.patch`
   source: https://github.com/mydanyi/armada-danyi-build/blob/ec6055d92099c616ff76cad8d34cd60514d9b036/packages/gamescope/patches/0029-personal-fifo-display-identity-hud.patch
-  notes: FIFO head-of-line blocking fix; binds displayed DRM frames to the base/app identity and publishes the HUD wire layout, matched by the receiver.
+  notes: Binds displayed DRM frames to the base/app identity and publishes the HUD wire layout used by the receiver. Gamescope 3.17 supplies the FIFO queue and selection logic.
 
 - `patches/0038-steamcompmgr-steamui-refresh-ceiling.patch`
   source: armada

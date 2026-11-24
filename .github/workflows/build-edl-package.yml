@@ -137,7 +137,7 @@ jobs:
           fi
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: 'v2.6.3'
 
@@ -199,6 +199,9 @@ jobs:
 
       - name: Build EDL package
         env:
+          ARMADA_BOOT_FILES: "1"
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
           IMAGE: ${{ steps.image.outputs.image }}
           IMAGE_DIGEST: ${{ inputs.image_digest }}
           REVISION: ${{ steps.revision.outputs.revision }}

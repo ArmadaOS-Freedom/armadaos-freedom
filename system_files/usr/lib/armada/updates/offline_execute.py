@@ -12,6 +12,7 @@ from . import (
     UPDATER_VERSION,
     _io,
     boot_candidate,
+    boot_disk_switch,
     deployment_options,
     models,
     offline_boot_writer,
@@ -157,7 +158,10 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
     prepared, _ = _load_json(work, 'prepared.json')
     plan, plan_bytes = _load_json(work, 'plan.json')
     trust, _ = _load_json(work, 'trust.json')
-    materials, _ = _load_json(work, 'materials.json')
+    disk = saved_status.get('bootSource') == 'armada_boot'
+    materials = None
+    if not disk:
+        materials, _ = _load_json(work, 'materials.json')
     manifest, manifest_bytes = _load_json(work, 'recovery-manifest.json')
     package_doc = _read_bounded(work / 'package.json', _JSON_MAX, 'package.json')
     signature_b64 = _read_bounded(work / 'package.sig', _SIG_MAX, 'package.sig')
@@ -206,7 +210,9 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
 
     package = package_contract.load_package(
         package_doc, signature_b64, trusted_key=trusted_key)
-    initial = (physical_slots.inspect_physical_slots())
+    initial = physical_slots.inspect_physical_slots()
+    if disk != (initial.get('bootSource') == 'armada_boot') or disk != ('armadaBootSwitch' in plan):
+        raise ValueError('prepared boot source differs from the running system')
     if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
         raise ValueError('unsupported physical model')
     package_contract.require_operation(
@@ -232,20 +238,43 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
     dep_opts = deployment_options.read_deployment_options(
         sysroot_path=root, current_binding=current_binding,
         target_binding=plan['newDeployment'])
-    if (materials.get('transactionUuid') != tx or
-            materials.get('model') != initial['model'] or
-            materials.get('deployment') != plan['newDeployment'] or
-            materials.get('deployment') != dep_opts['deployment'] or
-            materials.get('target') != dep_opts['path'] or
-            materials.get('rootUuid') != dep_opts['rootUuid'] or
-            materials.get('bootUuid') != dep_opts['bootUuid']):
-        raise ValueError('prepared deployment or boot materials binding mismatch')
-    actual, inactive = initial['actualSlot'], initial['inactiveSlot']
-    if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
-        raise ValueError('physical active/inactive slots invalid')
-    if (plan.get('fromSlot') != actual or plan.get('targetSlot') != inactive or
-            plan.get('model') != initial['model']):
-        raise ValueError('plan slot/model bindings mismatch physical state')
+    if disk:
+        switch = plan['armadaBootSwitch']
+        if (not isinstance(switch, dict) or
+                set(switch) != {'expected', 'target', 'model', 'currentDeployment', 'newDeployment'} or
+                initial['model'] not in package.get('armadaBootCapsules', {}) or
+                switch['model'] != initial['model'] or
+                switch['currentDeployment'] != current_binding or
+                switch['newDeployment'] != dep_opts['deployment']):
+            raise ValueError('prepared ARMADA_BOOT switch does not match the signed package')
+    else:
+        if (materials.get('transactionUuid') != tx or
+                materials.get('model') != initial['model'] or
+                materials.get('deployment') != plan['newDeployment'] or
+                materials.get('deployment') != dep_opts['deployment'] or
+                materials.get('target') != dep_opts['path'] or
+                materials.get('rootUuid') != dep_opts['rootUuid'] or
+                materials.get('bootUuid') != dep_opts['bootUuid']):
+            raise ValueError('prepared deployment or boot materials binding mismatch')
+    if disk:
+        if 'actualSlot' not in initial or 'inactiveSlot' not in initial:
+            raise ValueError('disk context requires explicit actualSlot/inactiveSlot')
+        if 'fromSlot' not in plan or 'targetSlot' not in plan:
+            raise ValueError('disk context requires explicit plan fromSlot/targetSlot')
+        actual, inactive = initial['actualSlot'], initial['inactiveSlot']
+        if actual is not None or inactive is not None:
+            raise ValueError('armada_boot physical slots must be explicitly null')
+        if plan.get('fromSlot') is not None or plan.get('targetSlot') is not None:
+            raise ValueError('armada_boot plan slots must be explicitly null')
+        if plan.get('model') != initial['model']:
+            raise ValueError('plan slot/model bindings mismatch physical state')
+    else:
+        actual, inactive = initial['actualSlot'], initial['inactiveSlot']
+        if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
+            raise ValueError('physical active/inactive slots invalid')
+        if (plan.get('fromSlot') != actual or plan.get('targetSlot') != inactive or
+                plan.get('model') != initial['model']):
+            raise ValueError('plan slot/model bindings mismatch physical state')
 
     if (not _is_schema_one(trust.get('schemaVersion')) or
             not physical_slots.same_physical_identity(trust.get('physical'), initial) or
@@ -257,17 +286,21 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
     sources = trust['sources']
     candidates = {}
     for slot in _SLOTS:
-        candidate, _ = _load_json(work, 'candidate-%s.json' % slot)
         original = boot_candidate._verify_claim(sources['slots'][slot]['boot'],
                                                 'old boot %s' % slot)
         if not _under(work, Path(original['path'])):
             raise ValueError('original boot claim outside work directory')
+        if plan['originalBootSha256'][slot] != original['sha256']:
+            raise ValueError('plan original boot digest mismatch for slot %s' % slot)
+        if disk:
+            if plan['newBootSha256'][slot] != original['sha256']:
+                raise ValueError('ARMADA_BOOT update plan changes raw Boot for slot %s' % slot)
+            continue
+        candidate, _ = _load_json(work, 'candidate-%s.json' % slot)
         offline_prepare._check_candidate(
             candidate, slot=slot, tx=tx, deployment=plan['newDeployment'],
             model=initial['model'], mode=trust['mode'],
             source_sha=original['sha256'])
-        if plan['originalBootSha256'][slot] != original['sha256']:
-            raise ValueError('plan original boot digest mismatch for slot %s' % slot)
         candidate_claim = boot_candidate._verify_claim(candidate['candidate'],
                                                        'new boot %s' % slot)
         if not _under(work, Path(candidate_claim['path'])):
@@ -276,7 +309,8 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
             raise ValueError('plan new boot digest mismatch for slot %s' % slot)
         candidates[slot] = candidate
 
-    journal = system_transaction._check_recovery(initial, old)
+    journal = (offline_prepare._read_recovery_for_disk(initial) if disk else
+               system_transaction._check_recovery(initial, old))
     layout = journal.layout
     if (manifest.get('installationUuid') != str(uuid.UUID(bytes=layout.installation_uuid)) or
             manifest.get('recoveryPartUuid') != str(uuid.UUID(bytes=layout.partition_uuid)) or
@@ -327,7 +361,7 @@ def _preflight(work, recovery_ack, updater_version, trusted_key):
     _check_recovery_ack(recovery_ack, tx=tx, plan=prepared, manifest=manifest)
     result = {'initial': initial, 'old': old, 'new': new, 'tx': tx, 'plan': plan,
               'trust': trust, 'candidates': candidates, 'manifest': manifest,
-              'journal': journal, 'saved_status': saved_status}
+              'journal': journal, 'saved_status': saved_status, 'disk': disk}
     return result
 
 
@@ -370,11 +404,40 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
         write_call_started = False
         boots_written = False
         report_validated = False
+        disk = False
+        selector_started = False
         try:
             ctx = _preflight(work, recovery_ack, updater_version, trusted_key)
             status = dict(ctx['saved_status'])
             initial, plan = ctx['initial'], ctx['plan']
             actual, inactive = initial['actualSlot'], initial['inactiveSlot']
+            disk = ctx.get('disk', False)
+            if disk:
+                started = True
+                system_transaction._save_json(work, 'recovery-ack.json', recovery_ack)
+                status.update(state='executing', phase='switching_armada_boot')
+                system_transaction._save_json(work, 'status.json', status)
+                switch = plan['armadaBootSwitch']
+                system_transaction._save_json(work, 'write-report.json', {
+                    'schemaVersion': 1, 'phase': 'armada_boot_switch_intent',
+                    'transactionId': ctx['tx'], 'planSha256': status['planSha256'],
+                    'armadaBootSwitch': switch,
+                })
+                try:
+                    boot_disk_switch.activate(
+                        Path(plan['sysrootPath']), initial, switch, trusted_key=trusted_key,
+                        receipt={key: status[key] for key in
+                                 ('transactionId', 'planSha256', 'fromSlot', 'targetSlot')},
+                        reclaim_failed_target=True)
+                except boot_disk_switch.BootDiskSwitchUncertainError:
+                    selector_started = True
+                    raise
+                else:
+                    selector_started = True
+                status.update(state='awaiting_reboot', phase='awaiting_reboot',
+                              requiresReboot=True, bootWriteState='not_started')
+                system_transaction._save_json(work, 'status.json', status)
+                return status
             record = _build_record(ctx, ctx['saved_status']['planSha256'])
             started = True
             system_transaction._save_json(work, 'recovery-ack.json', recovery_ack)
@@ -449,7 +512,10 @@ def _execute_offline_update(*, work_dir=None, recovery_ack,
             status['phase'] = 'failed'
             status['requiresReboot'] = False
             status['slotControlState'] = 'not_issued'
-            if not write_call_started:
+            if disk:
+                status['bootWriteState'] = 'not_started'
+                status['state'] = 'recovery_required' if selector_started else 'failed'
+            elif not write_call_started:
                 status['bootWriteState'] = 'not_started'
                 status['state'] = 'failed'
             elif (isinstance(exc, offline_boot_writer.BootWriteError) and

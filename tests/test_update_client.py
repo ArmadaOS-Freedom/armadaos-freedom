@@ -174,6 +174,43 @@ class LegacyCliTest(unittest.TestCase):
             self.assertIn("armada-update:", err)
 
 
+# system/tests/test_update_client.py — insert after test_apply_pending_progress_and_terminal_guards, before class UpdateClientTest
+    def test_apply_accepts_disk_boot_verified_result(self):
+        def run(comp, op, **kw):
+            if op == "status":
+                return {"state": "installed"}
+            return {"state": "awaiting_reboot", "requiresReboot": True,
+                    "bootSource": "armada_boot",
+                    "bootWriteState": "not_started",
+                    "fromSlot": None, "targetSlot": None,
+                    "slotControlState": "not_issued",
+                    "bootPolicy": "dual-boot-no-slot-control"}
+
+        ok = mock.Mock(run=mock.Mock(side_effect=run))
+        rc, out, err = self._run_cli([], ok)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "100%\n")
+
+        for bad in (
+            {"state": "awaiting_reboot", "requiresReboot": True,
+             "bootSource": "armada_boot", "bootWriteState": "not_started",
+             "fromSlot": 0, "targetSlot": 1,
+             "slotControlState": "not_issued",
+             "bootPolicy": "dual-boot-no-slot-control"},
+            {"state": "awaiting_reboot", "requiresReboot": True,
+             "bootSource": "armada_boot", "bootWriteState": "written",
+             "fromSlot": None, "targetSlot": None,
+             "slotControlState": "not_issued",
+             "bootPolicy": "dual-boot-no-slot-control"},
+        ):
+            with self.subTest(bad=bad):
+                c = mock.Mock()
+                c.run.side_effect = [{"state": "up_to_date"}, bad]
+                rc, out, err = self._run_cli([], c)
+                self.assertEqual(rc, 7)
+                self.assertNotIn("100%", out)
+                self.assertIn("armada-update:", err)
+
 class UpdateClientTest(unittest.TestCase):
     def test_operation_mapping_and_polling(self):
         expected = [

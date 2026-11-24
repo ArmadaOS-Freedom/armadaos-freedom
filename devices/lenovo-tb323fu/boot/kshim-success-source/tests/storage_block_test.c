@@ -3,12 +3,15 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+/* Declared by the next work order; provided here so this test file compiles
+ * and exercises the contract before production code lands. */
+int kshim_gpt_find_linux_boot(const struct kshim_blockdev *, struct kshim_partition *, void *, size_t);
 static unsigned char disk[4096u * 1024u], scratch[8192];
 static unsigned reads, writes;
 static int read_error;
 static struct kshim_blockdev dev;
-static void le32(unsigned char *p, uint32_t n) { for (unsigned i=0;i<4;i++) p[i]=(unsigned char)(n>>(8*i)); }
-static void le64(unsigned char *p, uint64_t n) { for (unsigned i=0;i<8;i++) p[i]=(unsigned char)(n>>(8*i)); }
+static void le32(unsigned char *p, uint32_t n) { for(unsigned i=0;i<4;i++) p[i]=(unsigned char)(n>>(8*i)); }
+static void le64(unsigned char *p, uint64_t n) { for(unsigned i=0;i<8;i++) p[i]=(unsigned char)(n>>(8*i)); }
 /* Independent MSB-first polynomial division with explicit reflected input. */
 static uint32_t fixture_crc(const unsigned char *p, size_t n) {
     uint32_t crc=~0u;
@@ -48,6 +51,7 @@ static void fixture(unsigned block_size) {
     reseal(); reads=writes=0; read_error=0;
 }
 static int find(struct kshim_partition *p) { return kshim_gpt_find_backup(&dev,p,scratch,sizeof(scratch)); }
+static int find_boot(struct kshim_partition *p) { return kshim_gpt_find_linux_boot(&dev,p,scratch,sizeof(scratch)); }
 static void test_boundaries(void) {
     /* Missing bounds checks would permit callbacks for past-end/wrapped IO. */
     fixture(512); unsigned before=reads;
@@ -93,9 +97,60 @@ static void test_gpt(unsigned bs) {
     fixture(bs); assert(kshim_gpt_find_backup(&dev,&p,scratch,8191)==KSHIM_STORAGE_ARG);
     assert(writes==0);
 }
+static void seed_boot(const char *name) {
+    static const unsigned char uuid_boot[16]={0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0x11,0x22};
+    entry(2)[0]=1; memcpy(entry(2)+16,uuid_boot,16);
+    le64(entry(2)+32,800); le64(entry(2)+40,899);
+    memset(entry(2)+56,0,72);
+    for(unsigned i=0;name && name[i];i++) entry(2)[56+2*i]=(unsigned char)name[i];
+    reseal();
+}
+static void test_linux_boot(unsigned bs) {
+    /* ARMADA_BOOT must be selected by exact (NUL-terminated UTF-16LE) name,
+     * with the correct range/UUID, while ARMADA_BACKUP keeps prior behavior. */
+    static const unsigned char want_backup[16]={0xb0,0xe3,0x4a,0x51,0x64,0x12,0x45,0xec,0xb0,0x45,0xbe,0xf3,0x66,0x4d,0x14,0xd3};
+    static const unsigned char want_boot[16]={0x44,0x33,0x22,0x11,0x66,0x55,0x88,0x77,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0x11,0x22};
+    struct kshim_partition p;
+    /* No ARMADA_BOOT present: NOT_FOUND, no writes. */
+    fixture(bs); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    /* ARMADA_BACKUP still found via old entry point. */
+    assert(find(&p)==0 && p.first_lba==300 && p.last_lba==799);
+    assert(memcmp(p.uuid,want_backup,16)==0 && writes==0);
+    /* Exact match selects correct range and UUID. */
+    fixture(bs); seed_boot("ARMADA_BOOT"); assert(writes==0);
+    assert(find_boot(&p)==0); assert(p.first_lba==800 && p.last_lba==899);
+    assert(memcmp(p.uuid,want_boot,16)==0);
+    /* ARMADA_BACKUP behavior unchanged in the presence of ARMADA_BOOT. */
+    struct kshim_partition pb; assert(find(&pb)==0);
+    assert(pb.first_lba==300 && pb.last_lba==799 && memcmp(pb.uuid,want_backup,16)==0);
+    assert(writes==0);
+    /* Suffix / prefix must not match. */
+    fixture(bs); seed_boot("ARMADA_BOOT-old"); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    fixture(bs); seed_boot("ARMADA_BOOTX"); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    fixture(bs); seed_boot("xARMADA_BOOT"); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    fixture(bs); seed_boot("ARMADA_BOO"); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    /* Duplicate exact names rejected. */
+    fixture(bs); seed_boot("ARMADA_BOOT");
+    entry(3)[0]=1; entry(3)[16]=3; le64(entry(3)+32,900); le64(entry(3)+40,950);
+    memset(entry(3)+56,0,72);
+    for(unsigned i=0;"ARMADA_BOOT"[i];i++) entry(3)[56+2*i]=(unsigned char)"ARMADA_BOOT"[i];
+    reseal(); assert(find_boot(&p)==KSHIM_STORAGE_CONFLICT);
+    /* CRC failure surfaces even without a matching entry. */
+    fixture(bs); assert(find_boot(&p)==KSHIM_STORAGE_NOT_FOUND);
+    fixture(bs); disk[bs+16]^=1; assert(find_boot(&p)==KSHIM_STORAGE_CRC);
+    /* IO failure propagated. */
+    fixture(bs); read_error=1; assert(find_boot(&p)==KSHIM_STORAGE_IO);
+    /* Buffer-too-small argument check. */
+    fixture(bs); seed_boot("ARMADA_BOOT");
+    assert(kshim_gpt_find_linux_boot(&dev,&p,scratch,8191)==KSHIM_STORAGE_ARG);
+    /* Small buffer larger than required entry table is accepted. */
+    assert(kshim_gpt_find_linux_boot(&dev,&p,scratch,8192)==0);
+    assert(writes==0);
+}
 int main(void) {
     assert(fixture_crc((const unsigned char *)"123456789",9)==0xcbf43926u);
     test_boundaries(); test_gpt(512); test_gpt(4096);
+    test_linux_boot(512); test_linux_boot(4096);
     assert(kshim_crc32("123456789",9)==0xcbf43926u);
     assert(kshim_crc32("",0)==0);
     puts("PASS storage_block: bounds, 512/4096 GPT CRC, GUID, uniqueness, overlap, IO");

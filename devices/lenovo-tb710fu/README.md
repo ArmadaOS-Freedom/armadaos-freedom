@@ -60,7 +60,7 @@ ArmadaOS Freedom 统一内核与 kShimC 启动菜单对小新 Pad Pro GT 的适�
 
 ## 已知问题与待完成项
 
-- **系统更新：** 系统更新后重新生成并写入 boot 的流程目前不支持 TB710FU（本机要求 boot 用测试密钥签名并写入 `boot_a`）。在支持之前，**装好后不要做系统更新**，否则可能无法启动。
+- **系统更新：** TB710FU 使用与 Y700 相同的双槽更新：每次系统更新用两个槽各自已校验的引导材料分别重建并写入 `boot_a`、`boot_b`，只对 boot 用测试密钥重新签名（AospPreserved），两个槽启动同一个 Linux 部署；Android 的槽位选择和 vbmeta、recovery、vbmeta_system 不变。用不含该后端的旧部署包装的系统没有这条更新路径，**不要在旧系统上做系统更新**（可能无法启动），请用新部署包重新安装。
 - **桌面模式：** 当前镜像里 KWin 与 Plasma 组件版本不一致，切换到桌面会退回游戏模式。这个问题与机型无关，所有设备都受影响。
 - **手写笔（游戏模式）：** gamescope 不处理手写笔（tablet-tool）事件，游戏模式下需要另外把笔转成触摸。
 - **充电上限：** 充到 80% 后停止，与 sysfs 的 `charge_control_*_threshold` 无关，推测是 ADSP 一侧保存的上限（可能来自 Android 下的“智能充电”设置），尚未查清。
@@ -119,7 +119,7 @@ bash packages/kernel/scripts/build-kernel.sh
 加速度计、光线等传感器挂在 ADSP 的传感器中枢（SSC）上，不是 IIO 设备。读取链路：
 
 1. **设备树**：ADSP 的 FastRPC 节点去掉 `qcom,non-secure-domain`，内核只建 `/dev/fastrpc-adsp-secure`。SM8650 的传感器 PD 只在 secure 会话下加载传感器；用普通节点时 ADSP 每秒报 `Handover signaled, but it already happened`，传感器列表为空。这个节点只有 hexagonrpcd 使用，音频走 GPR，CDSP 不变。
-2. **传感器文件**：传感器中枢运行时向主机要 DSP 库、传感器配置和注册表（含本机校准）。这些是联想的私有文件，镜像不带；`tb710fu-hexagonrpcd.service` 每次启动前先运行 `tb710fu-sensors-prepare`，从当前 Android 槽**只读**复制到 `/var/lib/tb710fu-sensors`：
+2. **传感器文件**：传感器中枢运行时向主机要 DSP 库、传感器配置和注册表（含本机校准）。这些是联想的私有文件，镜像不带；`tb710fu-hexagonrpcd.service` 每次启动前先运行 `tb710fu-sensors-prepare.service`（单独的单元：守护进程的 `DevicePolicy=` 作用于整个控制组，在它里面运行的准备脚本打不开 Android 分区），从当前 Android 槽**只读**复制到 `/var/lib/tb710fu-sensors`：
 
    | 来源 | 目标 |
    |---|---|
@@ -127,7 +127,9 @@ bash packages/kernel/scripts/build-kernel.sh
    | super 里 `vendor_<槽>`（erofs）的 `/etc/sensors/config/`、`/etc/sensors/sns_reg_config` | `fw/sensors/config/`、`fw/sensors/sns_reg.conf` |
    | `persist` 分区（ext4）的 `/sensors/registry/` | `registry/`（只在第一次复制） |
 
-   当前槽取自 GPT 属性（`boot_a`/`boot_b` 的 active 位）；super 的动态分区表在脚本里解析，ext4 用 `debugfs`（不带 `-w`），erofs 用 `dump.erofs --offset`，都只读打开，不挂载、**不写任何分区**。`fw/` 在槽、dsp 分区或 vendor 里的传感器文件变化时重新提取（`stamp.json` 记录来源）；每次复制都对照源文件系统的清单核对名字和大小，核对通过才替换旧文件。提取失败时服务启动失败，由 `Restart=` 连同提取一起重试（3 秒起，逐步退到 1 分钟）。
+   当前槽取自 GPT 属性（`boot_a`/`boot_b` 的 active 位）；super 的动态分区表在脚本里解析（主副本读不出或校验不过时用备份副本，同 liblp），ext4 用 `debugfs`（不带 `-w`），erofs 用 `dump.erofs --offset`，都只读打开，不挂载、**不写任何分区**。`fw/` 在槽、dsp 分区或 vendor 里的传感器文件变化时重新提取（`stamp.json` 记录来源）；每次复制都对照源文件系统的清单核对名字和大小，核对通过才替换旧文件；`dump.erofs` 在 stderr 报错（即使退出码为 0）也算失败。提取失败时服务启动失败，由 `Restart=` 连同提取一起重试（3 秒起，逐步退到 1 分钟）。
+
+   **分区布局要求**：当前槽的 `vendor_<槽>` 必须是 erofs，并且在 super 里只占**一个线性区段**。Android 重新分区后如果 vendor 被拆成多个区段，准备脚本会报 `vendor_<槽> is not one extent` 并一直失败，重试不会好转——这是不支持的布局，不是暂时的读取错误；格式不对则报 `vendor is not erofs`。
 3. **hexagonrpcd**（`tb710fu-hexagonrpcd.service`）：传感器中枢启动时会写注册表目录（写 `DIR` 探测可写、写临时文件后改名为 `parsed_file_list.csv`），失败就不加载传感器。镜像里的 hexagonrpcd 带两个补丁（[`packages/hexagonrpc`](../../packages/hexagonrpc/PATCHES.md)）：`HEXAGONRPCD_WRITABLE_REGISTRY` 指向的主机目录作为可写注册表（只允许该目录及其 `registry/` 子目录里的普通文件），以及超过 256 字节的输入缓冲。这里指向 `/var/lib/tb710fu-sensors/registry`，persist 本身保持原样。要恢复成 persist 里的原始注册表，删除这个目录后重启即可。
 4. **iio-sensor-proxy**：镜像改用带 libssc 后端的 3.9（[`packages/iio-sensor-proxy`](../../packages/iio-sensor-proxy/BASE.env)），其它机型的 IIO 传感器行为不变。`81-armada-tb710fu-sensors.rules` 给 secure 节点设 `IIO_SENSOR_PROXY_TYPE=ssc-accel ssc-light ssc-proximity` 和挂载矩阵 `0, 1, 0; -1, 0, 0; 0, 0, 1`（面板原生横屏；顺时针转一圈依次报 normal → left-up → bottom-up → right-up），并在节点出现时启动上面两个服务。传感器中枢在 hexagonrpcd 启动几秒后才就绪，`tb710fu-sensors-generator` 只在本机给 iio-sensor-proxy 加上找不到传感器时重试。休眠前停止 iio-sensor-proxy、唤醒后恢复（`45-tb710fu-sensors`），避免加速度计流在 s2idle 中反复唤醒 ADSP（五代上测得的现象）。
 

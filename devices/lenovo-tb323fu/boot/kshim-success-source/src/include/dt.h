@@ -27,7 +27,9 @@ int dt_reservations(const void *fdt, struct dt_range *ranges, bool *no_map,
 /* Contract: callers must dt_validate the blob first. The tree must stay
  * immutable and initialization is single-threaded, non-nested scope; call
  * dt_parent_index_end before any mutation. Larger or deeper trees fall back
- * unchanged; 8192 nodes / 64 levels are performance caps only. */
+ * unchanged; 8192 nodes / 64 levels are performance caps only. The same scope
+ * also indexes phandles for dt_phandle(); outside it dt_phandle() keeps its
+ * full walk, and neither the index nor its lifetime ever outlives the scope. */
 void dt_parent_index_begin(const void *fdt);
 void dt_parent_index_end(void);
 int dt_parent_offset(const void *fdt, int offset);

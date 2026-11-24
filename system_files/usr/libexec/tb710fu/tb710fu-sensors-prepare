@@ -115,17 +115,27 @@ def pread_exact(f, size, offset):
 
 
 def lp_geometry(f):
-    """The primary geometry, or the backup copy when the primary is invalid."""
+    """The primary geometry, or the backup copy when the primary cannot be
+    read or is invalid (like liblp)."""
+    errors = []
     for offset in (LP_RESERVED, LP_RESERVED + LP_GEOMETRY_SIZE):
-        geo = pread_exact(f, LP_GEOMETRY_SIZE, offset)
+        try:
+            geo = pread_exact(f, LP_GEOMETRY_SIZE, offset)
+        except (PrepareError, OSError) as exc:
+            errors.append('read: %s' % exc)
+            continue
         magic, struct_size = struct.unpack_from('<II', geo, 0)
         if magic != LP_GEOMETRY_MAGIC or not 52 <= struct_size <= LP_GEOMETRY_SIZE:
+            errors.append('invalid')
             continue
         checked = bytearray(geo[:struct_size])
         checked[8:40] = bytes(32)
-        if hashlib.sha256(checked).digest() == geo[8:40]:
-            return struct.unpack_from('<III', geo, 40)
-    raise PrepareError('super has no valid dynamic partition geometry')
+        if hashlib.sha256(checked).digest() != geo[8:40]:
+            errors.append('checksum mismatch')
+            continue
+        return struct.unpack_from('<III', geo, 40)
+    raise PrepareError('super has no valid dynamic partition geometry (%s)'
+                       % ' / '.join(errors))
 
 
 def lp_metadata_error(meta, max_size):
@@ -145,11 +155,30 @@ def lp_metadata_error(meta, max_size):
     return None
 
 
+def lp_tables(meta):
+    """(partition entries, extents) of a checksummed metadata copy. Like liblp,
+    the table bounds are checked before the copy is accepted."""
+    header_size, = struct.unpack_from('<I', meta, 8)
+    tables_size, = struct.unpack_from('<I', meta, 44)
+    tables = meta[header_size:header_size + tables_size]
+
+    def table(index, entry_min):
+        offset, count, entry = struct.unpack_from('<III', meta, 80 + 12 * index)
+        if entry < entry_min or offset + count * entry > tables_size:
+            raise PrepareError('table %d invalid' % index)
+        return [tables[offset + i * entry:offset + (i + 1) * entry]
+                for i in range(count)]
+
+    extents = [struct.unpack_from('<QIQI', e) for e in table(1, 24)]
+    entries = [struct.unpack_from('<36sIIII', e) for e in table(0, 52)]
+    return entries, extents
+
+
 def lp_partition_extent(super_path, name, metadata_slot):
     """Byte offset and size of a dynamic partition stored in one linear extent.
 
     Like liblp, the backup copy of the slot's metadata is used when the
-    primary copy does not validate.
+    primary copy cannot be read or does not validate.
     """
     with open(super_path, 'rb') as f:
         size = f.seek(0, os.SEEK_END)
@@ -159,28 +188,23 @@ def lp_partition_extent(super_path, name, metadata_slot):
         primary = LP_RESERVED + 2 * LP_GEOMETRY_SIZE
         errors = []
         for base in (primary, primary + slots * max_size):
-            meta = pread_exact(f, max_size, base + metadata_slot * max_size)
+            try:
+                meta = pread_exact(f, max_size, base + metadata_slot * max_size)
+            except (PrepareError, OSError) as exc:
+                errors.append('read: %s' % exc)
+                continue
             error = lp_metadata_error(meta, max_size)
             if error is None:
-                break
+                try:
+                    entries, extents = lp_tables(meta)
+                    break
+                except PrepareError as exc:
+                    error = str(exc)
             errors.append(error)
         else:
             raise PrepareError('super metadata ' + ' / '.join(errors))
 
-    header_size, = struct.unpack_from('<I', meta, 8)
-    tables_size, = struct.unpack_from('<I', meta, 44)
-    tables = meta[header_size:header_size + tables_size]
-
-    def table(index, entry_min):
-        offset, count, entry = struct.unpack_from('<III', meta, 80 + 12 * index)
-        if entry < entry_min or offset + count * entry > tables_size:
-            raise PrepareError('super metadata table %d invalid' % index)
-        return [tables[offset + i * entry:offset + (i + 1) * entry]
-                for i in range(count)]
-
-    extents = [struct.unpack_from('<QIQI', e) for e in table(1, 24)]
-    for entry in table(0, 52):
-        raw, _, first, count, _ = struct.unpack_from('<36sIIII', entry)
+    for raw, _, first, count, _ in entries:
         if raw.rstrip(b'\0').decode('ascii', 'replace') != name:
             continue
         if count != 1 or first >= len(extents):
@@ -287,8 +311,15 @@ def debugfs_rdump(device, source, dest):
 
 
 def erofs(super_path, offset, *args):
-    return subprocess.run([DUMP_EROFS, '--offset=%d' % offset, *args, super_path],
-                          check=True, capture_output=True).stdout
+    """Run dump.erofs. It can report a read error and still exit 0 with part of
+    the output, so anything on stderr counts as a failure."""
+    result = subprocess.run([DUMP_EROFS, '--offset=%d' % offset, *args, super_path],
+                            capture_output=True)
+    errors = result.stderr.decode('utf-8', 'replace').strip()
+    if result.returncode != 0 or errors:
+        raise PrepareError('dump.erofs %s failed: %s'
+                           % (' '.join(args), errors or result.returncode))
+    return result.stdout
 
 
 def erofs_regular_files(super_path, offset, directory):

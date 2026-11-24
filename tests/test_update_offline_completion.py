@@ -144,6 +144,66 @@ class IdentityTests(unittest.TestCase):
         self.assertIsNone(offline_completion.document_identity(prepared, None))
         self.assertIsNone(offline_completion.document_identity(None, plan))
 
+    def test_session_identity_accepts_null_slots_with_armada_boot(self):
+        result = dict(receipt()['result'], fromSlot=None, targetSlot=None,
+                      bootSource='armada_boot')
+        identity = offline_completion.session_identity(
+            {'state': 'awaiting_reboot', 'result': result})
+        self.assertEqual(identity['transactionId'], TX)
+        self.assertIsNone(identity['fromSlot'])
+        self.assertIsNone(identity['targetSlot'])
+
+    def test_session_identity_rejects_missing_or_invalid_bindings(self):
+        without_marker = {'state': 'awaiting_reboot',
+                          'result': dict(receipt()['result'],
+                                         fromSlot=None, targetSlot=None)}
+        self.assertIsNone(offline_completion.session_identity(without_marker))
+        for field in ('fromSlot', 'targetSlot'):
+            with self.subTest(missing=field):
+                body = dict(receipt()['result'], fromSlot=None, targetSlot=None,
+                            bootSource='armada_boot')
+                del body[field]
+                self.assertIsNone(offline_completion.session_identity(
+                    {'state': 'awaiting_reboot', 'result': body}))
+        for field in ('transactionId', 'oldDeployment', 'newDeployment', 'planSha256'):
+            with self.subTest(invalid=field):
+                body = dict(receipt()['result'], fromSlot=None, targetSlot=None,
+                            bootSource='armada_boot', **{field: None})
+                self.assertIsNone(offline_completion.session_identity(
+                    {'state': 'awaiting_reboot', 'result': body}))
+        original_slots = receipt(bootSource='armada_boot')
+        self.assertIsNone(offline_completion.session_identity(original_slots))
+
+    def test_document_identity_accepts_null_plan_slots_with_switch(self):
+        plan = {'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
+                'fromSlot': None, 'targetSlot': None,
+                'armadaBootSwitch': {'source': 'armada_boot'}}
+        prepared = {'transactionId': TX, 'planSha256': SHA}
+        identity = offline_completion.document_identity(prepared, plan, SHA)
+        self.assertEqual(identity['transactionId'], TX)
+        self.assertIsNone(identity['fromSlot'])
+        self.assertIsNone(identity['targetSlot'])
+
+    def test_document_identity_rejects_incomplete_switch_evidence(self):
+        base_plan = {'transactionId': TX, 'oldDeployment': OLD, 'newDeployment': NEW,
+                     'fromSlot': None, 'targetSlot': None,
+                     'armadaBootSwitch': {'source': 'armada_boot'}}
+        prepared = {'transactionId': TX, 'planSha256': SHA}
+        dropped = dict(base_plan)
+        del dropped['newDeployment']
+        self.assertIsNone(offline_completion.document_identity(prepared, dropped, SHA))
+        without_switch = dict(base_plan)
+        del without_switch['armadaBootSwitch']
+        self.assertIsNone(offline_completion.document_identity(prepared, without_switch, SHA))
+        self.assertIsNone(offline_completion.document_identity(prepared, base_plan, OTHER_SHA))
+        no_boot_source = dict(base_plan, armadaBootSwitch=None,
+                              fromSlot='a', targetSlot='b')
+        no_boot_source.pop('armadaBootSwitch', None)
+        no_boot_source_without_slots = dict(no_boot_source)
+        no_boot_source_without_slots['armadaBootSwitch'] = None
+        self.assertIsNone(offline_completion.document_identity(
+            prepared, no_boot_source_without_slots, SHA))
+
 
 class ExecuteCompletionTests(unittest.TestCase):
     """The shared validator must reject any write report it cannot verify."""

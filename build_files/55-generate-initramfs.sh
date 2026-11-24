@@ -76,6 +76,7 @@ required=(
     usr/share/armada/splash/splash.asp \
     usr/libexec/armada/armada-ostree-fallback \
     usr/libexec/armada/armada-bound-deployment \
+    var/lib/dracut/hooks/pre-mount/90-armada-diagnostic-return.sh \
     usr/lib/systemd/system/ostree-prepare-root.service.d/armada-fallback.conf \
     usr/lib/ostree/ostree-prepare-root
 )

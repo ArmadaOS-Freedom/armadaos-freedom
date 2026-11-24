@@ -105,8 +105,25 @@ class UpdateBootPayloadTests(unittest.TestCase):
         )
         return bytes(data)
 
+    def _use_custom_profile(self) -> str:
+        """Add a registered profile outside the mirrored-policy table.
+
+        Every shipped profile is now a mirrored-policy model, so the
+        policy-specific negative path needs a custom install-only profile.
+        """
+        custom = "CUSTOM9"
+        self.assertNotIn(custom, boot_payload.MIRROR_POLICY_MODELS)
+        cfg = copy.deepcopy(self.cfg)
+        profile = copy.deepcopy(next(iter(cfg["profiles"].values())))
+        profile["dtb"] = "custom/custom9.dtb"
+        cfg["profiles"][custom] = profile
+        self.cfg = cfg
+        self.models = list(cfg["profiles"])
+        return custom
+
     def test_mirror_marker_gate_is_policy_specific(self) -> None:
-        for model in ("TB322FC", "TB323FU"):
+        for model in ("TB322FC", "TB323FU", "TB710FU"):
+            self.assertIn(model, boot_payload.MIRROR_POLICY_MODELS)
             if model not in self.models:
                 continue
             with self.subTest(model=model):
@@ -130,17 +147,18 @@ class UpdateBootPayloadTests(unittest.TestCase):
                     document["models"][model]["runtime"]["sha256"],
                 )
 
-        if "TB710FU" in self.models:
-            root = self._make_root()
-            document = copy.deepcopy(boot_payload.create_manifest(root))
-            self._unmark_runtime(root, "TB710FU", document)
-            verified = boot_payload.verify_manifest(
-                root, "TB710FU", document, require_runtime_marker=True
-            )
-            self.assertEqual(
-                verified["runtime"]["sha256"],
-                document["models"]["TB710FU"]["runtime"]["sha256"],
-            )
+        # A profile outside the mirrored-policy table is not gated.
+        custom = self._use_custom_profile()
+        root = self._make_root()
+        document = copy.deepcopy(boot_payload.create_manifest(root))
+        self._unmark_runtime(root, custom, document)
+        verified = boot_payload.verify_manifest(
+            root, custom, document, require_runtime_marker=True
+        )
+        self.assertEqual(
+            verified["runtime"]["sha256"],
+            document["models"][custom]["runtime"]["sha256"],
+        )
 
     def test_mutated_files_and_symlinks_rejected(self) -> None:
         m0 = self.models[0]
@@ -373,7 +391,7 @@ class UpdateBootPayloadTests(unittest.TestCase):
 
     def test_package_builder_requires_mirror_marker(self):
         wrapper = self._load_wrapper()
-        for model in ("TB322FC", "TB323FU"):
+        for model in ("TB322FC", "TB323FU", "TB710FU"):
             if model not in self.models:
                 continue
             with self.subTest(model=model):
@@ -384,11 +402,12 @@ class UpdateBootPayloadTests(unittest.TestCase):
                 ):
                     self._call_verified(wrapper, case, [model], {})
 
-        if "TB710FU" in self.models:
-            case = self._prepare_case(["TB710FU"])
-            digest = self._unmark_case_runtime(case, "TB710FU")
-            verified = self._call_verified(wrapper, case, ["TB710FU"], {})
-            self.assertEqual(verified["TB710FU"]["sha256"], digest)
+        # A custom profile outside the mirrored-policy table is not gated.
+        custom = self._use_custom_profile()
+        case = self._prepare_case([custom])
+        digest = self._unmark_case_runtime(case, custom)
+        verified = self._call_verified(wrapper, case, [custom], {})
+        self.assertEqual(verified[custom]["sha256"], digest)
 
     def test_external_runtime_crosscheck_rejections(self):
         wrapper = self._load_wrapper()

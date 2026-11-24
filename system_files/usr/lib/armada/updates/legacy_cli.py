@@ -1,7 +1,10 @@
 """Compatibility adapter for the legacy Steam system-update command."""
 
+# updates/legacy_cli.py — add helper import near standard imports
 import re
 import sys
+
+from .client import system_reboot_ready
 
 _COMMIT = re.compile(r"[0-9a-f]{64}\Z")
 _DEPLOYMENT = re.compile(
@@ -70,12 +73,11 @@ def main(argv=None, client=None):
                 print("0%", flush=True)
                 progress["started"] = True
 
+# updates/legacy_cli.py — replace the terminal success assignment block
         result = client.run("system", "update", on_progress=on_progress)
         complete = result.get("state") == "up_to_date"
         if _awaiting_reboot(result):
-            complete = (result.get("bootWriteState") == "written"
-                        and result.get("bootPolicy") == "dual-boot-no-slot-control"
-                        and result.get("slotControlState") == "not_issued")
+            complete = system_reboot_ready(result)
         if complete:
             print("100%", flush=True)
             return 0

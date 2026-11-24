@@ -185,9 +185,13 @@ class ImageSourceIntegrationTests(unittest.TestCase):
             "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
             f"armadaos-freedom:stable@{pkg['ociDigest']}"
         )
+        expected_pull_ref = (
+            "ostree-image-signed:docker://ghcr.io/armadaos-freedom/"
+            f"armadaos-freedom@{pkg['ociDigest']}"
+        )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], work / "staging-repo")
-        self.assertEqual(calls[0][1], expected_origin)
+        self.assertEqual(calls[0][1], expected_pull_ref)
         self.assertEqual(calls[0][2], work)
         self.assertEqual(result["commit"], commit)
         self.assertEqual(result["package"], pkg)

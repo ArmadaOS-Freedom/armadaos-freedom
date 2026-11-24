@@ -112,6 +112,8 @@ kshim_test(crdk_poll_test crdk_poll_test.c)
 target_link_libraries(crdk_poll_test PRIVATE crdk)
 kshim_test(dt_handoff_test dt_handoff_test.c)
 target_link_libraries(dt_handoff_test PRIVATE kshim_dt)
+kshim_test(boot_disk_memory_test boot_disk_memory_test.c "${KSHIM_ROOT}/src/dt/boot_disk_memory.c" "${KSHIM_ROOT}/src/arch/arm64/boot_disk_stage.c")
+target_link_libraries(boot_disk_memory_test PRIVATE kshim_dt)
 kshim_test(initrd_test initrd_test.c)
 target_link_libraries(initrd_test PRIVATE kshim_dt)
 kshim_test(dt_handoff_reservations_test dt_handoff_reservations_test.c)
@@ -232,6 +234,12 @@ target_link_options(dt_compatible_index_test PRIVATE -Wl,--wrap=fdt_node_offset_
 kshim_test(dt_phandle_scan_test phandle_scan_test.c)
 target_link_libraries(dt_phandle_scan_test PRIVATE kshim_dt)
 target_link_options(dt_phandle_scan_test PRIVATE -Wl,--wrap=fdt_getprop)
+
+# Indexed phandle lookup: wrap fdt_next_node to observe that bulk indexed
+# lookups never walk the tree.
+kshim_test(dt_phandle_index_test phandle_index_test.c)
+target_link_libraries(dt_phandle_index_test PRIVATE kshim_dt)
+target_link_options(dt_phandle_index_test PRIVATE -Wl,--wrap=fdt_next_node)
 
 kshim_test(dt_probe_report_test probe_report_test.c)
 target_link_libraries(dt_probe_report_test PRIVATE kshim_dt)
@@ -505,3 +513,12 @@ target_link_libraries(android_touch_spi_trial_test PRIVATE kshim_dt)
 add_test(NAME android_touch_profile_test
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/android_touch_profile_test.py"
         --cc "${CMAKE_C_COMPILER}" --crdk-include "${CRDK_ROOT}/Include")
+
+# --- ext4 read-only boot image test (build target only; no CTest entry here) ---
+add_executable(boot_ext4_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/boot_ext4_test.c
+    ${KSHIM_ROOT}/src/core/boot_ext4.c
+    ${KSHIM_ROOT}/src/core/storage_block.c
+)
+target_compile_options(boot_ext4_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+target_include_directories(boot_ext4_test PRIVATE ${KSHIM_ROOT}/src/include)

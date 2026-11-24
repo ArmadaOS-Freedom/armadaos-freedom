@@ -7,6 +7,7 @@
 | 本仓库源文件 | 目标部署路径 | 属主/权限 |
 | --- | --- | --- |
 | [DSP 保护配置](../rootfs/usr/share/tb323fu/pipewire/tb323fu-speakers-protection.json) | `/usr/share/tb323fu/pipewire/tb323fu-speakers-protection.json` | root:root / mode 0644 |
+| [扬声器路由脚本](../../../system_files/usr/share/wireplumber/scripts/device/tb323fu-speaker-volume.lua) | `/usr/share/wireplumber/scripts/device/tb323fu-speaker-volume.lua` | root:root / mode 0644 |
 | [WirePlumber 规则](../rootfs/usr/share/wireplumber/wireplumber.conf.d/61-tb323fu-speakers-dsp.conf) | `/usr/share/wireplumber/wireplumber.conf.d/61-tb323fu-speakers-dsp.conf` | root:root / mode 0644 |
 | [功放增益服务](../rootfs/usr/lib/systemd/user/tb323fu-speaker-gain.service) | `/usr/lib/systemd/user/tb323fu-speaker-gain.service` | root:root / mode 0644 |
 | [功放增益程序](../rootfs/usr/libexec/tb323fu/tb323fu-speaker-gain) | `/usr/libexec/tb323fu/tb323fu-speaker-gain` | root:root / mode 0755 |
@@ -20,7 +21,7 @@
 1. 备份并**停用**旧的手动加载配置 `/usr/share/pipewire/pipewire.conf.d/60-tb323fu-speakers.conf`——
    必须把它**移出所有会被扫描的 `*.conf` 目录**；仅改 basename 但仍以 `.conf` 结尾无效。
    目的是确保不再有原手动 `context.modules` 实例，避免出现两个同名保护 sink。
-2. 部署上面四个文件到对应路径；不能遗漏服务调用的增益程序。
+2. 按上表部署五个文件。先安装扬声器路由脚本，再部署引用该脚本的 WirePlumber 规则。
 3. 由 root 在**实际的 armada 用户会话**中（而非 root 自身的 user 会话）替换该 unit 后执行
    `systemctl --user daemon-reload` 与 `systemctl --user enable tb323fu-speaker-gain.service`。
    `enable` 依据 `WantedBy=pipewire.service wireplumber.service` 同时创建

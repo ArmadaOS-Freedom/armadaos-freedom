@@ -30,4 +30,4 @@ remains required and is never a demand to reboot into the other slot.
 # reporting, descriptor minimums and every entrypoint default read this one
 # value, so this baseline stays distinguishable from the pre-unification 0.8.0
 # updater that cannot consume a mixed package.
-UPDATER_VERSION = "0.8.1"
+UPDATER_VERSION = "0.8.2"

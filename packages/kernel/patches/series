@@ -147,6 +147,10 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 1020-wifi-ath12k-send-the-computed-scan-priority-to-the-f.patch
 1021-wifi-ath12k-convert-scan-timeout-to-wiphy-delayed-work.patch
 
+# ============== Video decode ==============
+1030-media-iris-send-the-stream-POC-type.patch
+1031-media-iris-stop-AV1-tier-overwriting-HEVC-tier.patch
+
 # ============== System tweaks ==============
 0500-ROCKNIX-set-boot-fanspeed.patch
 0501-ROCKNIX-fix-wifi-and-bt-mac.patch
@@ -286,6 +290,7 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0189-Bluetooth-qca-baldur-brahma.patch
 0190-drm-msm-baldur-vfp-switch.patch
 0191-drm-msm-baldur-idle-refresh.patch
+0191a-drm-msm-dpu-baldur-idle-refresh-timeouts.patch
 0192-usb-baldur-runtime-pm.patch
 0193-drm-msm-baldur-new-state-bandwidth.patch
 0194-wifi-ath12k-baldur-rx-panic.patch
@@ -302,11 +307,19 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0205-drm-msm-defer-ring-and-vm-free-with-rcu.patch
 0206-drm-msm-adreno-release-autosuspend-on-cleanup.patch
 0207-thermal-step-wise-release-cleared-trip-vote.patch
-0208-input-aw86927-accept-aw86937.patch
+0208a-Input-aw86927-fix-the-7-V-boost-reference-for-AW8693.patch
+0208b-Input-aw86927-widen-the-AW86938-boost-mode-mask.patch
+0208c-dt-bindings-input-awinic-aw86927-document-the-AW8693.patch
+0208d-Input-aw86927-add-support-for-Awinic-AW86937.patch
+0208e-Input-aw86927-handle-the-AW8693X-play-and-boost-regi.patch
+0208f-Input-aw86927-stop-playback-over-suspend-and-on-shut.patch
+0208g-Input-aw86927-retry-playback-after-failed-suspend.patch
 0209-leds-rgb-add-aw22127-driver.patch
+0209a-arm64-dts-qcom-kaanapali-gcc-cx-domain.patch
 0210-drm-msm-snapshot-sspp-rec-blocks.patch
 0211-clk-qcom-kaanapali-fix-pcie-rscc-enable-bits.patch
 0212-clk-qcom-kaanapali-force-pcie-pipe-memory.patch
+0212a-clk-qcom-kaanapali-force-ufs-axi-memory.patch
 0213-clk-qcom-branch-clear-enable-on-failure.patch
 0214-pci-qcom-baldur-disable-slot-hotplug-capabilities.patch
 0215-phy-qcom-qmp-combo-add-kaanapali-usb3-dp.patch
@@ -316,6 +329,11 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0219-drm-msm-dp-reset-sink-link-capabilities.patch
 0220-drm-msm-dp-baldur-balance-plugged-runtime-pm.patch
 0221-drm-msm-dp-baldur-retrain-after-quick-replug.patch
+0221a-usb-typec-fsa4480-keep-usb2-in-dp-only.patch
+0221b-arm64-dts-qcom-kaanapali-qmp-dp-mode-switch.patch
+0221c-usb-dwc3-qcom-restore-utmi-pipe-clock.patch
+0221d-dt-bindings-usb-qcom-dwc3-mode-switch.patch
+0221e-usb-dwc3-qcom-dp-only-utmi-pipe-clock.patch
 0222-arm64-dts-qcom-kaanapali-describe-ufs-mcq.patch
 0223-Bluetooth-qca-baldur-preserve-configured-address.patch
 0224-drm-msm-dpu-sm8850-inline-rotation.patch

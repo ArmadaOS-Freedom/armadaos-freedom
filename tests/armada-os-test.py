@@ -559,6 +559,35 @@ class OperationTests(unittest.TestCase):
         self.command.assert_not_called()
         self.assertTrue(maintenance.status()["reboot_ready"])
 
+# system/tests/armada-os-test.py — insert after test_rollback_executes_via_update_service_and_marks_ready, before test_rollback_rejects_invalid_or_incomplete_service_results
+    def test_rollback_accepts_disk_boot_verified_result(self):
+        self.prepare_rollback()
+        good = {
+            "component": "system",
+            "state": "awaiting_reboot",
+            "requiresReboot": True,
+            "bootSource": "armada_boot",
+            "bootWriteState": "not_started",
+            "fromSlot": None,
+            "targetSlot": None,
+            "slotControlState": "not_issued",
+            "bootPolicy": "dual-boot-no-slot-control",
+            "newDeployment": f"default/{'b' * 64}.0",
+        }
+
+        def responder(component, operation, channel=None, checksum=None, **kwargs):
+            if operation == "status":
+                return copy.deepcopy(self.service_result)
+            if operation == "rollback":
+                self.service_result = copy.deepcopy(good)
+                return copy.deepcopy(self.service_result)
+            raise AssertionError(f"Unexpected call: {operation}")
+
+        self.client_run.side_effect = responder
+        result = self.perform("rollback")
+        self.assertEqual(result["message"], "Rollback ready. Restart to apply.")
+        self.assertTrue(maintenance.status()["reboot_ready"])
+
     def test_rollback_rejects_invalid_or_incomplete_service_results(self):
         good = {
             "component": "system",

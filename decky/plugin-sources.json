@@ -6,6 +6,12 @@
       "directory": "DeckyClash",
       "repository": "chenx-dust/DeckyClash",
       "assetPattern": "DeckyClash-full-linux-arm64.zip"
+    },
+    {
+      "name": "UU加速器",
+      "directory": "uu-accelerator",
+      "repository": "ArmadaOS-Freedom/decky-uu-accelerator",
+      "assetPattern": "uu-accelerator-v*.zip"
     }
   ],
   "git": [
