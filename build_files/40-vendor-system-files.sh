@@ -187,6 +187,7 @@ systemctl enable armada-updates.service
 # can start the Steam update bridge.
 systemctl enable armada-steam-bridge-guard.service
 systemctl enable armada-update-confirm.service
+systemctl enable armada-linux-recovery.service
 systemctl enable armada-control.service
 systemctl enable steamos-manager.service
 systemctl --global enable steamos-manager.service

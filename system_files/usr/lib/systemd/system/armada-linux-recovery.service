@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[Unit]
+Description=Armada Linux early boot recovery
+ConditionPathExists=/sys/firmware/devicetree/base/chosen/armada,boot-recovery
+After=local-fs.target
+Before=armada-update-confirm.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/
+Environment=PYTHONPATH=/usr/lib/armada
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m updates.trial_confirmation
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

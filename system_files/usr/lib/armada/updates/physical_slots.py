@@ -312,8 +312,13 @@ def _inspect_slots(reader, phase):
         for lun in sorted(found):
             item = found[lun]
             fds.append(_device_fd(item['path'], item['rdev']))
-        current, bootable = _read_slot_state(fds, found)
-        selected_slot = 'ab'[current]
+        if context.get('bootSource') == 'armada_boot':
+            current = None
+            bootable = None
+            selected_slot = None
+        else:
+            current, bootable = _read_slot_state(fds, found)
+            selected_slot = 'ab'[current]
         # The controller-selected slot and the Android bootable bits are
         # Android-owned telemetry.  A pending switch must not block the
         # mirrored update: the running slot still comes from the verified boot
@@ -353,11 +358,14 @@ def _inspect_slots(reader, phase):
             'inactiveSlot': context['inactiveSlot'],
         }
         report['deployment'] = context['deployment']
-        report['selectedSlot'] = selected_slot
-        report['bootableSlots'] = dict(bootable)
+        if context.get('bootSource') != 'armada_boot':
+            report['selectedSlot'] = selected_slot
+            report['bootableSlots'] = dict(bootable)
         report['recoveryPartUuid'] = part_uuid
         report['ufsController'] = str(anchor)
         report['luns'] = luns
+        if 'bootSource' in context:
+            report['bootSource'] = context['bootSource']
         return report
     finally:
         for fd in fds:

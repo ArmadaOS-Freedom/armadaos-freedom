@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "lich.wang" <lich.wang@gmail.com>
+Date: Wed, 18 Nov 2026 16:30:47 +0800
+Subject: [PATCH 2/3] rpcd: apps_std: optional writable sensor registry
+
+The sensor hub (SSC) of SM8650 writes its registry directory: it opens a
+probe file for writing, writes a temporary file and renames it to
+parsed_file_list.csv, and stops loading sensors when any of this fails.
+
+When HEXAGONRPCD_WRITABLE_REGISTRY names a host directory, map the whole
+persist sensor registry directory (sns_reg_version, parsed_file_list.csv
+and registry/) to it and allow the DSP to write there:
+
+- fopen with "w" or "a" creates or truncates regular files directly in
+  the registry directory or in its registry/ subdirectory; any other path,
+  name with a slash, "." or "..", and symbolic links are refused;
+- fwrite (5), fsync (23), fremove (24) and frename (33) are implemented
+  for those files only.
+
+Write handles have their own numbers above the hexagonfs descriptors.
+Without the variable nothing changes: the registry stays read-only.
+---
+ hexagonrpcd/apps_std.c           | 309 +++++++++++++++++++++++++++++--
+ hexagonrpcd/interface/apps_std.c |  52 ++++++
+ hexagonrpcd/interface/apps_std.h |   4 +
+ hexagonrpcd/rpcd_builder.c       |  25 ++-
+ 4 files changed, 373 insertions(+), 17 deletions(-)
+
+diff --git a/hexagonrpcd/apps_std.c b/hexagonrpcd/apps_std.c
+index 7172bf0..2eafbf1 100644
+--- a/hexagonrpcd/apps_std.c
++++ b/hexagonrpcd/apps_std.c
+@@ -20,9 +20,11 @@
+  */
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <libhexagonrpc/error.h>
+ #include <stdio.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -32,13 +34,112 @@
+ #include "iobuffer.h"
+ #include "listener.h"
+ 
++/*
++ * Writable sensor registry.
++ *
++ * The sensor hub of newer platforms (SM8650 "lanai") writes its registry
++ * directory and stops loading sensors when that fails. When the environment
++ * variable HEXAGONRPCD_WRITABLE_REGISTRY names a host directory, files that
++ * the DSP opens for writing directly inside the persist registry directory are
++ * created there instead; everything else stays read-only. Point the variable at
++ * the same host directory that is mapped as the registry, so the DSP reads back
++ * what it wrote. Write handles use their own numbers, above the hexagonfs ones.
++ */
++#define APPS_STD_MAX_WFD	16
++#define APPS_STD_WFD_BASE	0x10000
++
++static const char *const apps_std_registry_prefixes[] = {
++	"/mnt/vendor/persist/sensors/registry/",
++	"/persist/sensors/registry/",
++};
++
++/* A plain file name: not empty, no slash, not "." or "..". */
++static bool apps_std_plain_name(const char *name, size_t len)
++{
++	if (len == 0 || memchr(name, '/', len) != NULL)
++		return false;
++
++	return !(len == 1 && name[0] == '.') && !(len == 2 && !strncmp(name, "..", 2));
++}
++
+ struct apps_std_ctx {
+ 	int rootfd;
+ 	int adsp_avs_cfg_dirfd;
+ 	int adsp_library_dirfd;
+ 	struct hexagonfs_fd *fds[HEXAGONFS_MAX_FD];
++	int registry_dirfd;
++	int wfds[APPS_STD_MAX_WFD];
+ };
+ 
++static bool apps_std_is_wfd(uint32_t fd)
++{
++	return fd >= APPS_STD_WFD_BASE
++	    && fd < APPS_STD_WFD_BASE + APPS_STD_MAX_WFD;
++}
++
++/*
++ * The path relative to the registry directory, or NULL when the path is
++ * anything else. Only "<name>" (the registry directory itself, which holds the
++ * version file, the parsed file list and temporary files) and "registry/<name>"
++ * (the registry entries) are accepted.
++ */
++static const char *apps_std_registry_leaf(const char *path)
++{
++	size_t i, n;
++	const char *rel, *slash;
++
++	for (i = 0; i < HRPC_ARRAY_SIZE(apps_std_registry_prefixes); i++) {
++		n = strlen(apps_std_registry_prefixes[i]);
++		if (strncmp(path, apps_std_registry_prefixes[i], n))
++			continue;
++
++		rel = path + n;
++		slash = strchr(rel, '/');
++		if (slash == NULL)
++			return apps_std_plain_name(rel, strlen(rel)) ? rel : NULL;
++
++		if ((size_t) (slash - rel) == strlen("registry")
++		 && !strncmp(rel, "registry", strlen("registry"))
++		 && apps_std_plain_name(slash + 1, strlen(slash + 1)))
++			return rel;
++
++		return NULL;
++	}
++
++	return NULL;
++}
++
++static int apps_std_open_write(struct apps_std_ctx *ctx, const char *path, char mode)
++{
++	const char *leaf;
++	int i, fd;
++
++	if (ctx->registry_dirfd < 0)
++		return -EROFS;
++
++	leaf = apps_std_registry_leaf(path);
++	if (leaf == NULL)
++		return -EACCES;
++
++	for (i = 0; i < APPS_STD_MAX_WFD; i++)
++		if (ctx->wfds[i] < 0)
++			break;
++
++	if (i == APPS_STD_MAX_WFD)
++		return -EMFILE;
++
++	fd = openat(ctx->registry_dirfd, leaf,
++		    O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW
++		    | (mode == 'a' ? O_APPEND : O_TRUNC),
++		    0600);
++	if (fd < 0)
++		return -errno;
++
++	ctx->wfds[i] = fd;
++
++	return APPS_STD_WFD_BASE + i;
++}
++
+ static const int apps_std_whence_table[] = {
+ 	SEEK_SET,
+ 	SEEK_CUR,
+@@ -73,6 +174,20 @@ static uint32_t apps_std_fclose(void *data,
+ 	const uint32_t *first_in = inbufs[0].p;
+ 	int ret;
+ 
++	if (apps_std_is_wfd(*first_in)) {
++		int *wfd = &ctx->wfds[*first_in - APPS_STD_WFD_BASE];
++
++		if (*wfd < 0)
++			return AEE_EBADPARM;
++
++		ret = close(*wfd);
++		*wfd = -1;
++#ifdef HEXAGONRPC_VERBOSE
++		printf("close-write(%u) -> %d\n", *first_in, ret);
++#endif
++		return ret ? AEE_EFAILED : 0;
++	}
++
+ 	ret = hexagonfs_close(ctx->fds, *first_in);
+ 	if (ret) {
+ 		fprintf(stderr, "Could not close: %s\n", strerror(-ret));
+@@ -120,6 +235,134 @@ static uint32_t apps_std_fread(void *data,
+ 	return 0;
+ }
+ 
++static uint32_t apps_std_fwrite(void *data,
++				const struct fastrpc_io_buffer *inbufs,
++				struct fastrpc_io_buffer *outbufs)
++{
++	struct apps_std_ctx *ctx = data;
++	const struct {
++		uint32_t fd;
++		uint32_t buf_size;
++	} *first_in = inbufs[0].p;
++	struct {
++		uint32_t written;
++		uint32_t is_eof;
++	} *first_out = outbufs[0].p;
++	const char *buf = inbufs[1].p;
++	size_t done = 0;
++	ssize_t ret;
++	int wfd;
++
++	if (!apps_std_is_wfd(first_in->fd))
++		return AEE_EBADPARM;
++
++	wfd = ctx->wfds[first_in->fd - APPS_STD_WFD_BASE];
++	if (wfd < 0 || first_in->buf_size > inbufs[1].s)
++		return AEE_EBADPARM;
++
++	while (done < first_in->buf_size) {
++		ret = write(wfd, buf + done, first_in->buf_size - done);
++		if (ret < 0) {
++			if (errno == EINTR)
++				continue;
++			fprintf(stderr, "Could not write file: %s\n", strerror(errno));
++			return AEE_EFAILED;
++		}
++		done += ret;
++	}
++
++#ifdef HEXAGONRPC_VERBOSE
++	printf("write(%u, %u)\n", first_in->fd, first_in->buf_size);
++#endif
++
++	first_out->written = done;
++	first_out->is_eof = 0;
++
++	return 0;
++}
++
++/* A NUL-terminated registry path from inbuf i, relative to the registry directory, or NULL. */
++static const char *apps_std_registry_arg(const struct apps_std_ctx *ctx,
++					 const struct fastrpc_io_buffer *inbufs, int i)
++{
++	if (ctx->registry_dirfd < 0 || inbufs[i].s == 0
++	 || ((const char *) inbufs[i].p)[inbufs[i].s - 1] != 0)
++		return NULL;
++
++	return apps_std_registry_leaf(inbufs[i].p);
++}
++
++static uint32_t apps_std_fremove(void *data,
++				 const struct fastrpc_io_buffer *inbufs,
++				 struct fastrpc_io_buffer *outbufs)
++{
++	struct apps_std_ctx *ctx = data;
++	const char *rel = apps_std_registry_arg(ctx, inbufs, 1);
++
++	if (rel == NULL) {
++		fprintf(stderr, "Refused to remove %s\n",
++			inbufs[1].s ? (const char *) inbufs[1].p : "");
++		return AEE_EUNSUPPORTED;
++	}
++
++	if (unlinkat(ctx->registry_dirfd, rel, 0) && errno != ENOENT) {
++		fprintf(stderr, "Could not remove %s: %s\n", rel, strerror(errno));
++		return AEE_EFAILED;
++	}
++
++#ifdef HEXAGONRPC_VERBOSE
++	printf("remove(%s)\n", rel);
++#endif
++
++	return 0;
++}
++
++static uint32_t apps_std_frename(void *data,
++				 const struct fastrpc_io_buffer *inbufs,
++				 struct fastrpc_io_buffer *outbufs)
++{
++	struct apps_std_ctx *ctx = data;
++	const char *from = apps_std_registry_arg(ctx, inbufs, 1);
++	const char *to = apps_std_registry_arg(ctx, inbufs, 2);
++
++	if (from == NULL || to == NULL) {
++		fprintf(stderr, "Refused to rename %s to %s\n",
++			inbufs[1].s ? (const char *) inbufs[1].p : "",
++			inbufs[2].s ? (const char *) inbufs[2].p : "");
++		return AEE_EUNSUPPORTED;
++	}
++
++	if (renameat(ctx->registry_dirfd, from, ctx->registry_dirfd, to)) {
++		fprintf(stderr, "Could not rename %s to %s: %s\n",
++			from, to, strerror(errno));
++		return AEE_EFAILED;
++	}
++
++#ifdef HEXAGONRPC_VERBOSE
++	printf("rename(%s, %s)\n", from, to);
++#endif
++
++	return 0;
++}
++
++static uint32_t apps_std_fsync(void *data,
++			       const struct fastrpc_io_buffer *inbufs,
++			       struct fastrpc_io_buffer *outbufs)
++{
++	struct apps_std_ctx *ctx = data;
++	const uint32_t *fd = inbufs[0].p;
++
++	if (apps_std_is_wfd(*fd) && ctx->wfds[*fd - APPS_STD_WFD_BASE] >= 0
++	 && fsync(ctx->wfds[*fd - APPS_STD_WFD_BASE]))
++		return AEE_EFAILED;
++
++#ifdef HEXAGONRPC_VERBOSE
++	printf("fsync(%u)\n", *fd);
++#endif
++
++	return 0;
++}
++
+ static uint32_t apps_std_fseek(void *data,
+ 			       const struct fastrpc_io_buffer *inbufs,
+ 			       struct fastrpc_io_buffer *outbufs)
+@@ -167,9 +410,18 @@ static uint32_t apps_std_fopen_with_env(void *data,
+ 
+ 	rw_mode = ((const char *) inbufs[4].p)[0];
+ 	if (rw_mode == 'w' || rw_mode == 'a') {
+-		fprintf(stderr, "Tried to open %s for writing\n",
+-				(const char *) inbufs[3].p);
+-		return AEE_EUNSUPPORTED;
++		fd = apps_std_open_write(ctx, inbufs[3].p, rw_mode);
++		if (fd < 0) {
++			fprintf(stderr, "Tried to open %s for writing: %s\n",
++					(const char *) inbufs[3].p, strerror(-fd));
++			return AEE_EUNSUPPORTED;
++		}
++#ifdef HEXAGONRPC_VERBOSE
++		printf("open-write(%s, %c) -> %d\n", (const char *) inbufs[3].p,
++						     rw_mode, fd);
++#endif
++		*out = fd;
++		return 0;
+ 	}
+ 
+ 	if (!strcmp(inbufs[1].p, "ADSP_LIBRARY_PATH")) {
+@@ -379,6 +631,19 @@ struct fastrpc_interface *fastrpc_apps_std_init(struct hexagonfs_dirent *root)
+ 						   ctx->rootfd,
+ 						   "/usr/lib/qcom/adsp/");
+ 
++	for (int i = 0; i < APPS_STD_MAX_WFD; i++)
++		ctx->wfds[i] = -1;
++
++	ctx->registry_dirfd = -1;
++	if (getenv("HEXAGONRPCD_WRITABLE_REGISTRY") != NULL) {
++		ctx->registry_dirfd = open(getenv("HEXAGONRPCD_WRITABLE_REGISTRY"),
++					   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		if (ctx->registry_dirfd < 0)
++			fprintf(stderr, "Could not open writable registry %s: %s\n",
++					getenv("HEXAGONRPCD_WRITABLE_REGISTRY"),
++					strerror(errno));
++	}
++
+ 	iface->data = ctx;
+ 
+ 	return iface;
+@@ -401,6 +666,14 @@ void fastrpc_apps_std_deinit(struct fastrpc_interface *iface)
+ 			hexagonfs_close(ctx->fds, i);
+ 	}
+ 
++	for (i = 0; i < APPS_STD_MAX_WFD; i++) {
++		if (ctx->wfds[i] >= 0)
++			close(ctx->wfds[i]);
++	}
++
++	if (ctx->registry_dirfd >= 0)
++		close(ctx->registry_dirfd);
++
+ 	free(iface->data);
+ 	free(iface);
+ }
+@@ -420,7 +693,10 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
+ 		.def = &apps_std_fread_def,
+ 		.impl = apps_std_fread,
+ 	},
+-	{ .def = NULL, .impl = NULL, },
++	{
++		.def = &apps_std_fwrite_def,
++		.impl = apps_std_fwrite,
++	},
+ 	{ .def = NULL, .impl = NULL, },
+ 	{ .def = NULL, .impl = NULL, },
+ 	{ .def = NULL, .impl = NULL, },
+@@ -441,12 +717,18 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
+ 		.def = &apps_std_fopen_with_env_def,
+ 		.impl = apps_std_fopen_with_env,
+ 	},
+-	{ .def = NULL, .impl = NULL, },
+-	{ .def = NULL, .impl = NULL, },
+-	{ .def = NULL, .impl = NULL, },
+-	{ .def = NULL, .impl = NULL, },
+-	{ .def = NULL, .impl = NULL, },
+-	{ .def = NULL, .impl = NULL, },
++	{ .def = NULL, .impl = NULL, },	/* 20 fgets */
++	{ .def = NULL, .impl = NULL, },	/* 21 get_search_paths_with_env */
++	{ .def = NULL, .impl = NULL, },	/* 22 fileExists */
++	{
++		.def = &apps_std_fsync_def,	/* 23 */
++		.impl = apps_std_fsync,
++	},
++	{
++		.def = &apps_std_fremove_def,	/* 24 */
++		.impl = apps_std_fremove,
++	},
++	{ .def = NULL, .impl = NULL, },	/* 25 fdopen_decrypt */
+ 	{
+ 		.def = &apps_std_opendir_def,
+ 		.impl = apps_std_opendir,
+@@ -465,10 +747,15 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
+ 		.def = &apps_std_stat_def,
+ 		.impl = apps_std_stat,
+ 	},
++	{ .def = NULL, .impl = NULL, },	/* 32 ftrunc */
++	{
++		.def = &apps_std_frename_def,	/* 33 */
++		.impl = apps_std_frename,
++	},
+ };
+ 
+ const struct fastrpc_interface apps_std_interface = {
+ 	.name = "apps_std",
+-	.n_procs = 32,
++	.n_procs = HRPC_ARRAY_SIZE(apps_std_procs),
+ 	.procs = apps_std_procs,
+ };
+diff --git a/hexagonrpcd/interface/apps_std.c b/hexagonrpcd/interface/apps_std.c
+index 67b3ace..b5856e8 100644
+--- a/hexagonrpcd/interface/apps_std.c
++++ b/hexagonrpcd/interface/apps_std.c
+@@ -75,6 +75,58 @@ const struct hrpc_method_def_interp4 apps_std_fread_def = {
+ 	.inner_types = NULL,
+ };
+ 
++static struct hrpc_arg_def_interp4 apps_std_fwrite_args[] = {
++	{ HRPC_ARG_WORD, sizeof(uint32_t) },
++	{ HRPC_ARG_BLOB_SEQ, sizeof(char) },
++	{ HRPC_ARG_OUT_BLOB, sizeof(uint32_t) },
++	{ HRPC_ARG_OUT_BLOB, sizeof(uint32_t) },
++};
++
++const struct hrpc_method_def_interp4 apps_std_fwrite_def = {
++	.msg_id = 5,
++	.n_args = HRPC_ARRAY_SIZE(apps_std_fwrite_args),
++	.args = apps_std_fwrite_args,
++	.n_inner_types = 0,
++	.inner_types = NULL,
++};
++
++static struct hrpc_arg_def_interp4 apps_std_fsync_args[] = {
++	{ HRPC_ARG_WORD, sizeof(uint32_t) },
++};
++
++const struct hrpc_method_def_interp4 apps_std_fsync_def = {
++	.msg_id = 23,
++	.n_args = HRPC_ARRAY_SIZE(apps_std_fsync_args),
++	.args = apps_std_fsync_args,
++	.n_inner_types = 0,
++	.inner_types = NULL,
++};
++
++static struct hrpc_arg_def_interp4 apps_std_fremove_args[] = {
++	{ HRPC_ARG_BLOB_SEQ, sizeof(char) },
++};
++
++const struct hrpc_method_def_interp4 apps_std_fremove_def = {
++	.msg_id = 24,
++	.n_args = HRPC_ARRAY_SIZE(apps_std_fremove_args),
++	.args = apps_std_fremove_args,
++	.n_inner_types = 0,
++	.inner_types = NULL,
++};
++
++static struct hrpc_arg_def_interp4 apps_std_frename_args[] = {
++	{ HRPC_ARG_BLOB_SEQ, sizeof(char) },
++	{ HRPC_ARG_BLOB_SEQ, sizeof(char) },
++};
++
++const struct hrpc_method_def_interp4 apps_std_frename_def = {
++	.msg_id = 33,
++	.n_args = HRPC_ARRAY_SIZE(apps_std_frename_args),
++	.args = apps_std_frename_args,
++	.n_inner_types = 0,
++	.inner_types = NULL,
++};
++
+ static struct hrpc_arg_def_interp4 apps_std_fseek_args[] = {
+ 	{ HRPC_ARG_WORD, sizeof(uint32_t) },
+ 	{ HRPC_ARG_WORD, sizeof(uint32_t) },
+diff --git a/hexagonrpcd/interface/apps_std.h b/hexagonrpcd/interface/apps_std.h
+index b80a1ca..4914bcf 100644
+--- a/hexagonrpcd/interface/apps_std.h
++++ b/hexagonrpcd/interface/apps_std.h
+@@ -28,6 +28,10 @@ extern struct hrpc_method_def_interp4 apps_std_freopen_def;
+ extern struct hrpc_method_def_interp4 apps_std_fflush_def;
+ extern struct hrpc_method_def_interp4 apps_std_fclose_def;
+ extern struct hrpc_method_def_interp4 apps_std_fread_def;
++extern struct hrpc_method_def_interp4 apps_std_fwrite_def;
++extern struct hrpc_method_def_interp4 apps_std_fsync_def;
++extern struct hrpc_method_def_interp4 apps_std_fremove_def;
++extern struct hrpc_method_def_interp4 apps_std_frename_def;
+ extern struct hrpc_method_def_interp4 apps_std_fseek_def;
+ extern struct hrpc_method_def_interp4 apps_std_fopen_with_env_def;
+ extern struct hrpc_method_def_interp4 apps_std_opendir_def;
+diff --git a/hexagonrpcd/rpcd_builder.c b/hexagonrpcd/rpcd_builder.c
+index d374958..82983ef 100644
+--- a/hexagonrpcd/rpcd_builder.c
++++ b/hexagonrpcd/rpcd_builder.c
+@@ -160,13 +160,26 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ 	 * Some platforms need this in / and some need it in /mnt/vendor. Form
+ 	 * a hard link between both locations.
+ 	 */
+-	persist_dir = hfs_mkdir("persist", 1,
+-				hfs_mkdir("sensors", 1,
+-					hfs_mkdir("registry", 1,
+-						hfs_map("registry", sns_reg)
++	/*
++	 * With a writable registry (see apps_std.c) the whole persist registry
++	 * directory is that host directory: it holds sns_reg_version,
++	 * parsed_file_list.csv and temporary files next to registry/.
++	 */
++	if (getenv("HEXAGONRPCD_WRITABLE_REGISTRY") != NULL)
++		persist_dir = hfs_mkdir("persist", 1,
++					hfs_mkdir("sensors", 1,
++						hfs_map("registry",
++							getenv("HEXAGONRPCD_WRITABLE_REGISTRY"))
+ 					)
+-				)
+-		      );
++			      );
++	else
++		persist_dir = hfs_mkdir("persist", 1,
++					hfs_mkdir("sensors", 1,
++						hfs_mkdir("registry", 1,
++							hfs_map("registry", sns_reg)
++						)
++					)
++			      );
+ 
+ 	/*
+ 	 * Some platforms need vendor in / and some need it in /system. Form

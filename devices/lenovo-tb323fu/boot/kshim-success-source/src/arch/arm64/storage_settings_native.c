@@ -191,3 +191,41 @@ int storage_settings_native_trial_save(uint64_t expected_sequence,
     *written=local_written;
     return 0;
 }
+
+int storage_settings_native_read_boot(int (*reader)(const struct kshim_blockdev *, void *), void *ctx)
+{
+    if(!reader)return KSHIM_STORAGE_ARG;
+    if(Backend.board!=DEVICE_BOARD_TB322FC && Backend.board!=DEVICE_BOARD_TB323FU)return KSHIM_UFS_UNSUPPORTED;
+    bool restore_off=!kshim_mmu_is_enabled();
+    if(restore_off && (!kshim_mmu_root_table() || kshim_mmu_enable_current_cpu())){
+        Backend.begin_status=KSHIM_UFS_UNSUPPORTED;
+        return KSHIM_UFS_UNSUPPORTED;
+    }
+    int rc=kshim_ufs_settings_read_boot(&Backend,reader,ctx);
+    if(!kshim_ufs_settings_handoff_safe(&Backend))return KSHIM_UFS_QUARANTINED;
+    if(restore_off && kshim_mmu_prepare_handoff()){
+        Backend.unsafe=1;
+        return KSHIM_UFS_QUARANTINED;
+    }
+    return rc;
+}
+
+int storage_settings_native_log_boot(uint32_t target, uint32_t phase,
+                                    int32_t status)
+{
+    if(Backend.board!=DEVICE_BOARD_TB322FC && Backend.board!=DEVICE_BOARD_TB323FU &&
+       Backend.board!=DEVICE_BOARD_TB710FU)return KSHIM_UFS_UNSUPPORTED;
+    if(!storage_settings_native_ab_supported())return KSHIM_UFS_UNSUPPORTED;
+    bool restore_off=!kshim_mmu_is_enabled();
+    if(restore_off && (!kshim_mmu_root_table() || kshim_mmu_enable_current_cpu())){
+        Backend.begin_status=KSHIM_UFS_UNSUPPORTED;
+        return KSHIM_UFS_UNSUPPORTED;
+    }
+    int rc=kshim_ufs_settings_log_boot(&Backend,target,phase,status);
+    if(!kshim_ufs_settings_handoff_safe(&Backend))return KSHIM_UFS_QUARANTINED;
+    if(restore_off && kshim_mmu_prepare_handoff()){
+        Backend.unsafe=1;
+        return KSHIM_UFS_QUARANTINED;
+    }
+    return rc;
+}

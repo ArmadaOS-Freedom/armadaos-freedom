@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import stat
 import uuid
 
@@ -13,7 +14,9 @@ from . import (
     UPDATER_VERSION,
     _io,
     boot_candidate,
+    boot_disk_switch,
     boot_materials,
+    boot_sources,
     boot_trust,
     deployment_store,
     image_source,
@@ -21,10 +24,12 @@ from . import (
     offline_payload,
     package_contract,
     physical_slots,
+    recovery_device,
     signature,
     system_transaction,
     trial_confirmation,
     trial_record,
+    trial_store,
 )
 
 _CHANNELS = frozenset({'stable', 'beta', 'testing'})
@@ -121,6 +126,14 @@ def _recovery_files(work, sources, journal):
     return entries
 
 
+def _read_recovery_for_disk(initial):
+    with recovery_device.open_recovery(writable=False) as (fd, partuuid, board):
+        if (partuuid != initial['recoveryPartUuid'] or
+                physical_slots._MODEL.get(board) != initial['model']):
+            raise ValueError('recovery identity changed')
+        return trial_store.load(fd, partuuid, board)
+
+
 def prepare_offline_update(*, document, signature_b64, payload_directory,
                            expected_channel, sysroot_path, work_dir,
                            updater_version=UPDATER_VERSION,
@@ -149,6 +162,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
               'requiresReboot': False}
     work = None
     created = False
+    created_generation = None
     with trial_confirmation._locked():
         try:
             if type(expected_channel) is not str or expected_channel not in _CHANNELS:
@@ -165,6 +179,10 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             initial = inspect_slots()
             if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
                 raise ValueError('unsupported physical model')
+            disk = initial.get('bootSource') == 'armada_boot'
+            if disk:
+                boot_disk_switch.ensure_ready(root, initial)
+                status['bootSource'] = 'armada_boot'
             snapshot = armada_os.snapshot()
             if (snapshot['repository'] not in armada_os.REPOSITORIES or
                     snapshot['staged'] or snapshot['rollback_queued']):
@@ -173,13 +191,19 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 raise ValueError('requested channel differs from configured channel')
             current_binding = initial['deployment']
             old = system_transaction._binding(current_binding)
-            journal = system_transaction._check_recovery(initial, old)
+            journal = (_read_recovery_for_disk(initial) if disk else
+                       system_transaction._check_recovery(initial, old))
 
             package = package_contract.load_package(
                 document, signature_b64, trusted_key=trusted_key)
             package_contract.require_operation(
                 package, initial['model'], 'offline-upgrade',
                 updater_version=updater_version)
+            has_capsule = initial['model'] in package.get('armadaBootCapsules', {})
+            if disk and not has_capsule:
+                raise ValueError('signed package lacks ARMADA_BOOT materials for model')
+            if has_capsule and not disk:
+                raise ValueError('this package requires an existing ARMADA_BOOT installation')
             status.update(model=initial['model'], fromSlot=initial['actualSlot'],
                           targetSlot=initial['inactiveSlot'],
                           oldDeployment=current_binding)
@@ -212,12 +236,22 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             status['phase'] = 'capturing_boot_trust'
             system_transaction._save_json(work, 'status.json', status)
-            trust = boot_trust.capture_boot_trust(
-                output_dir=work / 'trust', boot_tool_path=boot_tool_path)
-            if (not physical_slots.same_physical_identity(trust['physical'], initial) or
-                    not physical_slots.same_physical_identity(
-                        trust['sources']['physical'], initial)):
-                raise ValueError('boot trust physical report mismatch')
+            if disk:
+                labels = ('recovery_a', 'recovery_b', 'vbmeta_system_a', 'vbmeta_system_b')
+                if initial['model'] in models.GBL_MODELS:
+                    labels += ('efisp',)
+                sources = boot_sources.capture_boot_sources(initial, work / 'trust', extra_labels=labels)
+                if not physical_slots.same_physical_identity(sources['physical'], initial):
+                    raise ValueError('boot sources physical report mismatch')
+                trust = {'schemaVersion': 1, 'physical': initial, 'sources': sources}
+            else:
+                trust = boot_trust.capture_boot_trust(
+                    output_dir=work / 'trust', boot_tool_path=boot_tool_path)
+                if (not physical_slots.same_physical_identity(trust['physical'], initial) or
+                        not physical_slots.same_physical_identity(
+                            trust['sources']['physical'], initial)):
+                    raise ValueError('boot trust physical report mismatch')
+                sources = trust['sources']
 
             status['phase'] = 'deploying'
             system_transaction._save_json(work, 'status.json', status)
@@ -242,48 +276,65 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             except OSError:
                 pass
 
-            status['phase'] = 'preparing_materials'
-            system_transaction._save_json(work, 'status.json', status)
-            materials = boot_materials.prepare_boot_materials(
-                sysroot_path=root, current_binding=current_binding,
-                target_binding=target_deployment, model=initial['model'],
-                output_dir=work / 'materials', dtb_helper_path=dtb_helper_path,
-                transaction_uuid=tx)
-            if (materials['transactionUuid'] != tx or
-                    materials['deployment'] != target_deployment or
-                    materials['model'] != initial['model']):
-                raise ValueError('boot materials binding mismatch')
-
-            status['phase'] = 'preparing_candidates'
-            system_transaction._save_json(work, 'status.json', status)
-            candidates = {}
-            old_sha = {}
-            new_sha = {}
-            for slot in ('a', 'b'):
-                status['preparingSlot'] = slot
+            switch_plan = None
+            if disk:
+                status['phase'] = 'preparing_armada_boot'
                 system_transaction._save_json(work, 'status.json', status)
-                original = boot_candidate._verify_claim(
-                    trust['sources']['slots'][slot]['boot'], 'old boot')
-                old_sha[slot] = original['sha256']
-                candidate = boot_candidate.prepare_boot_candidate(
-                    slot=slot, slot_files=trust['sources']['slots'][slot],
-                    materials=materials, mode=trust['mode'],
-                    max_raw_bytes=trust['trust'][slot]['maxRawBytes'],
-                    output_dir=work / ('candidate-' + slot),
-                    boot_tool_path=boot_tool_path)
-                _check_candidate(candidate, slot=slot, tx=tx,
-                                 deployment=target_deployment, model=initial['model'],
-                                 mode=trust['mode'], source_sha=original['sha256'])
-                candidates[slot] = candidate
-                new_sha[slot] = candidate['candidate']['sha256']
+                def _generation_created(name, path):
+                    nonlocal created_generation
+                    created_generation = path
 
-            system_transaction._save_json(work, 'trust.json', trust)
-            system_transaction._save_json(work, 'materials.json', materials)
-            for slot in ('a', 'b'):
-                system_transaction._save_json(
-                    work, 'candidate-%s.json' % slot, candidates[slot])
+                switch_plan = boot_disk_switch.prepare(
+                    root, initial, target_deployment, package, trusted_key=trusted_key,
+                    on_stage=_generation_created)
+                old_sha = {
+                    slot: boot_candidate._verify_claim(sources['slots'][slot]['boot'], 'old boot')['sha256']
+                    for slot in ('a', 'b')
+                }
+                new_sha = dict(old_sha)
+                system_transaction._save_json(work, 'trust.json', trust)
+            else:
+                status['phase'] = 'preparing_materials'
+                system_transaction._save_json(work, 'status.json', status)
+                materials = boot_materials.prepare_boot_materials(
+                    sysroot_path=root, current_binding=current_binding,
+                    target_binding=target_deployment, model=initial['model'],
+                    output_dir=work / 'materials', dtb_helper_path=dtb_helper_path,
+                    transaction_uuid=tx)
+                if (materials['transactionUuid'] != tx or
+                        materials['deployment'] != target_deployment or
+                        materials['model'] != initial['model']):
+                    raise ValueError('boot materials binding mismatch')
 
-            sources = trust['sources']
+                status['phase'] = 'preparing_candidates'
+                system_transaction._save_json(work, 'status.json', status)
+                candidates = {}
+                old_sha = {}
+                new_sha = {}
+                for slot in ('a', 'b'):
+                    status['preparingSlot'] = slot
+                    system_transaction._save_json(work, 'status.json', status)
+                    original = boot_candidate._verify_claim(
+                        trust['sources']['slots'][slot]['boot'], 'old boot')
+                    old_sha[slot] = original['sha256']
+                    candidate = boot_candidate.prepare_boot_candidate(
+                        slot=slot, slot_files=trust['sources']['slots'][slot],
+                        materials=materials, mode=trust['mode'],
+                        max_raw_bytes=trust['trust'][slot]['maxRawBytes'],
+                        output_dir=work / ('candidate-' + slot),
+                        boot_tool_path=boot_tool_path)
+                    _check_candidate(candidate, slot=slot, tx=tx,
+                                     deployment=target_deployment, model=initial['model'],
+                                     mode=trust['mode'], source_sha=original['sha256'])
+                    candidates[slot] = candidate
+                    new_sha[slot] = candidate['candidate']['sha256']
+
+                system_transaction._save_json(work, 'trust.json', trust)
+                system_transaction._save_json(work, 'materials.json', materials)
+                for slot in ('a', 'b'):
+                    system_transaction._save_json(
+                        work, 'candidate-%s.json' % slot, candidates[slot])
+
             manifest = {
                 'schemaVersion': 1, 'operation': 'offline-upgrade',
                 'transactionId': tx, 'model': initial['model'],
@@ -316,6 +367,8 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'recoveryManifestSha256': manifest_sha,
                 'packageDescriptorSha256': document_sha,
             }
+            if switch_plan is not None:
+                plan['armadaBootSwitch'] = switch_plan
             plan_sha = _sha256(system_transaction._save_json(work, 'plan.json', plan))
             prepared = {
                 'schemaVersion': 1, 'operation': 'offline-upgrade',
@@ -332,7 +385,8 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             if not physical_slots.same_physical_identity(inspect_slots(), initial):
                 raise ValueError('physical slots changed before preparation completed')
-            final_journal = system_transaction._check_recovery(initial, old)
+            final_journal = (_read_recovery_for_disk(initial) if disk else
+                             system_transaction._check_recovery(initial, old))
             if (final_journal.header != journal.header or
                     final_journal.region != journal.region):
                 raise ValueError('recovery journal changed during preparation')
@@ -346,9 +400,19 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
         except Exception as exc:
             status.update(failedPhase=status.get('phase'), phase='failed',
                           state='failed', error=str(exc))
+            persisted = False
             if created:
                 try:
                     system_transaction._save_json(work, 'status.json', status)
+                    persisted = True
                 except Exception as save_exc:
                     status['persistenceError'] = str(save_exc)
+            if created_generation is not None and (persisted or not created):
+                try:
+                    if created_generation.is_dir():
+                        shutil.rmtree(created_generation)
+                        _io.fsync_dir(created_generation.parent, nofollow=True)
+                except OSError as cleanup_exc:
+                    status.setdefault('supplementalErrors', []).append(
+                        'generation cleanup failed: %s' % (cleanup_exc,))
             raise system_transaction.SystemTransactionError(str(exc), status) from exc

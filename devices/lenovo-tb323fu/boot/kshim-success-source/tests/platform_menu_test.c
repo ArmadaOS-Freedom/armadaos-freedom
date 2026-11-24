@@ -2475,6 +2475,78 @@ static void test_settings_remember_last(void)
     assert(!menu.default_ok && menu.boot.default_target==BOOT_TARGET_LAST);
     kshim_platform_bind_settings(NULL);
 }
+static void test_settings_pending_menu(void)
+{
+    const char *names[]={"Android","Internal","Diagnostic"};
+    const kshim_menu_role_t roles[]={KSHIM_MENU_ROLE_ANDROID,KSHIM_MENU_ROLE_INTERNAL,KSHIM_MENU_ROLE_DIAGNOSTIC};
+    const enum device_board board_list[]={DEVICE_BOARD_TB322FC,DEVICE_BOARD_TB323FU};
+    for (size_t b=0;b<2;++b) {
+        enum device_board board=board_list[b];
+        const enum device_board boards[]={DEVICE_BOARD_UNKNOWN,board,board};
+        struct device_info info=settings_info(board);
+        struct kshim_settings_session session={0};
+        memset(menu_storage_bytes,0,sizeof(menu_storage_bytes));
+        menu_storage_writes=menu_storage_flushes=0;menu_storage_fail=menu_storage_flush_fail=0;
+        struct kshim_blockdev dev={0};dev.block_size=4096;dev.block_count=16;
+        dev.read=menu_storage_read;dev.write=menu_storage_write;dev.flush=menu_storage_flush;
+        session.source=KSHIM_SETTINGS_INTERNAL;
+        struct kshim_config_store *store=&session.medium[0].config;
+        store->dev=&dev;store->ready=1;store->descriptor_version=3;store->board_id=board;
+        store->scratch=session.medium[0].scratch;
+        memset(store->partition.uuid,1,16);memset(store->installation_uuid,2,16);
+        struct kshim_config_values values={0,BOOT_TARGET_INTERNAL,0,BOOT_TARGET_INTERNAL,0};
+        assert(kshim_settings_save(&session,&values)==0);
+        kshim_platform_bind_settings(&session);
+        struct menu_selection menu={0};size_t selected=99;uint64_t sequence=0;const char *failure=NULL;
+        assert(menu_build(&menu,names,NULL,roles,&info,boards,3,0,UINT64_C(1)<<2,1,1,1)==0);
+        /* Existing log flag determines visible mode: debug toggle before the
+         * optional next action row. Default is log enabled (flag clear). */
+        assert(menu_build(&menu,names,NULL,roles,&info,boards,3,0,UINT64_C(1)<<2,1,1,1)==0);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.boot_log_row]==MENU_BOOT_LOG_TOGGLE);
+        assert(menu.boot_log_row+1==menu.next_boot_row);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.next_boot_row]==MENU_NEXT_BOOT_CYCLE);
+        /* Queue an action, then disable debug logging: NEXT_BOOT hides but the
+         * already pending action is preserved. */
+        const uint8_t expected[]={KSHIM_ACTION_ANDROID,KSHIM_ACTION_LINUX,KSHIM_ACTION_LINUX_DIAG};
+        menu.page=MENU_PAGE_SETTINGS;
+        assert(menu_activate(&menu,menu.next_boot_row,&selected,&failure)==2);
+        struct kshim_config_values read={0};
+        assert(kshim_config_load(store,&read,&sequence)==0);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
+        menu.page=MENU_PAGE_SETTINGS;
+        assert(menu_activate(&menu,menu.boot_log_row,&selected,&failure)==2);
+        for (size_t row=0;row<menu.pages[MENU_PAGE_SETTINGS].count;++row)
+            assert(menu.pages[MENU_PAGE_SETTINGS].actions[row]!=MENU_NEXT_BOOT_CYCLE);
+        assert(menu.pages[MENU_PAGE_SETTINGS].initial==menu.boot_log_row);
+        memset(&read,0,sizeof(read));
+        assert(kshim_config_load(store,&read,&sequence)==0);
+        assert((read.next_action&KSHIM_FLAG_NO_BOOT_LOG)!=0);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
+        /* Re-enable: next action reappears at the following row, with the
+         * pending action still intact. */
+        menu.page=MENU_PAGE_SETTINGS;
+        assert(menu_activate(&menu,menu.boot_log_row,&selected,&failure)==2);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.boot_log_row]==MENU_BOOT_LOG_TOGGLE);
+        assert(menu.boot_log_row+1==menu.next_boot_row);
+        assert(menu.pages[MENU_PAGE_SETTINGS].actions[menu.next_boot_row]==MENU_NEXT_BOOT_CYCLE);
+        memset(&read,0,sizeof(read));
+        assert(kshim_config_load(store,&read,&sequence)==0);
+        assert((read.next_action&KSHIM_FLAG_NO_BOOT_LOG)==0);
+        assert(kshim_next_action_value(read.next_action)==expected[0]);
+        for (size_t i=1;i<3;++i) {
+            menu.page=MENU_PAGE_SETTINGS;
+            assert(menu_activate(&menu,menu.next_boot_row,&selected,&failure)==2);
+            memset(&read,0,sizeof(read));
+            assert(kshim_config_load(store,&read,&sequence)==0);
+            assert(kshim_next_action_value(read.next_action)==expected[i]);
+        }
+        assert(kshim_next_action_value(read.next_action)==KSHIM_ACTION_LINUX_DIAG);
+        assert(read.default_target==BOOT_TARGET_INTERNAL && read.last_target==BOOT_TARGET_INTERNAL);
+        assert(selected==99);
+        assert(session.values.default_target==BOOT_TARGET_INTERNAL && session.values.last_target==BOOT_TARGET_INTERNAL);
+        kshim_platform_bind_settings(NULL);
+    }
+}
 static void test_settings_default_page(void)
 {
     static const kshim_menu_role_t roles[2] = { KSHIM_MENU_ROLE_ANDROID, KSHIM_MENU_ROLE_INTERNAL };
@@ -3213,6 +3285,7 @@ int main(void)
     test_settings_record_pristine();
     test_settings_persistent_menu();
     test_settings_remember_last();
+    test_settings_pending_menu();
     test_settings_default_page();
     test_settings_default_invalidated();
     test_settings_back_labels();

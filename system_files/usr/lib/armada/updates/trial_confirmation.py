@@ -22,10 +22,14 @@ from pathlib import Path
 from typing import Iterator
 
 from . import (
+    boot_context,
+    boot_disk_switch,
     deployment_store,
     finalization_receipt,
     job_retirement,
     runtime_health,
+    physical_slots,
+    signature,
     trial_store,
 )
 from .boot_health import BootEvidence, collect_boot_evidence
@@ -173,6 +177,53 @@ def _retire_job_artifacts(record) -> None:
 def confirm_trial() -> dict:
     """Confirm the pending trial record after verified stability evidence."""
     with _locked():
+        try:
+            boot_source = boot_context._read_regular(boot_context.BOOT_SOURCE_PATH, 16)
+        except FileNotFoundError:
+            boot_source = None
+        if boot_source is not None:
+            if boot_source != b"armada_boot\0":
+                raise ConfirmationError("invalid disk boot witness")
+            initial = physical_slots.inspect_physical_slots()
+            try:
+                recovery = boot_context._read_regular(
+                    boot_context.BOOT_SOURCE_PATH.with_name("armada,boot-recovery"), 1)
+            except FileNotFoundError:
+                recovery = None
+            if recovery is not None:
+                if recovery != b"\0":
+                    raise ConfirmationError("invalid boot recovery marker")
+                recovered = boot_disk_switch.recover_pending(
+                        SYSROOT_PATH, initial, trusted_key=signature.DEFAULT_TRUSTED_KEY)
+                return {'state': 'rolled_back' if recovered else 'not_pending',
+                        'bootSource': 'armada_boot',
+                        'deployment': initial['deployment']}
+            evidence = boot_disk_switch.read_trial_status(initial, SYSROOT_PATH)
+            if evidence.get("recordState") == "confirmed":
+                try:
+                    job_retirement.retire_confirmed_disk_session(evidence, initial)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            if (evidence.get("recordState") != "prepared" or
+                    evidence.get("runningDeployment") != "new"):
+                return {"state": "not_pending", "bootSource": "armada_boot"}
+            runtime = _check_runtime_evidence(collect_runtime_evidence())
+            time.sleep(STABILITY_SECONDS)
+            if (not physical_slots.same_physical_identity(
+                    initial, physical_slots.inspect_physical_slots()) or
+                    runtime != _check_runtime_evidence(collect_runtime_evidence())):
+                raise ConfirmationError("disk boot evidence changed during stability window")
+            if not boot_disk_switch.confirm(
+                    SYSROOT_PATH, initial, trusted_key=signature.DEFAULT_TRUSTED_KEY):
+                raise ConfirmationError("disk boot confirmation did not complete")
+            try:
+                confirmed = boot_disk_switch.read_trial_status(initial, SYSROOT_PATH)
+                job_retirement.retire_confirmed_disk_session(confirmed, initial)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+            return {"state": "confirmed", "bootSource": "armada_boot",
+                    "transactionId": evidence["transactionId"], "deployment": initial["deployment"]}
+
         with open_recovery(writable=False) as (fd, partition_uuid, board):
             snapshot = trial_store.load(fd, partition_uuid, board)
 

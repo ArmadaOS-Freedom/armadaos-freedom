@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "lich.wang" <lich.wang@gmail.com>
+Date: Wed, 18 Nov 2026 20:03:47 +0800
+Subject: [PATCH 3/3] rpcd: listener: keep serving after a call fails
+
+invoke_requested_procedure() returns an error for calls it cannot run,
+such as a method hexagonrpcd does not implement, and the listener loop
+then exited, ending the DSP's whole session. On SM8650 the sensor hub
+calls apps_std method 36 (fopen_with_env_fd) once after the ADSP boots;
+hexagonrpcd stopped there and the sensors only came up after the daemon
+was started a second time.
+
+Send the error back to the DSP with no output buffers and wait for the
+next call instead. Free the input buffers of the failed call and do not
+keep a pointer to output buffers that were already freed.
+---
+ hexagonrpcd/listener.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/hexagonrpcd/listener.c b/hexagonrpcd/listener.c
+index be5a15d..594c5fb 100644
+--- a/hexagonrpcd/listener.c
++++ b/hexagonrpcd/listener.c
+@@ -621,12 +621,27 @@ int run_fastrpc_listener(int fd,
+ 
+ 		if (returned != NULL)
+ 			iobuf_free(n_outbufs, returned);
++		returned = NULL;
+ 
+ 		ret = invoke_requested_procedure(n_ifaces, ifaces,
+ 						 handle, sc, &result,
+ 						 decoded, &returned);
+-		if (ret)
+-			break;
++		if (ret) {
++			/*
++			 * The call failed before it ran (unsupported handle or
++			 * method, bad arguments, no memory): send the error back
++			 * with no output buffers and keep serving. Exiting here
++			 * would drop the DSP's whole session, which the DSP does
++			 * not expect for an optional method.
++			 */
++			if (decoded != NULL)
++				iobuf_free(REMOTE_SCALARS_INBUFS(sc), decoded);
++			decoded = NULL;
++			sc = REMOTE_SCALARS_MAKE(0, 0, 0);
++			n_outbufs = 0;
++			ret = 0;
++			continue;
++		}
+ 
+ 		if (decoded != NULL)
+ 			iobuf_free(REMOTE_SCALARS_INBUFS(sc), decoded);

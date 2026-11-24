@@ -209,6 +209,31 @@ class OfflineImageIntegrationTests(unittest.TestCase):
         self.assertFalse(work.exists())
         self._assert_untouched()
 
+    def test_zstd_fallback_extract_log_and_restore(self):
+        work = self._work("inline-zstd-fallback")
+        calls = []
+        real_run = offline_image._run_command
+
+        def fake_run(command, log_path):
+            calls.append(list(command))
+            if len(calls) == 1:
+                log_path.write_text("ERROR: zstd frame incomplete\n")
+                raise offline_image.ImageSourceError("zstd extract failed")
+            assert command[0] == "/usr/bin/unshare"
+            assert "ro,rescue=nologreplay" in command[7]
+            return real_run(calls[0][:-1] + [command[-1]], log_path)
+
+        with mock.patch.object(
+            offline_image, "_run_command", side_effect=fake_run
+        ):
+            result = self._invoke(work=work)
+
+        assert len(calls) == 2
+        assert result["phase"] == "imported"
+        assert "content-mounted" in Path(result["sourceRepository"]).parts
+        self.fixture.assert_commit_present()
+        assert "ERROR: zstd frame incomplete" in (work / "extract.log").read_text()
+
     def test_corrupted_signed_image_fails_real_extraction(self) -> None:
         blank = self.temp / "not-btrfs.img"
         with blank.open("xb") as stream:

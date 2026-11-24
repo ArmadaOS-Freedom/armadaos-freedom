@@ -28,6 +28,7 @@
 	dr_mode = "otg";
 	usb-role-switch;
 	role-switch-default-mode = "peripheral";
+	mode-switch;
 
 	/delete-property/ snps,usb3_lpm_capable;
 

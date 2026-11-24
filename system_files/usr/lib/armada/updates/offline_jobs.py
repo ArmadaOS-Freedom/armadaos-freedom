@@ -60,6 +60,17 @@ def _is_sha256(value):
             all(ch in '0123456789abcdef' for ch in value))
 
 
+def _execute_result_unrecorded(receipt):
+    """Return True when an execute receipt may have a finished result."""
+    if receipt.get('state') in _UNRECORDED_EXECUTE_STATES:
+        return True
+    result = receipt.get('result')
+    return (receipt.get('state') == 'failed'
+            and isinstance(result, dict)
+            and result.get('state') == 'recovery_required'
+            and result.get('bootSource') == 'armada_boot')
+
+
 def _read_trial_evidence():
     """Read the live trial/boot evidence without changing anything."""
     try:
@@ -200,6 +211,10 @@ class OfflineJobManager:
         restart-eligible, while a fully finalized matching transaction that is
         already booting the new deployment is accepted as confirmation.  No
         restart is scheduled here; that verdict only denies one.
+
+        The status is reconstructed from the durable receipt after an ext4
+        checkpoint, and a confirmed new deployment with complete finalization
+        is accepted as confirmation.
         """
         transaction = session / 'transaction'
         if transaction.is_symlink() or not transaction.is_dir():
@@ -214,18 +229,22 @@ class OfflineJobManager:
             ack, _raw = offline_execute._load_json(session, 'ack.json')
         except (OSError, ValueError, RuntimeError):
             return None
-        identity = offline_completion.execute_completion(
-            prepared, plan, _io.sha256_hex(plan_raw),
-            status, report, ack, receipt.get('model'))
+        evidence = _read_trial_evidence()
+        identity, status = offline_completion.resolve_execute_status(
+            prepared, plan, _io.sha256_hex(plan_raw), status, report, ack,
+            evidence, receipt.get('model'))
         if identity is None:
             return None
         verdict = offline_completion.evaluate(
             {'state': 'awaiting_reboot', 'result': status},
-            _read_trial_evidence(), identity)
+            evidence, identity)
         if verdict.get('state') == offline_completion.AWAITING_REBOOT:
             if verdict.get('restartEligible') is not True:
                 return None
-        elif verdict.get('state') != offline_completion.CONFIRMED:
+        elif not (verdict.get('state') == offline_completion.CONFIRMED or
+                  (status.get('bootSource') == 'armada_boot' and
+                   verdict.get('state') in (offline_completion.AWAITING_CONFIRMATION,
+                                            offline_completion.FINALIZING))):
             return None
         return status
 
@@ -316,6 +335,16 @@ class OfflineJobManager:
                 status.get('newDeployment') != identity['newDeployment']):
             return None
 
+        # armada_boot: exact marker propagation
+        if identity.get('bootSource') == 'armada_boot':
+            if (status.get('bootSource') != 'armada_boot' or
+                    physical.get('bootSource') != 'armada_boot'):
+                return None
+            if 'fromSlot' not in status or 'targetSlot' not in status:
+                return None
+            if 'actualSlot' not in physical or 'inactiveSlot' not in physical:
+                return None
+
         manifest_sha = prepared.get('recoveryManifestSha256')
         package_sha = prepared.get('packageDescriptorSha256')
         if (not _is_sha256(manifest_sha) or
@@ -360,7 +389,7 @@ class OfflineJobManager:
         if operation == 'prepare' and state in _UNRECORDED_PREPARE_STATES:
             result = self._durable_prepare(session, receipt)
             final = 'prepared'
-        elif operation == 'execute' and state in _UNRECORDED_EXECUTE_STATES:
+        elif operation == 'execute' and _execute_result_unrecorded(receipt):
             result = self._durable_completion(session, receipt)
             final = 'awaiting_reboot'
         else:
@@ -723,7 +752,7 @@ class OfflineJobManager:
         re-checked for eligibility.
         """
         current = self.store.status(sessionId)
-        if current.get('state') in _UNRECORDED_EXECUTE_STATES:
+        if _execute_result_unrecorded(current):
             # A dead execute worker may have completed the transaction without
             # recording it.  Adopt that durable result once and continue with
             # the normal checks; never while the worker still runs.
@@ -792,24 +821,30 @@ class OfflineJobManager:
 
     def status(self, sessionId):
         receipt = self.store.status(sessionId)
-        if receipt.get('state') not in _BUSY:
-            return self._attach_completion(sessionId, receipt)
         operation = receipt.get('jobOperation')
+        if (receipt.get('state') not in _BUSY and
+                not (operation == 'execute' and
+                     _execute_result_unrecorded(receipt))):
+            return self._attach_completion(sessionId, receipt)
         if operation not in ('prepare', 'execute'):
-            raise offline_session.OfflineSessionError('busy session has invalid job operation')
+            raise offline_session.OfflineSessionError(
+                'session receipt has an unrecognized state')
         if self._job_active(operation, sessionId):
             receipt['jobActive'] = True
             return receipt
         # Re-read after the query: a worker may have committed a terminal result.
         receipt = self.store.status(sessionId)
         receipt['jobActive'] = False
-        if receipt.get('state') in _BUSY:
+        busy = receipt.get('state') in _BUSY
+        if (busy or
+                (receipt.get('jobOperation') == 'execute' and
+                 _execute_result_unrecorded(receipt))):
             if self._reconcile_interrupted(sessionId):
                 # The durable completion is read back from the receipt instead
                 # of being fabricated in this response.
                 receipt = self.store.status(sessionId)
                 receipt['jobActive'] = False
-            else:
+            elif busy:
                 receipt['jobInterrupted'] = True
                 receipt['attentionRequired'] = True
         return self._attach_completion(sessionId, receipt)

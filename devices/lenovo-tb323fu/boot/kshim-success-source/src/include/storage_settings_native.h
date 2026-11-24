@@ -22,3 +22,9 @@ int storage_settings_native_trial_load(struct kshim_update_trial *record,
 int storage_settings_native_trial_save(uint64_t expected_sequence,
                                        const struct kshim_update_trial *next,
                                        unsigned *written);
+
+int storage_settings_native_read_boot(int (*reader)(const struct kshim_blockdev *, void *),
+                                      void *ctx);
+
+int storage_settings_native_log_boot(uint32_t target, uint32_t phase,
+                                    int32_t status);

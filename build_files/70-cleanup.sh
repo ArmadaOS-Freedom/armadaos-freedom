@@ -55,7 +55,10 @@ for package in \
     terra-gamescope-libs \
     gamescope-session \
     gamescope-session-steam \
+    hexagonrpc \
+    iio-sensor-proxy \
     inputplumber \
+    libssc \
     mangohud \
     mesa-vulkan-drivers \
     NetworkManager \

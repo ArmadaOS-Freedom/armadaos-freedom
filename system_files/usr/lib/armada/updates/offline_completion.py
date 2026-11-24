@@ -91,13 +91,23 @@ def _identity(source, plan_sha256=None):
         'planSha256': _sha(plan_sha256 if plan_sha256 is not None
                            else source.get('planSha256')),
     }
+    disk = (source.get('bootSource') == 'armada_boot' and
+            'fromSlot' in source and source['fromSlot'] is None and
+            'targetSlot' in source and source['targetSlot'] is None)
+    if source.get('bootSource') == 'armada_boot' and not (
+            'fromSlot' in source and 'targetSlot' in source and
+            source['fromSlot'] is None and source['targetSlot'] is None):
+        return None
     if (identity['transactionId'] is None or identity['oldDeployment'] is None or
             identity['newDeployment'] is None or
-            identity['fromSlot'] not in _SLOTS or
-            identity['targetSlot'] not in _SLOTS or
-            identity['fromSlot'] == identity['targetSlot'] or
+            (not disk and (
+                identity['fromSlot'] not in _SLOTS or
+                identity['targetSlot'] not in _SLOTS or
+                identity['fromSlot'] == identity['targetSlot'])) or
             identity['planSha256'] is None):
         return None
+    if disk:
+        identity['bootSource'] = 'armada_boot'
     return identity
 
 
@@ -119,14 +129,26 @@ def document_identity(prepared, plan, plan_sha256=None):
         return None
     if plan_sha256 is not None and plan_sha256 != prepared.get('planSha256'):
         return None
-    identity = _identity({
+    armada_boot = ('armadaBootSwitch' in plan or
+                   plan.get('bootSource') == 'armada_boot')
+    if armada_boot:
+        if ('fromSlot' not in plan or 'targetSlot' not in plan or
+                plan['fromSlot'] is not None or plan['targetSlot'] is not None or
+                not isinstance(plan.get('armadaBootSwitch'), dict)):
+            return None
+    elif 'fromSlot' not in plan or 'targetSlot' not in plan:
+        return None
+    source = {
         'transactionId': prepared.get('transactionId'),
         'planSha256': prepared.get('planSha256'),
         'oldDeployment': plan.get('oldDeployment'),
         'newDeployment': plan.get('newDeployment'),
         'fromSlot': plan.get('fromSlot'),
         'targetSlot': plan.get('targetSlot'),
-    })
+    }
+    if armada_boot:
+        source['bootSource'] = 'armada_boot'
+    identity = _identity(source)
     if identity is None or plan.get('transactionId') != identity['transactionId']:
         return None
     return identity
@@ -196,10 +218,15 @@ def _slot_digests(plan, name):
     return digests
 
 
-def _status_evidence(status, identity, model):
+def _status_evidence(status, identity, model, *, disk=False):
     """Return whether the final status proves the dual boot write completed."""
     if not isinstance(status, dict):
         return False
+    if identity.get('bootSource') == 'armada_boot':
+        if (status.get('bootSource') != 'armada_boot' or
+                'fromSlot' not in status or
+                'targetSlot' not in status):
+            return False
     return (
         type(status.get('schemaVersion')) is int and
         status['schemaVersion'] == 1 and
@@ -216,7 +243,8 @@ def _status_evidence(status, identity, model):
         status.get('state') == AWAITING_REBOOT and
         status.get('phase') == AWAITING_REBOOT and
         status.get('requiresReboot') is True and
-        status.get('bootWriteState') == 'written' and
+        status.get('bootWriteState') == ('not_started' if disk else 'written') and
+        (status.get('bootSource') == 'armada_boot') == disk and
         status.get('slotControlState') == 'not_issued' and
         status.get('bootPolicy') == BOOT_POLICY)
 
@@ -296,10 +324,25 @@ def execute_completion(prepared, plan, plan_sha256, status, report, ack,
     old_digests = _slot_digests(plan, 'originalBootSha256')
     if new_digests is None or old_digests is None:
         return None
-    if not _status_evidence(status, identity, plan_model):
+    disk = 'armadaBootSwitch' in plan
+    if not _status_evidence(status, identity, plan_model, disk=disk):
         return None
     if not isinstance(report, dict):
         return None
+    if disk:
+        switch = plan['armadaBootSwitch']
+        if (not isinstance(switch, dict) or old_digests != new_digests or
+                report.get('schemaVersion') != 1 or
+                report.get('phase') not in ('armada_boot_selected',
+                                            'armada_boot_switch_intent') or
+                report.get('transactionId') != identity['transactionId'] or
+                report.get('planSha256') != identity['planSha256'] or
+                report.get('armadaBootSwitch') != switch or
+                switch.get('model') != plan_model or
+                switch.get('currentDeployment') != identity['oldDeployment'] or
+                switch.get('newDeployment') != identity['newDeployment']):
+            return None
+        return identity
     if (report.get('phase') != 'dual_boots_written' or
             report.get('model') != plan_model or
             report.get('transactionUuid') != identity['transactionId'] or
@@ -312,6 +355,49 @@ def execute_completion(prepared, plan, plan_sha256, status, report, ack,
     if not _write_evidence(report.get('writes'), new_digests, old_digests):
         return None
     return identity
+
+
+def resolve_execute_status(prepared, plan, plan_sha256, status, report, ack,
+                           trial, model=None):
+    """Resolve a durable execute result against live trial evidence.
+
+    Returns ``(identity, status)`` when the durable transaction documents
+    prove an executed transaction and the live trial agrees with it, or
+    ``(None, None)`` otherwise.  A status interrupted during the armada boot
+    switch is first normalized in memory to the awaiting_reboot checkpoint
+    the validator accepts; only ``state``, ``phase`` and ``requiresReboot``
+    are replaced on that copy.
+    """
+    interrupted_disk = (
+        isinstance(status, dict) and
+        status.get('bootSource') == 'armada_boot' and
+        ((status.get('state') == 'executing' and
+          status.get('phase') == 'switching_armada_boot') or
+         (status.get('state') == 'recovery_required' and
+          status.get('phase') == 'failed' and
+          status.get('failedPhase') in ('awaiting_reboot', 'switching_armada_boot'))))
+    checked_status = status
+    if interrupted_disk:
+        checked_status = dict(status)
+        checked_status['state'] = 'awaiting_reboot'
+        checked_status['phase'] = 'awaiting_reboot'
+        checked_status['requiresReboot'] = True
+    identity = execute_completion(
+        prepared, plan, plan_sha256, checked_status, report, ack, model)
+    if identity is None:
+        return None, None
+    if not interrupted_disk:
+        return identity, checked_status
+    verdict = evaluate(
+        {'state': 'awaiting_reboot', 'result': checked_status},
+        trial, identity)
+    if verdict.get('state') in (AWAITING_CONFIRMATION, FINALIZING, CONFIRMED):
+        return identity, checked_status
+    if (verdict.get('state') == AWAITING_REBOOT and
+            verdict.get('restartEligible') is True and
+            trial.get('selectorCheckpointed') is True):
+        return identity, checked_status
+    return None, None
 
 
 def _outcome(receipt):
@@ -362,7 +448,17 @@ def _mismatch(identity, reason, error=None):
 
 def _classify(receipt, trial, identity):
     outcome = _outcome(receipt)
-    if outcome in _TERMINAL_FAILURE_STATES:
+    terminal_rollback = (
+        isinstance(trial, dict) and
+        identity.get('bootSource') == 'armada_boot' and
+        trial.get('bootSource') == 'armada_boot' and
+        trial.get('state') == 'available' and
+        trial.get('recordState') == ROLLED_BACK and
+        trial.get('runningDeployment') == 'old' and
+        trial.get('bootConfirmed') is False and
+        trial.get('transactionId') == identity['transactionId'] and
+        trial.get('planSha256') == identity['planSha256'])
+    if outcome in _TERMINAL_FAILURE_STATES and not terminal_rollback:
         return _result(FAILED, identity, reason=outcome)
 
     if not isinstance(trial, dict) or trial.get('state') != 'available':
@@ -373,7 +469,11 @@ def _classify(receipt, trial, identity):
             trial.get('oldDeployment') != identity['oldDeployment'] or
             trial.get('newDeployment') != identity['newDeployment'] or
             trial.get('fromSlot') != identity['fromSlot'] or
-            trial.get('targetSlot') != identity['targetSlot']):
+            trial.get('targetSlot') != identity['targetSlot'] or
+            (identity.get('bootSource') == 'armada_boot' and (
+                trial.get('bootSource') != 'armada_boot' or
+                'fromSlot' not in trial or
+                'targetSlot' not in trial))):
         return _mismatch(
             identity, 'transaction_mismatch',
             'the live trial journal does not describe this session')

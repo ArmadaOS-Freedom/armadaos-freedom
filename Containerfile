@@ -31,6 +31,8 @@ ARG ARMADA_RGB_REF
 ARG UMTP_RESPONDER_REF
 ARG KSHIM_TOOLS_REF
 ARG BTOP_CN_REF
+ARG HEXAGONRPC_REF
+ARG IIO_SENSOR_PROXY_REF
 
 FROM ${STEAM_BOOTSTRAP_REF} AS steam-bootstrap
 
@@ -83,6 +85,10 @@ FROM ${UMTP_RESPONDER_REF} AS umtp-responder
 FROM ${KSHIM_TOOLS_REF} AS kshim-tools
 
 FROM ${BTOP_CN_REF} AS btop-cn
+
+FROM ${HEXAGONRPC_REF} AS hexagonrpc
+
+FROM ${IIO_SENSOR_PROXY_REF} AS iio-sensor-proxy
 
 FROM docker.io/library/node:22-slim AS decky-build
 WORKDIR /build/freedom-control
@@ -149,6 +155,7 @@ RUN python3 -m venv /opt/kconfig \
 ENV PATH="/opt/kconfig/bin:${PATH}"
 
 COPY build_files/build-edl-runtime.sh build_files/edl_device_config.py build_files/edl-devices.json /runtime-source/build_files/
+COPY system_files/etc/pki/containers/armadaos-freedom.pub /runtime-source/system_files/etc/pki/containers/armadaos-freedom.pub
 COPY build_files/update_ab_inspect.c build_files/update_ufs_boot.c build_files/update_ufs_boot.h /runtime-source/build_files/
 COPY devices/lenovo-tb323fu/boot/kshim-success-source /runtime-source/devices/lenovo-tb323fu/boot/kshim-success-source
 
@@ -246,6 +253,8 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=umtp-responder,source=/rpms,target=/packages/umtp-responder \
     --mount=type=bind,from=kshim-tools,source=/kshim-tools,target=/packages/kshim-tools \
     --mount=type=bind,from=btop-cn,source=/rpms,target=/packages/btop-cn \
+    --mount=type=bind,from=hexagonrpc,source=/rpms,target=/packages/hexagonrpc \
+    --mount=type=bind,from=iio-sensor-proxy,source=/rpms,target=/packages/iio-sensor-proxy \
     --mount=type=bind,from=decky-build,source=/build/freedom-control/dist,target=/packages/decky-dist \
     --mount=type=bind,from=decky-build,source=/build/armada-store/dist,target=/packages/decky-store-dist \
     --mount=type=secret,id=decky_releases,target=/run/secrets/decky_releases,required=false \

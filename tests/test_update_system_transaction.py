@@ -179,6 +179,84 @@ class SystemTransactionTests(unittest.TestCase):
         return case.env.images[part['lun']].read_bytes()[
             part['firstLba'] * bs:(part['firstLba'] + part['blockCount']) * bs]
 
+    def test_armada_boot_path_skips_mirroring_and_journal(self) -> None:
+        import updates.boot_disk_switch as boot_disk_switch
+        with ExitStack() as stack:
+            act_test, case, trust, _, sysroot, work = self._prepare(stack)
+
+            # Snapshot physical slot images and recovery journal bytes.
+            part_a = case.trust['sources']['partitions']['boot_a']
+            part_b = case.trust['sources']['partitions']['boot_b']
+            before_a = case.env.images[part_a['lun']].read_bytes()
+            before_b = case.env.images[part_b['lun']].read_bytes()
+            journal_before = os.pread(case.journal.fd, 64 * 1024, jf.REGION_OFFSET)
+
+            initial = dict(trust['physical'])
+            initial['bootSource'] = 'armada_boot'
+            initial['actualSlot'] = None
+            initial['inactiveSlot'] = None
+            stack.enter_context(mock.patch.object(
+                tx_mod.physical_slots, 'inspect_physical_slots',
+                return_value=copy.deepcopy(initial)))
+            stack.enter_context(mock.patch.object(
+                tx_mod.physical_slots, 'same_physical_identity',
+                return_value=True))
+
+            ensure_ready = stack.enter_context(mock.patch.object(
+                boot_disk_switch, 'ensure_ready'))
+
+            expected_plan = {
+                'expected': 'seed', 'target': 'gen-' + '1' * 32,
+                'model': initial['model'], 'currentDeployment': initial['deployment'],
+                'newDeployment': wf.TARGET_DEP,
+            }
+            prepare = stack.enter_context(mock.patch.object(
+                boot_disk_switch, 'prepare', return_value=expected_plan))
+            activate = stack.enter_context(mock.patch.object(
+                boot_disk_switch, 'activate'))
+
+            capture = stack.enter_context(mock.patch.object(
+                boot_trust, 'capture_boot_trust',
+                side_effect=AssertionError('capture_boot_trust must not run')))
+            write_offline = stack.enter_context(mock.patch.object(
+                offline_boot_writer, 'write_offline_boots',
+                side_effect=AssertionError('write_offline_boots must not run')))
+
+            package = copy.deepcopy(PACKAGE)
+            package['armadaBootCapsules'] = {initial['model']: {'stub': True}}
+            stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image',
+                return_value={'package': package, 'commit': 'b' * 64,
+                              'originRef': 'armada/stable'}))
+
+            status = self._run(sysroot, work)
+
+            self.assertEqual(status['state'], 'awaiting_reboot')
+            self.assertEqual(status['phase'], 'awaiting_reboot')
+            self.assertTrue(status['requiresReboot'])
+            self.assertEqual(status['bootSource'], 'armada_boot')
+            self.assertEqual(status['bootWriteState'], 'not_started')
+            self.assertIsNone(status['fromSlot'])
+            self.assertIsNone(status['targetSlot'])
+
+            ensure_ready.assert_called_once()
+            prepare.assert_called_once()
+            activate.assert_called_once()
+            capture.assert_not_called()
+            write_offline.assert_not_called()
+
+            plan = json.loads((work / 'plan.json').read_bytes())
+            self.assertEqual(plan, expected_plan)
+            self.assertEqual(status['newDeployment'], wf.TARGET_DEP)
+
+            # Both real fake-device slot images must be byte-identical.
+            self.assertEqual(case.env.images[part_a['lun']].read_bytes(), before_a)
+            self.assertEqual(case.env.images[part_b['lun']].read_bytes(), before_b)
+            # No 2GiB recovery journal record written.
+            journal_after = os.pread(case.journal.fd, 64 * 1024, jf.REGION_OFFSET)
+            self.assertEqual(journal_after, journal_before)
+            act_test._assert_all_closed(case)
+
     def test_online_transaction_mirrors_both_slots(self) -> None:
         for board in (1, 2):
             for current in (0, 1):

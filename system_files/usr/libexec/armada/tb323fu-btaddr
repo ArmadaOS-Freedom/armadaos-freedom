@@ -20,9 +20,11 @@
 # THE SOFTWARE.
 #
 # Apply the provisioned public Bluetooth address on TB323FU (lenovo,baldur).
-# The address file and pairing state are read-only inputs here.
+# Keep the applied address in /var so it survives a different OSTree deployment.
 
 ADDR_FILE=/etc/tb323fu/bt-address
+STATE_FILE=/var/lib/armada/bluetooth/bt-address
+MACHINE_ID_FILE=/etc/machine-id
 COMPAT=/sys/firmware/devicetree/base/compatible
 DEADLINE_SECONDS=55
 
@@ -46,20 +48,73 @@ if ! is_target; then
     exit 0
 fi
 
-if [ ! -f "$ADDR_FILE" ] || [ ! -r "$ADDR_FILE" ]; then
-    warn "$ADDR_FILE is missing or unreadable"
-    exit 1
+read_address() {
+    [ -f "$1" ] && [ -r "$1" ] || return 1
+    sed -n '1p' "$1" | tr -d ' \t\r' | tr 'A-F' 'a-f'
+}
+
+derive_address() {
+    id=$(cat "$MACHINE_ID_FILE" 2>/dev/null) || return 1
+    [ "${#id}" -eq 32 ] || return 1
+    case "$id" in
+        *[!0-9a-fA-F]*|00000000000000000000000000000000) return 1 ;;
+    esac
+    id=$(printf '%s' "$id" | tr 'A-F' 'a-f')
+    hash=$(printf 'tb323fu-bt:%s' "$id" | sha256sum) || return 1
+    first=$(printf '%s' "$hash" | cut -c1-2)
+    rest=$(printf '%s' "$hash" | cut -c3-12)
+    # Set the locally administered bit and clear the multicast bit.
+    printf '%02x%s\n' "$(( (0x$first | 2) & 254 ))" "$rest" | sed 's/../&:/g; s/:$//'
+}
+
+save_address() {
+    if [ "$desired" = "$(read_address "$STATE_FILE")" ]; then
+        return 0
+    fi
+
+    if (
+        umask 077
+        dir=${STATE_FILE%/*}
+        mkdir -p "$dir" || exit 1
+        tmp=$(mktemp "$dir/.bt-address.XXXXXX") || exit 1
+        trap 'rm -f -- "$tmp"' EXIT
+        printf '%s\n' "$desired" > "$tmp" && mv -fT -- "$tmp" "$STATE_FILE"
+    ); then
+        return 0
+    fi
+    warn "could not save Bluetooth address to $STATE_FILE"
+    return 1
+}
+
+address_source=
+if [ -e "$ADDR_FILE" ] || [ -L "$ADDR_FILE" ]; then
+    address_source=$ADDR_FILE
+elif [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+    address_source=$STATE_FILE
 fi
 
-desired=$(sed -n '1p' "$ADDR_FILE")
-desired=$(printf '%s' "$desired" | tr -d ' \t\r')
-desired=$(printf '%s' "$desired" | tr 'A-F' 'a-f')
+if [ -n "$address_source" ]; then
+    desired=$(read_address "$address_source") || {
+        warn "could not read $address_source"
+        exit 1
+    }
+else
+    desired=$(derive_address) || {
+        warn "cannot initialize Bluetooth address without a valid machine-id"
+        exit 1
+    }
+    address_source=$MACHINE_ID_FILE
+fi
 
 case "$desired" in
+    00:00:00:00:00:00|ff:ff:ff:ff:ff:ff)
+        warn "invalid Bluetooth address from $address_source"
+        exit 1
+        ;;
     [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f])
         ;;
     *)
-        warn "invalid address in $ADDR_FILE: '$desired'"
+        warn "invalid Bluetooth address from $address_source"
         exit 1
         ;;
 esac
@@ -83,7 +138,8 @@ while :; do
 done
 
 if [ "$current" = "$desired" ]; then
-    exit 0
+    save_address
+    exit $?
 fi
 
 # Power the controller off before changing the public address.
@@ -118,7 +174,8 @@ fi
 while :; do
     current=$(info_addr)
     if [ "$current" = "$desired" ]; then
-        exit 0
+        save_address
+        exit $?
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
         warn "controller did not adopt public address $desired (read back: ${current:-unavailable})"

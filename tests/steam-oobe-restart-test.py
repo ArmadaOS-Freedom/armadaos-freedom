@@ -41,6 +41,7 @@ count=$(cat "$HOME/calls.count" 2>/dev/null || echo 0)
 count=$((count + 1))
 printf '%s' "$count" > "$HOME/calls.count"
 printf '%s\\n' "$@" > "$HOME/args.$count"
+printf '%s\\n' "${STEAMLINK_V4L2_RESET_AFTER_LAST_BUF-}" > "$HOME/reset.$count"
 [[ -e "$HOME/write-completion" ]] && : > "$HOME/completed"
 if [[ -e "$HOME/wait-mode" ]]; then
     printf '%s\\n' "$$" > "$HOME/child.pid"
@@ -168,6 +169,15 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(fx.call_args(1), ["-applaunch", "570", "-silent"])
         self.assertEqual(fx.call_args(2), fx.call_args(1))
         self.assertTrue((fx.home / "completed").exists())
+
+    def test_launcher_sets_v4l2_reset_for_both_invocations(self):
+        fx = self.fixture([42, 0])
+        rc, _, err = self.run_launcher(fx, "-silent")
+
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fx.call_count(), 2)
+        for index in (1, 2):
+            self.assertEqual((fx.home / f"reset.{index}").read_text(), "1\n")
 
     def test_repeated_exit42_restarts_until_clean_exit(self):
         fx = self.fixture([42, 42, 0])

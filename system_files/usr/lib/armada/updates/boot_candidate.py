@@ -1,7 +1,7 @@
 """Prepare boot candidate files only; no physical trust, OTA, or device writes are authorized.
 
 The caller must hold the operation lock and supply verified materials and the current trusted helper.
-TB710FU uses payload build, not A/B; this does not perform a complete OS update.
+Each physical slot gets its own candidate; this does not perform a complete OS update.
 """
 
 from __future__ import annotations

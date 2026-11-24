@@ -103,6 +103,54 @@ class Tests(unittest.TestCase):
         f,h,r=self.makefile()
         with patch.object(edl,'device_context',return_value=(Path(f.name),PART,1,0)),patch.object(edl.os,'pwrite') as write,patch.object(edl.subprocess,'run') as reboot,contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(edl.main(['--check']),0);write.assert_not_called();reboot.assert_not_called()
+    def test_v4_next_and_log_skip_edl_and_write(self):
+        for argv,expected in ((['--next','linux'],'linux'),(['--log','off'],'off')):
+            with self.subTest(argv=argv):
+                f,h,r=self.makefile(3,3)
+                contexts=[]
+                def fake_context(*,require_edl=True):
+                    contexts.append(require_edl);return (Path(f.name),PART,1,0)
+                out=io.StringIO()
+                with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),contextlib.redirect_stdout(out):
+                    self.assertEqual(edl.main(argv),0)
+                self.assertEqual(contexts,[False])
+                current=edl.parse_store(h,os.pread(f.fileno(),65536,edl.REGION_OFFSET),PART,1)
+                if expected=='linux':
+                    self.assertEqual(json.loads(out.getvalue())['next'],'linux')
+                    self.assertEqual(current['best']['values'][4]&0xff,3)
+                else:
+                    self.assertEqual(json.loads(out.getvalue())['log'],'off')
+                    self.assertEqual(current['best']['values'][4],0x100)
+    def test_v4_checks_without_edl_and_no_write(self):
+        f,h,r=self.makefile(3,3)
+        def fake_context(*,require_edl=True):
+            if require_edl:raise edl.Refuse('no EDL')
+            return (Path(f.name),PART,1,0)
+        for argv in ([], ['--check']):
+            out=io.StringIO()
+            with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(out):
+                self.assertEqual(edl.main(argv),0)
+                status=json.loads(out.getvalue())
+                self.assertTrue(status['ready'])
+                self.assertTrue(status['v4SettingsAvailable'])
+                write.assert_not_called()
+        with patch.object(edl,'launcher_settings_available',return_value=True),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(edl.Refuse,'no EDL'):
+                edl.main(['--reboot'])
+            with self.assertRaisesRegex(edl.Refuse,'no EDL'):
+                edl.main(['--next','edl'])
+        write.assert_not_called()
+    def test_legacy_check_requires_edl_and_next_fails_read_only(self):
+        f,h,r=self.makefile()
+        gates=[]
+        def fake_context(*,require_edl=True):
+            gates.append(require_edl);return (Path(f.name),PART,1,0)
+        with patch.object(edl,'launcher_settings_available',return_value=False),patch.object(edl,'device_context',side_effect=fake_context),patch.object(edl.os,'pwrite') as write,contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(edl.main(['--check']),0)
+            with self.assertRaisesRegex(edl.Refuse,'does not support next-boot'):
+                edl.main(['--next','linux'])
+        self.assertEqual(gates,[True])
+        write.assert_not_called()
     def test_cli_reboot_failure_cancels_request(self):
         f,h,r=self.makefile(2)
         class Failed:returncode=1
@@ -115,4 +163,54 @@ class Tests(unittest.TestCase):
         with self.assertRaises(edl.Refuse):edl.parse_store(h,bytes(bad),PART,1)
         rec=bytearray(r[4096:8192]);struct.pack_into('<I',rec,64,0);seal(rec);bad=bytearray(r);bad[8192:12288]=rec
         with self.assertRaises(edl.Refuse):edl.parse_store(h,bytes(bad),PART,1)
+
+    def test_log_toggle_preserves_raw_and_sequence(self):
+        f, h, r = self.makefile(3, 3)
+        fd = f.fileno()
+        store = edl.parse_store(h, r, PART, 1)
+        self.assertEqual((store['best']['values'][4] & 0xff), 0)
+        self.assertEqual(edl.set_request(fd, store, 0, log_enabled=False), 8)
+        disabled = edl.parse_store(h, os.pread(fd, 65536, edl.REGION_OFFSET), PART, 1)
+        self.assertEqual(disabled['best']['values'][4], 0x100)
+        self.assertEqual((disabled['best']['values'][4] & 0xff), 0)
+        self.assertEqual(disabled['best']['sequence'], 8)
+        self.assertEqual(edl.set_request(fd, disabled, 4), 9)
+        queued = edl.parse_store(h, os.pread(fd, 65536, edl.REGION_OFFSET), PART, 1)
+        self.assertEqual(queued['best']['values'][4], 0x104)
+        self.assertEqual(queued['best']['values'][:4], [0, 4, 1, 2])
+        self.assertEqual((queued['best']['values'][4] & 0xff), 4)
+        self.assertEqual(queued['best']['sequence'], 9)
+        self.assertEqual(edl.set_request(fd, queued, 4, log_enabled=True), 10)
+        enabled = edl.parse_store(h, os.pread(fd, 65536, edl.REGION_OFFSET), PART, 1)
+        self.assertEqual(enabled['best']['values'][4], 4)
+        self.assertEqual(enabled['best']['values'][:4], [0, 4, 1, 2])
+        self.assertEqual((enabled['best']['values'][4] & 0xff), 4)
+        self.assertEqual(enabled['best']['sequence'], 10)
+        self.assertEqual(edl.set_request(fd, enabled, 0), 11)
+        cancelled = edl.parse_store(h, os.pread(fd, 65536, edl.REGION_OFFSET), PART, 1)
+        self.assertEqual(cancelled['best']['values'][4], 0)
+        self.assertEqual(cancelled['best']['values'][:4], [0, 4, 1, 2])
+        self.assertEqual((cancelled['best']['values'][4] & 0xff), 0)
+        self.assertEqual(cancelled['best']['sequence'], 11)
+
+    def test_parse_refuses_unrecognized_versions_and_packed_flags(self):
+        h, r = fixture(3, 3)
+        bad = bytearray(r)
+        rec = bytearray(bad[4096:8192])
+        struct.pack_into('<I', rec, 72, 4)
+        seal(rec)
+        bad[4096:8192] = rec
+        with self.assertRaises(edl.Refuse):
+            edl.parse_store(h, bytes(bad), PART, 1)
+        bad = bytearray(r)
+        rec = bytearray(bad[4096:8192])
+        values = bytearray(rec[56:76])
+        struct.pack_into('<I', rec, 8, 4)
+        struct.pack_into('<I', values, 16, 0x200)
+        rec[56:76] = values
+        seal(rec)
+        bad[4096:8192] = rec
+        with self.assertRaises(edl.Refuse):
+            edl.parse_store(h, bytes(bad), PART, 1)
+
 if __name__=='__main__':unittest.main()

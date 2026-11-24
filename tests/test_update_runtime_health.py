@@ -133,7 +133,23 @@ class RuntimeHealthTests(unittest.TestCase):
                 return listing
             self.assertEqual(argv[1], "show-session")
             show_commands.append(argv)
-            self.assertIn("--all", argv)
+            self.assertEqual(
+                argv,
+                [
+                    runtime_health.LOGINCTL_BIN,
+                    "show-session",
+                    argv[2],
+                    "--all",
+                    "--no-pager",
+                    "--property=Active",
+                    "--property=Remote",
+                    "--property=Type",
+                    "--property=Class",
+                    "--property=State",
+                    "--property=Seat",
+                    "--property=User",
+                ],
+            )
             return _session_output(sessions[argv[2]])
 
         with mock.patch.object(runtime_health, "_run_cmd", side_effect=run_cmd), mock.patch.object(

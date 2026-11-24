@@ -409,6 +409,12 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/1021-wifi-ath12k-convert-scan-timeout-to-wiphy-delayed-work.patch`
   source: https://lkml.iu.edu/2609.1/17957.html
   upstream: https://lkml.iu.edu/2609.1/17957.html
+- `patches/1030-media-iris-send-the-stream-POC-type.patch`
+  source: https://github.com/armada-os/armada/blob/b35cabd277ff98c40a1ac4057c55384722de7600/packages/kernel/patches/1030-media-iris-send-the-stream-POC-type.patch
+  upstream: local
+- `patches/1031-media-iris-stop-AV1-tier-overwriting-HEVC-tier.patch`
+  source: https://github.com/armada-os/armada/blob/b35cabd277ff98c40a1ac4057c55384722de7600/packages/kernel/patches/1031-media-iris-stop-AV1-tier-overwriting-HEVC-tier.patch
+  upstream: local
 - `patches/0500-ROCKNIX-set-boot-fanspeed.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0500-ROCKNIX-set-boot-fanspeed.patch
   upstream: unknown
@@ -719,7 +725,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   license: GPL-2.0-only. The file carries no notice of its own; the repository's [LICENSE](https://github.com/MeteoricmeteorLL/tb710fu-linux/blob/16e800d4f6e5cf4a8517900a9e11eec0ebc91bd3/LICENSE) (section 3) puts `kernel/sources/` under GPL-2.0. An SPDX line and an origin header were added; the rest is verbatim.
 - `dts/sm8650-lenovo-tb710fu.dts.patch`
   source: armada
-  notes: The whole TB710FU delta on top of the vendored board file; it was three fdtoverlay overlays (board, touch, audio) while the board lived in a kernel overlay, and the blocks are appended unchanged and in the same order. Board: kShimC simple-framebuffer template, the 903 MHz GPU level, the unit's own ADSP/CDSP firmware paths, the TB710FU touch compatible; disables the original port's boot-log reservations and clears another unit's Bluetooth address; iris stays enabled as in the board file, with the unit's Lenovo-signed `vpu33_4v.mbn` from the firmware bundle. Touch: `novatek,pen-support`, as in the vendor dtbo; with 0721 the driver scans for the pen from boot. Audio: TDM1 pins, the four amplifiers (reset GPIOs, sound channels) and the sound card, as on the vendor Android.
+  notes: The whole TB710FU delta on top of the vendored board file; it was three fdtoverlay overlays (board, touch, audio) while the board lived in a kernel overlay, and the blocks are appended unchanged and in the same order. Board: kShimC simple-framebuffer template, the 903 MHz GPU level, the unit's own ADSP/CDSP firmware paths, the ADSP FastRPC node without `qcom,non-secure-domain` (the sensor hub only loads its sensors for a secure session, so the node becomes `/dev/fastrpc-adsp-secure`; nothing else uses it, audio goes through GPR), the TB710FU touch compatible; disables the original port's boot-log reservations and clears another unit's Bluetooth address; iris stays enabled as in the board file, with the unit's Lenovo-signed `vpu33_4v.mbn` from the firmware bundle. Touch: `novatek,pen-support`, as in the vendor dtbo; with 0721 the driver scans for the pen from boot. Audio: TDM1 pins, the four amplifiers (reset GPIOs, sound channels) and the sound card, as on the vendor Android.
 - `dts/sm8250-retroidpocket-common.dtsi`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/linux/dts/qcom/sm8250-retroidpocket-common.dtsi
 - `dts/sm8250-ayaneo-pocket-micro2.dts`
@@ -857,7 +863,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Extracts only the `cci0`, `cci1`, and `camss` nodes under `&soc` with one indentation normalization; it closes the labels the board DTS references and does not imply camera support.
 - `dts/sm8750-lenovo-elden.dts.patch`
   source: armada
-  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`. The panel node also reports rotation 270 for the fixed landscape-right startup profile.
+  notes: Runtime RAM and simplefb template; disables the unverified fixed reservations and enables the runtime SMMU preserved-mapping handoff from `0146`. The panel node also reports rotation 270 for the fixed landscape-right startup profile. Iris additionally selects the signed firmware from the same device's Android vendor_a (ZUXOS_1.5.10.259_260611_PRC), SHA-256 9f6352d526f39bc3f25b6d670ba9f4a18ebd9dea57e043683b70a301e22ee6c7.
 - `patches/0147-power-sequencing-qcom-wcn-add-wcn7861-pmu.patch`
   source: https://github.com/h0cheung/tb322fc-linux-kernel/blob/6f97250ead155fc3b980856323e99a4623dae73d/drivers/power/sequencing/pwrseq-qcom-wcn.c
   upstream: unknown
@@ -931,9 +937,9 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   upstream: unknown
   notes: Gen5 Kaanapali dispcc display-artifact fix, imported byte-for-byte as original `patches/0009`.
 - `patches/0169-arm64-dts-qcom-kaanapali-add-the-second-DSI-controll.patch`
-  source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
-  upstream: unknown
-  notes: Gen5 Kaanapali second DSI controller devicetree node, imported byte-for-byte as original `patches/0019`.
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261120-molokai-soc-v3-8-403d763685d9@yahoo.com/
+  notes: Gen5 Kaanapali second DSI controller devicetree node, updated to the upstream Venkat Yadlapati version with authorship preserved; adds DISPCC DSI1 byte / pixel PLL inputs now wired and existing DSI1 controller/PHY and links, no change to panel timing.
 - `patches/0170-drm-panel-nt36523-add-DSC-and-the-Lenovo-TB323FU-CSO.patch`
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
@@ -1022,6 +1028,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
   notes: Kernel-side idle refresh from the pinned tree's legacy 0110, layered on the 0190 vertical-front-porch switch: the committed mode and its vtotal are untouched while the running DSI video interface's VFP is stretched from the mode's own refresh rate, and the INTFs are flushed outside a commit; the vtotal is restored and latched before system suspend and on encoder disable. `idle_refresh_enable()` returns before arming the base mode, encoder pointer, notifiers or work unless `lenovo,baldur`, and every other machine stays on the existing path. Author and licence terms are kept; this is a rebase, not a byte-for-byte import.
+- `patches/0191a-drm-msm-dpu-baldur-idle-refresh-timeouts.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/pull/62
+  upstream: local
+  notes: Floors idle refresh timeouts at three slow frames on flush and five slow frames for the watchdog; other encoders remain unchanged.
 - `patches/0192-usb-baldur-runtime-pm.patch`
   source: https://github.com/joonhoekim/tb323fu-linux/commit/11a25bf89b65fff48112a91a0b25bc247e7736d8
   upstream: unknown
@@ -1086,14 +1096,42 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/torvalds/linux/commit/ec0d89150a9381d591344a9f6f5428655c227a7f
   upstream: https://github.com/torvalds/linux/commit/ec0d89150a9381d591344a9f6f5428655c227a7f
   notes: Verbatim upstream backport. Releases the step-wise governor's vote when a trip point is cleared, so the governor no longer holds a stale cooling state. Fixes a vote leak only; cooling maps and thermal policy are unchanged.
-- `patches/0208-input-aw86927-accept-aw86937.patch`
-  source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0038)
-  upstream: unknown
-  notes: Extends the AW86927 haptic driver's chip-ID matching so the AW86937 variant also probes. Chip-ID handling only; no haptic waveform, gain or timing changes.
+- `patches/0208a-Input-aw86927-fix-the-7-V-boost-reference-for-AW8693.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-2-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Corrects the boost reference voltage used for AW86938 so the 7 V setting maps to the right register value.
+- `patches/0208b-Input-aw86927-widen-the-AW86938-boost-mode-mask.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-3-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Widens the AW86938 boost mode mask so all relevant mode bits are preserved when updating the register.
+- `patches/0208c-dt-bindings-input-awinic-aw86927-document-the-AW8693.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-4-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Documents the AW86937 variant in the awinic,aw86927 devicetree binding.
+- `patches/0208d-Input-aw86927-add-support-for-Awinic-AW86937.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-5-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Adds AW86937 device support, including its compatible string and variant-specific parameters.
+- `patches/0208e-Input-aw86927-handle-the-AW8693X-play-and-boost-regi.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-6-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Handles the AW8693X play and boost register layout differences during playback setup.
+- `patches/0208f-Input-aw86927-stop-playback-over-suspend-and-on-shut.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/c3d5afb
+  upstream: https://lore.kernel.org/all/20261117052112.32527-7-xiaqinghuan@mail.ustc.edu.cn/
+  notes: Stops ongoing playback when the device suspends and on shutdown to avoid stuck haptics.
+- `patches/0208g-Input-aw86927-retry-playback-after-failed-suspend.patch`
+  source: armada
+  upstream: local
+  notes: aw86927: record level while suspended, retry schedule on suspend error, clear stale level on resume
 - `patches/0209-leds-rgb-add-aw22127-driver.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0048)
   upstream: unknown
   notes: Adds the AW22127 RGB LED controller driver and its LED-class registration. New driver plus its config symbol only; no existing LED driver is modified.
+- `patches/0209a-arm64-dts-qcom-kaanapali-gcc-cx-domain.patch`
+  source: https://github.com/torvalds/linux/commit/9339897ad7eded77adf834e032482f7609911448
+  upstream: https://patch.msgid.link/20260924-qcom-tie-cx-to-gcc-v5-28-38732033e5b5@oss.qualcomm.com
+  notes: GCC GDSCs backed by RPMh CX, adds missing DT parent to propagate consumer votes; Kaanapali only.
 - `patches/0210-drm-msm-snapshot-sspp-rec-blocks.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0052)
   upstream: unknown
@@ -1106,6 +1144,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0072)
   upstream: unknown
   notes: Forces the PCIe pipe memory on for the Kaanapali clock controller so the pipe clock remains usable while the link is active. Kaanapali-gated; SM8750 and other SoCs are not touched.
+- `patches/0212a-clk-qcom-kaanapali-force-ufs-axi-memory.patch`
+  source: https://github.com/torvalds/linux/commit/ab3c9fbc73091b3c132fce5827ef7de2f5bcd58a
+  upstream: https://github.com/torvalds/linux/commit/ab3c9fbc73091b3c132fce5827ef7de2f5bcd58a
+  notes: Preserve Kaanapali UFS PHY AXI clock memory across system suspend in MCQ mode. Hunk context refreshed after `0212`.
 - `patches/0213-clk-qcom-branch-clear-enable-on-failure.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0073)
   upstream: unknown
@@ -1142,6 +1184,26 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0057)
   upstream: unknown
   notes: Retrains the DP link after a quick replug on Baldur, where the previous link state can still look valid. Baldur only; no change to link-training parameters or timeouts for other boards.
+- `patches/0221a-usb-typec-fsa4480-keep-usb2-in-dp-only.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/blob/c3d5afb/kernel/patches/0134-usb-typec-mux-fsa4480-keep-the-USB-2.0-switch-on-in-.patch
+  upstream: https://lore.kernel.org/all/20261022165143.1327-1-26rote@gmail.com/
+  notes: FSA4480 typec mux keeps the USB 2.0 switch enabled in DP-only mode.
+- `patches/0221b-arm64-dts-qcom-kaanapali-qmp-dp-mode-switch.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/blob/c3d5afb/kernel/patches/0138-arm64-dts-qcom-kaanapali-Mark-the-USB3-DP-PHY-as-a-T.patch
+  upstream: local
+  notes: Kaanapali DTS marks the USB3/DP PHY as a Type-C mode switch for QMP DP mode switching.
+- `patches/0221c-usb-dwc3-qcom-restore-utmi-pipe-clock.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261027-dwc3-utmi-resume-v1-1-ca9f0aa65783@gmail.com/
+  notes: Restores the lost QSCRATCH UTMI/PIPE clock configuration on USB resume.
+- `patches/0221d-dt-bindings-usb-qcom-dwc3-mode-switch.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261119124558.1548-1-26rote@gmail.com/
+  notes: Adds DT binding documentation for the Qualcomm DWC3 mode-switch property.
+- `patches/0221e-usb-dwc3-qcom-dp-only-utmi-pipe-clock.patch`
+  source: https://github.com/joonhoekim/tb323fu-linux/commit/ad418ad42632980d633a709167cc8a9f2e91f17e
+  upstream: https://lore.kernel.org/all/20261119124558.1548-1-26rote@gmail.com/
+  notes: DWC3 QCOM mode mux preserves USB2 while the physical PIPE clock can stop in DP-only mode.
 - `patches/0222-arm64-dts-qcom-kaanapali-describe-ufs-mcq.patch`
   source: devices/lenovo-tb323fu/kernel/tb323fu-linux-11a25bf8 (legacy 0119)
   upstream: unknown

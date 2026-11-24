@@ -118,11 +118,21 @@ def _apply_outcome(stdout, returncode, base, work_dir):
         return uncertain(
             "The system apply worker did not confirm definite slot control")
     if state == "awaiting_reboot":
+        armada_boot = report.get("bootSource") == "armada_boot"
+        expected_boot_write_state = "not_started" if armada_boot else "written"
         if (not report["requiresReboot"]
-                or report.get("bootWriteState") != "written"
+                or report.get("bootWriteState") != expected_boot_write_state
                 or report.get("bootPolicy") != BOOT_POLICY):
             return uncertain(
                 "The system apply worker reported inconsistent reboot evidence")
+        if armada_boot:
+            if ("fromSlot" not in report or "targetSlot" not in report):
+                return uncertain(
+                    "The system apply worker omitted armada boot slot evidence")
+            if (report["fromSlot"], report["targetSlot"]) != (None, None):
+                return uncertain(
+                    "The system apply worker reported an unexpected "
+                    "armada boot slot transition")
     elif report["requiresReboot"]:
         return uncertain(
             "The system apply worker reported a reboot requirement "
@@ -284,11 +294,37 @@ def _valid_trial_receipt(trial, model):
                 or receipt.get("planSha256") != trial.get("planSha256")
                 or receipt.get("model") != model):
             return False
+        if (trial.get("bootSource") == "armada_boot"
+                or receipt.get("bootSource") == "armada_boot"):
+            if (trial.get("bootSource") != "armada_boot"
+                    or receipt.get("bootSource") != "armada_boot"):
+                return False
+        if trial.get("bootSource") == "armada_boot":
+            if ("fromSlot" not in trial or "targetSlot" not in trial
+                    or "fromSlot" not in receipt or "targetSlot" not in receipt):
+                return False
+            pair = (trial["fromSlot"], trial["targetSlot"])
+            if pair != (None, None):
+                return False
+            plan_path = work_dir / "plan.json"
+            raw_plan = _read_regular(plan_path, MAX_CONFIG_BYTES)
+            if _io.sha256_hex(raw_plan) != trial["planSha256"]:
+                return False
+            plan = _io.strict_loads(raw_plan)
+            if not isinstance(plan, dict):
+                return False
+            if (plan.get("model") != model
+                    or plan.get("currentDeployment") != trial["oldDeployment"]
+                    or plan.get("newDeployment") != trial["newDeployment"]):
+                return False
+        expected_boot_write = ("not_started"
+                               if trial.get("bootSource") == "armada_boot"
+                               else "written")
         return (receipt.get("state") == "awaiting_reboot"
                 and receipt.get("phase") == "awaiting_reboot"
                 and receipt.get("requiresReboot") is True
                 and receipt.get("bootPolicy") == BOOT_POLICY
-                and receipt.get("bootWriteState") == "written"
+                and receipt.get("bootWriteState") == expected_boot_write
                 and receipt.get("slotControlState") == "not_issued")
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return False
@@ -344,9 +380,22 @@ def _valid_offline_completion(trial, model):
                 or type(receipt.get("schemaVersion")) is not int
                 or receipt["schemaVersion"] != 1
                 or receipt.get("sessionId") != session_id
-                or receipt.get("state") not in _OFFLINE_RECEIPT_STATES
                 or receipt.get("model") != model):
             return False
+        if receipt.get("state") not in _OFFLINE_RECEIPT_STATES:
+            if receipt.get("state") != "failed":
+                return False
+            if receipt.get("jobOperation") != "execute":
+                return False
+            nested = receipt.get("result")
+            if not isinstance(nested, dict):
+                return False
+            if nested.get("state") != "recovery_required":
+                return False
+            if nested.get("bootSource") != "armada_boot":
+                return False
+            if trial.get("bootSource") != "armada_boot":
+                return False
         transaction = session / "transaction"
         if transaction.parent != session or transaction.resolve(strict=True) != transaction:
             return False
@@ -360,11 +409,15 @@ def _valid_offline_completion(trial, model):
         status = _json_document(transaction / "status.json")
         report = _json_document(transaction / "write-report.json")
         ack = _json_document(session / "ack.json")
-        identity = offline_completion.execute_completion(
+        identity, _ = offline_completion.resolve_execute_status(
             prepared, plan, _io.sha256_hex(plan_raw),
-            status, report, ack, model)
+            status, report, ack, trial, model)
         if identity is None:
             return False
+        if identity.get("bootSource") == "armada_boot":
+            if (trial.get("bootSource") != "armada_boot" or
+                    "fromSlot" not in trial or "targetSlot" not in trial):
+                return False
         return (
             trial.get("transactionId") == identity["transactionId"]
             and trial.get("fromSlot") == identity["fromSlot"]
