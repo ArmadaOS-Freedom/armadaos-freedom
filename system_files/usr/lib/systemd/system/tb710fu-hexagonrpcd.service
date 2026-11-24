@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# FastRPC reverse tunnel for the TB710FU ADSP sensor hub (SSC). The hub only
+# loads its sensors for a secure session, and it writes its registry, so the
+# daemon serves a writable copy of it (HEXAGONRPCD_WRITABLE_REGISTRY).
+# 81-armada-tb710fu-sensors.rules starts it when the secure node appears.
+#
+# Every start first stages the hub's files from the Android partitions
+# (tb710fu-sensors-prepare.service, read-only). It runs as a unit of its own:
+# DevicePolicy= below covers the whole control group, so a helper started here,
+# even with "+", could not open the partitions. A failed staging fails the
+# start, so Restart= retries it together with the daemon, backing off from
+# 3 s to a minute.
+[Unit]
+Description=TB710FU sensor hub FastRPC daemon
+ConditionFirmware=device-tree-compatible(lenovo,tb710fu)
+BindsTo=dev-fastrpc\x2dadsp\x2dsecure.device
+After=dev-fastrpc\x2dadsp\x2dsecure.device
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+# "+": systemctl talks to systemd outside the sandbox below. It waits for the
+# oneshot and fails when the staging fails.
+ExecStartPre=+/usr/bin/systemctl start tb710fu-sensors-prepare.service
+Environment=HEXAGONRPCD_WRITABLE_REGISTRY=/var/lib/tb710fu-sensors/registry
+ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R /var/lib/tb710fu-sensors/fw
+Restart=always
+RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
+
+DevicePolicy=closed
+DeviceAllow=/dev/fastrpc-adsp-secure rw
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/tb710fu-sensors/registry
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

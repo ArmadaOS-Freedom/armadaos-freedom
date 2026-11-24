@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copies the TB710FU sensor hub files from the running Android slot, read-only,
+# into /var/lib/tb710fu-sensors (see the helper). tb710fu-hexagonrpcd.service
+# starts it before every start of the daemon. It is a unit of its own because
+# the daemon's DevicePolicy= applies to its whole control group, ExecStartPre=+
+# included, and would keep the helper from opening the Android partitions.
+[Unit]
+Description=TB710FU sensor hub files
+ConditionFirmware=device-tree-compatible(lenovo,tb710fu)
+After=local-fs.target systemd-udev-trigger.service
+# The partitions it reads, for either Android slot.
+Wants=dev-disk-by\x2dpartlabel-boot_a.device dev-disk-by\x2dpartlabel-boot_b.device
+Wants=dev-disk-by\x2dpartlabel-dsp_a.device dev-disk-by\x2dpartlabel-dsp_b.device
+Wants=dev-disk-by\x2dpartlabel-super.device dev-disk-by\x2dpartlabel-persist.device
+After=dev-disk-by\x2dpartlabel-boot_a.device dev-disk-by\x2dpartlabel-boot_b.device
+After=dev-disk-by\x2dpartlabel-dsp_a.device dev-disk-by\x2dpartlabel-dsp_b.device
+After=dev-disk-by\x2dpartlabel-super.device dev-disk-by\x2dpartlabel-persist.device
+
+[Service]
+# No RemainAfterExit=: every "systemctl start" runs the helper again, which
+# re-extracts when the Android slot or its files changed.
+Type=oneshot
+ExecStart=/usr/libexec/tb710fu/tb710fu-sensors-prepare
+StandardOutput=journal
+StandardError=journal

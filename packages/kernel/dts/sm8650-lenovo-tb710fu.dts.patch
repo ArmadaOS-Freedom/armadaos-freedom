@@ -11,7 +11,9 @@ no longer carries __symbols__, like the other board DTBs.
 
 Board: the simple-framebuffer template kShimC fills with the ABL scanout,
 the 903 MHz GPU level of the vendor DTB, the unit's own ADSP/CDSP firmware
-paths, the TB710FU touchscreen compatible, and uart15 enabled. The
+paths, the ADSP FastRPC node as secure only (the sensor hub loads its
+sensors for a secure session only), the TB710FU touchscreen compatible,
+and uart15 enabled. The
 original port's boot-log reservations, the video codec and another unit's
 Bluetooth address are dropped.
 
@@ -35,7 +37,7 @@ collide with another board's bare aw882xx_acf.bin.
  #include "sm8650.dtsi"
  #include "pm8550.dtsi"
  #include "pm8550b.dtsi"
-@@ -1259,4 +1262,192 @@
+@@ -1259,4 +1262,203 @@
  
  &xo_board {
  	clock-frequency = <76800000>;
@@ -101,6 +103,17 @@ collide with another board's bare aw882xx_acf.bin.
 +&remoteproc_adsp {
 +	firmware-name = "qcom/sm8650/xiaoxin/gt/adsp.mbn",
 +			"qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn";
++
++	/*
++	 * The sensor hub (SSC) on this ADSP only loads its sensors for a
++	 * secure FastRPC session, so the node is /dev/fastrpc-adsp-secure.
++	 * Only hexagonrpcd uses it; audio goes through GPR.
++	 */
++	glink-edge {
++		fastrpc {
++			/delete-property/ qcom,non-secure-domain;
++		};
++	};
 +};
 +
 +&remoteproc_cdsp {
