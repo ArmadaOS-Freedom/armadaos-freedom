@@ -28,6 +28,9 @@ INTERCEPT_MODES = {"overlay", "reset"}
 SWIPE_GESTURES_CONFIG = Path("/etc/armada/swipe-gestures.conf")
 DISPLAY_ORIENTATION_CONFIG = Path("/etc/armada/display-orientation.conf")
 DISPLAY_ORIENTATIONS = ("normal", "left", "right", "upsidedown")
+# Game Mode follows the accelerometer (armada-gamemode-autorotate); only on
+# devices whose profile sets ARMADA_GAMEMODE_AUTOROTATE=1.
+DISPLAY_ORIENTATION_AUTO = "auto"
 SLEEP_CONFIG = Path("/etc/armada/sleep.conf")
 SUSPEND_MODE_KEY = "suspend_mode"
 NM_IGNORE_SLEEP = Path("/etc/NetworkManager/ignore-sleep")
@@ -449,7 +452,7 @@ def read_display_orientation():
         value = match.group(1).strip()
         # Later assignments win; an empty or malformed value disables the
         # override instead of falling back to an earlier assignment.
-        orientation = value if value in DISPLAY_ORIENTATIONS else ""
+        orientation = value if value in DISPLAY_ORIENTATIONS + (DISPLAY_ORIENTATION_AUTO,) else ""
     return orientation
 
 
@@ -461,11 +464,19 @@ def default_display_orientation():
     return value if value in DISPLAY_ORIENTATIONS else "normal"
 
 
+def display_auto_rotation_supported():
+    try:
+        return device_env().get("ARMADA_GAMEMODE_AUTOROTATE", "") == "1"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
 def display_orientation_state():
     return {
         "supported": True,
         "orientation": read_display_orientation(),
         "defaultOrientation": default_display_orientation(),
+        "autoSupported": display_auto_rotation_supported(),
     }
 
 
@@ -476,11 +487,16 @@ def action_get_display_orientation(request):
 def action_set_display_orientation(request):
     orientation = request.get("orientation")
     # An empty string disables the override; the other values are the panel
-    # orientations. Missing, non-string, and unknown values are rejected.
+    # orientations, or "auto" where the device can follow its accelerometer.
+    # Missing, non-string, and unknown values are rejected.
     if not isinstance(orientation, str) or (
-        orientation and orientation not in DISPLAY_ORIENTATIONS
+        orientation
+        and orientation not in DISPLAY_ORIENTATIONS
+        and orientation != DISPLAY_ORIENTATION_AUTO
     ):
         raise ValueError("invalid display orientation")
+    if orientation == DISPLAY_ORIENTATION_AUTO and not display_auto_rotation_supported():
+        raise ValueError("automatic rotation is not supported on this device")
     atomic_write(DISPLAY_ORIENTATION_CONFIG, f"orientation={orientation}\n")
     return display_orientation_state()
 

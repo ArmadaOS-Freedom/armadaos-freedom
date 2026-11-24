@@ -111,3 +111,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 - `patches/0047-wlserver-associate-normal-virtual-touch-with-internal-panel.patch`
   source: armada
   notes: Extends 0040 to a virtual touch device on a natively landscape panel. A device tagged `GAMESCOPE_TOUCH_CALIBRATION=normal` (the TB710FU pen-as-touch bridge, `99-armada-tb710fu-pen-touch.rules`) is associated with the internal panel like the real SPI touchscreen, without any calibration undo, so a Game Mode orientation override rotates the pen together with the picture. Real buses, untagged devices and the `right` tag are unchanged. Regression: `GAMESCOPE_SOURCE_DIR=/path/to/patched/gamescope python3 tests/gamescope-touch-orientation-test.py`.
+
+- `patches/0048-wlserver-add-rotate-display-command.patch`
+  source: armada
+  notes: Adds the `rotate_display` console command (`gamescopectl rotate_display normal|left|right|upsidedown`), which rotates the internal display at runtime through the existing `gamescope_control.rotate_display` handler (orientation, mode/EDID update and touch mapping unchanged). Lets `armada-gamemode-autorotate` follow the accelerometer with the shipped gamescopectl.

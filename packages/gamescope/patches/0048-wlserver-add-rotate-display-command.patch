@@ -1,0 +1,41 @@
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -1411,6 +1411,37 @@
+ 
+ }
+ 
++// gamescopectl rotate_display <normal|left|right|upsidedown>: the internal
++// display through the same path as the gamescope_control request, for clients
++// that only have gamescopectl (such as a sensor-driven auto-rotation service).
++static gamescope::ConCommand cc_rotate_display( "rotate_display",
++	"Rotate the internal display at runtime: normal, left, right or upsidedown",
++[]( std::span<std::string_view> args )
++{
++	static constexpr std::pair<std::string_view, uint32_t> k_Orientations[] =
++	{
++		{ "normal",     GAMESCOPE_CONTROL_DISPLAY_ROTATION_FLAG_NORMAL },
++		{ "left",       GAMESCOPE_CONTROL_DISPLAY_ROTATION_FLAG_LEFT },
++		{ "right",      GAMESCOPE_CONTROL_DISPLAY_ROTATION_FLAG_RIGHT },
++		{ "upsidedown", GAMESCOPE_CONTROL_DISPLAY_ROTATION_FLAG_UPSIDEDOWN },
++	};
++
++	if ( args.size() == 2 )
++	{
++		for ( const auto &[ svName, uOrientation ] : k_Orientations )
++		{
++			if ( args[1] == svName )
++			{
++				gamescope_control_rotate_display( nullptr, nullptr, uOrientation,
++					GAMESCOPE_CONTROL_DISPLAY_TARGET_TYPE_INTERNAL );
++				return;
++			}
++		}
++	}
++
++	wl_log.errorf( "rotate_display: expected normal, left, right or upsidedown" );
++});
++
+ void drm_sleep_screen( gamescope::GamescopeScreenType eType, bool bSleep );
+ 
+ static void gamescope_control_display_sleep( struct wl_client *client, struct wl_resource *resource, uint32_t display_type_flags, uint32_t flags )
