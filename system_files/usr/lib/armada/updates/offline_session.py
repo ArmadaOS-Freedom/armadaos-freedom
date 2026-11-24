@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import heapq
@@ -19,9 +20,11 @@ from . import (
     UPDATER_VERSION,
     _io,
     boot_context,
+    boot_disk_switch,
     models,
     offline_execute,
     offline_payload,
+    offline_prepare,
     package_contract,
     physical_slots,
     recovery_device,
@@ -55,6 +58,10 @@ _RECLAIM_SCAN_LIMIT = 16
 _RECLAIM_CURSOR = 'reclaim-cursor.json'
 _RECLAIM_CURSOR_MAX = 4096
 _RECLAIMABLE_STATES = frozenset({'uploading', 'up_to_date'})
+_BTRFS_IOCTL_FS_INFO = 0x8400941F
+_BTRFS_FS_INFO_SIZE = 1024
+_BTRFS_FSID_OFFSET = 16
+_BTRFS_FSID_SIZE = 16
 
 
 class OfflineSessionError(RuntimeError):
@@ -253,6 +260,7 @@ class OfflineSessionStore:
             'schemaVersion': 1,
             'updaterVersion': self.updater_version,
             'bootPolicy': trial_record.BOOT_POLICY,
+            'capabilities': ['preflight-session-v1'],
             'model': physical['model'],
             'actualSlot': physical['actualSlot'],
             'inactiveSlot': physical['inactiveSlot'],
@@ -262,6 +270,73 @@ class OfflineSessionStore:
         }
         if physical.get('bootSource') == 'armada_boot':
             result['bootSource'] = 'armada_boot'
+        return result
+
+    def preflight(self, document, signature_b64, *, session_id=None,
+                  sysroot_path=Path('/sysroot')):
+        if type(document) is not bytes or not 0 < len(document) <= _DOCUMENT_MAX:
+            raise ValueError('document must be nonempty bytes of at most 2 MiB')
+        if type(signature_b64) is not bytes or not 0 < len(signature_b64) <= _SIGNATURE_MAX:
+            raise ValueError('signature must be nonempty bytes of at most 16 KiB')
+        if session_id is not None and (type(session_id) is not str or not _SESSION_ID.match(session_id)):
+            raise ValueError('invalid offline session id')
+        physical = self._require_identity(self._physical_info())
+        snapshot = armada_os.snapshot()
+        if (snapshot['repository'] not in armada_os.REPOSITORIES or
+                snapshot['staged'] or snapshot['rollback_queued']):
+            raise OfflineSessionError('legacy OSTree transaction conflict')
+        channel = system_transaction._snapshot_channel(snapshot)
+        binding = system_transaction._binding(physical['deployment'])
+        package = package_contract.load_package(
+            document, signature_b64, trusted_key=self.trusted_key)
+        package_contract.require_operation(
+            package, physical['model'], 'offline-upgrade',
+            updater_version=self.updater_version)
+        parts, size, digest, expanded_size, _expanded_sha = \
+            offline_payload._select_payload_entry(package)
+        root = Path(sysroot_path)
+        if not root.is_absolute() or not root.is_dir() or root.resolve(strict=True) != root:
+            raise OfflineSessionError('sysroot must be an absolute existing canonical path')
+        boot_source = physical.get('bootSource', _LEGACY_BOOT_SOURCE)
+        disk = boot_source == 'armada_boot'
+        has_capsule = physical['model'] in package.get('armadaBootCapsules', {})
+        if boot_source == 'armada_boot':
+            if physical.get('actualSlot') is not None or physical.get('inactiveSlot') is not None:
+                raise OfflineSessionError('device identity reports invalid slots')
+        elif boot_source == _LEGACY_BOOT_SOURCE:
+            actual = physical['actualSlot']
+            if actual not in ('a', 'b') or physical['inactiveSlot'] != ('b' if actual == 'a' else 'a'):
+                raise OfflineSessionError('device identity reports invalid slots')
+        else:
+            raise OfflineSessionError('device identity reports unknown boot source')
+        if disk and not has_capsule:
+            raise OfflineSessionError('signed package lacks ARMADA_BOOT materials for model')
+        if has_capsule and not disk:
+            raise OfflineSessionError('this package requires an existing ARMADA_BOOT installation')
+        if boot_source == 'armada_boot':
+            boot_disk_switch.check_ready_readonly(root, physical)
+            offline_prepare._read_recovery_for_disk(physical)
+        else:
+            system_transaction._check_recovery(physical, binding)
+        if session_id is not None:
+            storage_dir, stored_bytes = self._preflight_bound_payload(
+                session_id, physical, channel, document, signature_b64,
+                '/'.join(parts), size, digest)
+        else:
+            storage_dir, stored_bytes = self.base, 0
+        self._preflight_storage(storage_dir, root / 'ostree' / 'repo', size - stored_bytes, expanded_size)
+        result = {
+            'schemaVersion': 1,
+            'phase': 'preflight_passed',
+            'bootWriteState': 'not_started',
+            'model': physical['model'],
+            'currentDeployment': physical['deployment'],
+            'recoveryPartUuid': physical['recoveryPartUuid'],
+            'actualSlot': physical['actualSlot'],
+            'channel': channel,
+        }
+        if session_id is not None:
+            result['sessionId'] = session_id
         return result
 
     def _ensure_base(self):
@@ -564,6 +639,124 @@ class OfflineSessionStore:
         _fsync_dir(session)
         _fsync_dir(base)
         return receipt
+
+    def _preflight_bound_payload(self, session_id, physical, channel, document,
+                                 signature_b64, payload_path: str, size, digest):
+        session = self.resolve_session(session_id)
+        receipt = self.read_receipt(session)
+        receipt_physical = receipt.get('physical')
+        if not physical_slots.same_physical_identity(physical, receipt_physical):
+            raise OfflineSessionError(
+                'session physical identity mismatch: request=%r' % (physical,))
+        receipt_channel = receipt.get('channel')
+        if receipt_channel != channel:
+            raise OfflineSessionError(
+                'session channel mismatch: request=%r' % (channel,))
+        receipt_payload = receipt.get('payload')
+        if type(receipt_payload) is not dict:
+            raise OfflineSessionError('session receipt payload is not an object')
+        bound = {
+            'path': receipt_payload.get('path'),
+            'bytes': receipt_payload.get('bytes'),
+            'sha256': receipt_payload.get('sha256'),
+        }
+        requested = {'path': payload_path, 'bytes': size, 'sha256': digest}
+        if bound != requested:
+            raise OfflineSessionError(
+                'payload binding mismatch: request=%r' % (requested,))
+        document_raw = offline_execute._read_bounded(
+            session / 'package.json', _DOCUMENT_MAX, 'package document')
+        if document_raw != document:
+            raise OfflineSessionError('package document does not match bound bytes')
+        signature_raw = offline_execute._read_bounded(
+            session / 'package.sig', _SIGNATURE_MAX, 'signature')
+        if signature_raw != signature_b64:
+            raise OfflineSessionError('signature does not match bound bytes')
+        return session, self._received(session, receipt)
+
+    def _preflight_storage(self, storage_dir, ostree_repo, upload_bytes,
+                           expanded_bytes) -> None:
+        if not isinstance(upload_bytes, int) or upload_bytes < 0:
+            raise OfflineSessionError('upload_bytes must be a non-negative integer')
+        if not isinstance(expanded_bytes, int) or expanded_bytes < 0:
+            raise OfflineSessionError('expanded_bytes must be a non-negative integer')
+        storage_dir = Path(storage_dir)
+        ostree_repo = Path(ostree_repo)
+        if not ostree_repo.is_absolute() or ostree_repo.is_symlink():
+            raise OfflineSessionError('ostree repository must be an absolute non-symlink path')
+        ostree_repo = _check_dir(ostree_repo)
+        _check_dir(ostree_repo / 'objects')
+        config = ostree_repo / 'config'
+        try:
+            offline_execute._read_bounded(config, _JSON_MAX, 'ostree config')
+        except OfflineSessionError:
+            raise
+        except Exception as exc:
+            raise OfflineSessionError('ostree config cannot be read: %s' % exc) from exc
+        if storage_dir.exists() or storage_dir.is_symlink():
+            storage_dir = _check_dir(storage_dir)
+        else:
+            if not storage_dir.is_absolute():
+                raise OfflineSessionError('storage directory must be absolute')
+            current = storage_dir
+            while not current.exists() and not current.is_symlink():
+                parent = current.parent
+                if parent == current:
+                    raise OfflineSessionError(
+                        'storage directory has no existing canonical ancestor')
+                current = parent
+            storage_dir = _check_dir(current)
+        upload_required = upload_bytes + 2 * expanded_bytes
+        import_required = expanded_bytes
+        groups = {}
+        for directory, required, label in (
+                (storage_dir, upload_required, 'storage'),
+                (ostree_repo, import_required, 'repository')):
+            if required <= 0:
+                continue
+            identity = self._preflight_fs_identity(directory, label)
+            groups.setdefault(identity, []).append((directory, required, label))
+        for entries in groups.values():
+            required = sum(item[1] for item in entries)
+            labels = ', '.join(item[2] for item in entries)
+            for directory, _unused, _label in entries:
+                free = _available(directory)
+                if free < required:
+                    raise OfflineSessionError(
+                        'insufficient space for %s on %s: required=%d available=%d'
+                        % (labels, directory, required, free))
+
+    @staticmethod
+    def _preflight_fs_identity(directory, label):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(directory, flags)
+        except OSError as exc:
+            raise OfflineSessionError(
+                'cannot open %s storage: %s' % (label, exc)) from exc
+        try:
+            info = bytearray(_BTRFS_FS_INFO_SIZE)
+            try:
+                fcntl.ioctl(fd, _BTRFS_IOCTL_FS_INFO, info)
+            except OSError as exc:
+                if exc.errno != errno.ENOTTY:
+                    raise OfflineSessionError(
+                        'cannot identify the %s filesystem: %s'
+                        % (label, exc)) from exc
+                try:
+                    return ('device', os.fstat(fd).st_dev)
+                except OSError as stat_exc:
+                    raise OfflineSessionError(
+                        'cannot inspect %s storage: %s'
+                        % (label, stat_exc)) from stat_exc
+            fsid = bytes(info[_BTRFS_FSID_OFFSET:
+                              _BTRFS_FSID_OFFSET + _BTRFS_FSID_SIZE])
+            if not any(fsid):
+                raise OfflineSessionError(
+                    '%s storage reports an empty filesystem FSID' % label)
+            return ('btrfs', fsid)
+        finally:
+            os.close(fd)
 
     def _payload_path(self, session, receipt):
         raw = receipt['payload']['path']

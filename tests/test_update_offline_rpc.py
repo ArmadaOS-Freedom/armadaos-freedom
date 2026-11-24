@@ -26,6 +26,9 @@ def _manager() -> mock.MagicMock:
     mgr.store.info.return_value = {
         'schemaVersion': 1, 'bootPolicy': 'dual-boot-no-slot-control'}
     mgr.store.begin.return_value = {'sessionId': SID, 'state': 'uploading'}
+    mgr.store.preflight.return_value = {
+        'schemaVersion': 1, 'sessionId': SID, 'state': 'uploading',
+        'preflight': {'schemaVersion': 1, 'accepted': True}}
     mgr.status.return_value = {'sessionId': SID, 'state': 'uploaded'}
     mgr.store.upload.return_value = {'offset': 9}
     mgr.store.seal.return_value = {'sessionId': SID, 'state': 'uploaded'}
@@ -153,6 +156,88 @@ class OfflineRpcTests(unittest.TestCase):
             self.assertFalse(response['ok'])
             self.assertEqual(response['error']['code'], 'invalid_request')
         _assert_no_calls(mgr)
+
+    def test_preflight_plain_and_bound_forward_and_succeed(self):
+        mgr = _manager()
+        reqs = [
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc2'), 'signature': _b64(b'sig2'),
+                        'sessionId': SID}},
+        ]
+        payload = b''.join((json.dumps(r) + '\n').encode('utf-8') for r in reqs)
+        rc, out = _run_lines(mgr, payload)
+        self.assertEqual(rc, 0)
+        self.assertEqual([r['id'] for r in out], [1, 2])
+        self.assertTrue(all(r['ok'] for r in out))
+        self.assertEqual(out[0]['result'], mgr.store.preflight.return_value)
+        self.assertEqual(out[1]['result'], mgr.store.preflight.return_value)
+        self.assertEqual(mgr.store.preflight.call_args_list, [
+            mock.call(b'doc', b'sig'),
+            mock.call(b'doc2', b'sig2', session_id=SID),
+        ])
+
+    def test_preflight_invalid_parameters_rejected(self):
+        mgr = _manager()
+        bad = [
+            {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+             'params': {}},
+            {'protocolVersion': 1, 'id': 2, 'method': 'preflight',
+             'params': {'document': _b64(b'doc')}},
+            {'protocolVersion': 1, 'id': 3, 'method': 'preflight',
+             'params': {'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 4, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'extra': 1}},
+            {'protocolVersion': 1, 'id': 5, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': None}},
+            {'protocolVersion': 1, 'id': 6, 'method': 'preflight',
+             'params': {'document': None, 'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 7, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': None}},
+            {'protocolVersion': 1, 'id': 8, 'method': 'preflight',
+             'params': {'document': 'not-b64!', 'signature': _b64(b'sig')}},
+            {'protocolVersion': 1, 'id': 9, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': 'not-b64!'}},
+            {'protocolVersion': 1, 'id': 10, 'method': 'preflight',
+             'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig'),
+                        'sessionId': 'BAD'}},
+        ]
+        rc, out = _run_lines(
+            mgr, b''.join((json.dumps(r) + '\n').encode('utf-8') for r in bad))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), len(bad))
+        for response in out:
+            self.assertFalse(response['ok'])
+            self.assertEqual(response['error']['code'], 'invalid_request')
+        _assert_no_calls(mgr)
+
+    def test_preflight_is_offered_on_normal_and_restricted_endpoints(self):
+        mgr = _manager()
+        request = {'protocolVersion': 1, 'id': 1, 'method': 'preflight',
+                   'params': {'document': _b64(b'doc'), 'signature': _b64(b'sig')}}
+        payload = (json.dumps(request) + '\n').encode('utf-8')
+        rc, out = _run_lines(mgr, payload)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0]['ok'])
+        mgr.store.preflight.assert_called_once_with(b'doc', b'sig')
+
+        mgr2 = _manager()
+        rc, out = _run_lines(mgr2, payload,
+                             allowed_methods=frozenset({'status'}))
+        self.assertEqual(rc, 0)
+        self.assertFalse(out[0]['ok'])
+        self.assertEqual(out[0]['error']['code'], 'operation_not_available')
+        _assert_no_calls(mgr2)
+
+        mgr3 = _manager()
+        rc, out = _run_lines(mgr3, payload,
+                             allowed_methods=frozenset({'preflight'}))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0]['ok'])
+        mgr3.store.preflight.assert_called_once_with(b'doc', b'sig')
 
     def test_invalid_requests_rejected_without_side_effects(self):
         mgr = _manager()

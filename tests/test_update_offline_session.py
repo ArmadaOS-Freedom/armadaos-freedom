@@ -545,6 +545,85 @@ class OfflineSessionStoreTest(unittest.TestCase):
         (tx / "trust.json").write_text("secret")
         return store, sid, blob, tx
 
+    def _preflight_store(self, base, model="TB322FC"):
+        repo_name = next(iter(offline_session.armada_os.REPOSITORIES))
+        patcher = mock.patch.object(
+            offline_session.armada_os, "snapshot",
+            return_value={"channel": "stable", "repository": repo_name,
+                          "staged": False, "rollback_queued": False})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        store = offline_session.OfflineSessionStore(
+            base=base, trusted_key=self.pub_key, inspect=self._inspect(model))
+        return store
+
+    def _preflight_guards(self):
+        patches = [
+            mock.patch.object(offline_session.system_transaction, "_binding",
+                              return_value={"slotProfile": "legacy"}),
+            mock.patch.object(offline_session.system_transaction, "_check_recovery"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _preflight_root(self, name):
+        root = self.tmp / name / "sysroot"
+        repo = root / "ostree" / "repo"
+        (repo / "objects").mkdir(parents=True)
+        (repo / "config").write_text("[core]\nrepo_version=1\n")
+        return root
+
+    def test_preflight_success_leaves_no_state(self):
+        doc, sig, _data = self._signed_package()
+        base = self.tmp / "preflight-ok" / "offline"
+        store = self._preflight_store(base)
+        self._preflight_guards()
+        root = self._preflight_root("preflight-ok")
+        result = store.preflight(doc, sig, sysroot_path=root)
+        self.assertEqual(result["phase"], "preflight_passed")
+        self.assertIn("preflight-session-v1", store.info()["capabilities"])
+        self.assertFalse(base.exists())
+
+    def test_preflight_resumed_session_is_read_only(self):
+        doc, sig, data = self._signed_package()
+        base = self.tmp / "preflight-resume" / "offline"
+        store = self._preflight_store(base)
+        self._preflight_guards()
+        receipt = self._make_session(store, doc, sig, self._ids(1)[0],
+                                     data=data[:128])
+        sid = receipt["sessionId"]
+        root = self._preflight_root("preflight-resume")
+        before = {p: p.stat().st_mtime_ns for p in base.rglob("*")}
+        result = store.preflight(doc, sig, session_id=sid, sysroot_path=root)
+        self.assertEqual(result["phase"], "preflight_passed")
+        self.assertEqual(result["sessionId"], sid)
+        after = {p: p.stat().st_mtime_ns for p in base.rglob("*")}
+        self.assertEqual(before, after)
+        self.assertEqual(store.status(sid)["receivedBytes"], 128)
+        self.assertFalse((base / sid / "transaction").exists())
+
+    def test_preflight_rejects_bound_mismatch_and_staged_conflict(self):
+        doc, sig, data = self._signed_package()
+        other_doc, other_sig, _o = self._signed_package()
+        base = self.tmp / "preflight-reject" / "offline"
+        store = self._preflight_store(base)
+        self._preflight_guards()
+        receipt = self._make_session(store, doc, sig, self._ids(1)[0],
+                                     data=data[:128])
+        sid = receipt["sessionId"]
+        root = self._preflight_root("preflight-reject")
+        with self.assertRaises(offline_session.OfflineSessionError):
+            store.preflight(other_doc, other_sig, session_id=sid, sysroot_path=root)
+        with mock.patch.object(
+                offline_session.armada_os, "snapshot",
+                return_value={"channel": "stable",
+                              "repository": next(iter(offline_session.armada_os.REPOSITORIES)),
+                              "staged": True, "rollback_queued": False}):
+            with self.assertRaises(offline_session.OfflineSessionError):
+                store.preflight(doc, sig, sysroot_path=root)
+        self.assertEqual(store.status(sid)["receivedBytes"], 128)
+
     def test_export_streams_only_requested_range(self):
         store, sid, blob, tx = self._export_session()
         real_pread = os.pread

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
 from updates import system_manager  # noqa: E402
+from updates import DEFAULT_MINIMUM_UPDATER_VERSION  # noqa: E402
 
 DESCRIPTOR = ROOT / "build_files" / "make-universal-update-descriptor.py"
 JUSTFILE = ROOT / "Justfile"
@@ -103,13 +104,13 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
 
     def test_builder_factory_baselines_cannot_drift(self):
         # The builder factory's own defaults are the shipped baselines: the
-        # unified updater version for minimumUpdaterVersion, and the unchanged
-        # installer minimum. Reading the shared constant keeps the build
+        # unified updater floor for minimumUpdaterVersion, and the unchanged
+        # installer minimum. Reading the shared constants keeps the build
         # factory and the running updater from silently disagreeing.
         parameters = inspect.signature(fixture.build_descriptor).parameters
         self.assertEqual(
             parameters["minimum_updater_version"].default,
-            system_manager.UPDATER_VERSION,
+            DEFAULT_MINIMUM_UPDATER_VERSION,
         )
         self.assertEqual(
             parameters["minimum_installer_version"].default, "0.8.0"
@@ -127,11 +128,13 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
         self.assertEqual(document["supportedModels"], list(models))
         # This unified package replaces the pre-unification 0.8.0 updater
         # artifact: a 0.8.0 updater may not consume it, while the installer
-        # minimum stays unchanged.
+        # minimum stays unchanged. The updater floor is the shipped one, not
+        # the running runtime version.
         self.assertEqual(document["minimumInstallerVersion"], "0.8.0")
         self.assertEqual(document["minimumUpdaterVersion"], "0.8.2")
         self.assertEqual(
-            document["minimumUpdaterVersion"], system_manager.UPDATER_VERSION
+            document["minimumUpdaterVersion"],
+            DEFAULT_MINIMUM_UPDATER_VERSION,
         )
         self.assertEqual(fixture.validate_package(document), document)
 
@@ -142,6 +145,12 @@ class BuildEntrypointDescriptorTests(unittest.TestCase):
             # The installed unified runtime accepts every model's upgrade.
             fixture.require_operation(document, model, "offline-upgrade",
                                       updater_version=system_manager.UPDATER_VERSION)
+        for model in models:
+            # An updater exactly at the shipped floor is accepted.
+            fixture.require_operation(
+                document, model, "offline-upgrade",
+                updater_version=DEFAULT_MINIMUM_UPDATER_VERSION,
+            )
         for model in models:
             # The pre-unification 0.8.0 updater is too old for this package.
             with self.assertRaisesRegex(

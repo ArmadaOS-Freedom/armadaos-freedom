@@ -82,6 +82,7 @@ class DeviceIdentityInfoTest(unittest.TestCase):
             'deployment': 'armada/%s.2' % CHECKSUM,
             'recoveryPartUuid': PART_UUID,
             'channel': 'beta',
+            'capabilities': ['preflight-session-v1'],
         })
         self.boot.assert_called_once_with(self.record)
         self.recovery.assert_called_once_with(require_edl=False)
