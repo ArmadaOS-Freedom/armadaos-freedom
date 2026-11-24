@@ -14,8 +14,9 @@ the 903 MHz GPU level of the vendor DTB, the unit's own ADSP/CDSP firmware
 paths, the ADSP FastRPC node as secure only (the sensor hub loads its
 sensors for a secure session only), the TB710FU touchscreen compatible,
 and uart15 enabled. The
-original port's boot-log reservations, the video codec and another unit's
-Bluetooth address are dropped.
+original port's boot-log reservations and another unit's Bluetooth
+address are dropped. The video codec (iris) stays enabled as in the board
+file, with the unit's Lenovo-signed vpu33_4v.mbn.
 
 Touch: novatek,pen-support, as in the vendor dtbo, so the NT36532 driver
 registers the pen.
@@ -73,9 +74,9 @@ collide with another board's bare aw882xx_acf.bin.
 +	status = "disabled";
 +};
 +
-+/* the video codec is not brought up yet */
++/* the video codec (iris): the unit's Lenovo-signed firmware is in the firmware bundle */
 +&iris {
-+	status = "disabled";
++	status = "okay";
 +};
 +
 +&uart15 {
