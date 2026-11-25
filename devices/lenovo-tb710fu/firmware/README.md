@@ -11,6 +11,11 @@
 | `qcom/sm8650/xiaoxin/gt/aw882xx_acf.bin` | 4 颗 AW882xx 功放的参数（ACF） | 原厂安卓的功放配置（经 [tb710fu-linux](https://github.com/MeteoricmeteorLL/tb710fu-linux) 取得，与本机 `awinic/aw88461_tb710fu.bin` 相同） |
 | `novatek/novatek_nt36532_fw.bin`、`novatek_nt36532_mp.bin` | NT36532 触摸固件（开机刷写）与量产测试数据 | 原厂 `/vendor/firmware` |
 
+ADSP、CDSP 的四个 `.mbn` 还要进 initramfs：remoteproc（`qcom_q6v5_pas`）在 initramfs 阶段就加载并只请求一次固件，
+找不到就一直停在 offline（电池读不出、没有声卡和传感器）。所以它们和 sha256 一起写在
+`build_files/edl-devices.json` 里 TB710FU 的 `bootRequirements.earlyFirmware` / `firmwareSha256`，
+`tests/test_edl_device_config.py` 核对它们与本目录的 `SHA256SUMS` 一致。
+
 `.mbn` 是把原厂分段文件合并成的单个文件：`tools/squash-mdt.py` 做的事与 linux-msm 的 [pil-squasher](https://github.com/linux-msm/pil-squasher) 相同（`.mdt` 放在开头，每个有数据的程序段按 `p_offset` 写入对应的 `.bNN`），每个段都与原文件逐字节核对过。
 
 ```sh

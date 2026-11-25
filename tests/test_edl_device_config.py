@@ -19,6 +19,7 @@ import copy
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -204,7 +205,27 @@ TB710FU_PROFILE = {
     "runtimeCmakeArgs": ["-DKSHIM_TB323FU_ANDROID_TOUCH_4M8_TRIAL=OFF"],
     "bootPartitionBytes": BOOT_PARTITION_BYTES,
     "diagnosticMode": "rd-break",
-    "bootRequirements": {"earlyFirmware": [], "earlyDrivers": [], "firmwareSha256": {}},
+    "bootRequirements": {
+        "earlyFirmware": [
+            "qcom/sm8650/xiaoxin/gt/adsp.mbn",
+            "qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn",
+            "qcom/sm8650/xiaoxin/gt/cdsp.mbn",
+            "qcom/sm8650/xiaoxin/gt/cdsp_dtb.mbn",
+        ],
+        "earlyDrivers": [
+            "qcom_pil_info",
+            "qcom_common",
+            "qcom_sysmon",
+            "qcom_q6v5",
+            "qcom_q6v5_pas",
+        ],
+        "firmwareSha256": {
+            "qcom/sm8650/xiaoxin/gt/adsp.mbn": "cc8b25cc2216b276dba53fec5ca0f50440f725f9fc83a531dec4ffbab02c3c88",
+            "qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn": "6eef7a5884cecb80830f9bdbb5806b86cf2e6ac1339d4891149614687aa2ed78",
+            "qcom/sm8650/xiaoxin/gt/cdsp.mbn": "4c88e5dcc3abe8fb4f359bebdea5426baa20a3bc8373a71f61a8c02ffda37d07",
+            "qcom/sm8650/xiaoxin/gt/cdsp_dtb.mbn": "ce7e069492f88573229894d01db4b32048e37feff9a9eb8f55bf8d3689f4da84",
+        },
+    },
 }
 
 REAL_PROFILES = {
@@ -456,6 +477,27 @@ class RealConfigurationTests(TempConfigMixin, unittest.TestCase):
         self.assertIn("qcom/sm8750/adsp.mdt", committed)
         self.assertIn("qcom/sm8750/adsp_dtb.mdt", committed)
         self.assertEqual(sorted(committed - declared), [])
+
+    def test_tb710fu_early_dsp_firmware_matches_committed_bundle(self):
+        # remoteproc (qcom_q6v5_pas) probes in the initramfs and requests the ADSP/CDSP images once;
+        # without them there the DSPs stay offline (no battery, sound or sensors) until started by hand.
+        configuration = HELPER.load_configuration(CONFIG_PATH)
+        boot = configuration["profiles"]["TB710FU"]["bootRequirements"]
+        bundle = REPO_ROOT / "devices" / "lenovo-tb710fu" / "firmware"
+        sums = {}
+        for line in (bundle / "SHA256SUMS").read_text().splitlines():
+            digest, name = line.split(maxsplit=1)
+            sums[name] = digest
+        dsp = sorted(
+            name for name in sums
+            if re.fullmatch(r"qcom/sm8650/xiaoxin/gt/[ac]dsp(_dtb)?\.mbn", name)
+        )
+        self.assertEqual(len(dsp), 4)
+        self.assertEqual(sorted(set(dsp) - set(boot["earlyFirmware"])), [])
+        for name in dsp:
+            self.assertEqual(boot["firmwareSha256"].get(name), sums[name], name)
+        self.assertIn("qcom_q6v5_pas", boot["earlyDrivers"])
+
 
 class SelectionTests(unittest.TestCase):
     def setUp(self):

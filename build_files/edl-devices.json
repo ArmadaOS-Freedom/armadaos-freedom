@@ -207,9 +207,25 @@
       "bootPartitionBytes": 100663296,
       "diagnosticMode": "rd-break",
       "bootRequirements": {
-        "earlyFirmware": [],
-        "earlyDrivers": [],
-        "firmwareSha256": {}
+        "earlyFirmware": [
+          "qcom/sm8650/xiaoxin/gt/adsp.mbn",
+          "qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn",
+          "qcom/sm8650/xiaoxin/gt/cdsp.mbn",
+          "qcom/sm8650/xiaoxin/gt/cdsp_dtb.mbn"
+        ],
+        "earlyDrivers": [
+          "qcom_pil_info",
+          "qcom_common",
+          "qcom_sysmon",
+          "qcom_q6v5",
+          "qcom_q6v5_pas"
+        ],
+        "firmwareSha256": {
+          "qcom/sm8650/xiaoxin/gt/adsp.mbn": "cc8b25cc2216b276dba53fec5ca0f50440f725f9fc83a531dec4ffbab02c3c88",
+          "qcom/sm8650/xiaoxin/gt/adsp_dtb.mbn": "6eef7a5884cecb80830f9bdbb5806b86cf2e6ac1339d4891149614687aa2ed78",
+          "qcom/sm8650/xiaoxin/gt/cdsp.mbn": "4c88e5dcc3abe8fb4f359bebdea5426baa20a3bc8373a71f61a8c02ffda37d07",
+          "qcom/sm8650/xiaoxin/gt/cdsp_dtb.mbn": "ce7e069492f88573229894d01db4b32048e37feff9a9eb8f55bf8d3689f4da84"
+        }
       }
     }
   }
