@@ -1,44 +1,63 @@
-From: Armada <noreply@armada.local>
-Subject: [PATCH] arm64: dts: qcom: tb710fu: board additions for the kShimC boot
-
-The board file is vendored from tb710fu-linux; this patch is the whole
-TB710FU delta on top of it. It was three device-tree overlays (board, touch,
-audio) merged by fdtoverlay while the board lived in a kernel overlay; the
-blocks are appended here in the same order and unchanged (their #includes
-moved to the top). The built tree has the same nodes and properties as the
-old composite DTB (compared after decompiling, phandle values resolved); it
-no longer carries __symbols__, like the other board DTBs.
-
-Board: the simple-framebuffer template kShimC fills with the ABL scanout,
-the 903 MHz GPU level of the vendor DTB, the unit's own ADSP/CDSP firmware
-paths, the ADSP FastRPC node as secure only (the sensor hub loads its
-sensors for a secure session only), the TB710FU touchscreen compatible,
-and uart15 enabled. The
-original port's boot-log reservations and another unit's Bluetooth
-address are dropped. The video codec (iris) stays enabled as in the board
-file, with the unit's Lenovo-signed vpu33_4v.mbn.
-
-Touch: novatek,pen-support, as in the vendor dtbo, so the NT36532 driver
-registers the pen.
-
-Audio: four AW882xx amplifiers on i2c_hub_4, fed by SECONDARY_TDM_RX_0
-(slots 0-3 of an 8 x 32-bit frame), and the lenovo,tb710fu-sndcard card.
-The amplifiers name their parameter file with firmware-name, so it does not
-collide with another board's bare aw882xx_acf.bin.
-
 --- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
 +++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
-@@ -17,6 +17,9 @@
+@@ -17,6 +17,10 @@
  #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
  #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
  #include <dt-bindings/leds/common.h>
++#include <dt-bindings/interconnect/qcom,sm8650-rpmh.h>
 +#include <dt-bindings/power/qcom,rpmhpd.h>
 +#include <dt-bindings/gpio/gpio.h>
 +#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
  #include "sm8650.dtsi"
  #include "pm8550.dtsi"
  #include "pm8550b.dtsi"
-@@ -1259,4 +1262,203 @@
+@@ -651,6 +655,30 @@
+ // Enable i2c
+ &qupv3_id_0 {
+ 	status = "okay";
++
++	/* Pogo magnetic keyboard: QUP1 SE7 two-wire UART (Android
++	 * qupv3_se7_uart@a9c000). TX = GPIO62, RX = GPIO63, both use the
++	 * qup1_se7 mux. The magnetic keyboard speaks a PPP-framed,
++	 * XOR-scrambled protocol that is decoded in userspace.
++	 */
++	uart7: serial@a9c000 {
++		compatible = "qcom,geni-uart";
++		reg = <0x0 0x00a9c000 0x0 0x4000>;
++		interrupts = <GIC_SPI 579 IRQ_TYPE_LEVEL_HIGH 0>;
++		clocks = <&gcc GCC_QUPV3_WRAP1_S7_CLK>;
++		clock-names = "se";
++		interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
++				 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
++				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
++				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ACTIVE_ONLY>;
++		interconnect-names = "qup-core",
++				     "qup-config";
++		power-domains = <&rpmhpd RPMHPD_CX>;
++		operating-points-v2 = <&qup_opp_table_100mhz>;
++		pinctrl-0 = <&qup_uart7_default>;
++		pinctrl-names = "default";
++		status = "okay";
++	};
+ };
+ 
+ &qupv3_id_1 {
+@@ -999,6 +1027,14 @@
+ 			function = "gpio";
+ 			bias-pull-down;
+ 		};
++	};
++
++
++	qup_uart7_default: qup-uart7-state {
++		pins = "gpio62", "gpio63";
++		function = "qup1_se7";
++		drive-strength = <2>;
++		bias-disable;
+ 	};
+ 
+ 	keyboard_sensor_default: keyboard-sensor-default-state {
+@@ -1259,4 +1295,203 @@
  
  &xo_board {
  	clock-frequency = <76800000>;
