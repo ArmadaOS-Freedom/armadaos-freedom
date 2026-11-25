@@ -11,8 +11,10 @@
 import os
 import select
 import subprocess
+import queue
 import struct
 import sys
+import threading
 import time
 
 TTY = "/dev/ttyHS2"
@@ -51,6 +53,7 @@ USER_ENV = dict(os.environ,
                 DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{USER_UID}/bus")
 BACKLIGHT = "/sys/class/backlight/sy7758-backlight"
 SCREENSHOT = "/var/lib/pogo/tb-screenshot.py"
+BEEP = "/var/lib/pogo/beep.wav"
 
 
 def run_async(cmd):
@@ -122,9 +125,104 @@ def brightness_step(direction):
     osd("brightnessChanged", int(round(new * 100 / mx)))
 
 
-def toggle_mute():
-    wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "toggle")
+def inject(code):
+    """把按键注入 uinput，让 gamescope/Plasma 自己处理（这样才有原生 OSD）。"""
+    dev = KBD_DEV[0]
+    if dev is None:
+        return
+    try:
+        dev.emit(EV_KEY, code, 1)
+        dev.syn()
+        time.sleep(0.02)
+        dev.emit(EV_KEY, code, 0)
+        dev.syn()
+    except Exception as exc:
+        log(f"inject {code} failed: {exc}")
+
+
+def sync_mute_led():
+    time.sleep(0.10)          # 等合成器把静音状态落下去
     pct, muted = sink_percent()
+    LED_BITS["mute"] = 1 if muted else 0
+    if KBD_FD[0] is not None:
+        send_led_bitmap(KBD_FD[0], force=True)
+
+
+def consumer_action(usage):
+    if usage == 0x0E2:
+        # 注入 KEY_MUTE 合成器不认（实测音量键认、静音键不认），只能自己调 wpctl。
+        # 先乐观翻灯（立刻可见），再真正切静音，最后按真实状态纠错。
+        LED_BITS["mute"] = 0 if LED_BITS["mute"] else 1
+        if KBD_FD[0] is not None:
+            send_led_bitmap(KBD_FD[0], force=True)
+        try:
+            wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "toggle")
+        except Exception as exc:
+            log(f"mute toggle failed: {exc}")
+        beep()
+        sync_mute_led()
+        # 键盘自己会在按下/松开时闪一下灯，把我们的状态冲掉；
+        # 之后 0.15/0.35/0.60 s 各重发一次位图，保证松手后灯仍是我们想要的状态。
+        def _reassert():
+            for delay in (0.15, 0.35, 0.60):
+                time.sleep(delay if delay == 0.15 else 0.20)
+                fd = KBD_FD[0]
+                if fd is not None:
+                    send_led_bitmap(fd, force=True)
+        threading.Thread(target=_reassert, daemon=True).start()
+    elif usage == 0x0EA:
+        inject(KEY_VOLUMEDOWN)
+    elif usage == 0x0E9:
+        inject(KEY_VOLUMEUP)
+    elif usage == 0x06F:
+        brightness_step(+1)
+    elif usage == 0x070:
+        brightness_step(-1)
+    elif usage == 0x391:
+        toggle_mic()
+    elif usage == 0x395:
+        tile_window()
+    else:
+        combo = CONSUMER_COMBO.get(usage)
+        if combo:
+            slow_combo(*combo)
+
+
+def ensure_audible():
+    """WirePlumber on this image comes up with sink volume 0, so a mute toggle
+    is inaudible until the user raises the volume.  Lift a silent sink once."""
+    pct, muted = sink_percent()
+    if pct < 5:
+        wpctl("set-volume", "@DEFAULT_AUDIO_SINK@", "50%")
+        if muted:
+            wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "0")
+        return True
+    return False
+
+
+def beep():
+    """游戏模式没有 OSD，用一声短促提示音当"静音状态"的反馈。"""
+    try:
+        subprocess.run(["runuser", "-u", USER, "--", "paplay", BEEP], env=USER_ENV,
+                       timeout=1.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def toggle_mute():
+    pct, muted = sink_percent()
+    if not muted:
+        beep()               # 静音之后放不出来，所以先响再静音
+        wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "1")
+    else:
+        wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "0")
+        if pct < 5:
+            wpctl("set-volume", "@DEFAULT_AUDIO_SINK@", "50%")
+        beep()
+    pct, muted = sink_percent()
+    LED_BITS["mute"] = 1 if muted else 0
+    if KBD_FD[0] is not None:
+        send_led_bitmap(KBD_FD[0])
     osd("volumeChanged", pct)
     osd("showText", "Speaker", "Muted" if muted else "Unmuted")
 
@@ -140,10 +238,20 @@ def volume_step(delta):
 
 
 def toggle_mic():
-    wpctl("set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle")
-    out = wpctl("get-volume", "@DEFAULT_AUDIO_SOURCE@")
-    muted = "MUTED" in out
-    osd("showText", "Microphone", "Muted" if muted else "Unmuted")
+    # 这台机器目前没有任何采集设备（arecord -l 为空），wpctl 切不了麦克风，
+    # 所以这里做"本地开关"：灯的状态由我们自己维护，等以后有 capture 设备再挂上去。
+    LED_BITS["mic"] = 0 if LED_BITS["mic"] else 1
+    if KBD_FD[0] is not None:
+        send_led_bitmap(KBD_FD[0], force=True)
+
+    def _reassert():
+        for _ in range(3):
+            time.sleep(0.22)
+            fd = KBD_FD[0]
+            if fd is not None:
+                send_led_bitmap(fd, force=True)
+    threading.Thread(target=_reassert, daemon=True).start()
+    beep()
 
 
 def screenshot():
@@ -233,7 +341,11 @@ def session_toggle():
 
 
 def slow_combo(mods, tap):
-    """Emit a shortcut with human-ish spacing so kwin registers it reliably."""
+    """Emit a shortcut with human-ish spacing so kwin registers it reliably.
+
+    注意：合成用的修饰键必须全部松开，但**用户物理上还按着的**修饰键要重新按下，
+    否则"按住 Ctrl 再按放大键"会把 Ctrl 卡在松开状态。
+    """
     for m in mods:
         kbd.key(m, True)
         time.sleep(0.02)
@@ -243,6 +355,10 @@ def slow_combo(mods, tap):
     for m in reversed(mods):
         time.sleep(0.02)
         kbd.key(m, False)
+    for m in mods:
+        if PHYS_MODS[0] & MOD_BITS.get(m, 0):
+            time.sleep(0.01)
+            kbd.key(m, True)
 
 ENABLE = "/sys/class/pogo_power/power/enable"
 
@@ -444,50 +560,126 @@ LED_SENT = [0]  # 我们最后一次真正发出去的 LED 状态（唯一真相
 
 led_retry = [0.0, 0]  # [last_retry_time, retries_done]
 LED_LAST = [None, 0.0]  # [最后写入的值, 时间] —— 限速用
+class LinkLost(Exception):
+    """tx-en 无法恢复成"收"，这条链路已经不可信，必须重开串口。"""
+
+
+LINK_LOCK = threading.RLock()   # 串口方向切换是互斥资源：主线程点灯 / 动作线程点灯 / 回声
+PHYS_MODS = [0]                 # 当前物理按住的 HID 修饰键位图（主循环维护）
+MOD_BITS = {29: 0x01, 42: 0x02, 56: 0x04, 125: 0x08,
+            97: 0x10, 54: 0x20, 100: 0x40, 126: 0x80}
+
+ACTION_Q = queue.Queue(maxsize=64)
+
+
+def dispatch(usage):
+    """把功能键动作排进队列：动作里可能跑 wpctl/busctl（秒级超时），
+    绝不能在读串口的线程里同步执行，否则按键/触摸板帧会被拖住。"""
+    try:
+        ACTION_Q.put_nowait(usage)
+    except queue.Full:
+        log(f"action queue full, dropping 0x{usage:03x}")
+
+
+def action_worker():
+    while True:
+        usage = ACTION_Q.get()
+        try:
+            consumer_action(usage)
+        except Exception as exc:
+            log(f"action 0x{usage:03x} failed: {exc!r}")
+
+
+def set_txen(on):
+    """切 UART 方向，失败重试；仍然失败就抛 LinkLost。"""
+    want = 1 if on else 0
+    for _ in range(3):
+        if write_attr(TXEN, want):
+            return
+        time.sleep(0.02)
+    raise LinkLost(f"cannot set txen={want}")
+
+
+def release_all(last_keys, last_mods):
+    """把虚拟键盘上还按着的键全部松开（拔键盘/串口重开时必须做）。"""
+    for code in list(last_keys):
+        try:
+            kbd.key(code, False)
+        except Exception:
+            pass
+    for code, bit in MOD_BITS.items():
+        if last_mods & bit:
+            try:
+                kbd.key(code, False)
+            except Exception:
+                pass
+
+
+REPEATABLE = {0x0EA, 0x0E9, 0x06F, 0x070}  # 长按要连发的功能键（音量/亮度）
+held = {}  # usage -> [按下时刻, 上次连发时刻]
 caps_key_t = [0.0]  # last physical CapsLock press
+
+# 三灯位图：反汇编 lenovo_kb_restore_leds 得到
+#   载荷 6A 06 2B 04 <caps> 00 <mute> <mic>
+# caps=bit2(0x4)、mute=bit3(0x8)、mic=bit4(0x10)，真机已确认 bit3=mute、bit4=mic。
+KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_MICMUTE = 113, 114, 115, 248
+LED_BITS = {"caps": 0, "mute": 0, "mic": 0}
+KBD_FD = [None]  # 主循环打开的 tty fd，供动作函数回写 LED
+KBD_DEV = [None]  # uinput 键盘设备，音量/静音键走注入让合成器出 OSD
+led_rate = [0.0]  # 上一次真正发位图的时刻
+
+
+def send_led_bitmap(fd, tries=2, force=False):
+    """把三灯位图发给键盘（幂等，可重复发）。"""
+    now = time.time()
+    if not force and now - led_rate[0] < 0.12:
+        return
+    led_rate[0] = now
+    payload = bytes([0x6A, 0x06, 0x2B, 0x04,
+                     LED_BITS["caps"], 0x00, LED_BITS["mute"], LED_BITS["mic"]])
+    with LINK_LOCK:
+        try:
+            for i in range(tries):
+                frame = build_frame(payload, seed=(int(time.time() * 1000) + i * 37) & 0xFF)
+                set_txen(1)
+                try:
+                    time.sleep(0.004)
+                    os.write(fd, frame)
+                    time.sleep(0.008)
+                finally:
+                    # 无论写成功与否，都必须把方向切回"收"，否则键盘/触摸板的帧全丢
+                    set_txen(0)
+                if i + 1 < tries:
+                    time.sleep(0.030)
+            log(f"leds caps={LED_BITS['caps']} mute={LED_BITS['mute']} mic={LED_BITS['mic']}")
+        except (OSError, LinkLost) as exc:
+            log(f"led bitmap write failed: {exc!r}")
 
 
 def send_caps_led(fd, on, tries=1):
-    # 反汇编 lenovo_kb_capsled_work：5 字节载荷 6a 03 27 01 <caps>
-    # tx-en 是半双工方向控制：低=收，高=发（内核里 lenovo_kb_enable_uart_tx），
-    # 所以发之前要把 tx-en 拉高，发完再拉低。
-    #
-    # 重发 3 次：键盘每秒都在发 0x16 状态帧，主机切到发送方向时若正好撞上它
-    # 的帧，这一帧就会被吞掉——这正是"按几下才灭灯"的原因。
+    # 三灯位图里的 caps 位（bit2）。旧单灯命令 6A 03 27 01 也能用，但统一走位图，
+    # 免得和静音/麦克风灯互相覆盖。
     val = 1 if on else 0
     now = time.time()
-    # 限速：同一状态 0.5s 内不重复写；否则每次 caps 事件都去抢 tx-en，
-    # 把主循环（按键注入）阻塞几十毫秒 —— 用户感知就是"打字/退格卡一下"。
-    if val == LED_LAST[0] and now - LED_LAST[1] < 0.5:
+    if val == LED_BITS["caps"] and now - led_rate[0] < 0.5:
         return
-    LED_LAST[0] = val
-    LED_LAST[1] = now
-    try:
-        for i in range(tries):
-            payload = bytes([0x6A, 0x03, 0x27, 0x01, val])
-            frame = build_frame(payload, seed=(int(time.time() * 1000) + i * 37) & 0xFF)
-            write_attr(TXEN, 1)
-            time.sleep(0.004)
-            os.write(fd, frame)
-            time.sleep(0.008)
-            write_attr(TXEN, 0)
-            if i + 1 < tries:
-                time.sleep(0.010)
-        LED_SENT[0] = val
-        led_retry[0] = time.time()
-        led_retry[1] = 0
-        log(f"caps led -> {val} t={time.time():.3f} (x{tries})")
-    except OSError as e:
-        write_attr(TXEN, 0)
-        log(f"led write failed: {e}")
+    LED_BITS["caps"] = val
+    LED_SENT[0] = val
+    send_led_bitmap(fd, tries=max(1, tries), force=True)
+    led_retry[0] = time.time()
+    led_retry[1] = 0
+    log(f"caps led -> {val} t={time.time():.3f} (x{tries})")
 
 
 def write_attr(path, value):
+    """写 sysfs 属性。返回 True/False —— 方向控制(txen)出错必须让上层知道。"""
     try:
         with open(path, "w") as f:
             f.write(str(value))
+        return True
     except OSError as e:
         log(f"write {path}={value} failed: {e}")
+        return False
 
 
 def toggle_session_mode():
@@ -512,15 +704,24 @@ def toggle_session_mode():
 
 
 def wait_attr(path, value, timeout=120.0):
-    """开机早期 pogo_power 驱动可能还没 probe 完（regulator provider 未就绪 → EPROBE_DEFER），
-    等节点出现再写，不要一次失败就放弃。"""
+    """等节点出现并**确认写入生效**（读回校验）。
+
+    开机早期 pogo_power 可能还没 probe 完（regulator provider 未就绪 → EPROBE_DEFER），
+    只"文件存在就写一次"是不够的：写失败会被吞掉，上层拿着 True 去开串口，
+    结果是没电或 TX 一直占着方向。
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         if os.path.exists(path):
             write_attr(path, value)
-            return True
+            try:
+                with open(path) as f:
+                    if f.read().strip() == str(value):
+                        return True
+            except OSError:
+                pass
         time.sleep(0.2)
-    log(f"timeout waiting for {path}")
+    log(f"timeout/failed waiting for {path}={value}")
     return False
 
 
@@ -566,13 +767,19 @@ def main():
                  leds=[LED_CAPSL])
     pad = UInput("TB710FU Touchpad", keys=[BTN_LEFT, BTN_RIGHT],
                  rels=[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL])
+    KBD_DEV[0] = kbd
     log("uinput devices created")
+    threading.Thread(target=action_worker, daemon=True).start()
 
     wait_attr(ENABLE, 1, 180)
     wait_attr(TXEN, 0, 10)
     log("pogo power on, tx-en low")
 
     fd = open_tty()
+    KBD_FD[0] = fd
+
+    if ensure_audible():
+        log("sink was silent, raised to 50%")
 
     buf = bytearray()
     last_keys = set()
@@ -613,16 +820,21 @@ def main():
         # Magnetic keyboard: detach/re-attach leaves the old fd open but silent.
         if time.time() - last_any > 8.0:
             log("tty silent for 8s, reopening")
+            # 先把虚拟键盘上还按着的键松开（否则 Shift/Ctrl 会"卡住"）
+            release_all(last_keys, last_mods)
             try:
                 os.close(fd)
             except OSError:
                 pass
-            wait_attr(ENABLE, 1, 10)
-            wait_attr(TXEN, 0, 5)
+            if not wait_attr(ENABLE, 1, 10):
+                log("warning: pogo power not confirmed before reopen")
+            if not wait_attr(TXEN, 0, 5):
+                log("warning: txen not confirmed before reopen")
             fd = open_tty()
             last_any = time.time()
             last_keys = set()
             last_mods = 0
+            PHYS_MODS[0] = 0
         r, _, _ = select.select([fd, kbd.fd], [], [], TICK)
         if kbd.fd in r:
             try:
@@ -663,6 +875,13 @@ def main():
             if DEBUG:
                 log("click up (hold elapsed)")
         # ---- 每 15 s 打一行统计：能区分"串口没数据"和"我们丢帧" ----
+        # 长按连发：键盘对功能键只发一次按压（release 前不重复），
+        # 所以自己起节奏，按住 0.45s 后每 0.12s 触发一次。
+        for usage, ts in list(held.items()):
+            if now - ts[0] > 0.45 and now - ts[1] > 0.12:
+                dispatch(usage)
+                ts[1] = now
+
         if now - stats_at >= 15:
             stats_at = now
             top = sorted(STATS["by_type"].items())
@@ -680,12 +899,15 @@ def main():
             if in_click:
                 pad.button(False)
                 in_click = False
+            pad_press_click = False
             cluster = False
             prev_x = None
             prev_seq = None
             pend_x = pend_y = 0.0
             two_prev = None
             drag_prev = None
+            drag_3f = False
+            suppress_tap = True
             three_frames = 0
 
         if fd not in r:
@@ -694,6 +916,10 @@ def main():
             chunk = os.read(fd, 4096)
         except OSError as e:
             log(f"read error {e}, reopening")
+            release_all(last_keys, last_mods)
+            last_keys = set()
+            last_mods = 0
+            PHYS_MODS[0] = 0
             try:
                 os.close(fd)
             except OSError:
@@ -720,11 +946,14 @@ def main():
                     del buf[:start]
                 break
             frame = bytes(buf[start:end + 1])
-            del buf[:end + 1]
             pkt = parse_frame(frame)
             if not pkt:
+                # 只前进 1 字节：这一帧里可能还套着下一个完整帧的前导，
+                # 整段丢掉会把紧跟着的正常帧（比如松键报告）一起吃掉。
                 STATS["crc"] += 1
+                del buf[:start + 1]
                 continue
+            del buf[:end + 1]
             STATS["frames"] += 1
             last_any = time.time()
             STATS["by_type"][pkt[0]] = STATS["by_type"].get(pkt[0], 0) + 1
@@ -763,32 +992,18 @@ def main():
                     caps_key_t[0] = time.time()
                     log(f"caps key t={time.time():.3f} (LED_SENT={LED_SENT[0]})")
                 last_keys, last_mods = keys, mods
+                PHYS_MODS[0] = mods
             elif pkt[0] == 0x12 and len(pkt) >= 4:
                 usage = pkt[2] | (pkt[3] << 8)
                 if usage == 0:
                     consumer_seen.clear()
+                    held.clear()
                 elif usage not in consumer_seen:
                     consumer_seen.add(usage)
                     log(f"action usage=0x{usage:03x}")
-                    if usage == 0x0E2:
-                        toggle_mute()
-                    elif usage == 0x0EA:
-                        volume_step(-5)
-                    elif usage == 0x0E9:
-                        volume_step(5)
-                    elif usage == 0x06F:
-                        brightness_step(+1)
-                    elif usage == 0x070:
-                        brightness_step(-1)
-                    elif usage == 0x391:
-                        toggle_mic()
-                    elif usage == 0x395:
-                        tile_window()
-
-                    else:
-                        combo = CONSUMER_COMBO.get(usage)
-                        if combo:
-                            slow_combo(*combo)
+                    dispatch(usage)
+                    if usage in REPEATABLE:
+                        held[usage] = [time.time(), time.time()]
             elif pkt[0] == 0x13 and len(pkt) >= 8:
                 x = pkt[4] | (pkt[5] << 8)
                 y = pkt[6] | (pkt[7] << 8)
@@ -820,6 +1035,7 @@ def main():
                 now_t = time.time()
                 gap = now_t - last_touch_t
                 last_touch_t = now_t
+                cluster = True
                 if gap > 0.12 and prev_x is not None:
                     prev_x, prev_y = x, y
                     prev_seq = seq
@@ -849,7 +1065,9 @@ def main():
                         if not in_click:
                             pad.button(True)
                             in_click = True
-                            pad_press_click = True
+                        # 物理按键永远接管所有权：即使此时还压着一次合成轻点，
+                        # 松手也必须由"物理松开"来释放，不能留下无限期按住的左键。
+                        pad_press_click = True
                         click_release_at = float("inf")   # 由物理按键松开决定，不做定时释放
                         pend_x = pend_y = 0.0
                         if DEBUG:
