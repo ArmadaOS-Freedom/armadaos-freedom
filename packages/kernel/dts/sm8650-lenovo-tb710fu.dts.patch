@@ -57,7 +57,7 @@
  	};
  
  	keyboard_sensor_default: keyboard-sensor-default-state {
-@@ -1259,4 +1295,203 @@
+@@ -1259,4 +1295,217 @@
  
  &xo_board {
  	clock-frequency = <76800000>;
@@ -82,7 +82,7 @@
 +		format = "a8r8g8b8";
 +		status = "disabled";
 +	};
- };
++};
 +
 +/* boot-log rings of the original port's debug kernel; nothing uses them here */
 +&blackbox_a_mem {
@@ -91,7 +91,7 @@
 +
 +&blackbox_b_mem {
 +	status = "disabled";
-+};
+ };
 +
 +/* the video codec (iris): the unit's Lenovo-signed firmware is in the firmware bundle */
 +&iris {
@@ -259,5 +259,19 @@
 +				sound-dai = <&q6apm>;
 +			};
 +		};
++	};
++};
++
++/* Pogo magnetic keyboard power gate.
++ * Driven by the out-of-tree pogo_power module until a home for it is
++ * agreed: enables ldo1 (1.8 V logic) + ldo8 (keyboard rail, PMIC tops out
++ * at 3.296 V) and holds the tx-en level shifter (GPIO100) low.
++ */
++&{/} {
++	pogo-power {
++		compatible = "tb710fu,pogo-power";
++		vdd-1p8-supply = <&vreg_l1b_1p8>;
++		vdd-3p3-supply = <&vreg_l8b_1p8>;
++		tx-en-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
 +	};
 +};
