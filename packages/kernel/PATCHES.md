@@ -1312,6 +1312,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Rechecks an inconclusive OFF status after successful power-off or failed power-on. Holds the provider runtime PM reference in the retry worker, releases votes after confirming OFF, and drains work before provider teardown.
+- `patches/0255-clk-qcom-gcc-sm8750-retain-usb-power-domains.patch`
+  source: https://lore.kernel.org/r/20261110213346.1359-1-tvlad744@gmail.com
+  upstream: https://lore.kernel.org/r/20261110213346.1359-1-tvlad744@gmail.com
+  notes: Original Linux submission by Vladyslav Tymoshchuk, currently still under review rather than merged. Keeps the SM8750 USB controller and PHY GDSCs in retention across s2idle; upstream testing covered a OnePlus Pad 3 with USB storage in host mode and device-mode NCM. Hunk context is adapted to Linux 7.2.6 with no behavior change. Reviewed-by: Abel Vesa. The author disclosed Claude assistance for the analysis and initial patch draft.
 - `dts/sm8750-lenovo-elden-camera-bus.patch`
   source: armada
   upstream: local
