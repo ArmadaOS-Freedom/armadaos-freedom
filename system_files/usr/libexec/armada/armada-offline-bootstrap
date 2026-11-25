@@ -16,6 +16,7 @@ SSH/sudo policy or remounts the root filesystem.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import hmac
 import json
@@ -90,6 +91,7 @@ REQUIRED_FILES = (
     UPDATER_INIT_PATH,
 ) + tuple(UPDATES_DIR + '/' + name for name in CORE_MODULES) + LEGACY_RUNTIME_PATHS
 
+REQUIRED_EXECUTABLES = frozenset({ENTRY_PATH, BOOT_TOOL_PATH})
 ALLOWED_EXACT = frozenset(REQUIRED_FILES)
 ALLOWED_PREFIXES = (
     UPDATES_DIR + '/',
@@ -337,14 +339,6 @@ def _extension_active(base):
 
 def _extension_dir(base):
     return _p(base, RUN_EXTENSIONS + '/' + EXTENSION_NAME)
-
-
-def _runtime_root(base):
-    """Root that actually holds the updater runtime for reading its files."""
-    extension = _extension_dir(base)
-    if _extension_active(base) and extension.is_dir() and not extension.is_symlink():
-        return extension
-    return Path(base)
 
 
 def _sha256_file(path):
@@ -719,6 +713,9 @@ def _validate_manifest(manifest, members):
                                  'manifest digest is malformed: %s' % path)
         if entry.get('mode') not in _MODES:
             raise BootstrapError('manifest_invalid', 'manifest mode is unsupported: %s' % path)
+        if path in REQUIRED_EXECUTABLES and entry['mode'] != '0755':
+            raise BootstrapError('manifest_invalid',
+                                 'runtime executable must have mode 0755: %s' % path)
         specs[path] = entry
 
     payload = set(members) - {'manifest.json'}
@@ -877,6 +874,32 @@ def _refresh(runner, sysext):
     return getattr(completed, 'returncode', 1) == 0
 
 
+@contextlib.contextmanager
+def _install_lock(base):
+    extensions = _p(base, RUN_EXTENSIONS)
+    _mkdirs(extensions)
+    if extensions.is_symlink() or not extensions.is_dir():
+        raise BootstrapError('extensions_dir_unusable',
+                             '/run/extensions is not a plain directory')
+    # Keep this inode after unlocking so concurrent invocations always contend
+    # for the same lock, including waiters already blocked on it.
+    path = extensions / ('.' + EXTENSION_NAME + '.lock')
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        raise BootstrapError('lock_failed', 'cannot open installer lock: %s' % error) from error
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BootstrapError('lock_failed', 'installer lock is not a regular file')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise BootstrapError('lock_failed', 'cannot acquire installer lock: %s' % error) from error
+        yield extensions
+    finally:
+        os.close(fd)
+
+
 def _new_stage(extensions):
     """Create a stage directory that belongs to this invocation only."""
     try:
@@ -918,7 +941,7 @@ def _restore(final, stage, backup):
     """Roll back only the extension this invocation replaced."""
     try:
         if final.exists() or final.is_symlink():
-            shutil.rmtree(final, ignore_errors=True)
+            shutil.rmtree(final)
         if backup is not None and (backup.exists() or backup.is_symlink()):
             os.rename(backup, final)
     finally:
@@ -984,13 +1007,14 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
     except OSError as error:
         raise BootstrapError('bundle_unreadable', 'cannot open bundle: %s' % error)
 
-    with stream, _verified_bundle_snapshot(stream, expected_sha256) as snapshot:
+    with (stream,
+          _verified_bundle_snapshot(stream, expected_sha256) as snapshot,
+          _install_lock(base) as extensions):
         manifest, members = _scan_archive(snapshot)
         specs = _validate_manifest(manifest, members)
 
         version = manifest['version']
-        runtime = _runtime_root(base)
-        current = _read_updater_version(runtime)
+        current = _read_updater_version(base)
         comparison = _version_compare(current, version)
         if comparison is not None and comparison > 0:
             raise BootstrapError('newer_runtime_present',
@@ -1005,7 +1029,7 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
         if comparison == 0:
             # The same version string is not proof of the same runtime: only
             # reuse an installation whose files still match the manifest.
-            problems = _verify_runtime(runtime, specs)
+            problems = _verify_runtime(base, specs)
             if not problems:
                 return {
                     'schemaVersion': SCHEMA_VERSION,
@@ -1031,11 +1055,6 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
                                  'systemd-sysext is required to deploy the updater')
         os_release = _read_os_release(base)
         release = _extension_release(os_release)
-        extensions = _p(base, RUN_EXTENSIONS)
-        _mkdirs(extensions)
-        if extensions.is_symlink() or not extensions.is_dir():
-            raise BootstrapError('extensions_dir_unusable',
-                                 '/run/extensions is not a plain directory')
         final = _extension_dir(base)
         if final.is_symlink():
             raise BootstrapError('extension_conflict',
@@ -1074,20 +1093,27 @@ def install(bundle, expected_sha256, *, root='/', runner=None):
         try:
             if not _refresh(runner, sysext):
                 raise BootstrapError('sysext_failed', 'systemd-sysext refresh failed')
-            if base == Path('/') and not _extension_active(base):
+            if not _extension_active(base):
                 raise BootstrapError('verify_failed',
                                      'systemd-sysext did not merge the updater extension')
-            merged_version = _read_updater_version(final)
+            merged_version = _read_updater_version(base)
             if merged_version != version:
                 raise BootstrapError('verify_failed',
                                      'merged updater version is %r, expected %r'
                                      % (merged_version, version))
-            if _missing_runtime(final):
-                raise BootstrapError('verify_failed',
-                                     'merged updater runtime is incomplete')
-        except BaseException:
-            _restore(final, stage, backup)
-            _refresh(runner, sysext)
+            problems = _verify_runtime(base, specs)
+            if problems:
+                raise BootstrapError('verify_failed', 'merged updater files differ from the bundle: %s'
+                                     % ', '.join(problems))
+        except BaseException as install_error:
+            try:
+                _restore(final, stage, backup)
+                if not _refresh(runner, sysext):
+                    raise BootstrapError('sysext_failed', 'systemd-sysext rollback refresh failed')
+            except Exception as rollback_error:
+                raise BootstrapError('rollback_failed',
+                                     'updater install failed (%s); rollback failed (%s)'
+                                     % (install_error, rollback_error)) from install_error
             raise
 
         if backup is not None:

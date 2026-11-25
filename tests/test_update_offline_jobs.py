@@ -345,6 +345,20 @@ class OfflineJobTests(OfflineJobRecoveryCases, OfflineJobFixtureMixin,
         self.assertEqual(
             self.manager().status(sid)['completion']['restartState'], 'failed')
 
+    def test_rejected_prepare_preflight_does_not_change_session_or_queue_job(self):
+        sid = self.session()
+        with self.store.session_lock(sid) as session:
+            receipt_path = session / 'receipt.json'
+            original = receipt_path.read_bytes()
+        self.preflight.side_effect = offline_session.OfflineSessionError('preflight rejected')
+
+        with self.assertRaisesRegex(offline_session.OfflineSessionError, 'preflight rejected'):
+            self.manager().submit_prepare(sid)
+
+        self.preflight.assert_called_once_with(self.document, self.signature, session_id=sid)
+        self.assertEqual(receipt_path.read_bytes(), original)
+        self.runner.assert_not_called()
+
     def test_prepare_once_reconnect_and_bindings(self):
         sid = self.session()
         with mock.patch('updates.offline_prepare.prepare_offline_update',
@@ -352,6 +366,7 @@ class OfflineJobTests(OfflineJobRecoveryCases, OfflineJobFixtureMixin,
             first = self.manager().submit_prepare(sid)
             self.assertEqual(first['state'], 'prepare_queued')
             self.assertEqual(self.manager().submit_prepare(sid)['state'], 'prepare_queued')
+            self.preflight.assert_called_once_with(self.document, self.signature, session_id=sid)
             launches = [call for call in self.runner.call_args_list
                         if call.args[0][0] == 'systemd-run']
             self.assertEqual(len(launches), 1)

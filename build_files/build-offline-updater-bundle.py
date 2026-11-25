@@ -22,9 +22,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tarfile
+import tempfile
 
 BUNDLE_NAME = 'armada-offline-updater'
 MANIFEST_NAME = 'manifest.json'
@@ -87,8 +89,16 @@ REQUIRED_LEGACY_PATHS = (
 ) + tuple(UPDATE_BOOT_DIR + '/runtimes/' + model + '.bin'
           for model in LEGACY_RUNTIME_MODELS)
 
-_CHUNK = 1024 * 1024
+# Match the consumer in armada-offline-bootstrap.
+_MAX_BUNDLE_BYTES = 512 * 1024 * 1024
+_MAX_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_TEXT_BYTES = 256 * 1024
 _MAX_FILES = 4096
+_UPDATER_VERSION_LINE = re.compile(
+    r'UPDATER_VERSION\s*=\s*"(\d+(?:\.\d+)*)"\s*\Z', re.ASCII)
+_UPDATER_INIT_PATH = UPDATES_DIR + '/__init__.py'
+_REQUIRED_EXECUTABLES = frozenset({ENTRY_PATH, BOOT_TOOL_PATH})
 
 
 class BundleError(RuntimeError):
@@ -289,7 +299,7 @@ def _is_session_argument(node):
             and node.args[0].id == 'params')
 
 
-def _provides_session_preflight(updates_root):
+def _provides_session_preflight(source):
     """True when the shipped RPC accepts and forwards preflight ``sessionId``.
 
     The installer never executes bundle code, so the contract is read from the
@@ -300,7 +310,10 @@ def _provides_session_preflight(updates_root):
     must compare the params keys against the exact preflight-only optional
     ``sessionId`` set.
     """
-    module = _parse_module(updates_root / 'offline_rpc.py')
+    try:
+        module = ast.parse(source, filename='offline_rpc.py')
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise BundleError('shipped offline_rpc.py is not valid: %s' % exc) from exc
     handler = None
     offered = None
     dispatch = None
@@ -364,9 +377,9 @@ def _provides_session_preflight(updates_root):
     return guarded
 
 
-def _capabilities(root):
+def _capabilities(rpc_source):
     """Capabilities the bundle can honestly declare, or a build error."""
-    if _provides_session_preflight(root / UPDATES_DIR):
+    if _provides_session_preflight(rpc_source):
         return MANIFEST_CAPABILITIES
     raise BundleError(
         'updater runtime does not provide session-aware preflight; cannot '
@@ -426,17 +439,18 @@ def _collect(root):
         relative = path.relative_to(root).as_posix()
         sources[relative] = _require_input(root, relative)
 
-    if len(sources) > _MAX_FILES:
-        raise BundleError('bundle exceeds %d files' % _MAX_FILES)
+    if len(sources) + 1 > _MAX_FILES:
+        raise BundleError('bundle exceeds %d files including the manifest' % _MAX_FILES)
     return sources
 
 
-def _runtime_version(root):
-    """Read the updater version constant the bundle actually ships."""
-    path = _require_input(root, UPDATES_DIR + '/__init__.py')
+def _runtime_version(data):
+    """Read the canonical version from the same bytes the bundle ships."""
+    if len(data) > _MAX_TEXT_BYTES:
+        raise BundleError('updates/__init__.py exceeds the bootstrap text limit')
     try:
-        source = path.read_bytes().decode('ascii', 'strict')
-        tree = ast.parse(source, filename=str(path))
+        source = data.decode('ascii', 'strict')
+        tree = ast.parse(source, filename=_UPDATER_INIT_PATH)
     except (UnicodeDecodeError, SyntaxError) as exc:
         raise BundleError('shipped updates/__init__.py is not valid: ' + str(exc))
     values = []
@@ -455,29 +469,47 @@ def _runtime_version(root):
     for part in parts:
         if not part.isdigit() or not part.isascii():
             raise BundleError('UPDATER_VERSION components must be decimal')
+    canonical_values = [
+        match.group(1) for line in source.splitlines()
+        if (match := _UPDATER_VERSION_LINE.fullmatch(line)) is not None
+    ]
+    if canonical_values != values:
+        raise BundleError('UPDATER_VERSION must be a bare, double-quoted assignment')
     return values[0]
 
 
-def _mode_text(path):
-    return '0755' if _is_executable(path) else '0644'
-
-
-def _sha256(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        while True:
-            chunk = stream.read(_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+def _read_entries(sources):
+    # A single bounded read feeds both the manifest and the tar member. A file
+    # changing between collection and packaging cannot split those two views.
+    entries = {}
+    total = 0
+    for name, path in sorted(sources.items()):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_MEMBER_BYTES:
+                    raise BundleError('invalid bundle member size or type: %s' % name)
+                total += info.st_size
+                if total > _MAX_BUNDLE_BYTES:
+                    raise BundleError('bundle payload is too large')
+                mode = '0755' if info.st_mode & 0o111 else '0644'
+                if name in _REQUIRED_EXECUTABLES and mode != '0755':
+                    raise BundleError('required runtime file is not executable: %s' % name)
+                data = stream.read(info.st_size + 1)
+                if len(data) != info.st_size:
+                    raise BundleError('bundle member size changed while reading: %s' % name)
+        except OSError as exc:
+            raise BundleError('cannot read bundle member %s: %s' % (name, exc)) from exc
+        entries[name] = (data, mode)
+    return entries
 
 
 def _manifest_bytes(entries, fmt, capabilities, version):
     files = [
-        {'path': name, 'bytes': path.stat().st_size, 'sha256': _sha256(path),
-         'mode': _mode_text(path)}
-        for name, path in sorted(entries.items())
+        {'path': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+         'mode': mode}
+        for name, (data, mode) in entries.items()
     ]
     document = {
         'schemaVersion': 1,
@@ -488,32 +520,25 @@ def _manifest_bytes(entries, fmt, capabilities, version):
         'capabilities': list(capabilities),
         'files': files,
     }
-    return (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + '\n').encode('utf-8')
+    manifest = (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + '\n').encode('utf-8')
+    if len(manifest) > _MAX_MANIFEST_BYTES:
+        raise BundleError('bundle manifest is too large')
+    return manifest
 
 
 def _archive_bytes(entries, manifest):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT,
                       encoding='utf-8') as archive:
-        for name, data in ((MANIFEST_NAME, manifest),):
+        for name, (data, mode) in {MANIFEST_NAME: (manifest, '0644'), **entries}.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mtime = 0
-            info.mode = 0o644
+            info.mode = int(mode, 8)
             info.uid = info.gid = 0
             info.uname = info.gname = ''
             info.type = tarfile.REGTYPE
             archive.addfile(info, io.BytesIO(data))
-        for name, path in sorted(entries.items()):
-            info = tarfile.TarInfo(name)
-            info.size = path.stat().st_size
-            info.mtime = 0
-            info.mode = 0o755 if _is_executable(path) else 0o644
-            info.uid = info.gid = 0
-            info.uname = info.gname = ''
-            info.type = tarfile.REGTYPE
-            with path.open('rb') as stream:
-                archive.addfile(info, stream)
     return buffer.getvalue()
 
 
@@ -524,20 +549,19 @@ def _write_output(output, payload, gzipped):
                            compresslevel=9) as stream:
             stream.write(payload)
         payload = buffer.getvalue()
+    if len(payload) > _MAX_BUNDLE_BYTES:
+        raise BundleError('bundle archive is too large')
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name('.' + output.name + '.tmp')
+    fd, temporary = tempfile.mkstemp(prefix='.' + output.name + '.', suffix='.tmp', dir=output.parent)
     try:
-        with temporary.open('xb') as stream:
+        with os.fdopen(fd, 'wb') as stream:
             stream.write(payload)
+            os.fchmod(stream.fileno(), 0o644)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, output)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return payload
 
 
@@ -552,10 +576,9 @@ def build(root, output):
     if not output.is_absolute() or not output.name:
         raise BundleError('output must be an absolute file path: %s' % output)
 
-    version = _runtime_version(root)
-
-    entries = _collect(root)
-    capabilities = _capabilities(root)
+    entries = _read_entries(_collect(root))
+    version = _runtime_version(entries[_UPDATER_INIT_PATH][0])
+    capabilities = _capabilities(entries[UPDATES_DIR + '/offline_rpc.py'][0])
     fmt = 'tar' if output.name.endswith('.tar') else 'tar.gz'
     manifest = _manifest_bytes(entries, fmt, capabilities, version)
     payload = _archive_bytes(entries, manifest)
