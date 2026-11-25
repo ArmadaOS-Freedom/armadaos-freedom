@@ -12,7 +12,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "system_files/usr/lib/armada"))
 
-from updates import UPDATER_VERSION
+from updates import DEFAULT_MINIMUM_UPDATER_VERSION
 from updates.package_contract import (
     AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS, PackageError, _portable_path,
     validate_package,
@@ -177,7 +177,7 @@ def _artifact(item, model, shared, directory):
 
 def build_descriptor(archive_path: Path, *, release_id: str,
                      minimum_installer_version="0.8.0",
-                     minimum_updater_version=UPDATER_VERSION,
+                     minimum_updater_version=DEFAULT_MINIMUM_UPDATER_VERSION,
                      parts_manifest: Path | None = None,
                      enable_offline_upgrade: bool = False,
                      install_models=()) -> dict:

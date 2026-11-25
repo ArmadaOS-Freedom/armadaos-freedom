@@ -23,7 +23,7 @@ from updates import (  # noqa: E402
     system_transaction,
 )
 
-EXPECTED_UPDATER_VERSION = "0.8.2"
+EXPECTED_UPDATER_VERSION = "1.0.0"
 
 _FORWARDING_SITES = (
     (offline_prepare, "prepare_offline_update"),

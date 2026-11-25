@@ -23,6 +23,7 @@ _REQUEST_KEYS = frozenset({'protocolVersion', 'id', 'method', 'params'})
 _SESSION_HEX = frozenset('0123456789abcdef')
 _METHOD_PARAMS = {
     'info': frozenset(),
+    'preflight': frozenset({'document', 'signature'}),
     'begin': frozenset({'document', 'signature'}),
     'status': frozenset({'sessionId'}),
     'upload': frozenset({'sessionId', 'offset', 'data'}),
@@ -37,8 +38,8 @@ _METHOD_PARAMS = {
     'recovery_boot_seal': frozenset({'sessionId'}),
 }
 _NORMAL_METHODS = frozenset({
-    'info', 'begin', 'status', 'upload', 'seal', 'prepare', 'execute', 'export',
-    'restart_to_verify',
+    'info', 'preflight', 'begin', 'status', 'upload', 'seal', 'prepare',
+    'execute', 'export', 'restart_to_verify',
 })
 
 
@@ -88,6 +89,15 @@ def _op_begin(manager, params):
     document = _b64(params['document'], _DOCUMENT_MAX, 'document')
     signature = _b64(params['signature'], _SIGNATURE_MAX, 'signature')
     return manager.store.begin(document, signature)
+
+
+def _op_preflight(manager, params):
+    document = _b64(params['document'], _DOCUMENT_MAX, 'document')
+    signature = _b64(params['signature'], _SIGNATURE_MAX, 'signature')
+    if 'sessionId' in params:
+        return manager.store.preflight(
+            document, signature, session_id=_session_id(params))
+    return manager.store.preflight(document, signature)
 
 
 def _op_status(manager, params):
@@ -168,6 +178,7 @@ def _op_export(manager, params):
 
 _OPERATIONS = {
     'info': _op_info,
+    'preflight': _op_preflight,
     'begin': _op_begin,
     'status': _op_status,
     'upload': _op_upload,
@@ -189,7 +200,11 @@ def _dispatch(manager, method, params, *, allowed_methods=None):
     expected = _METHOD_PARAMS.get(method)
     if expected is None:
         raise _Invalid('unknown method')
-    if frozenset(params) != expected:
+    if method == 'preflight':
+        keys = frozenset(params)
+        if keys not in (expected, expected | {'sessionId'}):
+            raise _Invalid('unexpected or missing method parameters')
+    elif frozenset(params) != expected:
         raise _Invalid('unexpected or missing method parameters')
     offered = _NORMAL_METHODS if allowed_methods is None else allowed_methods
     if method not in offered:

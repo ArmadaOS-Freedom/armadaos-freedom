@@ -510,6 +510,8 @@ class OfflineJobManager:
             state = receipt.get('state')
             if state == 'uploaded':
                 self._recheck_submission_identity(receipt)
+                document, signature_b64 = self._read_session_package(session)
+                self.store.preflight(document, signature_b64, session_id=sessionId)
                 receipt.update(
                     state='prepare_queued', jobOperation='prepare',
                     jobUnit=self._unit('prepare', sessionId))
@@ -599,12 +601,17 @@ class OfflineJobManager:
                             session, 'execute', sessionId, 'execute_queued')
         return self.store.status(sessionId)
 
-    def _prepare(self, session, receipt):
-        self._recheck_submission_identity(receipt)
+    @staticmethod
+    def _read_session_package(session):
         document = offline_execute._read_bounded(
             session / 'package.json', _DOCUMENT_MAX, 'package document')
         signature_b64 = offline_execute._read_bounded(
             session / 'package.sig', _SIGNATURE_MAX, 'package signature')
+        return document, signature_b64
+
+    def _prepare(self, session, receipt):
+        self._recheck_submission_identity(receipt)
+        document, signature_b64 = self._read_session_package(session)
         from . import offline_prepare
         return offline_prepare.prepare_offline_update(
             document=document, signature_b64=signature_b64,

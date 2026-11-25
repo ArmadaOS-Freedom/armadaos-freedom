@@ -27,7 +27,12 @@ remains required and is never a demand to reboot into the other slot.
 """
 
 # The updater carried by the initial all-model unified package.  Runtime
-# reporting, descriptor minimums and every entrypoint default read this one
-# value, so this baseline stays distinguishable from the pre-unification 0.8.0
-# updater that cannot consume a mixed package.
-UPDATER_VERSION = "0.8.2"
+# reporting and every entrypoint default read this one value, so this baseline
+# stays distinguishable from the pre-unification 0.8.0 updater that cannot
+# consume a mixed package.
+UPDATER_VERSION = "1.0.0"
+
+# The minimum updater version declared by unified package descriptors.  This
+# stays at the version of the updater that first understood the unified
+# package, so it is distinct from the running updater's own version.
+DEFAULT_MINIMUM_UPDATER_VERSION = "0.8.2"

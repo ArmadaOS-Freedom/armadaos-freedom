@@ -676,6 +676,23 @@ def ensure_ready(root, initial):
     raise BootDiskSwitchError("an ARMADA_BOOT change already awaits restart or confirmation")
 
 
+def check_ready_readonly(root, initial):
+    """Read-only twin of :func:`ensure_ready` for preflight.
+
+    It reports the same blocker without checkpointing, reclaiming, removing
+    the recovery pointer, or clearing a stale pending record.  A pending
+    record that ``ensure_ready`` would simply clear is treated as cleared.
+    """
+    boot = _resolve_boot(root)
+    pending = _read_pending(boot)
+    if pending is None:
+        return
+    if (initial["deployment"] == pending["currentDeployment"]
+            and _read_boot_active(boot)[1] == pending["expected"]):
+        return
+    raise BootDiskSwitchError("an ARMADA_BOOT change already awaits restart or confirmation")
+
+
 def _reclaim_failed_target(boot, pending, completed):
     name = pending["target"]
     if not _GEN_DIR_RE.fullmatch(name) or not name.startswith("gen-"):

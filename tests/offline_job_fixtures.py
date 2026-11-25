@@ -68,6 +68,11 @@ class OfflineJobFixtureMixin:
         self.store = offline_session.OfflineSessionStore(
             base=root / 'private', trusted_key=public, inspect=self.inspect)
         self.public = public
+        # Session preflight's storage and hardware checks have their own tests.
+        # Here the job dispatcher treats a normal return as a passed preflight.
+        patcher = mock.patch.object(self.store, 'preflight')
+        self.preflight = patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = mock.patch('armada_os.snapshot',
                              return_value={'channel': 'stable'})
         self.snapshot = patcher.start()
