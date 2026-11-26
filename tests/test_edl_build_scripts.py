@@ -306,6 +306,13 @@ def build_fixture(full_build=False):
         env = os.environ.copy()
         env["PATH"] = os.pathsep.join((str(bin_dir), env.get("PATH", "/usr/bin:/bin")))
         env["FAKE_DOCKER_LOG"] = str(docker_log)
+        # As the release workflow does: the signed disk boot is on (TB710FU needs it in every bundle).
+        cosign = bin_dir / "cosign"
+        cosign.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        cosign.chmod(0o755)
+        env["ARMADA_BOOT_FILES"] = "1"
+        env["COSIGN_PRIVATE_KEY"] = "test-key"
+        env["COSIGN_PASSWORD"] = "test-password"
         if full_build:
             env["FAKE_DOCKER_PIPELINE"] = "1"
             env["FAKE_DOCKER_ZIP"] = "ArmadaOS-Freedom-%s.zip" % PACKAGE_VERSION
@@ -346,17 +353,6 @@ def base_arguments(fixture, models=(), runtime_models=()):
     for model in runtime_models:
         arguments += ["--runtime", "%s=%s" % (model, runtime_path(fixture, model))]
     return arguments
-
-
-def _enable_disk_boot_signing(fixture):
-    """Turn on ARMADA_BOOT_FILES with a fake cosign, as the release workflow does."""
-    bin_dir = Path(fixture.env["PATH"].split(os.pathsep)[0])
-    cosign = bin_dir / "cosign"
-    cosign.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    cosign.chmod(0o755)
-    fixture.env["ARMADA_BOOT_FILES"] = "1"
-    fixture.env["COSIGN_PRIVATE_KEY"] = "test-key"
-    fixture.env["COSIGN_PASSWORD"] = "test-password"
 
 
 def run_wrapper(fixture, arguments):
@@ -658,8 +654,6 @@ class WrapperArgumentTests(unittest.TestCase):
         )
 
         with build_fixture(full_build=True) as fixture:
-            if "TB710FU" in models and expected_upgrade:
-                _enable_disk_boot_signing(fixture)
             result = run_wrapper(fixture, base_arguments(fixture, models=models))
             self.assertEqual(0, result.returncode, _diagnostics(result))
 
@@ -721,11 +715,12 @@ class WrapperArgumentTests(unittest.TestCase):
         self.assertIn("--offline-upgrade", descriptor)
         self.assertEqual([], _values(descriptor, "--install-model"))
 
-    def test_tb710fu_upgrade_package_requires_the_signed_disk_boot(self):
-        # TB710FU updates only through ARMADA_BOOT, so an upgrade package without the
-        # signed disk boot capsule (ARMADA_BOOT_FILES unset) is refused before any producer runs.
-        for models in (("TB710FU",), ("TB322FC", "TB710FU")):
+    def test_a_bundle_with_tb710fu_requires_the_signed_disk_boot(self):
+        # TB710FU updates only through ARMADA_BOOT, so any bundle with it (upgrade or, with a custom
+        # profile, install-only) is refused without the signed disk boot, before any producer runs.
+        for models in (("TB710FU",), ("TB322FC", "TB710FU"), ("TB710FU", THIRD_MODEL), ()):
             with self.subTest(models=models), build_fixture(full_build=True) as fixture:
+                fixture.env.pop("ARMADA_BOOT_FILES")
                 result = run_wrapper(fixture, base_arguments(fixture, models=models))
                 self.assertNotEqual(0, result.returncode, _diagnostics(result))
                 self.assertIn("ARMADA_BOOT_FILES=1", result.stderr, _diagnostics(result))
@@ -746,6 +741,14 @@ class WrapperArgumentTests(unittest.TestCase):
             WrapperPreflightTests._wrapper_models("ARMADA_BOOT_ONLY_MODELS"),
             set(models.DISK_BOOT_MODELS - models.MIRROR_POLICY_MODELS),
         )
+
+    def test_install_only_bundle_with_tb710fu_still_signs_its_disk_boot(self):
+        producer, descriptor = self._run_full_build(("TB710FU", THIRD_MODEL))
+        self.assertNotIn("--offline-upgrade", producer)
+        self.assertIn("--disk-boot-cosign", producer)
+        # Without an ARMADA_BOOT-only model an install-only bundle keeps the existing behaviour.
+        producer, _ = self._run_full_build(("TB322FC", THIRD_MODEL))
+        self.assertNotIn("--disk-boot-cosign", producer)
 
     def test_custom_profile_alone_builds_an_install_only_package(self):
         producer, descriptor = self._run_full_build((THIRD_MODEL,))

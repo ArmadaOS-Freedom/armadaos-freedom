@@ -165,7 +165,7 @@ class ProducerContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
 
-    def test_offline_upgrade_for_an_armada_boot_only_model_requires_the_disk_signer(self):
+    def test_a_bundle_with_an_armada_boot_only_model_requires_the_disk_signer(self):
         # The resolved selection is checked, so omitting --model (every profile) cannot skip it.
         every_profile = tuple(producer.PROFILE_ORDER)
         self.assertIn("TB710FU", every_profile)
