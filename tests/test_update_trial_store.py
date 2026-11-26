@@ -27,6 +27,43 @@ REGION_OFFSET = layout.REGION_OFFSET
 REGION_BYTES = layout.REGION_BYTES
 
 
+def _write_fixture(fd: int, part: str, inst: str, dver: int = 3) -> None:
+    meta = {
+        "kind": "armada-board-recovery-image",
+        "schemaVersion": 3,
+        "imageBytes": SIZE,
+        "headerBytes": HEADER_BYTES,
+        "payloadOffset": HEADER_BYTES,
+        "compressedBytes": 1024,
+        "installationId": inst,
+        "configRegionOffset": REGION_OFFSET,
+        "configRegionBytes": REGION_BYTES,
+        "configPartitionUuid": part,
+        "configBoardId": 1,
+    }
+    header = json.dumps(meta).encode().ljust(HEADER_BYTES, b" ")
+
+    d = bytearray(4096)
+    d[0:8] = b"KSCFGV3\0"
+    struct.pack_into("<IIQQQII", d, 8, dver, 4096, SIZE, 66560,
+                     REGION_OFFSET, 65536, 4096)
+    d[48:64] = uuid_bytes(part)
+    d[64:80] = uuid_bytes(inst)
+    struct.pack_into("<6I", d, 80, 4096, 8192, 1, 0, 0, 0)
+    if dver == 3:
+        struct.pack_into("<III", d, 92, 28672, 32768, 4096)
+    struct.pack_into("<I", d, 4092, zlib.crc32(bytes(d[:4092])) & 0xFFFFFFFF)
+
+    region = bytearray(REGION_BYTES)
+    region[0:4096] = d
+    filler_end = {1: 3 * 4096, 2: 7 * 4096, 3: 7 * 4096}[dver]
+    region[4096:filler_end] = b"L" * (filler_end - 4096)
+
+    os.pwrite(fd, header, 0)
+    os.pwrite(fd, b"archive-marker", HEADER_BYTES)
+    os.pwrite(fd, bytes(region), REGION_OFFSET)
+
+
 class TrialStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
@@ -40,36 +77,7 @@ class TrialStoreTest(unittest.TestCase):
         self.part = "11111111-2222-4333-8444-555555555555"
         self.inst = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
-        meta = {
-            "kind": "armada-board-recovery-image",
-            "schemaVersion": 3,
-            "imageBytes": SIZE,
-            "headerBytes": HEADER_BYTES,
-            "payloadOffset": HEADER_BYTES,
-            "compressedBytes": 1024,
-            "installationId": self.inst,
-            "configRegionOffset": REGION_OFFSET,
-            "configRegionBytes": REGION_BYTES,
-            "configPartitionUuid": self.part,
-            "configBoardId": 1,
-        }
-        header = json.dumps(meta).encode().ljust(HEADER_BYTES, b" ")
-
-        d = bytearray(4096)
-        d[0:8] = b"KSCFGV3\0"
-        struct.pack_into("<IIQQQII", d, 8, 3, 4096, SIZE, 66560, REGION_OFFSET, 65536, 4096)
-        d[48:64] = uuid_bytes(self.part)
-        d[64:80] = uuid_bytes(self.inst)
-        struct.pack_into("<6I", d, 80, 4096, 8192, 1, 28672, 32768, 4096)
-        struct.pack_into("<I", d, 4092, zlib.crc32(bytes(d[:4092])) & 0xFFFFFFFF)
-
-        region = bytearray(REGION_BYTES)
-        region[0:4096] = d
-        region[4096:28672] = b"L" * (28672 - 4096)
-
-        os.pwrite(fd, header, 0)
-        os.pwrite(fd, b"archive-marker", HEADER_BYTES)
-        os.pwrite(fd, bytes(region), REGION_OFFSET)
+        _write_fixture(fd, self.part, self.inst, 3)
 
     def sample(self, sequence=1, **kw) -> rec.TrialRecord:
         fields = dict(
@@ -499,6 +507,118 @@ class TrialStoreTest(unittest.TestCase):
         with mock.patch.object(store.os, 'pread', return_value=b''):
             with self.assertRaises(layout.RecoveryLayoutError):
                 store.load(self.fd, self.part, 1)
+
+    def _legacy_fixture(self, version: int) -> int:
+        tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "recovery.img"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        os.ftruncate(fd, SIZE)
+        _write_fixture(fd, self.part, self.inst, version)
+        return fd
+
+    def test_legacy_descriptor_migration(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                fd = self._legacy_fixture(version)
+                with self.assertRaisesRegex(
+                        store.TrialStoreError,
+                        "unsupported recovery descriptor version"):
+                    store.load(fd, self.part, 1)
+
+                snapshot = store.load(
+                    fd, self.part, 1, allow_legacy=True)
+                self.assertEqual(snapshot.layout.descriptor_version, version)
+                self.assertTrue(snapshot.migration_required)
+                self.assertIsNone(snapshot.record)
+                self.assertIsNone(snapshot.selected)
+
+                # The read-only v1fix is not sufficient: save() re-checks the
+                # descriptor version in _validate_transition before any write.
+                with mock.patch.object(store.os, "pwrite") as pw:
+                    with self.assertRaisesRegex(
+                            store.TrialStoreError,
+                            "unsupported recovery descriptor version"):
+                        store.save(fd, snapshot, self.sample())
+                    pw.assert_not_called()
+
+                header_before = os.pread(fd, HEADER_BYTES, 0)
+                region_before = os.pread(fd, REGION_BYTES, REGION_OFFSET)
+                evidence = store.migrate_legacy_descriptor(
+                    fd, self.part, 1)
+                self.assertEqual(evidence["fromVersion"], version)
+                self.assertEqual(evidence["toVersion"], 3)
+                self.assertEqual(evidence["recordSlotOffsets"], [28672, 32768])
+
+                self.assertEqual(os.pread(fd, HEADER_BYTES, 0), header_before)
+                region_after = os.pread(fd, REGION_BYTES, REGION_OFFSET)
+                self.assertEqual(region_after[4096:], region_before[4096:])
+                descriptor = region_after[:4096]
+                self.assertEqual(struct.unpack_from("<I", descriptor, 8)[0], 3)
+                self.assertEqual(
+                    struct.unpack_from("<III", descriptor, 92),
+                    (28672, 32768, 4096))
+                self.assertEqual(descriptor[16:92], region_before[16:92])
+                self.assertEqual(descriptor[104:4092], bytes(4092 - 104))
+                self.assertEqual(
+                    zlib.crc32(descriptor[:4092]) & 0xFFFFFFFF,
+                    struct.unpack_from("<I", descriptor, 4092)[0])
+
+                strict = store.load(fd, self.part, 1)
+                self.assertEqual(strict.layout.descriptor_version, 3)
+                self.assertFalse(strict.migration_required)
+                self.assertIsNone(strict.record)
+
+                with mock.patch.object(store.os, "pwrite") as pw:
+                    self.assertIsNone(
+                        store.migrate_legacy_descriptor(fd, self.part, 1))
+                    pw.assert_not_called()
+
+                with mock.patch.object(
+                        store.os, "pwrite", wraps=os.pwrite) as pw:
+                    self.assertEqual(store.save(fd, strict, self.sample()), 0)
+                offsets = [call.args[2] for call in pw.call_args_list]
+                self.assertIn(REGION_OFFSET + rec.TAIL_OFFSET_A, offsets)
+                self.assertIn(REGION_OFFSET + rec.TAIL_OFFSET_B, offsets)
+                self.assertEqual(
+                    store.load(fd, self.part, 1).record, self.sample())
+
+    def test_migration_refuses_nonzero_reserved_tail(self):
+        fd = self._legacy_fixture(1)
+        os.pwrite(fd, b"X", REGION_OFFSET + 3 * 4096)
+        with self.assertRaises(layout.RecoveryLayoutError):
+            store.load(fd, self.part, 1, allow_legacy=True)
+        with self.assertRaises(layout.RecoveryLayoutError):
+            store.migrate_legacy_descriptor(fd, self.part, 1)
+
+    def test_migration_short_write_and_readback_failure(self):
+        short = self._legacy_fixture(1)
+        real_pwrite = os.pwrite
+
+        with mock.patch.object(
+                store.os, "pwrite",
+                side_effect=lambda fd, data, offset: real_pwrite(
+                    fd, data[:2048], offset)):
+            with self.assertRaisesRegex(store.TrialStoreError, "short write"):
+                store.migrate_legacy_descriptor(short, self.part, 1)
+
+        corrupt = self._legacy_fixture(1)
+        real_pread = os.pread
+        region_reads = {"n": 0}
+
+        def bad_readback(fd, size, offset):
+            if size == REGION_BYTES and offset == REGION_OFFSET:
+                region_reads["n"] += 1
+                if region_reads["n"] == 2:
+                    data = real_pread(fd, size, offset)
+                    return bytes([data[0] ^ 1]) + data[1:]
+            return real_pread(fd, size, offset)
+
+        with mock.patch.object(store.os, "pread", side_effect=bad_readback):
+            with self.assertRaisesRegex(
+                    store.TrialStoreError, "readback verification failed"):
+                store.migrate_legacy_descriptor(corrupt, self.part, 1)
 
     def test_save_pins_copy_on_write_previous_copy(self):
         snap = store.load(self.fd, self.part, 1)

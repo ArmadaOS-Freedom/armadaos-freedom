@@ -126,12 +126,36 @@ def _recovery_files(work, sources, journal):
     return entries
 
 
-def _read_recovery_for_disk(initial):
+def _read_recovery_for_disk(initial, *, allow_legacy=False):
     with recovery_device.open_recovery(writable=False) as (fd, partuuid, board):
         if (partuuid != initial['recoveryPartUuid'] or
                 physical_slots._MODEL.get(board) != initial['model']):
             raise ValueError('recovery identity changed')
+        if allow_legacy:
+            return trial_store.load(
+                fd, partuuid, board, allow_legacy=True)
         return trial_store.load(fd, partuuid, board)
+
+
+def _read_recovery(initial, old, *, allow_legacy=False):
+    if initial.get('bootSource') == 'armada_boot':
+        return _read_recovery_for_disk(initial, allow_legacy=allow_legacy)
+    return system_transaction._check_recovery(
+        initial, old, allow_legacy=allow_legacy)
+
+
+def _migrate_recovery_descriptor(initial):
+    """Upgrade a legacy v1/v2 settings descriptor before the first journal use.
+
+    The caller has already parsed the legacy layout read-only.  Re-open the
+    partition writable, re-verify its identity and let the journal store do a
+    locked re-read, so a concurrent migration simply becomes a no-op.
+    """
+    with recovery_device.open_recovery(writable=True) as (fd, partuuid, board):
+        if (partuuid != initial['recoveryPartUuid'] or
+                physical_slots._MODEL.get(board) != initial['model']):
+            raise ValueError('recovery identity changed')
+        return trial_store.migrate_legacy_descriptor(fd, partuuid, board)
 
 
 def prepare_offline_update(*, document, signature_b64, payload_directory,
@@ -194,8 +218,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 raise ValueError('requested channel differs from configured channel')
             current_binding = initial['deployment']
             old = system_transaction._binding(current_binding)
-            journal = (_read_recovery_for_disk(initial) if disk else
-                       system_transaction._check_recovery(initial, old))
+            journal = _read_recovery(initial, old, allow_legacy=True)
 
             package = package_contract.load_package(
                 document, signature_b64, trusted_key=trusted_key)
@@ -213,6 +236,15 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
             if package['ostreeCommit'] == old[1]:
                 status.update(state='up_to_date', phase='complete')
                 return status
+
+            descriptor_migration = None
+            if journal.layout.descriptor_version != trial_record.DESCRIPTOR_MIN_VERSION:
+                descriptor_migration = _migrate_recovery_descriptor(initial)
+                journal = _read_recovery(initial, old)
+                if journal.layout.descriptor_version != trial_record.DESCRIPTOR_MIN_VERSION:
+                    raise ValueError('recovery descriptor migration did not produce v3')
+                if descriptor_migration is not None:
+                    status['recoveryDescriptorMigration'] = descriptor_migration
 
             boot_materials._validate_output_dir(
                 requested_work, [root / 'ostree', root / 'boot'])
@@ -349,6 +381,8 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
                 'partitions': sources['partitions'],
                 'files': _recovery_files(work, sources, journal),
             }
+            if descriptor_migration is not None:
+                manifest['recoveryDescriptorMigration'] = descriptor_migration
             if manifest['recoveryPartUuid'] != initial['recoveryPartUuid']:
                 raise ValueError('recovery identity mismatch')
             manifest_bytes = system_transaction._save_json(
@@ -388,8 +422,7 @@ def _prepare_offline_update(*, document, signature_b64, payload_directory=None,
 
             if not physical_slots.same_physical_identity(inspect_slots(), initial):
                 raise ValueError('physical slots changed before preparation completed')
-            final_journal = (_read_recovery_for_disk(initial) if disk else
-                             system_transaction._check_recovery(initial, old))
+            final_journal = _read_recovery(initial, old)
             if (final_journal.header != journal.header or
                     final_journal.region != journal.region):
                 raise ValueError('recovery journal changed during preparation')

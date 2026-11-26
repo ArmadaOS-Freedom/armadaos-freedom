@@ -2,7 +2,9 @@
 """Durable dual-copy journal I/O for the Linux update trial record.
 Callers must supply a fresh, unlocked fd for an already-verified internal partition.
 Functions in this module own flock serialization on the supplied file descriptor.
-Does not perform device selection, partition migration, or slot activation.
+``migrate_legacy_descriptor`` rewrites only the descriptor sector the caller
+already parsed; this module does not perform device selection, partition
+migration, payload movement or slot activation.
 
 ``save`` is copy-on-write: the next sequence is written into the record copy
 that was *not* selected, then fsynced and read back in full.  The previously
@@ -37,13 +39,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import os
+import struct
 import uuid
+import zlib
 
 from .recovery_layout import (
     REGION_BYTES,
     REGION_OFFSET,
     RecoveryLayout,
+    SLOT_BYTES,
     parse_layout,
 )
 from .trial_record import (
@@ -60,6 +66,9 @@ from .trial_record import (
 
 _MAX_U64 = (1 << 64) - 1
 _ZERO_RECORD = b"\x00" * RECORD_BYTES
+LEGACY_DESCRIPTOR_VERSIONS = (1, 2)
+_V3_RECORD_SLOT_A = 7 * SLOT_BYTES
+_V3_RECORD_SLOT_B = 8 * SLOT_BYTES
 
 
 class TrialStoreError(RuntimeError):
@@ -74,12 +83,29 @@ class TrialSnapshot:
     record: TrialRecord | None
     selected: int | None
 
+    @property
+    def migration_required(self) -> bool:
+        return self.layout.descriptor_version != DESCRIPTOR_MIN_VERSION
 
-def _read_snapshot(fd: int, partition_uuid: str, board: int) -> TrialSnapshot:
+
+def _read_snapshot(fd: int, partition_uuid: str, board: int, *,
+                   allow_legacy: bool = False) -> TrialSnapshot:
     header = os.pread(fd, REGION_BYTES, 0)
     region = os.pread(fd, REGION_BYTES, REGION_OFFSET)
     layout = parse_layout(header, region, partition_uuid, board)
     if layout.descriptor_version != DESCRIPTOR_MIN_VERSION:
+        # v1/v2 describe a settings region whose reserved tail is required to
+        # be zero, so the v3 record slots cannot hold a journal yet.  Only a
+        # caller that has promised to migrate before any journal write may
+        # read them as an empty journal; every journal operation stays strict.
+        if allow_legacy and layout.descriptor_version in LEGACY_DESCRIPTOR_VERSIONS:
+            return TrialSnapshot(
+                header=header,
+                region=region,
+                layout=layout,
+                record=None,
+                selected=None,
+            )
         raise TrialStoreError(
             f"unsupported recovery descriptor version: {layout.descriptor_version}"
         )
@@ -131,10 +157,97 @@ def _validate_transition(snapshot: TrialSnapshot, next_record: TrialRecord) -> i
     return snapshot.selected ^ 1
 
 
-def load(fd: int, partition_uuid: str, board: int) -> TrialSnapshot:
+def load(fd: int, partition_uuid: str, board: int, *,
+         allow_legacy: bool = False) -> TrialSnapshot:
     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     try:
-        return _read_snapshot(fd, partition_uuid, board)
+        return _read_snapshot(fd, partition_uuid, board, allow_legacy=allow_legacy)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def migrate_legacy_descriptor(fd: int, partition_uuid: str, board: int) -> dict | None:
+    """Upgrade a v1/v2 settings descriptor to the v3 trial-capable layout.
+
+    The migration rewrites only the first 4096-byte descriptor slot.  The
+    payload, archive header, settings slots and every byte after the descriptor
+    are preserved.  ``parse_layout`` has already proved that the legacy
+    reserved tail is zero, which covers both v3 trial record slots, so the new
+    descriptor starts with an empty journal.
+
+    The write is a single sector-sized pwrite followed by fsync and a full
+    readback.  A short write, a flush failure or any readback difference is
+    reported as a migration failure; no caller may continue to journal writes.
+    Re-running on a v3 descriptor is a no-op.
+    """
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        header = os.pread(fd, REGION_BYTES, 0)
+        region = os.pread(fd, REGION_BYTES, REGION_OFFSET)
+        layout = parse_layout(header, region, partition_uuid, board)
+        if layout.descriptor_version == DESCRIPTOR_MIN_VERSION:
+            return None
+        if layout.descriptor_version not in LEGACY_DESCRIPTOR_VERSIONS:
+            raise TrialStoreError(
+                f"unsupported recovery descriptor version: {layout.descriptor_version}"
+            )
+
+        old_descriptor = region[:SLOT_BYTES]
+        if any(old_descriptor[92:4092]):
+            raise TrialStoreError("legacy descriptor has nonzero v3 reserved bytes")
+
+        descriptor = bytearray(old_descriptor)
+        struct.pack_into("<I", descriptor, 8, DESCRIPTOR_MIN_VERSION)
+        struct.pack_into(
+            "<III", descriptor, 92,
+            _V3_RECORD_SLOT_A, _V3_RECORD_SLOT_B, SLOT_BYTES,
+        )
+        descriptor[104:4092] = b"\x00" * (4092 - 104)
+        struct.pack_into(
+            "<I", descriptor, 4092,
+            zlib.crc32(bytes(descriptor[:4092])) & 0xFFFFFFFF,
+        )
+        expected_region = bytes(descriptor) + region[SLOT_BYTES:]
+        if (descriptor[:8] != old_descriptor[:8] or
+                descriptor[16:92] != old_descriptor[16:92]):
+            raise TrialStoreError("recovery descriptor identity changed during migration")
+
+        written = os.pwrite(fd, bytes(descriptor), REGION_OFFSET)
+        if written != SLOT_BYTES:
+            raise TrialStoreError(
+                f"recovery descriptor migration short write: {written}"
+            )
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise TrialStoreError(
+                "recovery descriptor migration fsync failed"
+            ) from exc
+
+        readback_header = os.pread(fd, REGION_BYTES, 0)
+        readback_region = os.pread(fd, REGION_BYTES, REGION_OFFSET)
+        if readback_header != header:
+            raise TrialStoreError("recovery header changed during descriptor migration")
+        if readback_region != expected_region:
+            raise TrialStoreError(
+                "recovery descriptor migration readback verification failed"
+            )
+        migrated = parse_layout(readback_header, readback_region, partition_uuid, board)
+        if (migrated.descriptor_version != DESCRIPTOR_MIN_VERSION or
+                migrated.partition_uuid != layout.partition_uuid or
+                migrated.installation_uuid != layout.installation_uuid or
+                migrated.board != layout.board):
+            raise TrialStoreError(
+                "recovery descriptor migration produced an invalid v3 descriptor"
+            )
+        return {
+            "fromVersion": layout.descriptor_version,
+            "toVersion": DESCRIPTOR_MIN_VERSION,
+            "descriptorSha256": hashlib.sha256(bytes(descriptor)).hexdigest(),
+            "regionSha256Before": hashlib.sha256(region).hexdigest(),
+            "regionSha256After": hashlib.sha256(readback_region).hexdigest(),
+            "recordSlotOffsets": [_V3_RECORD_SLOT_A, _V3_RECORD_SLOT_B],
+        }
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
 

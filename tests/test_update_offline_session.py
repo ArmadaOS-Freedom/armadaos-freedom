@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -558,10 +559,24 @@ class OfflineSessionStoreTest(unittest.TestCase):
         return store
 
     def _preflight_guards(self):
+        journal = SimpleNamespace(
+            layout=SimpleNamespace(
+                descriptor_version=3,
+                partition_uuid=uuid.UUID("11111111-2222-4333-8444-555555555555").bytes,
+                installation_uuid=uuid.UUID("66666666-7777-4888-9999-aaaaaaaaaaaa").bytes,
+                board=1,
+            ),
+            header=b"H" * 65536,
+            region=b"R" * 65536,
+            record=None,
+            selected=None,
+        )
         patches = [
             mock.patch.object(offline_session.system_transaction, "_binding",
                               return_value={"slotProfile": "legacy"}),
-            mock.patch.object(offline_session.system_transaction, "_check_recovery"),
+            mock.patch.object(
+                offline_session.system_transaction, "_check_recovery",
+                return_value=journal),
         ]
         for p in patches:
             p.start()
@@ -582,7 +597,36 @@ class OfflineSessionStoreTest(unittest.TestCase):
         root = self._preflight_root("preflight-ok")
         result = store.preflight(doc, sig, sysroot_path=root)
         self.assertEqual(result["phase"], "preflight_passed")
+        self.assertEqual(result["recoveryDescriptorVersion"], 3)
+        self.assertFalse(result["recoveryMigrationRequired"])
         self.assertIn("preflight-session-v1", store.info()["capabilities"])
+        self.assertFalse(base.exists())
+
+    def test_preflight_reports_a_legacy_recovery_descriptor(self):
+        doc, sig, _data = self._signed_package()
+        base = self.tmp / "preflight-legacy" / "offline"
+        store = self._preflight_store(base)
+        self._preflight_guards()
+        root = self._preflight_root("preflight-legacy")
+        legacy = SimpleNamespace(
+            layout=SimpleNamespace(
+                descriptor_version=1,
+                partition_uuid=uuid.UUID("11111111-2222-4333-8444-555555555555").bytes,
+                installation_uuid=uuid.UUID("66666666-7777-4888-9999-aaaaaaaaaaaa").bytes,
+                board=1,
+            ),
+            header=b"H" * 65536,
+            region=b"R" * 65536,
+            record=None,
+            selected=None,
+        )
+        with mock.patch.object(
+                offline_session.system_transaction, "_check_recovery",
+                return_value=legacy):
+            result = store.preflight(doc, sig, sysroot_path=root)
+        self.assertEqual(result["phase"], "preflight_passed")
+        self.assertEqual(result["recoveryDescriptorVersion"], 1)
+        self.assertTrue(result["recoveryMigrationRequired"])
         self.assertFalse(base.exists())
 
     def test_armada_boot_only_model_on_a_raw_boot_is_refused_before_a_session(self):
