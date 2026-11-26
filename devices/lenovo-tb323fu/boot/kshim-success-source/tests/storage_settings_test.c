@@ -199,8 +199,10 @@ int main(void){
     v4_take_action_tests();
     diag_auto_return_tests(1);
     diag_auto_return_tests(2);
+    diag_auto_return_tests(3);   /* TB710FU, the third ARMADA_BOOT board */
     diag_invalid_target_tests(1);
     diag_invalid_target_tests(2);
+    diag_invalid_target_tests(3);
     history_tests();
     static struct kshim_settings_session s;
     struct kshim_blockdev i=device(&internal),t=device(&tf);

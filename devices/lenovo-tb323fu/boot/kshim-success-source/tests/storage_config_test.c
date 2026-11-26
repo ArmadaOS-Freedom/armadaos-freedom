@@ -299,6 +299,7 @@ int main(void) {
     test_one_shot_v3(512);test_one_shot_v3(4096);
     test_bootlog_diag_auto_return(512,1);test_bootlog_diag_auto_return(512,2);
     test_bootlog_diag_auto_return(4096,1);test_bootlog_diag_auto_return(4096,2);
+    test_bootlog_diag_auto_return(512,3);test_bootlog_diag_auto_return(4096,3); /* TB710FU */
     test_v4_flags(512);test_v4_flags(4096);
     test_last_boot_v2(512);test_last_boot_v2(4096);
     assert(fixture_crc((const unsigned char *)"123456789",9)==0xcbf43926u);

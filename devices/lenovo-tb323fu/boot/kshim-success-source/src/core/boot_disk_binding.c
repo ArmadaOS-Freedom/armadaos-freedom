@@ -283,9 +283,11 @@ int kshim_disk_bootargs(char out[2048], const char *signed_args,
     }
 
     /* Board-specific diagnostics. */
-    if (board == 1 && entry->diagnostic && !auto_return) {
-        /* TB322FC: manual diagnostic keeps the interactive pre-mount shell;
-         * auto-return must omit rd.break so the hook can reboot cleanly. */
+    if ((board == 1 || board == 3) && entry->diagnostic && !auto_return) {
+        /* TB322FC and TB710FU (diagnosticMode rd-break): manual diagnostic
+         * keeps the interactive pre-mount shell; auto-return must omit
+         * rd.break so the hook can reboot cleanly.  TB710FU takes no TB323FU
+         * verbose filtering. */
         if (any) {
             if (kshim_append_cstr(out, 2048, &used, " ") != 0)
                 return -1;
