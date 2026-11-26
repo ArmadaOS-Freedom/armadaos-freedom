@@ -67,8 +67,8 @@ from .trial_record import (
 _MAX_U64 = (1 << 64) - 1
 _ZERO_RECORD = b"\x00" * RECORD_BYTES
 LEGACY_DESCRIPTOR_VERSIONS = (1, 2)
-_V3_RECORD_SLOT_A = 7 * SLOT_BYTES
-_V3_RECORD_SLOT_B = 8 * SLOT_BYTES
+_V3_RECORD_SLOT_A = TAIL_OFFSET_A
+_V3_RECORD_SLOT_B = TAIL_OFFSET_B
 
 
 class TrialStoreError(RuntimeError):
