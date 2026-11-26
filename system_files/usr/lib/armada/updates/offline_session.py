@@ -238,6 +238,17 @@ class OfflineSessionStore:
             raise OfflineSessionError('device identity reports unknown boot source')
         return physical
 
+    @staticmethod
+    def _require_upgrade_path(physical):
+        """An ARMADA_BOOT-only model (TB710FU) takes an offline upgrade only from a disk boot source.
+
+        Read-only info stays available so a client can explain the refusal; the mutating entry
+        points (preflight, begin) stop here before any session or job exists."""
+        if not models.upgrade_path_allowed(
+                physical.get('model'), physical.get('bootSource', _LEGACY_BOOT_SOURCE)):
+            raise OfflineSessionError(
+                'this model updates only through ARMADA_BOOT; reinstall it with the installer first')
+
     def _info_physical(self):
         """Identity for read-only info; mutation paths keep the full precheck."""
         if self._info_reader is not None:
@@ -281,6 +292,7 @@ class OfflineSessionStore:
         if session_id is not None and (type(session_id) is not str or not _SESSION_ID.match(session_id)):
             raise ValueError('invalid offline session id')
         physical = self._require_identity(self._physical_info())
+        self._require_upgrade_path(physical)
         snapshot = armada_os.snapshot()
         if (snapshot['repository'] not in armada_os.REPOSITORIES or
                 snapshot['staged'] or snapshot['rollback_queued']):
@@ -597,6 +609,7 @@ class OfflineSessionStore:
         if type(signature_b64) is not bytes or not 0 < len(signature_b64) <= _SIGNATURE_MAX:
             raise ValueError('signature must be nonempty bytes of at most 16 KiB')
         physical = self._physical_info()
+        self._require_upgrade_path(physical)
         channel = self._channel_info()
         package = package_contract.load_package(
             document, signature_b64, trusted_key=self.trusted_key)

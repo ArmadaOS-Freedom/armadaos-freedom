@@ -29,6 +29,9 @@ readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
 # the whole package install-only. Keep this list in sync with the
 # offline_upgrade flags in models.py (OFFLINE_UPGRADE_MODELS).
 readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU TB710FU"
+# Models that update only through ARMADA_BOOT (disk_boot without mirrored_boot in models.py): an offline-upgrade
+# package for them is useless without the signed disk boot capsule, so it requires ARMADA_BOOT_FILES=1.
+readonly ARMADA_BOOT_ONLY_MODELS="TB710FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -247,6 +250,14 @@ done
 upgrade_enabled=0
 if ((${#upgrade_eligible_models[@]} > 0)) && ((${#install_only_models[@]} == 0)); then
     upgrade_enabled=1
+fi
+if ((upgrade_enabled)) && [[ "${ARMADA_BOOT_FILES:-}" != "1" ]]; then
+    for model_id in "${upgrade_eligible_models[@]}"; do
+        case " $ARMADA_BOOT_ONLY_MODELS " in
+            *" $model_id "*)
+                die "$model_id updates only through ARMADA_BOOT: its offline-upgrade package requires ARMADA_BOOT_FILES=1 (the signed disk boot capsule)" ;;
+        esac
+    done
 fi
 
 readme_output="$(python3 -B "$helper" --config "$devices_config" --format readme \

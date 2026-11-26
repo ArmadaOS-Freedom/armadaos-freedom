@@ -348,6 +348,17 @@ def base_arguments(fixture, models=(), runtime_models=()):
     return arguments
 
 
+def _enable_disk_boot_signing(fixture):
+    """Turn on ARMADA_BOOT_FILES with a fake cosign, as the release workflow does."""
+    bin_dir = Path(fixture.env["PATH"].split(os.pathsep)[0])
+    cosign = bin_dir / "cosign"
+    cosign.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cosign.chmod(0o755)
+    fixture.env["ARMADA_BOOT_FILES"] = "1"
+    fixture.env["COSIGN_PRIVATE_KEY"] = "test-key"
+    fixture.env["COSIGN_PASSWORD"] = "test-password"
+
+
 def run_wrapper(fixture, arguments):
     return subprocess.run(
         ["bash", str(fixture.wrapper), *arguments],
@@ -647,6 +658,8 @@ class WrapperArgumentTests(unittest.TestCase):
         )
 
         with build_fixture(full_build=True) as fixture:
+            if "TB710FU" in models and expected_upgrade:
+                _enable_disk_boot_signing(fixture)
             result = run_wrapper(fixture, base_arguments(fixture, models=models))
             self.assertEqual(0, result.returncode, _diagnostics(result))
 
@@ -707,6 +720,32 @@ class WrapperArgumentTests(unittest.TestCase):
         self.assertIn("--offline-upgrade", producer)
         self.assertIn("--offline-upgrade", descriptor)
         self.assertEqual([], _values(descriptor, "--install-model"))
+
+    def test_tb710fu_upgrade_package_requires_the_signed_disk_boot(self):
+        # TB710FU updates only through ARMADA_BOOT, so an upgrade package without the
+        # signed disk boot capsule (ARMADA_BOOT_FILES unset) is refused before any producer runs.
+        for models in (("TB710FU",), ("TB322FC", "TB710FU")):
+            with self.subTest(models=models), build_fixture(full_build=True) as fixture:
+                result = run_wrapper(fixture, base_arguments(fixture, models=models))
+                self.assertNotEqual(0, result.returncode, _diagnostics(result))
+                self.assertIn("ARMADA_BOOT_FILES=1", result.stderr, _diagnostics(result))
+                producer = [
+                    argv for argv in read_docker_log(fixture)
+                    if _invoked(argv, "make-edl-raw-package.py")
+                ]
+                self.assertEqual([], producer)
+
+    def test_wrapper_armada_boot_only_models_follow_models_py(self):
+        module_root = str(REPO_ROOT / "system_files/usr/lib/armada")
+        sys.path.insert(0, module_root)
+        try:
+            from updates import models
+        finally:
+            sys.path.remove(module_root)
+        self.assertEqual(
+            WrapperPreflightTests._wrapper_models("ARMADA_BOOT_ONLY_MODELS"),
+            set(models.DISK_BOOT_MODELS - models.MIRROR_POLICY_MODELS),
+        )
 
     def test_custom_profile_alone_builds_an_install_only_package(self):
         producer, descriptor = self._run_full_build((THIRD_MODEL,))

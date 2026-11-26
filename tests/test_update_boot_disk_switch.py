@@ -338,6 +338,40 @@ class UpdateBootDiskSwitchTests(unittest.TestCase):
         self.assertEqual(rollback["newDeployment"], _OLD_BINDING)
         self.assertEqual(rollback["model"], "TB322FC")
 
+    def test_tb710fu_update_confirm_and_rollback_switch_only_the_generation(self):
+        # TB710FU (board 3) runs the same ARMADA_BOOT cycle: update, confirm, then an explicit rollback that
+        # selects the retained old generation again. Only the selector moves; every generation is verified as
+        # TB710FU (the board-3 manifest checks themselves are in test_update_boot_disk_generation).
+        initial = dict(self.initial, model="TB710FU")
+        plan = dict(self._make_plan(), model="TB710FU")
+        boot_disk_switch.activate(
+            self.root, initial, plan,
+            trusted_key=self.trusted_key, receipt=self._make_receipt(),
+        )
+        self.assertEqual(self._read_pending()["model"], "TB710FU")
+        self.assertEqual(self._read_selector(), _NEW_GEN)
+        boot_disk_switch.confirm(
+            self.root, dict(initial, deployment=_NEW_BINDING),
+            trusted_key=self.trusted_key,
+        )
+
+        rollback = boot_disk_switch.plan_rollback(
+            self.root, dict(initial, deployment=_NEW_BINDING), _OLD_BINDING,
+            trusted_key=self.trusted_key,
+        )
+        self.assertEqual(
+            (rollback["expected"], rollback["target"], rollback["model"]),
+            (_NEW_GEN, _OLD_GEN, "TB710FU"),
+        )
+        boot_disk_switch.activate(
+            self.root, dict(initial, deployment=_NEW_BINDING), rollback,
+            trusted_key=self.trusted_key, receipt=self._make_receipt(),
+        )
+        self.assertEqual(self._read_selector(), _OLD_GEN)
+        self.assertTrue((self.boot / "armada" / _NEW_GEN).exists())
+        verified_models = {call.args[1] for call in self.verify_mock.call_args_list}
+        self.assertEqual(verified_models, {"TB710FU"})
+
     def test_activate_rename_succeeded_but_fsync_failed(self):
         """If the rename succeeds but post-rename fsync fails, activate returns
         success after verifying the exact on-disk state."""
