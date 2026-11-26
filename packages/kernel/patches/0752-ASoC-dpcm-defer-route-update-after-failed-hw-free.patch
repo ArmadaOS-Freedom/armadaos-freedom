@@ -1,0 +1,749 @@
+From: 181981772 <181981772@qq.com>
+Subject: [PATCH] ASoC: dpcm: replay deferred routes after FE recovery
+
+Do not let a DAPM route update tear down a DPCM backend retained after a
+failed FE hw_free. Remember deferred route changes and replay the current
+DAPM paths after FE reconfiguration succeeds or close disconnects the FE.
+Propagate DPCM startup, shutdown, and route-connect errors so partial
+updates stay pending until a complete retry succeeds.
+
+Track changes made by each path-add operation. If a later connection fails,
+remove only links allocated by that operation and restore retained links to
+their previous update and backend state. A retained BE restarted while the
+path is reactivated is stopped again during rollback. If that STOP fails,
+the link and running BE stay attached and the route update remains pending
+for a later full retry. Ordinary PCM STOP retains its existing best-effort
+behavior.
+
+Keep links updated by a failed startup attached with their runtime-update
+state intact so the next full route pass can finish the transaction. A BE
+left CLOSE or NEW by that failed startup is reopened when its retained
+link is reused. Propagate path-add failures from normal and compressed PCM
+opens.
+
+Record when a route-update STOP has already handled a link's running
+reference. A retry then converges the exact old link before reconnecting it
+from the current DAPM graph instead of decrementing a shared backend again.
+On retry, force every retained old link through the normal shutdown path so
+a graph change back to its previous shape cannot skip pending cleanup.
+
+Signed-off-by: 181981772 <181981772@qq.com>
+
+---
+
+diff --git a/include/sound/soc.h b/include/sound/soc.h
+index 10ad80f..614128b 100644
+--- a/include/sound/soc.h
++++ b/include/sound/soc.h
+@@ -998,6 +998,8 @@ struct snd_soc_card {
+ 
+ 	/* Mutex for PCM operations */
+ 	struct mutex pcm_mutex;
++	/* A DAPM route change is waiting for FE cleanup to finish. */
++	bool dpcm_route_update_pending;
+ 
+ 	int (*probe)(struct snd_soc_card *card);
+ 	int (*late_probe)(struct snd_soc_card *card);
+diff --git a/include/sound/soc-dpcm.h b/include/sound/soc-dpcm.h
+index 683d7c4..2393175 100644
+--- a/include/sound/soc-dpcm.h
++++ b/include/sound/soc-dpcm.h
+@@ -73,6 +73,13 @@ struct snd_soc_dpcm {
+ 	/* link state */
+ 	enum snd_soc_dpcm_link_state state;
+ 
++	/*
++	 * The current route transaction has consumed this link's running
++	 * reference. Hardware may still be running for another shared FE.
++	 * Protected by the BE stream lock.
++	 */
++	bool route_stop_done;
++
+ 	/* list of BE and FE for this DPCM link */
+ 	struct list_head list_be;
+ 	struct list_head list_fe;
+diff --git a/sound/soc/soc-compress.c b/sound/soc/soc-compress.c
+index b840280..59e3ad5 100644
+--- a/sound/soc/soc-compress.c
++++ b/sound/soc/soc-compress.c
+@@ -148,7 +148,9 @@ static int soc_compr_open_fe(struct snd_compr_stream *cstream)
+ 	snd_soc_dpcm_mutex_lock(fe);
+ 
+ 	/* calculate valid and active FE <-> BE dpcms */
+-	dpcm_add_paths(fe, stream, &list);
++	ret = dpcm_add_paths(fe, stream, &list);
++	if (ret < 0)
++		goto out;
+ 
+ 	fe->dpcm[stream].runtime_update = SND_SOC_DPCM_UPDATE_FE;
+ 
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index 380e787..fdd7dc5 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -2469,6 +2469,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
+ 	mutex_init(&card->mutex);
+ 	mutex_init(&card->dapm_mutex);
+ 	mutex_init(&card->pcm_mutex);
++	card->dpcm_route_update_pending = false;
+ 
+ 	guard(mutex)(&client_mutex);
+ 
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index e1c0064..a4f5b7d 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -38,6 +38,8 @@ static inline int _soc_pcm_ret(struct snd_soc_pcm_runtime *rtd,
+ 			   "at %s() on %s\n", func, rtd->dai_link->name);
+ }
+ 
++static int snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card);
++
+ /* is the current PCM operation for this FE ? */
+ #if 0
+ static int snd_soc_dpcm_can_fe_update(struct snd_soc_pcm_runtime *fe, int stream)
+@@ -1432,20 +1434,136 @@ static snd_pcm_uframes_t soc_pcm_pointer(struct snd_pcm_substream *substream)
+ 	return offset;
+ }
+ 
++/*
++ * A path-add operation can allocate a new DPCM link or revive an existing
++ * retained link.  Keep that distinction visible to the caller so a later
++ * connection failure can undo exactly the links changed by this operation.
++ */
++enum dpcm_path_change_type {
++	DPCM_PATH_UNCHANGED,
++	DPCM_PATH_NEW,
++	DPCM_PATH_REUSED,
++};
++
++struct dpcm_path_change {
++	struct snd_soc_dpcm *dpcm;
++	enum dpcm_path_change_type type;
++	enum snd_soc_dpcm_update update;
++	enum snd_soc_dpcm_state state;
++	int be_start;
++	int be_pause;
++	bool hardware_started;
++};
++
++static bool dpcm_route_stop_done(struct snd_soc_dpcm *dpcm, int stream)
++{
++	struct snd_pcm_substream *be_substream;
++	unsigned long flags;
++	bool done;
++
++	be_substream = snd_soc_dpcm_get_substream(dpcm->be, stream);
++	/*
++	 * A retained link without a BE substream cannot issue another STOP.
++	 * Treat it as converged so it can neither be reused nor left active.
++	 */
++	if (!be_substream)
++		return true;
++
++	snd_pcm_stream_lock_irqsave_nested(be_substream, flags);
++	done = READ_ONCE(dpcm->route_stop_done);
++	snd_pcm_stream_unlock_irqrestore(be_substream, flags);
++
++	return done;
++}
++
+ /* connect a FE and BE */
+ static int dpcm_be_connect(struct snd_soc_pcm_runtime *fe,
+-		struct snd_soc_pcm_runtime *be, int stream)
++		struct snd_soc_pcm_runtime *be, int stream,
++		struct dpcm_path_change *change)
+ {
+ 	struct snd_pcm_substream *fe_substream;
+ 	struct snd_pcm_substream *be_substream;
+ 	struct snd_soc_dpcm *dpcm;
++	unsigned long flags;
++	int ret;
+ 
+ 	snd_soc_dpcm_mutex_assert_held(fe);
+ 
+-	/* only add new dpcms */
+-	for_each_dpcm_be(fe, stream, dpcm)
+-		if (dpcm->be == be)
++	for_each_dpcm_be(fe, stream, dpcm) {
++		if (dpcm->be != be)
++			continue;
++
++		if (dpcm_route_stop_done(dpcm, stream))
++			return snd_soc_ret(be->dev, -EBUSY,
++				"route STOP for retained BE %s is not complete\n",
++				be->dai_link->name);
++
++		if (dpcm->state != SND_SOC_DPCM_LINK_STATE_FREE) {
++			change->type = DPCM_PATH_UNCHANGED;
+ 			return 0;
++		}
++
++		change->dpcm = dpcm;
++		change->type = DPCM_PATH_REUSED;
++		change->update = be->dpcm[stream].runtime_update;
++		change->state = be->dpcm[stream].state;
++		change->be_start = be->dpcm[stream].be_start;
++		change->be_pause = be->dpcm[stream].be_pause;
++
++		if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_STOP &&
++		    (fe->dpcm[stream].state == SND_SOC_DPCM_STATE_START ||
++		     fe->dpcm[stream].state == SND_SOC_DPCM_STATE_PAUSED)) {
++			be_substream = snd_soc_dpcm_get_substream(be, stream);
++			snd_pcm_stream_lock_irqsave_nested(be_substream, flags);
++			ret = soc_pcm_trigger(be_substream,
++					      SNDRV_PCM_TRIGGER_START);
++			if (!ret) {
++				be->dpcm[stream].be_start = 1;
++				be->dpcm[stream].state =
++					SND_SOC_DPCM_STATE_START;
++				change->hardware_started = true;
++			}
++			snd_pcm_stream_unlock_irqrestore(be_substream, flags);
++			if (ret)
++				return snd_soc_ret(be->dev, ret,
++					"failed to restore BE %s after failed STOP\n",
++					be->dai_link->name);
++		}
++
++		if (be->dpcm[stream].state != SND_SOC_DPCM_STATE_START &&
++		    be->dpcm[stream].state != SND_SOC_DPCM_STATE_PAUSED &&
++		    be->dpcm[stream].state != SND_SOC_DPCM_STATE_STOP &&
++		    be->dpcm[stream].state != SND_SOC_DPCM_STATE_NEW &&
++		    be->dpcm[stream].state != SND_SOC_DPCM_STATE_CLOSE)
++			return snd_soc_ret(be->dev, -EIO,
++				"retained BE %s is not active (%s)\n",
++				be->dai_link->name,
++				dpcm_state_string(be->dpcm[stream].state));
++
++		/*
++		 * Reuse a retained BE.  A stopped FE starts its stopped BE on
++		 * the next FE START, while a BE left CLOSE or NEW by a failed
++		 * route startup must be brought up again by this update.
++		 */
++		dpcm->state = SND_SOC_DPCM_LINK_STATE_NEW;
++		if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_NEW ||
++		    be->dpcm[stream].state == SND_SOC_DPCM_STATE_CLOSE)
++			dpcm_set_be_update_state(be, stream,
++						 SND_SOC_DPCM_UPDATE_BE);
++		else
++			dpcm_set_be_update_state(be, stream,
++						 SND_SOC_DPCM_UPDATE_NO);
++		return 0;
++	}
++
++	if (fe->card->component_chaining &&
++	    be->dpcm[stream].state != SND_SOC_DPCM_STATE_NEW &&
++	    be->dpcm[stream].state != SND_SOC_DPCM_STATE_OPEN &&
++	    be->dpcm[stream].state != SND_SOC_DPCM_STATE_HW_PARAMS &&
++	    be->dpcm[stream].state != SND_SOC_DPCM_STATE_CLOSE) {
++		change->type = DPCM_PATH_UNCHANGED;
++		return 0;
++	}
+ 
+ 	fe_substream = snd_soc_dpcm_get_substream(fe, stream);
+ 	be_substream = snd_soc_dpcm_get_substream(be, stream);
+@@ -1472,13 +1590,17 @@ static int dpcm_be_connect(struct snd_soc_pcm_runtime *fe,
+ 	list_add(&dpcm->list_fe, &be->dpcm[stream].fe_clients);
+ 	snd_pcm_stream_unlock_irq(fe_substream);
+ 
++	change->dpcm = dpcm;
++	change->type = DPCM_PATH_NEW;
++	change->update = be->dpcm[stream].runtime_update;
++
+ 	dev_dbg(fe->dev, "connected new DPCM %s path %s %s %s\n",
+ 			snd_pcm_direction_name(stream),  fe->dai_link->name,
+ 			stream ? "<-" : "->", be->dai_link->name);
+ 
+ 	dpcm_create_debugfs_state(dpcm, stream);
+ 
+-	return 1;
++	return 0;
+ }
+ 
+ /* reparent a BE onto another FE */
+@@ -1550,6 +1672,25 @@ void dpcm_be_disconnect(struct snd_soc_pcm_runtime *fe, int stream)
+ 	}
+ }
+ 
++/* Disconnect and free one link allocated by the current add operation. */
++static void dpcm_be_disconnect_one(struct snd_soc_pcm_runtime *fe,
++				   int stream, struct snd_soc_dpcm *dpcm)
++{
++	struct snd_pcm_substream *substream =
++		snd_soc_dpcm_get_substream(fe, stream);
++
++	snd_soc_dpcm_mutex_assert_held(fe);
++
++	snd_pcm_stream_lock_irq(substream);
++	dpcm_be_reparent(fe, dpcm->be, stream);
++	list_del(&dpcm->list_be);
++	list_del(&dpcm->list_fe);
++	snd_pcm_stream_unlock_irq(substream);
++
++	dpcm_remove_debugfs_state(dpcm);
++	kfree(dpcm);
++}
++
+ /* get BE for DAI widget and stream */
+ static struct snd_soc_pcm_runtime *dpcm_get_be(struct snd_soc_card *card,
+ 		struct snd_soc_dapm_widget *widget, int stream)
+@@ -1670,19 +1811,34 @@ static bool dpcm_be_is_active(struct snd_soc_dpcm *dpcm, int stream,
+ }
+ 
+ static int dpcm_prune_paths(struct snd_soc_pcm_runtime *fe, int stream,
+-			    struct snd_soc_dapm_widget_list **list_)
++			    struct snd_soc_dapm_widget_list **list_,
++			    bool replay)
+ {
+ 	struct snd_soc_dpcm *dpcm;
+ 	int prune = 0;
+ 
+-	/* Destroy any old FE <--> BE connections */
++	/*
++	 * Destroy every DPCM link for a replay, even if the current graph
++	 * contains it again.  A failed transaction must first finish its old
++	 * teardown before the new-path pass connects from the current graph.
++	 */
+ 	for_each_dpcm_be(fe, stream, dpcm) {
+-		if (dpcm_be_is_active(dpcm, stream, *list_))
++		if (dpcm_route_stop_done(dpcm, stream)) {
++			dev_dbg(fe->dev,
++				"ASoC: completing interrupted %s BE %s for %s\n",
++				snd_pcm_direction_name(stream),
++				dpcm->be->dai_link->name,
++				fe->dai_link->name);
++		} else if (!replay && dpcm_be_is_active(dpcm, stream, *list_)) {
+ 			continue;
++		} else {
++			dev_dbg(fe->dev, "ASoC: %s %s BE %s for %s\n",
++				replay ? "replaying" : "pruning",
++				snd_pcm_direction_name(stream),
++				dpcm->be->dai_link->name,
++				fe->dai_link->name);
++		}
+ 
+-		dev_dbg(fe->dev, "ASoC: pruning %s BE %s for %s\n",
+-			snd_pcm_direction_name(stream),
+-			dpcm->be->dai_link->name, fe->dai_link->name);
+ 		dpcm->state = SND_SOC_DPCM_LINK_STATE_FREE;
+ 		dpcm_set_be_update_state(dpcm->be, stream, SND_SOC_DPCM_UPDATE_BE);
+ 		prune++;
+@@ -1692,6 +1848,59 @@ static int dpcm_prune_paths(struct snd_soc_pcm_runtime *fe, int stream,
+ 	return prune;
+ }
+ 
++static void dpcm_rollback_path_changes(struct snd_soc_pcm_runtime *fe,
++				       int stream,
++				       struct dpcm_path_change *changes,
++				       int count)
++{
++	struct snd_pcm_substream *be_substream;
++	struct snd_soc_pcm_runtime *be;
++	unsigned long flags;
++	int i, ret;
++
++	for (i = count - 1; i >= 0; i--) {
++		struct dpcm_path_change *change = &changes[i];
++
++		if (change->type == DPCM_PATH_NEW) {
++			dpcm_set_be_update_state(change->dpcm->be, stream,
++						 change->update);
++			dpcm_be_disconnect_one(fe, stream, change->dpcm);
++			continue;
++		}
++
++		be = change->dpcm->be;
++		if (change->hardware_started) {
++			be_substream = snd_soc_dpcm_get_substream(be, stream);
++			snd_pcm_stream_lock_irqsave_nested(be_substream, flags);
++			ret = soc_pcm_trigger(be_substream,
++					      SNDRV_PCM_TRIGGER_STOP);
++			if (!ret) {
++				be->dpcm[stream].be_start = 0;
++				be->dpcm[stream].state = SND_SOC_DPCM_STATE_STOP;
++			}
++			snd_pcm_stream_unlock_irqrestore(be_substream, flags);
++			if (ret) {
++				/*
++				 * The BE may still be running.  Keep the link
++				 * active so a later route retry reconciles it.
++				 */
++				WRITE_ONCE(fe->card->dpcm_route_update_pending,
++					   true);
++				dev_err(be->dev,
++					"failed to roll back BE %s START (%d)\n",
++					be->dai_link->name, ret);
++				continue;
++			}
++		}
++
++		change->dpcm->state = SND_SOC_DPCM_LINK_STATE_FREE;
++		be->dpcm[stream].state = change->state;
++		be->dpcm[stream].be_start = change->be_start;
++		be->dpcm[stream].be_pause = change->be_pause;
++		dpcm_set_be_update_state(be, stream, change->update);
++	}
++}
++
+ int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
+ 		   struct snd_soc_dapm_widget_list **list_)
+ {
+@@ -1700,14 +1909,20 @@ int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
+ 	struct snd_soc_pcm_runtime *be;
+ 	struct snd_soc_dapm_widget *widget;
+ 	struct snd_pcm_substream *fe_substream = snd_soc_dpcm_get_substream(fe, stream);
+-	int i, new = 0, err;
++	struct dpcm_path_change *changes;
++	int i, changed = 0, err;
+ 
+ 	/* don't connect if FE is not running */
+ 	if (!fe_substream->runtime && !fe->fe_compr)
+-		return new;
++		return 0;
+ 
+-	/* Create any new FE <--> BE connections */
++	changes = kcalloc(list->num_widgets, sizeof(*changes), GFP_KERNEL);
++	if (!changes)
++		return -ENOMEM;
++
++	/* Create any new FE <--> BE connections. */
+ 	for_each_dapm_widgets(list, i, widget) {
++		struct dpcm_path_change *change = &changes[changed];
+ 
+ 		switch (widget->id) {
+ 		case snd_soc_dapm_dai_in:
+@@ -1730,35 +1945,25 @@ int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * Filter for systems with 'component_chaining' enabled.
+-		 * This helps to avoid unnecessary re-configuration of an
+-		 * already active BE on such systems and ensures the BE DAI
+-		 * widget is powered ON after hw_params() BE DAI callback.
+-		 */
+-		if (fe->card->component_chaining &&
+-		    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_NEW) &&
+-		    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_OPEN) &&
+-		    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_HW_PARAMS) &&
+-		    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_CLOSE))
+-			continue;
+-
+-		/* newly connected FE and BE */
+-		err = dpcm_be_connect(fe, be, stream);
++		err = dpcm_be_connect(fe, be, stream, change);
+ 		if (err < 0) {
+ 			dev_err(fe->dev, "ASoC: can't connect %s\n",
+ 				widget->name);
+-			break;
+-		} else if (err == 0) /* already connected */
++			dpcm_rollback_path_changes(fe, stream, changes, changed);
++			kfree(changes);
++			return err;
++		}
++		if (change->type == DPCM_PATH_UNCHANGED)
+ 			continue;
+-
+-		/* new */
+-		dpcm_set_be_update_state(be, stream, SND_SOC_DPCM_UPDATE_BE);
+-		new++;
++		if (change->type == DPCM_PATH_NEW)
++			dpcm_set_be_update_state(be, stream,
++						 SND_SOC_DPCM_UPDATE_BE);
++		changed++;
+ 	}
+ 
+-	dev_dbg(fe->dev, "ASoC: found %d new BE paths\n", new);
+-	return new;
++	dev_dbg(fe->dev, "ASoC: found %d changed BE paths\n", changed);
++	kfree(changes);
++	return changed;
+ }
+ 
+ void dpcm_clear_pending_state(struct snd_soc_pcm_runtime *fe, int stream)
+@@ -2345,6 +2550,8 @@ static int dpcm_fe_dai_hw_params(struct snd_pcm_substream *substream,
+ 
+ out:
+ 	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
++	if (ret >= 0 && !READ_ONCE(fe->dpcm[stream].hw_free_failed))
++		ret = snd_soc_dpcm_retry_pending_route_update(fe->card);
+ 	snd_soc_dpcm_mutex_unlock(fe);
+ 
+ 	return soc_pcm_ret(fe, ret);
+@@ -2437,6 +2644,14 @@ int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,
+ 			be->dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+ 			break;
+ 		case SNDRV_PCM_TRIGGER_STOP:
++			/*
++			 * A failed route update may be replayed from the current
++			 * graph.  Its successful links have already consumed this
++			 * FE's reference and must only continue with cleanup.
++			 */
++			if (READ_ONCE(dpcm->route_stop_done))
++				goto next;
++
+ 			if ((be->dpcm[stream].state != SND_SOC_DPCM_STATE_START) &&
+ 			    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_PAUSED))
+ 				goto next;
+@@ -2444,8 +2659,12 @@ int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,
+ 			if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_START)
+ 				be->dpcm[stream].be_start--;
+ 
+-			if (be->dpcm[stream].be_start != 0)
++			if (be->dpcm[stream].be_start != 0) {
++				if (fe->dpcm[stream].runtime_update ==
++				    SND_SOC_DPCM_UPDATE_BE)
++					WRITE_ONCE(dpcm->route_stop_done, true);
+ 				goto next;
++			}
+ 
+ 			pause_stop_transition = false;
+ 			if (fe->dpcm[stream].fe_pause) {
+@@ -2474,6 +2693,10 @@ int dpcm_be_dai_trigger(struct snd_soc_pcm_runtime *fe, int stream,
+ 			else
+ 				be->dpcm[stream].state = SND_SOC_DPCM_STATE_STOP;
+ 
++			if (fe->dpcm[stream].runtime_update ==
++			    SND_SOC_DPCM_UPDATE_BE)
++				WRITE_ONCE(dpcm->route_stop_done, true);
++
+ 			break;
+ 		case SNDRV_PCM_TRIGGER_SUSPEND:
+ 			if (be->dpcm[stream].state != SND_SOC_DPCM_STATE_START)
+@@ -2561,7 +2784,8 @@ static int dpcm_fe_dai_do_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	enum snd_soc_dpcm_trigger trigger = fe->dai_link->trigger[stream];
+ 
+ 	fe->dpcm[stream].runtime_update = SND_SOC_DPCM_UPDATE_FE;
+-	if (READ_ONCE(fe->dpcm[stream].hw_free_failed) &&
++	if ((READ_ONCE(fe->dpcm[stream].hw_free_failed) ||
++	     READ_ONCE(fe->card->dpcm_route_update_pending)) &&
+ 	    (cmd == SNDRV_PCM_TRIGGER_START ||
+ 	     cmd == SNDRV_PCM_TRIGGER_RESUME ||
+ 	     cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE ||
+@@ -2731,6 +2955,8 @@ static int dpcm_run_update_shutdown(struct snd_soc_pcm_runtime *fe, int stream)
+ 		snd_pcm_direction_name(stream), fe->dai_link->name);
+ 
+ 	err = dpcm_be_dai_trigger(fe, stream, SNDRV_PCM_TRIGGER_STOP);
++	if (err)
++		return soc_pcm_ret(fe, err);
+ 
+ 	dpcm_be_dai_hw_free(fe, stream);
+ 
+@@ -2815,11 +3041,32 @@ disconnect:
+ 	return soc_pcm_ret(fe, ret);
+ }
+ 
+-static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
++static int dpcm_run_update(struct snd_soc_pcm_runtime *fe, int stream, int new)
++{
++	int ret;
++
++	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_BE);
++	if (new)
++		ret = dpcm_run_update_startup(fe, stream);
++	else
++		ret = dpcm_run_update_shutdown(fe, stream);
++	dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
++
++	/* A later full retry finishes any partially applied route update. */
++	if (ret < 0)
++		return ret;
++
++	dpcm_clear_pending_state(fe, stream);
++	dpcm_be_disconnect(fe, stream);
++	return ret;
++}
++
++static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new,
++				      bool replay)
+ {
+ 	struct snd_soc_dapm_widget_list *list;
+ 	int stream;
+-	int count, paths;
++	int count, paths, ret = 0;
+ 
+ 	if (!fe->dai_link->dynamic)
+ 		return 0;
+@@ -2828,8 +3075,8 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ 		return snd_soc_ret(fe->dev, -EINVAL,
+ 			"%s doesn't support Multi CPU yet\n", __func__);
+ 
+-	/* only check active links */
+-	if (!snd_soc_dai_active(snd_soc_rtd_to_cpu(fe, 0)))
++	/* A replay must converge retained links even after their FE went idle. */
++	if (!replay && !snd_soc_dai_active(snd_soc_rtd_to_cpu(fe, 0)))
+ 		return 0;
+ 
+ 	/* DAPM sync will call this to update DSP paths */
+@@ -2838,6 +3085,20 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ 
+ 	for_each_pcm_streams(stream) {
+ 
++		/*
++		 * The current DAPM graph is authoritative only for the new-path
++		 * phase.  Force every retained link through the old-path transaction
++		 * first, including links whose DAI or stream currently looks idle.
++		 */
++		if (replay) {
++			count = dpcm_prune_paths(fe, stream, NULL, true);
++			if (count)
++				ret = dpcm_run_update(fe, stream, 0);
++			if (ret < 0)
++				return ret;
++			continue;
++		}
++
+ 		/* skip if FE doesn't have playback/capture capability */
+ 		if (!snd_soc_dai_stream_valid(snd_soc_rtd_to_cpu(fe, 0),   stream) ||
+ 		    !snd_soc_dai_stream_valid(snd_soc_rtd_to_codec(fe, 0), stream))
+@@ -2857,23 +3118,22 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ 		 * Find the corresponding BE DAIs that source or sink audio to this
+ 		 * FE substream.
+ 		 */
+-		if (new)
++		if (new) {
+ 			count = dpcm_add_paths(fe, stream, &list);
+-		else
+-			count = dpcm_prune_paths(fe, stream, &list);
+-		if (count) {
+-			dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_BE);
+-			if (new)
+-				dpcm_run_update_startup(fe, stream);
+-			else
+-				dpcm_run_update_shutdown(fe, stream);
+-			dpcm_set_fe_update_state(fe, stream, SND_SOC_DPCM_UPDATE_NO);
+-
+-			dpcm_clear_pending_state(fe, stream);
+-			dpcm_be_disconnect(fe, stream);
++			if (count < 0) {
++				ret = count;
++				goto out;
++			}
++		} else {
++			count = dpcm_prune_paths(fe, stream, &list, replay);
+ 		}
++		if (count)
++			ret = dpcm_run_update(fe, stream, new);
+ 
++out:
+ 		dpcm_path_put(&list);
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	return 0;
+@@ -2882,33 +3142,75 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
+ /* Called by DAPM mixer/mux changes to update audio routing between PCMs and
+  * any DAI links.
+  */
+-int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
++static int snd_soc_dpcm_runtime_update_locked(struct snd_soc_card *card)
+ {
+ 	struct snd_soc_pcm_runtime *fe;
+-	int ret = 0;
++	bool replay;
++	int ret = 0, stream;
++
++	snd_soc_dpcm_mutex_assert_held(card);
++	for_each_card_rtds(card, fe)
++		for_each_pcm_streams(stream)
++			if (READ_ONCE(fe->dpcm[stream].hw_free_failed)) {
++				WRITE_ONCE(card->dpcm_route_update_pending, true);
++				return -EBUSY;
++			}
+ 
+-	snd_soc_dpcm_mutex_lock(card);
+-	/* shutdown all old paths first */
++	replay = READ_ONCE(card->dpcm_route_update_pending);
++
++	/*
++	 * A retry deliberately tears down every old link.  The current DAPM
++	 * graph may look unchanged while a previous transaction is still
++	 * partially applied, so active-path filtering cannot drive recovery.
++	 */
+ 	for_each_card_rtds(card, fe) {
+-		ret = soc_dpcm_fe_runtime_update(fe, 0);
++		ret = soc_dpcm_fe_runtime_update(fe, 0, replay);
+ 		if (ret)
+-			goto out;
++			goto defer;
+ 	}
+ 
+-	/* bring new paths up */
++	/* Bring new paths up only after every old path has converged. */
+ 	for_each_card_rtds(card, fe) {
+-		ret = soc_dpcm_fe_runtime_update(fe, 1);
++		ret = soc_dpcm_fe_runtime_update(fe, 1, false);
+ 		if (ret)
+-			goto out;
++			goto defer;
+ 	}
+ 
+-out:
++	WRITE_ONCE(card->dpcm_route_update_pending, false);
++	return 0;
++defer:
++	/* A partial update needs a later full retry from the current DAPM graph. */
++	WRITE_ONCE(card->dpcm_route_update_pending, true);
++	return ret;
++}
++
++int snd_soc_dpcm_runtime_update(struct snd_soc_card *card)
++{
++	int ret;
++
++	snd_soc_dpcm_mutex_lock(card);
++	ret = snd_soc_dpcm_runtime_update_locked(card);
+ 	snd_soc_dpcm_mutex_unlock(card);
+ 
+ 	return snd_soc_ret(card->dev, ret, "%s() failed\n", __func__);
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_dpcm_runtime_update);
+ 
++static int snd_soc_dpcm_retry_pending_route_update(struct snd_soc_card *card)
++{
++	int ret;
++
++	snd_soc_dpcm_mutex_assert_held(card);
++	if (!READ_ONCE(card->dpcm_route_update_pending))
++		return 0;
++
++	ret = snd_soc_dpcm_runtime_update_locked(card);
++	if (ret && ret != -EBUSY)
++		dev_err(card->dev, "deferred DPCM route update failed (%d)\n", ret);
++
++	return ret;
++}
++
+ static void dpcm_fe_dai_cleanup(struct snd_pcm_substream *fe_substream)
+ {
+ 	struct snd_soc_pcm_runtime *fe = snd_soc_substream_to_rtd(fe_substream);
+@@ -2927,12 +3229,15 @@ static void dpcm_fe_dai_cleanup(struct snd_pcm_substream *fe_substream)
+ static int dpcm_fe_dai_close(struct snd_pcm_substream *fe_substream)
+ {
+ 	struct snd_soc_pcm_runtime *fe = snd_soc_substream_to_rtd(fe_substream);
+-	int ret;
++	int ret, retry_ret;
+ 
+ 	snd_soc_dpcm_mutex_lock(fe);
+ 	ret = dpcm_fe_dai_shutdown(fe_substream);
+ 
+ 	dpcm_fe_dai_cleanup(fe_substream);
++	retry_ret = snd_soc_dpcm_retry_pending_route_update(fe->card);
++	if (!ret)
++		ret = retry_ret;
+ 
+ 	snd_soc_dpcm_mutex_unlock(fe);
+ 	return ret;
+@@ -2952,7 +3257,9 @@ static int dpcm_fe_dai_open(struct snd_pcm_substream *fe_substream)
+ 		goto open_end;
+ 
+ 	/* calculate valid and active FE <-> BE dpcms */
+-	dpcm_add_paths(fe, stream, &list);
++	ret = dpcm_add_paths(fe, stream, &list);
++	if (ret < 0)
++		goto put_path;
+ 
+ 	/* There is no point starting up this FE if there are no BEs. */
+ 	if (list_empty(&fe->dpcm[stream].be_clients)) {

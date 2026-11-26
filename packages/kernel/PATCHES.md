@@ -1397,3 +1397,11 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: TDM BE fixup (4ch/S32) and DSP_B/IB_NF CPU format for `lenovo,tb710fu-sndcard` only. The TDM endpoint has no bit-clock inversion setting, so IB_NF is sent as plain DSP_B; the values match what the vendor userspace programs.
+- `patches/0750-ASoC-qcom-harden-audioreach-teardown.patch`
+  source: armada
+  upstream: local
+  notes: Stop the capture frontend during hw_free, serialize shared graph references, and match STOP and UNMAP replies by opcode and transaction token. Propagate capture FE hw_free errors through DPCM and retain BE resources until cleanup succeeds. Keep the component-wide hw_params mark operation-scoped; delayed recovery retries all FE components for the current substream. Shared AudioReach code; persistent DSP failure still limits callback lifetime guarantees after final teardown.
+- `patches/0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch`
+  source: armada
+  upstream: local
+  notes: Defer DAPM DPCM route updates while any FE direction has an unresolved hw_free failure, then replay the current routes after FE cleanup or close; retain pending state across partial route-update failures. Track route-update STOP completion per DPCM link, force old-path teardown before replay, and record new versus reused links in dpcm_add_paths(). On a connection failure, remove only links created by that operation and restore reused links; restart a retained BE only when its FE is START or PAUSED, and keep ordinary PCM STOP best-effort.

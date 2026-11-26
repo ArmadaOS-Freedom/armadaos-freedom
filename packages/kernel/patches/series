@@ -385,3 +385,6 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0252-regulator-report-consumer-disable-status.patch
 0253-media-fix-y700-camera-power-and-subdev-lifetime.patch
 0254-clk-qcom-retry-idle-gdsc-interconnect-votes.patch
+
+0750-ASoC-qcom-harden-audioreach-teardown.patch
+0752-ASoC-dpcm-defer-route-update-after-failed-hw-free.patch
