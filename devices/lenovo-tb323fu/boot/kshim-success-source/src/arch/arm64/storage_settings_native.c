@@ -195,7 +195,7 @@ int storage_settings_native_trial_save(uint64_t expected_sequence,
 int storage_settings_native_read_boot(int (*reader)(const struct kshim_blockdev *, void *), void *ctx)
 {
     if(!reader)return KSHIM_STORAGE_ARG;
-    if(Backend.board!=DEVICE_BOARD_TB322FC && Backend.board!=DEVICE_BOARD_TB323FU)return KSHIM_UFS_UNSUPPORTED;
+    if(!device_board_has_disk_boot((enum device_board)Backend.board))return KSHIM_UFS_UNSUPPORTED;
     bool restore_off=!kshim_mmu_is_enabled();
     if(restore_off && (!kshim_mmu_root_table() || kshim_mmu_enable_current_cpu())){
         Backend.begin_status=KSHIM_UFS_UNSUPPORTED;

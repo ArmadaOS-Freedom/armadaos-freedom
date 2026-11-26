@@ -12,6 +12,7 @@
 
 #define KSHIM_BOARD_TB322FC     1u
 #define KSHIM_BOARD_TB323FU     2u
+#define KSHIM_BOARD_TB710FU     3u
 
 struct kshim_board_paths {
     uint32_t board;
@@ -33,6 +34,12 @@ static const struct kshim_board_paths kshim_board_table[] = {
         "/armada/boot/TB323FU/manifest.sig",
         "/armada/boot/TB323FU/board.dtb",
     },
+    {
+        KSHIM_BOARD_TB710FU,
+        "/armada/boot/TB710FU/manifest.bin",
+        "/armada/boot/TB710FU/manifest.sig",
+        "/armada/boot/TB710FU/board.dtb",
+    },
 };
 
 static const struct kshim_board_paths kshim_board_table_recovery[] = {
@@ -47,6 +54,12 @@ static const struct kshim_board_paths kshim_board_table_recovery[] = {
         "/armada/recovery/TB323FU/manifest.bin",
         "/armada/recovery/TB323FU/manifest.sig",
         "/armada/recovery/TB323FU/board.dtb",
+    },
+    {
+        KSHIM_BOARD_TB710FU,
+        "/armada/recovery/TB710FU/manifest.bin",
+        "/armada/recovery/TB710FU/manifest.sig",
+        "/armada/recovery/TB710FU/board.dtb",
     },
 };
 
