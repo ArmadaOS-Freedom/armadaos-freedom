@@ -305,6 +305,9 @@ def _run_transaction(*, mode, sysroot_path, work_dir,
             if initial['model'] not in models.OFFLINE_UPGRADE_MODELS:
                 raise ValueError('unsupported physical model')
             disk = initial.get('bootSource') == 'armada_boot'
+            if not models.upgrade_path_allowed(initial.get('model'), initial.get('bootSource')):
+                raise ValueError('this model cannot update through its running boot path '
+                                 '(an ARMADA_BOOT-only model reported a raw Android Boot source)')
             if disk:
                 boot_disk_switch.ensure_ready(root, initial)
                 status['bootSource'] = 'armada_boot'

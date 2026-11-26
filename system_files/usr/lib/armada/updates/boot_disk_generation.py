@@ -16,6 +16,7 @@ from typing import Mapping, Optional
 from . import _io
 from . import signature
 from .boot_disk_binding import encode_binding
+from .models import DISK_BOOT_BOARDS
 
 
 MAGIC_DOC = b"ARMBTV1\0"       # 8 bytes
@@ -46,12 +47,10 @@ _SHA = struct.Struct("<32s32s32s")
 _ZERO = struct.Struct("<24s")
 _BINDING = struct.Struct("<8sB7s64s64sII")   # 152 bytes
 
-BOARD_TB322FC = 1
-BOARD_TB323FU = 2
-_MODEL_BOARD: Mapping[str, int] = {
-    "TB322FC": BOARD_TB322FC,
-    "TB323FU": BOARD_TB323FU,
-}
+# Manifest board ids of the ARMADA_BOOT models (TB322FC 1, TB323FU 2, TB710FU 3),
+# from the unified capability table so the signed manifest, the launcher and
+# the updater agree on one list.
+_MODEL_BOARD: Mapping[str, int] = DISK_BOOT_BOARDS
 
 _HEX64_RE = re.compile(rb"[0-9a-f]{64}")
 _GEN_RE = re.compile(r"gen-[0-9a-f]{32}")

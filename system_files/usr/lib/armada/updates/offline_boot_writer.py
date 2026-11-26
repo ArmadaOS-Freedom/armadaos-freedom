@@ -21,7 +21,7 @@ from .boot_writer import (
     _require_matching_metadata_hash,
 )
 from .deployment_store import _parse_binding
-from .models import GBL_MODELS, OFFLINE_UPGRADE_MODELS
+from .models import GBL_MODELS, RAW_BOOT_UPGRADE_MODELS
 
 _SLOTS = ('a', 'b')
 
@@ -170,7 +170,7 @@ def _write_offline_boots(trust_report, candidates, *, commit, progress):
         actual, inactive = initial['actualSlot'], initial['inactiveSlot']
         if actual not in _SLOTS or inactive != ('b' if actual == 'a' else 'a'):
             raise BootWriteError('invalid physical active/inactive slots')
-        if initial['model'] not in OFFLINE_UPGRADE_MODELS:
+        if initial['model'] not in RAW_BOOT_UPGRADE_MODELS:
             raise BootWriteError('unsupported physical model for offline dual-boot write')
         extras = ['recovery_a', 'recovery_b', 'vbmeta_system_a', 'vbmeta_system_b']
         if initial['model'] in GBL_MODELS:

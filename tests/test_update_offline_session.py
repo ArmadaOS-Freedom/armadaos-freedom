@@ -585,6 +585,21 @@ class OfflineSessionStoreTest(unittest.TestCase):
         self.assertIn("preflight-session-v1", store.info()["capabilities"])
         self.assertFalse(base.exists())
 
+    def test_armada_boot_only_model_on_a_raw_boot_is_refused_before_a_session(self):
+        # TB710FU updates only through ARMADA_BOOT: a raw A/B report passes neither preflight
+        # nor begin, and nothing is created, while read-only info stays available.
+        doc, sig, _data = self._signed_package()
+        base = self.tmp / "tb710fu-raw" / "offline"
+        store = self._preflight_store(base, model="TB710FU")
+        self._preflight_guards()
+        root = self._preflight_root("tb710fu-raw")
+        with self.assertRaisesRegex(offline_session.OfflineSessionError, "only through ARMADA_BOOT"):
+            store.preflight(doc, sig, sysroot_path=root)
+        with self.assertRaisesRegex(offline_session.OfflineSessionError, "only through ARMADA_BOOT"):
+            store.begin(doc, sig)
+        self.assertFalse(base.exists())
+        self.assertEqual(store.info()["model"], "TB710FU")
+
     def test_preflight_resumed_session_is_read_only(self):
         doc, sig, data = self._signed_package()
         base = self.tmp / "preflight-resume" / "offline"

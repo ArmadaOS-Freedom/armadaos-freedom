@@ -231,7 +231,7 @@ fetch_pinned "$CRDK_REPO" "$CRDK_COMMIT" "$runtime/lib/CrDK"
 fetch_pinned "$PICOLIBC_REPO" "$PICOLIBC_COMMIT" "$runtime/lib/picolibc"
 fetch_pinned "$LVGL_REPO" "$LVGL_COMMIT" "$runtime/third_party/lvgl"
 
-if [[ -n "${selected_model_set[TB322FC]:-}" || -n "${selected_model_set[TB323FU]:-}" ]]; then
+if [[ -n "${selected_model_set[TB322FC]:-}" || -n "${selected_model_set[TB323FU]:-}" || -n "${selected_model_set[TB710FU]:-}" ]]; then
     note "fetching pinned BearSSL and generating disk boot key header"
     fetch_pinned "$BEARSSL_REPO" "$BEARSSL_COMMIT" "$work_dir/dependency-sources/bearssl"
     bearssl="$work_dir/dependency-sources/bearssl"
@@ -326,7 +326,8 @@ build_profile() {
         mapfile -t profile_args <<< "$arg_output"
     fi
 
-    if [[ "$model" == "TB322FC" || "$model" == "TB323FU" ]]; then
+    # ARMADA_BOOT models: keep in sync with disk_boot in updates/models.py (DISK_BOOT_MODELS).
+    if [[ "$model" == "TB322FC" || "$model" == "TB323FU" || "$model" == "TB710FU" ]]; then
         profile_args+=("-DKSHIM_DISK_BOOT_BEARSSL=$bearssl")
         profile_args+=("-DKSHIM_DISK_BOOT_KEY_HEADER=$disk_boot_key")
     fi
@@ -347,7 +348,7 @@ build_profile() {
     [[ "$size" == "$RUNTIME_BYTES" ]] || die "$binary is $size bytes, expected $RUNTIME_BYTES"
     # Mirrored-policy models: keep in sync with the mirrored_boot flags in
     # system_files/usr/lib/armada/updates/models.py (MIRROR_POLICY_MODELS).
-    if [[ "$model" == TB322FC || "$model" == TB323FU || "$model" == TB710FU ]]; then
+    if [[ "$model" == TB322FC || "$model" == TB323FU ]]; then
         grep -aqF 'ARMADA_LINUX_MIRROR_V1' "$binary" \
             || die "$binary is missing the ARMADA_LINUX_MIRROR_V1 runtime contract marker"
     fi

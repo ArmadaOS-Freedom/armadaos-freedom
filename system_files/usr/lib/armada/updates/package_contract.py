@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 
 from .catalog import CatalogError, _identity, _updater_tuple
-from .models import AUTHORIZED_MODELS, OFFLINE_UPGRADE_MODELS
+from .models import AUTHORIZED_MODELS, DISK_BOOT_MODELS, OFFLINE_UPGRADE_MODELS
 from .signature import DEFAULT_TRUSTED_KEY, SignatureError, load_signed_json
 
 
@@ -188,7 +188,7 @@ def _armada_boot_capsules(value, supported_models):
     if not isinstance(value, dict) or not value:
         raise PackageError("armadaBootCapsules must be a nonempty object")
     for model, capsule in value.items():
-        if model not in {"TB322FC", "TB323FU"} or model not in supported_models:
+        if model not in DISK_BOOT_MODELS or model not in supported_models:
             raise PackageError(f"armadaBootCapsules is not allowed for model {model!r}")
         if not isinstance(capsule, dict) or capsule.keys() != _CAPSULE_SIZES.keys():
             raise PackageError(f"invalid boot capsule file list for {model}")

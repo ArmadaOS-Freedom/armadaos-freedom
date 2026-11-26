@@ -29,6 +29,10 @@ readonly AUTHORIZED_MODELS="TB322FC TB323FU TB710FU"
 # the whole package install-only. Keep this list in sync with the
 # offline_upgrade flags in models.py (OFFLINE_UPGRADE_MODELS).
 readonly OFFLINE_UPGRADE_MODELS="TB322FC TB323FU TB710FU"
+# Models that update only through ARMADA_BOOT (disk_boot without mirrored_boot in models.py): any bundle that
+# carries them, install-only included, needs the signed disk boot (ARMADA_BOOT_FILES=1); without it the
+# installed system could never take an update.
+readonly ARMADA_BOOT_ONLY_MODELS="TB710FU"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -248,6 +252,15 @@ upgrade_enabled=0
 if ((${#upgrade_eligible_models[@]} > 0)) && ((${#install_only_models[@]} == 0)); then
     upgrade_enabled=1
 fi
+armada_boot_only_selected=0
+for model_id in "${selected_models[@]}"; do
+    case " $ARMADA_BOOT_ONLY_MODELS " in
+        *" $model_id "*)
+            armada_boot_only_selected=1
+            [[ "${ARMADA_BOOT_FILES:-}" == "1" ]] \
+                || die "$model_id updates only through ARMADA_BOOT: a bundle with it requires ARMADA_BOOT_FILES=1 (the signed disk boot)" ;;
+    esac
+done
 
 readme_output="$(python3 -B "$helper" --config "$devices_config" --format readme \
     ${model_select_args[@]+"${model_select_args[@]}"})" \
@@ -557,7 +570,7 @@ else
     note "producing the install-only raw EDL package for ${selected_models[*]} (no selected model has the dual-slot upgrade backend)"
 fi
 disk_signer_mounts=()
-if [[ "${ARMADA_BOOT_FILES:-}" == "1" ]] && ((upgrade_enabled)); then
+if [[ "${ARMADA_BOOT_FILES:-}" == "1" ]] && ((upgrade_enabled || armada_boot_only_selected)); then
     if [[ -z "${COSIGN_PRIVATE_KEY:-}" || -z "${COSIGN_PASSWORD:-}" ]]; then
         echo "ARMADA_BOOT_FILES=1 with upgrade_eligible_models requires COSIGN_PRIVATE_KEY and COSIGN_PASSWORD" >&2
         exit 1

@@ -108,8 +108,8 @@ class UpdateBootPayloadTests(unittest.TestCase):
     def _use_custom_profile(self) -> str:
         """Add a registered profile outside the mirrored-policy table.
 
-        Every shipped profile is now a mirrored-policy model, so the
-        policy-specific negative path needs a custom install-only profile.
+        TB710FU is the shipped profile outside the mirrored-policy table;
+        the custom profile also covers models the table has never seen.
         """
         custom = "CUSTOM9"
         self.assertNotIn(custom, boot_payload.MIRROR_POLICY_MODELS)
@@ -122,7 +122,9 @@ class UpdateBootPayloadTests(unittest.TestCase):
         return custom
 
     def test_mirror_marker_gate_is_policy_specific(self) -> None:
-        for model in ("TB322FC", "TB323FU", "TB710FU"):
+        # TB710FU updates through ARMADA_BOOT, not the raw mirrored Boot.
+        self.assertNotIn("TB710FU", boot_payload.MIRROR_POLICY_MODELS)
+        for model in ("TB322FC", "TB323FU"):
             self.assertIn(model, boot_payload.MIRROR_POLICY_MODELS)
             if model not in self.models:
                 continue
@@ -391,7 +393,7 @@ class UpdateBootPayloadTests(unittest.TestCase):
 
     def test_package_builder_requires_mirror_marker(self):
         wrapper = self._load_wrapper()
-        for model in ("TB322FC", "TB323FU", "TB710FU"):
+        for model in ("TB322FC", "TB323FU"):
             if model not in self.models:
                 continue
             with self.subTest(model=model):
@@ -401,6 +403,13 @@ class UpdateBootPayloadTests(unittest.TestCase):
                     ValueError, "ARMADA_LINUX_MIRROR_V1"
                 ):
                     self._call_verified(wrapper, case, [model], {})
+
+        # TB710FU (ARMADA_BOOT only) is not gated by the raw mirror marker.
+        if "TB710FU" in self.models:
+            case = self._prepare_case(["TB710FU"])
+            digest = self._unmark_case_runtime(case, "TB710FU")
+            verified = self._call_verified(wrapper, case, ["TB710FU"], {})
+            self.assertEqual(verified["TB710FU"]["sha256"], digest)
 
         # A custom profile outside the mirrored-policy table is not gated.
         custom = self._use_custom_profile()

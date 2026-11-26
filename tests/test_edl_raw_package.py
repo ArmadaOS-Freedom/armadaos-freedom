@@ -165,6 +165,18 @@ class ProducerContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
 
+    def test_a_bundle_with_an_armada_boot_only_model_requires_the_disk_signer(self):
+        # The resolved selection is checked, so omitting --model (every profile) cannot skip it.
+        every_profile = tuple(producer.PROFILE_ORDER)
+        self.assertIn("TB710FU", every_profile)
+        for models in (("TB710FU",), ("TB322FC", "TB710FU"), every_profile):
+            with self.subTest(models=models):
+                with self.assertRaisesRegex(RuntimeError, "requires --disk-boot-cosign"):
+                    producer._require_disk_boot_signing(models, None)
+                producer._require_disk_boot_signing(models, "/run/armada-cosign")
+        # The Y700 boards keep the raw-Boot path, so they build without the signer.
+        producer._require_disk_boot_signing(("TB322FC", "TB323FU"), None)
+
     def test_root_image_accepts_only_32_or_48_gib(self):
         for gib in (32, 48):
             with self.subTest(gib=gib):

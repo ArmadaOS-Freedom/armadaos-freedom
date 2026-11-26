@@ -257,6 +257,38 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertEqual(journal_after, journal_before)
             act_test._assert_all_closed(case)
 
+    def test_armada_boot_only_model_rejects_a_raw_boot_source(self) -> None:
+        # TB710FU updates only through ARMADA_BOOT: a report without
+        # bootSource=armada_boot stops before any fetch, capture or write.
+        with ExitStack() as stack:
+            act_test, case, trust, _, sysroot, work = self._prepare(stack)
+            part_a = case.trust['sources']['partitions']['boot_a']
+            part_b = case.trust['sources']['partitions']['boot_b']
+            before_a = case.env.images[part_a['lun']].read_bytes()
+            before_b = case.env.images[part_b['lun']].read_bytes()
+
+            initial = dict(trust['physical'])
+            initial['model'] = 'TB710FU'
+            initial.pop('bootSource', None)
+            stack.enter_context(mock.patch.object(
+                tx_mod.physical_slots, 'inspect_physical_slots',
+                return_value=copy.deepcopy(initial)))
+            fetch = stack.enter_context(mock.patch.object(
+                image_source, 'fetch_online_image',
+                side_effect=AssertionError('fetch_online_image must not run')))
+            capture = stack.enter_context(mock.patch.object(
+                boot_trust, 'capture_boot_trust',
+                side_effect=AssertionError('capture_boot_trust must not run')))
+
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            self.assertIn('running boot path', str(ctx.exception))
+            fetch.assert_not_called()
+            capture.assert_not_called()
+            self.assertEqual(case.env.images[part_a['lun']].read_bytes(), before_a)
+            self.assertEqual(case.env.images[part_b['lun']].read_bytes(), before_b)
+            act_test._assert_all_closed(case)
+
     def test_online_transaction_mirrors_both_slots(self) -> None:
         for board in (1, 2):
             for current in (0, 1):

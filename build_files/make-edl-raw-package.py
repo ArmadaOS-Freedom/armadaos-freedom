@@ -81,6 +81,24 @@ _IO_CHUNK = 1 << 20
 _MAX_OPTIONS_BYTES = 4096
 
 
+# Models that update only through ARMADA_BOOT (models.py: disk_boot without mirrored_boot).
+_ARMADA_BOOT_ONLY_MODELS = frozenset({"TB710FU"})
+
+
+def _require_disk_boot_signing(models, disk_boot_cosign):
+    """Refuse a bundle with an ARMADA_BOOT-only model but without the disk boot signer.
+
+    Such a model has no raw-Boot update path: installed without the signed disk boot it could never
+    take an update, so install-only bundles are refused too. ``models`` is the resolved selection
+    (every profile when --model is omitted).
+    """
+    missing = sorted(set(models or ()) & _ARMADA_BOOT_ONLY_MODELS)
+    if missing and not disk_boot_cosign:
+        raise RuntimeError(
+            "bundle with ARMADA_BOOT-only "
+            f"{', '.join(missing)} requires --disk-boot-cosign"
+        )
+
 def _as_int(value, name):
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
@@ -1355,6 +1373,8 @@ def _produce(args):
         _verify_frozen_overlay(source, deployment)
         if args.offline_upgrade:
             _verify_normal_updater(deployment)
+        # The resolved set (every configured profile without --model), install-only bundles included.
+        _require_disk_boot_signing(models, args.disk_boot_cosign)
         _verify_plasma_packages(deployment)
         _verify_model_boot_requirements(
             source,
@@ -1419,7 +1439,7 @@ def _produce(args):
                 runtimes[name]["path"], model_dir / "runtime/runtime.bin"
             )
             recipes[name] = {"normal": normal, "diagnostic": diagnostic}
-            if args.disk_boot_cosign and name in {"TB322FC", "TB323FU"}:
+            if args.disk_boot_cosign and name in {"TB322FC", "TB323FU", "TB710FU"}:  # DISK_BOOT_MODELS
                 runtime_bytes = Path(runtimes[name]["path"]).read_bytes()
                 if b"ARMDSK1" not in runtime_bytes:
                     raise RuntimeError(

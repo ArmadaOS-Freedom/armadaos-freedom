@@ -9,8 +9,8 @@ legacy single-slot readiness.
 
 ## ARMADA_BOOT installations
 
-On TB322FC and TB323FU, each physical Android Boot image retains its own
-Android kernel and ramdisk alongside the Freedom launcher and its Linux entry
+On TB322FC, TB323FU and TB710FU, each physical Android Boot image retains its
+own Android kernel and ramdisk alongside the Freedom launcher and its Linux entry
 descriptors. Both the normal and diagnostic Linux entries load their kernel,
 initramfs and signed board DTB from the 1 GiB ext4 `ARMADA_BOOT` partition. A
 running deployment identifies this path with `bootSource=armada_boot`.
@@ -28,6 +28,15 @@ reports `bootWriteState=not_started` and `slotControlState=not_issued` because
 those fields track raw Android Boot writes and Android slot control. Both
 Android boot images, Android slot selection and user partitions are preserved.
 The updater changes the Linux deployment and boot files on `ARMADA_BOOT`.
+
+The models with this path are the ones with `disk_boot` in
+`updates/models.py` (`DISK_BOOT_MODELS`; the signed manifest carries the same
+board id: TB322FC 1, TB323FU 2, TB710FU 3). TB710FU has only this path: its
+locked AOSP-preserved chain is written once, at install or boot maintenance,
+with `vbmeta`, `vbmeta_system` and `recovery` kept as they are, so a TB710FU
+that does not report `bootSource=armada_boot` is refused before any write
+instead of reaching the embedded-layout writer below (`mirrored_boot` and
+`RAW_BOOT_UPGRADE_MODELS` cover only TB322FC and TB323FU).
 
 ## Recovering an unconfirmed update
 

@@ -57,7 +57,8 @@ int kshim_disk_manifest_verify(const uint8_t data[160],
         return 1;
     }
 
-    if (expected_board != 1u && expected_board != 2u) {
+    /* ARMADA_BOOT boards: TB322FC 1, TB323FU 2, TB710FU 3 (device_board_has_disk_boot). */
+    if (expected_board != 1u && expected_board != 2u && expected_board != 3u) {
         return 2;
     }
 

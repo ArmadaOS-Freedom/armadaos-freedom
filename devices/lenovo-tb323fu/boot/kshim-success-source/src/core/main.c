@@ -325,7 +325,7 @@ static uint32_t unique_disk_diagnostic_index(const MANIFEST_VIEW *view, uint64_t
                                              const struct device_info *info)
 {
     uint32_t found = UINT32_MAX;
-    if (!(info->board == DEVICE_BOARD_TB322FC || info->board == DEVICE_BOARD_TB323FU))
+    if (!device_board_has_disk_boot(info->board))
         return found;
     for (uint32_t i = 0; i + 1 < view->manifest->header.entry_count; ++i) {
         const MANIFEST_ENTRY *entry = view->entries[i];
@@ -434,7 +434,7 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
                     roles[count] = KSHIM_MENU_ROLE_INTERNAL;
 #if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
     defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS
-                    if (info->board == DEVICE_BOARD_TB322FC || info->board == DEVICE_BOARD_TB323FU) {
+                    if (device_board_has_disk_boot(info->board)) {
                         recovery_candidate = i;
                         memcpy(recovery_uuid, disk_entry.boot_uuid, sizeof(recovery_uuid));
                         ++recovery_count;
@@ -463,7 +463,7 @@ static uint32_t select_image(const MANIFEST_VIEW *view, uint64_t fdt, uint64_t l
             if (!role_ok) continue;
             if (next_action!=KSHIM_ACTION_ANDROID) {
                 /* require actual board known/safe and payload matches */
-                if (!((info->board==DEVICE_BOARD_TB322FC||info->board==DEVICE_BOARD_TB323FU)))
+                if (!device_board_has_disk_boot(info->board))
                     board_ok=false;
 #if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS
                 else if ((int)payload_boards[k]!=(int)info->board)
@@ -623,7 +623,7 @@ static int stage_disk_menu_entry(uint64_t linux_base, uint64_t manifest_address,
     int ret;
     _Alignas(64) uint8_t scratch[KSHIM_EXT4_SCRATCH_BYTES];
 
-    if (!runtime_fdt || (board != DEVICE_BOARD_TB322FC && board != DEVICE_BOARD_TB323FU))
+    if (!runtime_fdt || !device_board_has_disk_boot((enum device_board)board))
         return -500;
 
     if (kshim_disk_entry_decode((const void *)(uintptr_t)(linux_base + entry->offset),
@@ -749,7 +749,7 @@ static int set_disk_linux_chosen(void *blob, size_t capacity,
 #if defined(CONFIG_KSHIM_MENU_SESSION_SETTINGS) && CONFIG_KSHIM_MENU_SESSION_SETTINGS && \
     defined(CONFIG_KSHIM_MENU_ADVANCED_ACTIONS) && CONFIG_KSHIM_MENU_ADVANCED_ACTIONS && \
     defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
-    if (board == DEVICE_BOARD_TB322FC || board == DEVICE_BOARD_TB323FU) {
+    if (device_board_has_disk_boot((enum device_board)board)) {
         fdt32_t recovery_version = cpu_to_fdt32(1u);
         rc = fdt_setprop(blob, chosen, "armada,boot-recovery-version",
                          &recovery_version, sizeof(recovery_version));
@@ -1220,7 +1220,7 @@ int kshim_main(
                 if (raw_action==KSHIM_ACTION_EDL) admissible=1;
 #endif
                 if (raw_action!=KSHIM_ACTION_EDL && session->source==KSHIM_SETTINGS_INTERNAL &&
-                    (device_info.board==DEVICE_BOARD_TB322FC || device_info.board==DEVICE_BOARD_TB323FU))
+                    device_board_has_disk_boot(device_info.board))
                     admissible=1;
                 if (admissible) {
 #if defined(CONFIG_KSHIM_UFS_SETTINGS) && CONFIG_KSHIM_UFS_SETTINGS && defined(KSHIM_DISK_BOOT) && KSHIM_DISK_BOOT
@@ -1433,8 +1433,7 @@ int kshim_main(
                         int diag_auto_return =
                             one_shot &&
                             consumed_action == KSHIM_ACTION_LINUX_DIAG &&
-                            (device_info.board == DEVICE_BOARD_TB322FC ||
-                             device_info.board == DEVICE_BOARD_TB323FU);
+                            device_board_has_disk_boot(device_info.board);
                         status = set_disk_linux_chosen(
                             blob, sizeof(HandoffDtb), &disk_descriptor,
                             &disk_image, (uint32_t)device_info.board,

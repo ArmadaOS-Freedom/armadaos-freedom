@@ -81,6 +81,18 @@ enum device_board {
     DEVICE_BOARD_TB710FU,
 };
 
+/*
+ * Boards with the ARMADA_BOOT disk boot: the launcher loads the signed Linux
+ * kernel, initramfs and board DTB from ARMADA_BOOT (board id = the enum value,
+ * the same id the signed boot manifest carries).  Keep in sync with disk_boot
+ * in system_files/usr/lib/armada/updates/models.py.
+ */
+static inline bool device_board_has_disk_boot(enum device_board board)
+{
+    return board == DEVICE_BOARD_TB322FC || board == DEVICE_BOARD_TB323FU ||
+           board == DEVICE_BOARD_TB710FU;
+}
+
 enum device_soc {
     DEVICE_SOC_UNKNOWN = 0,
     DEVICE_SOC_SM8750,

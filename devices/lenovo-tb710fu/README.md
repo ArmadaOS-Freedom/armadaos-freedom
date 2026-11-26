@@ -60,7 +60,7 @@ ArmadaOS Freedom 统一内核与 kShimC 启动菜单对小新 Pad Pro GT 的适�
 
 ## 已知问题与待完成项
 
-- **系统更新：** TB710FU 使用与 Y700 相同的双槽更新：每次系统更新用两个槽各自已校验的引导材料分别重建并写入 `boot_a`、`boot_b`，只对 boot 用测试密钥重新签名（AospPreserved），两个槽启动同一个 Linux 部署；Android 的槽位选择和 vbmeta、recovery、vbmeta_system 不变。用不含该后端的旧部署包装的系统没有这条更新路径，**不要在旧系统上做系统更新**（可能无法启动），请用新部署包重新安装。
+- **系统更新：** TB710FU 和 Y700 一样走 `ARMADA_BOOT` 新启动：`boot_a`、`boot_b` 各自保留 Android 内核与 ramdisk、加上 Freedom 启动器，只在安装或引导维护时用测试密钥重签写入（AospPreserved，`vbmeta`、`vbmeta_system`、`recovery` 原样保留）；Linux 内核、initramfs 和板级 DTB 放在 `ARMADA_BOOT`，启动器按板号 3 读取 `/armada/boot/TB710FU/{manifest.bin,manifest.sig,board.dtb}` 并校验签名。在线更新、离线更新和回滚只切换 `ARMADA_BOOT` 里经过签名的启动文件代次，不重写 Android Boot、不切 Android 槽。TB710FU 没有旧的"每次更新重写两个 raw boot"路线：运行中的系统不是 `bootSource=armada_boot` 时，更新在写入前就被拒绝；旧版安装请用支持 `ARMADA_BOOT` 的安装器和统一包重新安装后再更新（#174）。
 - **桌面模式：** 当前镜像里 KWin 与 Plasma 组件版本不一致，切换到桌面会退回游戏模式。这个问题与机型无关，所有设备都受影响。
 - **手写笔（游戏模式）：** gamescope 不处理手写笔（tablet-tool）事件，游戏模式下需要另外把笔转成触摸。
 - **充电上限：** 充到 80% 后停止，与 sysfs 的 `charge_control_*_threshold` 无关，推测是 ADSP 一侧保存的上限（可能来自 Android 下的“智能充电”设置），尚未查清。

@@ -24,7 +24,7 @@ from .boot_sources import (
     BootSourcesError,
     capture_boot_sources,
 )
-from .models import GBL_MODELS, OFFLINE_UPGRADE_MODELS
+from .models import GBL_MODELS, RAW_BOOT_UPGRADE_MODELS
 from .physical_slots import (
     PhysicalSlotsError,
     inspect_physical_slots,
@@ -32,7 +32,7 @@ from .physical_slots import (
 )
 
 
-_NATIVE_MODELS = OFFLINE_UPGRADE_MODELS
+_NATIVE_MODELS = RAW_BOOT_UPGRADE_MODELS
 _SLOT_CLI_KEYS = ("boot", "vendorBoot", "initBoot", "abl", "xblConfig", "vbmeta")
 _SOURCE_KEY_MAP = {
     "boot": "current_boot",
