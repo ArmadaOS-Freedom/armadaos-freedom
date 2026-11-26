@@ -302,6 +302,20 @@ def save(fd: int, expected: TrialSnapshot, next_record: TrialRecord) -> int:
             raise TrialStoreError("concurrent modification detected")
         target = _validate_transition(fresh, next_record)
         if fresh.record is None:
+            # A previous v1/v2 -> v3 migration may have returned the v3
+            # descriptor only from the page cache after its own fsync failed.
+            # Flush and re-read before the first journal byte is written so a
+            # power loss can never pair a legacy descriptor with a nonzero
+            # record tail, a state parse_layout must reject and migration
+            # cannot repair.
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                raise TrialStoreError(
+                    "trial journal descriptor fsync failed before initial write"
+                ) from exc
+            if _read_snapshot(fd, partition_uuid, board) != fresh:
+                raise TrialStoreError("concurrent modification detected")
             # Anchor the initial write before touching copy A.  The marker is
             # flushed and read back even when an earlier attempt already left
             # the exact bytes behind.  If this or the record write tears,

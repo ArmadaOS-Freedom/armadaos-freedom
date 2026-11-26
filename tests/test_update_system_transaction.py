@@ -724,8 +724,57 @@ class SystemTransactionTests(unittest.TestCase):
             self.assertIsNone(store.load(
                 case.journal.fd, case.journal.part, case.board).record)
 
+    def test_journal_descriptor_barrier_failure_fails_closed(self) -> None:
+        # The barrier flushes the descriptor before the first journal byte is
+        # written.  If it fails nothing may be written, so the transaction is
+        # safely restorable rather than ambiguous.
+        with ExitStack() as stack:
+            act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
+            running = 'ab'[case.current]
+            inactive = 'ab'[1 - case.current]
+            running_before = self._boot_bytes(case, running, 512)
+            inactive_before = self._boot_bytes(case, inactive, 512)
+            real_fsync = os.fsync
+            journal_ino = os.fstat(case.journal.fd).st_ino
+            calls = {'n': 0}
+
+            def fail_first_journal_fsync(fd):
+                if os.fstat(fd).st_ino == journal_ino:
+                    calls['n'] += 1
+                    if calls['n'] == 1:
+                        raise OSError(
+                            errno.EIO, 'simulated descriptor barrier failure')
+                return real_fsync(fd)
+
+            stack.enter_context(mock.patch.object(
+                store.os, 'fsync', side_effect=fail_first_journal_fsync))
+            with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
+                self._run(sysroot, work)
+            res = ctx.exception.result
+            self.assertEqual(calls['n'], 1)
+            self.assertEqual(res['state'], 'failed')
+            self.assertFalse(res['requiresReboot'])
+            self.assertEqual(res['bootWriteState'], 'restored')
+            self.assertEqual(res['bootRestoreState'], 'restored')
+            self.assertEqual(res['slotResults'][inactive]['status'], 'restored')
+            self.assertEqual(self._boot_bytes(case, inactive, 512), inactive_before)
+            self.assertEqual(self._boot_bytes(case, running, 512), running_before)
+            self.assertIsNone(store.load(
+                case.journal.fd, case.journal.part, case.board).record)
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_A),
+                bytes(rec.RECORD_BYTES),
+            )
+            self.assertEqual(
+                os.pread(case.journal.fd, rec.RECORD_BYTES,
+                         store.REGION_OFFSET + rec.TAIL_OFFSET_B),
+                bytes(rec.RECORD_BYTES),
+            )
+
     def test_journal_marker_fsync_failure_is_ambiguous(self) -> None:
-        # The very first journal fsync flushes the logical-empty marker before
+        # The descriptor durability barrier is the first journal fsync and
+        # succeeds.  The second one flushes the logical-empty marker before
         # copy A is touched, so no record can be durable yet.
         with ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
@@ -734,10 +783,14 @@ class SystemTransactionTests(unittest.TestCase):
             running_before = self._boot_bytes(case, running, 512)
             real_fsync = os.fsync
             journal_ino = os.fstat(case.journal.fd).st_ino
+            calls = {'n': 0}
 
             def fail_journal_fsync(fd):
                 if os.fstat(fd).st_ino == journal_ino:
-                    raise OSError(errno.EIO, 'simulated journal fsync failure')
+                    calls['n'] += 1
+                    if calls['n'] == 2:
+                        raise OSError(
+                            errno.EIO, 'simulated journal fsync failure')
                 return real_fsync(fd)
 
             stack.enter_context(mock.patch.object(
@@ -745,6 +798,7 @@ class SystemTransactionTests(unittest.TestCase):
             with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
                 self._run(sysroot, work)
             res = ctx.exception.result
+            self.assertEqual(calls['n'], 2)
             self.assertEqual(res['state'], 'recovery_required')
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'uncertain')
@@ -770,9 +824,10 @@ class SystemTransactionTests(unittest.TestCase):
             )
 
     def test_journal_record_fsync_failure_after_marker_is_ambiguous(self) -> None:
-        # The marker fsync succeeds and only the record fsync fails, so the
-        # PREPARED bytes are visible in copy A while their durability is
-        # unproven.  That is ambiguous, never a committed or restorable state.
+        # The descriptor barrier and marker fsyncs succeed and only the third
+        # journal fsync (the record) fails, so the PREPARED bytes are visible
+        # in copy A while their durability is unproven.  That is ambiguous,
+        # never a committed or restorable state.
         with ExitStack() as stack:
             act_test, case, trust, candidates, sysroot, work = self._prepare(stack)
             running = 'ab'[case.current]
@@ -782,19 +837,19 @@ class SystemTransactionTests(unittest.TestCase):
             journal_ino = os.fstat(case.journal.fd).st_ino
             calls = {'n': 0}
 
-            def fail_second_journal_fsync(fd):
+            def fail_third_journal_fsync(fd):
                 if os.fstat(fd).st_ino == journal_ino:
                     calls['n'] += 1
-                    if calls['n'] == 2:
+                    if calls['n'] == 3:
                         raise OSError(errno.EIO, 'simulated record fsync failure')
                 return real_fsync(fd)
 
             stack.enter_context(mock.patch.object(
-                store.os, 'fsync', side_effect=fail_second_journal_fsync))
+                store.os, 'fsync', side_effect=fail_third_journal_fsync))
             with self.assertRaises(tx_mod.SystemTransactionError) as ctx:
                 self._run(sysroot, work)
             res = ctx.exception.result
-            self.assertEqual(calls['n'], 2)
+            self.assertEqual(calls['n'], 3)
             self.assertEqual(res['state'], 'recovery_required')
             self.assertFalse(res['requiresReboot'])
             self.assertEqual(res['bootWriteState'], 'uncertain')

@@ -314,13 +314,13 @@ class TrialStoreTest(unittest.TestCase):
         real_fsync = os.fsync
         calls = {"n": 0}
 
-        def fail_first_fsync(fd):
+        def fail_marker_fsync(fd):
             calls["n"] += 1
-            if calls["n"] == 1:
+            if calls["n"] == 2:
                 raise OSError("flush failed")
             return real_fsync(fd)
 
-        with mock.patch.object(store.os, "fsync", side_effect=fail_first_fsync):
+        with mock.patch.object(store.os, "fsync", side_effect=fail_marker_fsync):
             with self.assertRaisesRegex(store.TrialStoreError, "marker fsync failed"):
                 store.save(self.fd, snap, self.sample())
 
@@ -339,13 +339,20 @@ class TrialStoreTest(unittest.TestCase):
 
     def test_initial_anchor_repeated_flush_failure_keeps_slot_a_blank(self):
         snap = store.load(self.fd, self.part, 1)
+        real_fsync = os.fsync
+        calls = {"n": 0}
 
-        def always_fail(fd):
-            raise OSError("flush failed")
+        def fail_marker_flush(fd):
+            # The first fsync is the descriptor durability barrier added
+            # before the initial journal write; the marker fsync follows it.
+            calls["n"] += 1
+            if calls["n"] % 2 == 0:
+                raise OSError("flush failed")
+            return real_fsync(fd)
 
         # First attempt writes the marker bytes but the flush fails, so their
         # presence in the cache proves nothing about durability.
-        with mock.patch.object(store.os, "fsync", side_effect=always_fail):
+        with mock.patch.object(store.os, "fsync", side_effect=fail_marker_flush):
             with self.assertRaisesRegex(store.TrialStoreError, "marker fsync failed"):
                 store.save(self.fd, snap, self.sample())
 
@@ -364,7 +371,8 @@ class TrialStoreTest(unittest.TestCase):
             retry = store.load(self.fd, self.part, 1)
             self.assertIsNone(retry.record)
             with mock.patch.object(store.os, "pwrite", wraps=os.pwrite) as pw:
-                with mock.patch.object(store.os, "fsync", side_effect=always_fail):
+                with mock.patch.object(
+                        store.os, "fsync", side_effect=fail_marker_flush):
                     with self.assertRaisesRegex(
                             store.TrialStoreError, "marker fsync failed"):
                         store.save(self.fd, retry, self.sample())
@@ -620,6 +628,73 @@ class TrialStoreTest(unittest.TestCase):
                     store.TrialStoreError, "readback verification failed"):
                 store.migrate_legacy_descriptor(corrupt, self.part, 1)
 
+    def test_first_journal_write_flushes_cached_v3_descriptor(self):
+        fd = self._legacy_fixture(1)
+        real_fsync = os.fsync
+        calls = {"n": 0}
+
+        def fail_first_fsync(f):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("flush failed")
+            return real_fsync(f)
+
+        # A failed migration flush leaves the v3 descriptor only in cache.
+        with mock.patch.object(store.os, "fsync", side_effect=fail_first_fsync):
+            with self.assertRaisesRegex(store.TrialStoreError, "fsync failed"):
+                store.migrate_legacy_descriptor(fd, self.part, 1)
+        snapshot = store.load(fd, self.part, 1)
+        self.assertEqual(snapshot.layout.descriptor_version, 3)
+
+        real_pwrite = os.pwrite
+        events = []
+
+        def record_pwrite(f, data, offset):
+            events.append(("pwrite", offset, len(data)))
+            return real_pwrite(f, data, offset)
+
+        def record_fsync(f):
+            events.append(("fsync",))
+            return real_fsync(f)
+
+        with mock.patch.object(store.os, "pwrite", side_effect=record_pwrite), \
+                mock.patch.object(store.os, "fsync", side_effect=record_fsync):
+            self.assertEqual(store.save(fd, snapshot, self.sample()), 0)
+
+        marker = next(
+            index for index, event in enumerate(events)
+            if event[0] == "pwrite" and
+            event[1] == REGION_OFFSET + rec.TAIL_OFFSET_B)
+        barrier = next(
+            index for index, event in enumerate(events)
+            if event[0] == "fsync")
+        self.assertLess(barrier, marker)
+
+    def test_first_journal_write_fails_closed_when_descriptor_flush_fails(self):
+        fd = self._legacy_fixture(1)
+        real_fsync = os.fsync
+        calls = {"n": 0}
+
+        def fail_first_fsync(f):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("flush failed")
+            return real_fsync(f)
+
+        with mock.patch.object(store.os, "fsync", side_effect=fail_first_fsync):
+            with self.assertRaisesRegex(store.TrialStoreError, "fsync failed"):
+                store.migrate_legacy_descriptor(fd, self.part, 1)
+        snapshot = store.load(fd, self.part, 1)
+
+        with mock.patch.object(store.os, "pwrite") as pw, \
+                mock.patch.object(
+                    store.os, "fsync",
+                    side_effect=OSError("flush failed")):
+            with self.assertRaisesRegex(
+                    store.TrialStoreError, "fsync failed before initial write"):
+                store.save(fd, snapshot, self.sample())
+            pw.assert_not_called()
+
     def test_save_pins_copy_on_write_previous_copy(self):
         snap = store.load(self.fd, self.part, 1)
         self.assertIsNone(snap.selected)
@@ -664,7 +739,7 @@ class TrialStoreTest(unittest.TestCase):
         def read_snapshot(fd, partition_uuid, board):
             calls['n'] += 1
             value = real_read(fd, partition_uuid, board)
-            if calls['n'] == 2:
+            if calls['n'] == 3:
                 return replace(value, record=None)
             return value
 
