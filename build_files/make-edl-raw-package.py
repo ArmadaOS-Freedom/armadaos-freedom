@@ -84,6 +84,20 @@ _MAX_OPTIONS_BYTES = 4096
 # Models that update only through ARMADA_BOOT (models.py: disk_boot without mirrored_boot).
 _ARMADA_BOOT_ONLY_MODELS = frozenset({"TB710FU"})
 
+
+def _require_disk_boot_signing(models, disk_boot_cosign):
+    """Refuse an offline-upgrade package for an ARMADA_BOOT-only model without the disk boot signer.
+
+    Such a model has no raw-Boot update path, so its package without the signed disk boot capsule
+    could never be applied. ``models`` is the resolved selection (every profile when --model is omitted).
+    """
+    missing = sorted(set(models or ()) & _ARMADA_BOOT_ONLY_MODELS)
+    if missing and not disk_boot_cosign:
+        raise RuntimeError(
+            "offline-upgrade package for ARMADA_BOOT-only "
+            f"{', '.join(missing)} requires --disk-boot-cosign"
+        )
+
 def _as_int(value, name):
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
@@ -1358,16 +1372,8 @@ def _produce(args):
         _verify_frozen_overlay(source, deployment)
         if args.offline_upgrade:
             _verify_normal_updater(deployment)
-            # An ARMADA_BOOT-only model has no raw-Boot update path: without the signed disk boot
-            # capsule its offline-upgrade package could never be applied (models.py disk_boot).
-            missing = sorted(
-                set(args.model or ()) & _ARMADA_BOOT_ONLY_MODELS
-            ) if not args.disk_boot_cosign else []
-            if missing:
-                raise RuntimeError(
-                    "offline-upgrade package for ARMADA_BOOT-only "
-                    f"{', '.join(missing)} requires --disk-boot-cosign"
-                )
+            # The resolved set: without --model every configured profile is produced.
+            _require_disk_boot_signing(models, args.disk_boot_cosign)
         _verify_plasma_packages(deployment)
         _verify_model_boot_requirements(
             source,
