@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse, hashlib, os, struct, sys
 
-BOARDS = {"TB322FC": 1, "TB323FU": 2}
+BOARDS = {"TB322FC": 1, "TB323FU": 2, "TB710FU": 3}  # = updates/models.py DISK_BOOT_BOARDS
 CHUNK = 1 << 20
 LIMITS = {"kernel": 128 << 20, "initramfs": 128 << 20, "dtb": 256 << 10}
 KSHIM_KERNEL_CAP = 130 << 20

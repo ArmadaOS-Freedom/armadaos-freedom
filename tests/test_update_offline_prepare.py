@@ -297,8 +297,20 @@ class OfflinePrepareTest(unittest.TestCase):
                 spies=spies, run=_run, assert_untouched=_assert_untouched,
             )
 
+    def test_armada_boot_only_model_rejects_a_raw_boot_source(self) -> None:
+        # TB710FU updates only through ARMADA_BOOT; a raw Android Boot source
+        # must stop before any import, capture or write.
+        for actual in ("a", "b"):
+            with self.subTest(actual=actual), self._case(model="TB710FU", actual=actual) as env:
+                env.physical.pop("bootSource", None)  # raw Android Boot
+                with self.assertRaises(system_transaction.SystemTransactionError) as ctx:
+                    env.run()
+                self.assertIn("running boot path", str(ctx.exception))
+                env.import_payload.assert_not_called()
+                env.assert_untouched()
+
     def test_prepare_success_models_and_slots(self) -> None:
-        for model in ("TB322FC", "TB323FU", "TB710FU"):
+        for model in ("TB322FC", "TB323FU"):
             for actual in ("a", "b"):
                 with self.subTest(model=model, actual=actual), self._case(model=model, actual=actual) as env:
                     status = env.run()

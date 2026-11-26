@@ -410,7 +410,7 @@ wrapper never requests offline-upgrade for it, and it passes that configured
 model identifier explicitly so validation accepts the install package while
 still rejecting offline-upgrade and recovery for it.
 
-On TB322FC and TB323FU, the normal and diagnostic Linux entries load the
+On TB322FC, TB323FU and TB710FU, the normal and diagnostic Linux entries load the
 kernel, initramfs, and signed board device tree from the 1 GiB ext4
 `ARMADA_BOOT` partition. Each Android boot slot retains its own Android kernel
 and ramdisk, plus the Freedom launcher and Linux entry descriptors. New

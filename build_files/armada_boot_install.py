@@ -9,7 +9,7 @@ from typing import Callable
 
 _BINDING_MAGIC = b"ARMDEP1\0"
 _BINDING_LEN = 152
-_MODELS = ("TB322FC", "TB323FU")
+_MODELS = ("TB322FC", "TB323FU", "TB710FU")  # = updates/models.py DISK_BOOT_MODELS
 
 
 def _write_binding(path: Path, binding: bytes) -> None:

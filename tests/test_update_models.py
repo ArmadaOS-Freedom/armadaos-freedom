@@ -40,6 +40,7 @@ FIELD_NAMES = (
     "offline_upgrade",
     "mirrored_boot",
     "gbl_envelope",
+    "disk_boot",
 )
 EXPECTED_CAPABILITIES = {
     "TB322FC": (
@@ -49,11 +50,13 @@ EXPECTED_CAPABILITIES = {
         True,
         True,
         False,
+        True,
     ),
     "TB323FU": (
         (b"lenovo,baldur", b"lenovo,tb323fu"),
         (b"qcom,sm8850", b"qcom,kaanapali"),
         2,
+        True,
         True,
         True,
         True,
@@ -63,8 +66,9 @@ EXPECTED_CAPABILITIES = {
         (b"qcom,sm8650",),
         3,
         True,
-        True,
         False,
+        False,
+        True,
     ),
 }
 EXPECTED_PROFILES = {
@@ -104,6 +108,7 @@ class ModelCapabilityTableTests(unittest.TestCase):
                 self.assertEqual(capability.offline_upgrade, expected[3])
                 self.assertEqual(capability.mirrored_boot, expected[4])
                 self.assertEqual(capability.gbl_envelope, expected[5])
+                self.assertEqual(capability.disk_boot, expected[6])
 
                 self.assertIs(type(capability.compatible), tuple)
                 self.assertTrue(capability.compatible)
@@ -115,7 +120,7 @@ class ModelCapabilityTableTests(unittest.TestCase):
                 for token in capability.soc_compatible:
                     self.assertIs(type(token), bytes)
                     self.assertTrue(token.startswith(b"qcom,"))
-                for flag in ("offline_upgrade", "mirrored_boot", "gbl_envelope"):
+                for flag in ("offline_upgrade", "mirrored_boot", "gbl_envelope", "disk_boot"):
                     self.assertIs(type(getattr(capability, flag)), bool)
                 if capability.board_id is not None:
                     self.assertIs(type(capability.board_id), int)
@@ -140,7 +145,16 @@ class ModelCapabilityTableTests(unittest.TestCase):
             frozenset(("TB322FC", "TB323FU", "TB710FU")))
         self.assertEqual(
             models.MIRROR_POLICY_MODELS,
+            frozenset(("TB322FC", "TB323FU")))
+        self.assertEqual(
+            models.RAW_BOOT_UPGRADE_MODELS,
+            frozenset(("TB322FC", "TB323FU")))
+        self.assertEqual(
+            models.DISK_BOOT_MODELS,
             frozenset(("TB322FC", "TB323FU", "TB710FU")))
+        self.assertEqual(
+            dict(models.DISK_BOOT_BOARDS),
+            {"TB322FC": 1, "TB323FU": 2, "TB710FU": 3})
         self.assertEqual(models.GBL_MODELS, frozenset(("TB323FU",)))
         for name, capability in models.MODELS.items():
             with self.subTest(model=name):
@@ -152,6 +166,11 @@ class ModelCapabilityTableTests(unittest.TestCase):
                     name in models.MIRROR_POLICY_MODELS)
                 self.assertEqual(
                     capability.gbl_envelope, name in models.GBL_MODELS)
+                self.assertEqual(
+                    capability.disk_boot, name in models.DISK_BOOT_MODELS)
+                self.assertEqual(
+                    capability.offline_upgrade and capability.mirrored_boot,
+                    name in models.RAW_BOOT_UPGRADE_MODELS)
         self.assertEqual(
             models.GBL_MODELS,
             frozenset(
@@ -203,18 +222,36 @@ class ModelCapabilityTableTests(unittest.TestCase):
                 self.assertEqual((socs, board_id),
                                  (capability.soc_compatible, capability.board_id))
 
-    def test_tb710fu_is_a_mirrored_dual_slot_upgrade_model_without_gbl(self):
+    def test_tb710fu_is_an_armada_boot_only_upgrade_model_without_gbl(self):
+        # #174: TB710FU updates only through ARMADA_BOOT generations; the
+        # raw-Boot A/B writer and the mirror-policy marker are not for it.
         capability = models.MODELS["TB710FU"]
         self.assertEqual(capability.board_id, 3)
         self.assertTrue(capability.offline_upgrade)
-        self.assertTrue(capability.mirrored_boot)
+        self.assertFalse(capability.mirrored_boot)
+        self.assertTrue(capability.disk_boot)
         self.assertFalse(capability.gbl_envelope)
         self.assertIn("TB710FU", models.OFFLINE_UPGRADE_MODELS)
-        self.assertIn("TB710FU", models.MIRROR_POLICY_MODELS)
+        self.assertNotIn("TB710FU", models.MIRROR_POLICY_MODELS)
+        self.assertNotIn("TB710FU", models.RAW_BOOT_UPGRADE_MODELS)
+        self.assertIn("TB710FU", models.DISK_BOOT_MODELS)
         self.assertNotIn("TB710FU", models.GBL_MODELS)
         self.assertEqual(models.BOARD_MODELS[3], "TB710FU")
         self.assertIn((b"lenovo,tb710fu", (b"qcom,sm8650",), 3),
                       models.RECOVERY_PROFILES)
+
+    def test_upgrade_path_follows_the_running_boot_source(self):
+        for name in ("TB322FC", "TB323FU"):
+            with self.subTest(model=name):
+                self.assertTrue(models.upgrade_path_allowed(name, "armada_boot"))
+                self.assertTrue(models.upgrade_path_allowed(name, None))
+                self.assertTrue(models.upgrade_path_allowed(name, "android_boot"))
+        self.assertTrue(models.upgrade_path_allowed("TB710FU", "armada_boot"))
+        for source in (None, "android_boot", "", "ARMADA_BOOT"):
+            with self.subTest(source=source):
+                self.assertFalse(models.upgrade_path_allowed("TB710FU", source))
+        self.assertFalse(models.upgrade_path_allowed("TB999XX", "armada_boot"))
+        self.assertFalse(models.upgrade_path_allowed(None, None))
 
 
 class UpdaterPolicyImportTests(unittest.TestCase):

@@ -1419,7 +1419,7 @@ def _produce(args):
                 runtimes[name]["path"], model_dir / "runtime/runtime.bin"
             )
             recipes[name] = {"normal": normal, "diagnostic": diagnostic}
-            if args.disk_boot_cosign and name in {"TB322FC", "TB323FU"}:
+            if args.disk_boot_cosign and name in {"TB322FC", "TB323FU", "TB710FU"}:  # DISK_BOOT_MODELS
                 runtime_bytes = Path(runtimes[name]["path"]).read_bytes()
                 if b"ARMDSK1" not in runtime_bytes:
                     raise RuntimeError(
