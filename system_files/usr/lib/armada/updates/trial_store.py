@@ -175,10 +175,11 @@ def migrate_legacy_descriptor(fd: int, partition_uuid: str, board: int) -> dict 
     reserved tail is zero, which covers both v3 trial record slots, so the new
     descriptor starts with an empty journal.
 
-    The write is a single sector-sized pwrite followed by fsync and a full
-    readback.  A short write, a flush failure or any readback difference is
-    reported as a migration failure; no caller may continue to journal writes.
-    Re-running on a v3 descriptor is a no-op.
+    The descriptor has no second copy, so the update is one 4096-byte pwrite
+    (the same shape the installer uses when it upgrades launcher defaults),
+    followed by fsync and a full readback.  A short write, a flush failure or
+    any readback difference is reported as a migration failure; no caller may
+    continue to journal writes.  Re-running on a v3 descriptor is a no-op.
     """
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
@@ -195,6 +196,8 @@ def migrate_legacy_descriptor(fd: int, partition_uuid: str, board: int) -> dict 
         old_descriptor = region[:SLOT_BYTES]
         if any(old_descriptor[92:4092]):
             raise TrialStoreError("legacy descriptor has nonzero v3 reserved bytes")
+        if any(region[_V3_RECORD_SLOT_A:]):
+            raise TrialStoreError("legacy descriptor record slots are not empty")
 
         descriptor = bytearray(old_descriptor)
         struct.pack_into("<I", descriptor, 8, DESCRIPTOR_MIN_VERSION)
