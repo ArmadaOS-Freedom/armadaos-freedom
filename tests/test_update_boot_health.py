@@ -299,11 +299,17 @@ class UpdateBootHealthTests(unittest.TestCase):
         node = base / "controller1.ufs/host/sda/sda1"
         node.mkdir(parents=True)
         self.assertEqual(health._ufs_controller(node), base / "controller1.ufs")
+        # SM8650 (TB710FU) names the UFS host `<addr>.ufshc` (issue #227).
+        ufshc = base / "1d84000.ufshc/host0/sda/sda17"
+        ufshc.mkdir(parents=True)
+        self.assertEqual(health._ufs_controller(ufshc), base / "1d84000.ufshc")
         plain = base / "plain/sda1"
         plain.mkdir(parents=True)
         multiple = base / "one.ufs/two.ufs/sda1"
         multiple.mkdir(parents=True)
-        for path in (plain, multiple):
+        mixed = base / "one.ufs/two.ufshc/sda1"
+        mixed.mkdir(parents=True)
+        for path in (plain, multiple, mixed):
             with self.subTest(path=path), self.assertRaises(health.BootHealthError):
                 health._ufs_controller(path)
 

@@ -148,7 +148,7 @@ def _sysfs_block_node(rdev: int) -> Path:
 
 def _ufs_controller(sysfs_node: Path) -> Path:
     resolved = sysfs_node.resolve(strict=True)
-    matches = [idx for idx, part in enumerate(resolved.parts) if part.endswith(".ufs")]
+    matches = [idx for idx, part in enumerate(resolved.parts) if recovery_device.is_ufs_controller(part)]
     if len(matches) != 1:
         raise BootHealthError(f"Block sysfs path does not have a unique UFS controller: {resolved}")
     return Path(*resolved.parts[: matches[0] + 1])
