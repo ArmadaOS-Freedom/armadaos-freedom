@@ -18,6 +18,27 @@ resolutions = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(resolutions)
 
 
+class MockBridgeError(Exception):
+    pass
+
+
+class MockWebSocketException(Exception):
+    pass
+
+
+class MockWebSocketTimeoutException(MockWebSocketException):
+    pass
+
+
+def mock_watch_bridge(ws):
+    return SimpleNamespace(
+        BridgeError=MockBridgeError,
+        _verify_guard=mock.Mock(),
+        discover_target=mock.Mock(return_value=("test", "ws://127.0.0.1:8080/devtools/page/test")),
+        _default_ws_factory=mock.Mock(return_value=lambda: ws),
+    )
+
+
 class MockSteamSocket:
     def __init__(self, installed=False, rejected=False):
         self.ready = installed
@@ -78,12 +99,8 @@ class SteamGameResolutionsTest(unittest.TestCase):
         old_asset = "https://steamloopback.host/sp.js?contenthash=old"
         new_asset = "https://steamloopback.host/sp.js?contenthash=new"
         ws = mock.Mock()
-        bridge = SimpleNamespace(
-            BridgeError=RuntimeError,
-            discover_target=lambda: ("test", "ws://127.0.0.1:8080/devtools/page/test"),
-            _default_ws_factory=lambda _: lambda: ws,
-        )
-        websocket = SimpleNamespace(WebSocketException=OSError)
+        bridge = mock_watch_bridge(ws)
+        websocket = SimpleNamespace(WebSocketException=MockWebSocketException)
         states = [
             {"asset": old_asset, "installed": True},
             {"asset": old_asset, "installed": False},
@@ -93,6 +110,7 @@ class SteamGameResolutionsTest(unittest.TestCase):
 
         with (
             mock.patch.dict(sys.modules, {"websocket": websocket}),
+            mock.patch.object(resolutions.os, "geteuid", return_value=1000, create=True),
             mock.patch.object(resolutions, "ui_state", side_effect=states),
             mock.patch.object(resolutions, "install", side_effect=[True, False]) as install,
             mock.patch.object(resolutions.time, "monotonic", side_effect=lambda: ws.close.call_count * 40),
@@ -103,6 +121,64 @@ class SteamGameResolutionsTest(unittest.TestCase):
             resolutions.watch(bridge, "script")
 
         self.assertEqual(install.call_args_list, [mock.call(ws, "script"), mock.call(ws, "script")])
+        self.assertEqual(ws.close.call_count, len(states))
+
+    def test_watch_stops_before_connecting_when_the_guard_is_lost(self):
+        ws = mock.Mock()
+        bridge = mock_watch_bridge(ws)
+        bridge._verify_guard.side_effect = [None, MockBridgeError("guard proof unavailable")]
+        websocket = SimpleNamespace(WebSocketException=MockWebSocketException)
+
+        with (
+            mock.patch.dict(sys.modules, {"websocket": websocket}),
+            mock.patch.object(resolutions.os, "geteuid", return_value=1000, create=True),
+            mock.patch.object(resolutions, "ui_state", return_value=None),
+            mock.patch.object(resolutions.time, "sleep", side_effect=[None, AssertionError("watcher kept polling")]),
+            self.assertRaisesRegex(MockBridgeError, "guard proof unavailable"),
+        ):
+            resolutions.watch(bridge, "script")
+
+        self.assertEqual(bridge._verify_guard.call_args_list, [mock.call(1000), mock.call(1000)])
+        bridge.discover_target.assert_called_once_with()
+        bridge._default_ws_factory.assert_called_once()
+        ws.close.assert_called_once_with()
+
+    def test_watch_limits_install_errors_for_each_asset(self):
+        old_asset = "https://steamloopback.host/sp.js?contenthash=old"
+        new_asset = "https://steamloopback.host/sp.js?contenthash=new"
+        assets = [old_asset, old_asset, old_asset, old_asset, old_asset, new_asset, old_asset]
+        states = [{"asset": asset, "installed": False} for asset in assets]
+        clock = [0, 4, 32, 64, 96, 100, 132]
+        ws = mock.Mock()
+        bridge = mock_watch_bridge(ws)
+        websocket = SimpleNamespace(WebSocketException=MockWebSocketException)
+        attempted = []
+
+        def install_with_errors(_socket, _source):
+            attempted.append((clock[ws.close.call_count], assets[ws.close.call_count]))
+            if attempted[-1][1] == new_asset:
+                return True
+            if len(attempted) == 2:
+                raise RuntimeError("UI did not pause")
+            raise MockWebSocketTimeoutException("websocket timed out")
+
+        with (
+            mock.patch.dict(sys.modules, {"websocket": websocket}),
+            mock.patch.object(resolutions.os, "geteuid", return_value=1000, create=True),
+            mock.patch.object(resolutions, "ui_state", side_effect=states),
+            mock.patch.object(resolutions, "install", side_effect=install_with_errors),
+            mock.patch.object(resolutions.time, "monotonic", side_effect=lambda: clock[ws.close.call_count]),
+            mock.patch.object(resolutions.time, "sleep", side_effect=[None] * 6 + [KeyboardInterrupt]),
+            mock.patch("builtins.print") as log,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            resolutions.watch(bridge, "script")
+
+        self.assertEqual(attempted, [(0, old_asset), (32, old_asset), (64, old_asset), (100, new_asset)])
+        messages = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("UI did not pause", messages)
+        self.assertEqual(messages.count("websocket timed out"), 2)
+        self.assertIn("keeping Valve options", messages)
         self.assertEqual(ws.close.call_count, len(states))
 
     def test_resolutions_keep_configured_order_and_deduplicate(self):

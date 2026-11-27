@@ -14,6 +14,7 @@ LIBRARY = Path(__file__).resolve().parents[2] / "lib/armada"
 SCRIPT = LIBRARY / "steam-game-resolutions.js"
 READY = 'globalThis[Symbol.for("armada.tb322fc.resolutions")] === true'
 STEAM_SCRIPT_URL = r"^https://steamloopback\.host/sp\.js(?:\?|$)"
+MAX_INSTALL_ATTEMPTS = 3
 UI_STATE = f"""(() => {{
     const asset = performance.getEntriesByType("resource").findLast(
         entry => /^https:\\/\\/steamloopback\\.host\\/sp\\.js(?:\\?|$)/.test(entry.name));
@@ -130,29 +131,46 @@ def ui_state(ws):
 def watch(bridge, source):
     from websocket import WebSocketException
 
-    unsupported = None
+    retryable_errors = (OSError, RuntimeError, ValueError, WebSocketException)
+    connection_errors = (bridge.BridgeError,) + retryable_errors
+    unsupported_assets = set()
+    failed_attempts = {}
     next_attempt = 0
     while True:
+        bridge._verify_guard(os.geteuid())
         try:
             _, url = bridge.discover_target()
             ws = bridge._default_ws_factory(url)()
             try:
                 state = ui_state(ws)
-                if state and not state.get("installed") and state["asset"] != unsupported:
-                    if time.monotonic() >= next_attempt:
-                        # A client restart can interrupt injection. Throttle retries
-                        # so they cannot keep reloading a slow or closing UI.
-                        next_attempt = time.monotonic() + 30
-                        if install(ws, source):
+                if (state and not state.get("installed") and state["asset"] not in unsupported_assets
+                        and time.monotonic() >= next_attempt):
+                    asset = state["asset"]
+                    # A failed install may already have reloaded Steam's UI.
+                    next_attempt = time.monotonic() + 30
+                    try:
+                        active = install(ws, source)
+                    except retryable_errors as error:
+                        attempts = failed_attempts.get(asset, 0) + 1
+                        failed_attempts[asset] = attempts
+                        print(f"steam-game-resolutions: attempt {attempts}/{MAX_INSTALL_ATTEMPTS} failed: {error}",
+                              file=sys.stderr, flush=True)
+                        if attempts >= MAX_INSTALL_ATTEMPTS:
+                            unsupported_assets.add(asset)
+                            print("steam-game-resolutions: retry limit reached, keeping Valve options",
+                                  file=sys.stderr, flush=True)
+                    else:
+                        failed_attempts.pop(asset, None)
+                        if active:
                             next_attempt = 0
                             print("steam-game-resolutions: per-game options active", flush=True)
                         else:
-                            unsupported = state["asset"]
+                            unsupported_assets.add(asset)
                             print("steam-game-resolutions: unrecognized Steam UI, keeping Valve options",
-                                  file=sys.stderr)
+                                  file=sys.stderr, flush=True)
             finally:
                 ws.close()
-        except (bridge.BridgeError, OSError, RuntimeError, ValueError, WebSocketException):
+        except connection_errors:
             # Steam briefly has no usable CEF target during an update or a restart.
             pass
         time.sleep(4)
