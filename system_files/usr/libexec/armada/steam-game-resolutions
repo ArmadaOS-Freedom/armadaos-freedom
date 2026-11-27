@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Add the TB322FC per-game resolutions after Steam has verified its files."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+
+LIBRARY = Path(__file__).resolve().parents[2] / "lib/armada"
+SCRIPT = LIBRARY / "steam-game-resolutions.js"
+READY = 'globalThis[Symbol.for("armada.tb322fc.resolutions")] === true'
+STEAM_SCRIPT_URL = r"^https://steamloopback\.host/sp\.js(?:\?|$)"
+UI_STATE = f"""(() => {{
+    const asset = performance.getEntriesByType("resource").findLast(
+        entry => /^https:\\/\\/steamloopback\\.host\\/sp\\.js(?:\\?|$)/.test(entry.name));
+    return asset ? {{asset: asset.name, installed: {READY}}} : null;
+}})()"""
+
+
+def configured_modes(value):
+    options = []
+    for mode in dict.fromkeys(value.split()):
+        if not re.fullmatch(r"[1-9][0-9]{0,3}x[1-9][0-9]{0,3}", mode):
+            raise ValueError(f"invalid TB322FC resolution: {mode}")
+        width, height = map(int, mode.split("x"))
+        if (width, height) == (3040, 1904) or width > 3040 or height > 1904:
+            raise ValueError(f"TB322FC resolution must fit below native: {mode}")
+        options.append(mode)
+    return options
+
+
+def wait_for_steam(bridge):
+    from websocket import WebSocketException
+
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        try:
+            return bridge._default_ws_factory(bridge.discover_target()[1])()
+        except (bridge.BridgeError, OSError, WebSocketException):
+            time.sleep(1)
+    raise RuntimeError("Steam game UI did not become available")
+
+
+def receive_message(ws, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Steam UI did not reply before the deadline")
+    ws.settimeout(remaining)
+    return json.loads(ws.recv())
+
+
+def install(ws, source):
+    request_id = 0
+    paused = None
+
+    def receive(deadline):
+        nonlocal paused
+        message = receive_message(ws, deadline)
+        if message.get("method") == "Debugger.paused":
+            paused = message["params"]
+        return message
+
+    def request(method, **params):
+        nonlocal request_id
+        request_id += 1
+        ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
+        deadline = time.monotonic() + 5
+        while True:
+            reply = receive(deadline)
+            if reply.get("id") == request_id:
+                if "error" in reply:
+                    raise RuntimeError(f"{method}: {reply['error'].get('message')}")
+                return reply["result"]
+
+    def installed():
+        result = request("Runtime.evaluate", expression=READY, returnByValue=True)
+        return result.get("result", {}).get("value") is True
+
+    if installed():
+        return True
+
+    # CEF loads sp.js after Steam's updater. Install the hook before that script
+    # registers the game-properties module, without replacing any Steam files.
+    request("Debugger.enable")
+    try:
+        breakpoint = request("Debugger.setBreakpointByUrl", lineNumber=0, urlRegex=STEAM_SCRIPT_URL)["breakpointId"]
+        request("Page.reload", ignoreCache=False)
+        deadline = time.monotonic() + 12
+        while paused is None:
+            receive(deadline)
+        if breakpoint not in paused.get("hitBreakpoints", []):
+            raise RuntimeError("Steam UI paused outside the resolution hook")
+        frame = paused["callFrames"][0]["callFrameId"]
+        result = request("Debugger.evaluateOnCallFrame", callFrameId=frame, expression=source)
+        if "exceptionDetails" in result:
+            raise RuntimeError("Steam UI rejected the resolution hook")
+        request("Debugger.removeBreakpoint", breakpointId=breakpoint)
+        request("Debugger.resume")
+    finally:
+        request("Debugger.disable")
+
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if installed():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def ui_state(ws):
+    ws.send(json.dumps({
+        "id": 0,
+        "method": "Runtime.evaluate",
+        "params": {"expression": UI_STATE, "returnByValue": True},
+    }))
+    deadline = time.monotonic() + 5
+    while True:
+        reply = receive_message(ws, deadline)
+        if reply.get("id") == 0:
+            state = reply.get("result", {}).get("result", {}).get("value")
+            if isinstance(state, dict) and isinstance(state.get("asset"), str):
+                return state
+            return None
+
+
+def watch(bridge, source):
+    from websocket import WebSocketException
+
+    unsupported = None
+    next_attempt = 0
+    while True:
+        try:
+            _, url = bridge.discover_target()
+            ws = bridge._default_ws_factory(url)()
+            try:
+                state = ui_state(ws)
+                if state and not state.get("installed") and state["asset"] != unsupported:
+                    if time.monotonic() >= next_attempt:
+                        # A client restart can interrupt injection. Throttle retries
+                        # so they cannot keep reloading a slow or closing UI.
+                        next_attempt = time.monotonic() + 30
+                        if install(ws, source):
+                            next_attempt = 0
+                            print("steam-game-resolutions: per-game options active", flush=True)
+                        else:
+                            unsupported = state["asset"]
+                            print("steam-game-resolutions: unrecognized Steam UI, keeping Valve options",
+                                  file=sys.stderr)
+            finally:
+                ws.close()
+        except (bridge.BridgeError, OSError, RuntimeError, ValueError, WebSocketException):
+            # Steam briefly has no usable CEF target during an update or a restart.
+            pass
+        time.sleep(4)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--watch", action="store_true", help="restore the menu when Steam restarts its UI")
+    parser.add_argument("modes", help="space-separated TB322FC resolutions")
+    args = parser.parse_args()
+    sys.path.insert(0, str(LIBRARY))
+    from updates import steam_bridge
+    import websocket
+
+    try:
+        modes = configured_modes(args.modes)
+        if not modes:
+            return
+        steam_bridge._verify_guard(os.geteuid())
+        source = f"({SCRIPT.read_text(encoding='utf-8')})({json.dumps(modes)});"
+        if args.watch:
+            watch(steam_bridge, source)
+            return
+        ws = wait_for_steam(steam_bridge)
+        try:
+            if not install(ws, source):
+                print("steam-game-resolutions: unrecognized Steam UI, keeping Valve options", file=sys.stderr)
+        finally:
+            ws.close()
+    except (steam_bridge.BridgeError, OSError, RuntimeError, ValueError, websocket.WebSocketException) as error:
+        print(f"steam-game-resolutions: {error}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

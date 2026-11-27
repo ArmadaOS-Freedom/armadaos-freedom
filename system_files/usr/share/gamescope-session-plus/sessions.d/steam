@@ -35,6 +35,9 @@ function post_gamescope_start {
 	if command -v steam-tweaks > /dev/null; then
 		steam-tweaks
 	fi
+	if [[ "${ARMADA_DEVICE_ID:-}" == lenovo-tb322fc && -n "${ARMADA_TB322FC_GAME_RESOLUTIONS:-}" ]]; then
+		/usr/bin/python3 /usr/libexec/armada/steam-game-resolutions --watch "$ARMADA_TB322FC_GAME_RESOLUTIONS" &
+	fi
 }
 
 # Show VRR controls in Steam
