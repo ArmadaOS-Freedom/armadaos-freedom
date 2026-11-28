@@ -58,10 +58,13 @@ for package in \
     hexagonrpc \
     iio-sensor-proxy \
     inputplumber \
+    liblhdcv5 \
     libssc \
     mangohud \
     mesa-vulkan-drivers \
     NetworkManager \
+    pipewire \
+    pipewire-libs \
     powerdevil \
     protontricks \
     steamos-manager \

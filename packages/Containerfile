@@ -237,6 +237,15 @@ FROM scratch AS out-extest
 COPY --from=pkg-extest /work/out/libextest.so /
 
 
+FROM builder-base AS pkg-pipewire
+COPY pipewire/ /work/
+WORKDIR /work
+RUN ./build.sh && /src/scrub-scratch.sh
+
+FROM scratch AS out-pipewire
+COPY --from=pkg-pipewire /work/out/ /rpms/
+
+
 FROM ${BUILDER_IMAGE} AS pkg-steam-bootstrap-builder
 COPY steam-bootstrap/install-builder-deps.sh /tmp/
 RUN /tmp/install-builder-deps.sh
