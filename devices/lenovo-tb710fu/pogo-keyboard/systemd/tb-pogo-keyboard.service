@@ -1,0 +1,15 @@
+[Unit]
+Description=TB710FU magnetic keyboard daemon (pogo UART -> uinput)
+After=tb-pogo-power.service
+Wants=tb-pogo-power.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/lib/pogo/tbkb.py
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=TB710FU pogo keyboard power rails (ldo8 + ldo1 + tx-en)
+DefaultDependencies=no
+After=local-fs.target
+Before=tb-pogo-keyboard.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A previous boot may already have it loaded; insmod failing on "File exists"
+# is fine as long as the sysfs class showed up.
+# vdd33_uv=3296000 is the PMIC's real ceiling (3.3 V is rejected) and the only
+# value that tested stable; the driver's auto list starts at 2.96 V.
+ExecStart=/bin/sh -c '/sbin/insmod /var/lib/pogo/pogo_power.ko vdd33_uv=3296000 2>/dev/null || true'
+ExecStartPost=/bin/sh -c 'test -e /sys/class/pogo_power/power/enable'
+ExecStartPost=/bin/sh -c '/bin/echo 1 > /sys/class/pogo_power/power/enable'
+ExecStartPost=/bin/sh -c '/bin/echo 0 > /sys/class/pogo_power/power/txen || true'
+
+[Install]
+WantedBy=multi-user.target
