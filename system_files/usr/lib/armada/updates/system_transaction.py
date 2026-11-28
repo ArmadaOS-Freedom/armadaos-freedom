@@ -140,13 +140,17 @@ def _recheck_rollback_snapshot(expected_checksum, target):
         raise ValueError('rollback target changed before boot write')
 
 
-def _check_recovery(initial, old):
+def _check_recovery(initial, old, *, allow_legacy=False):
     with recovery_device.open_recovery(writable=False) as (fd, partuuid, board):
         if partuuid != initial['recoveryPartUuid']:
             raise ValueError('recovery partition changed')
         if physical_slots._MODEL.get(board) != initial['model']:
             raise ValueError('recovery board changed')
-        snapshot = trial_store.load(fd, partuuid, board)
+        if allow_legacy:
+            snapshot = trial_store.load(
+                fd, partuuid, board, allow_legacy=True)
+        else:
+            snapshot = trial_store.load(fd, partuuid, board)
     record = snapshot.record
     if record is not None:
         if record.state not in _TERMINAL:

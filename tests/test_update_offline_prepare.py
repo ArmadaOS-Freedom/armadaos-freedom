@@ -130,6 +130,7 @@ class OfflinePrepareTest(unittest.TestCase):
             region_bytes = b"R" * 65536
             journal = SimpleNamespace(
                 layout=SimpleNamespace(
+                    descriptor_version=3,
                     partition_uuid=RECOVERY_UUID.bytes,
                     installation_uuid=INSTALL_UUID.bytes,
                     board=board,
@@ -234,7 +235,7 @@ class OfflinePrepareTest(unittest.TestCase):
                 }))
             m_recovery = stack.enter_context(mock.patch.object(
                 offline_prepare.system_transaction, "_check_recovery",
-                side_effect=lambda phys, old: journal))
+                side_effect=lambda phys, old, **kwargs: journal))
             m_import = stack.enter_context(mock.patch.object(
                 offline_prepare.offline_payload, "import_offline_payload",
                 side_effect=_import_side_effect))
@@ -536,7 +537,7 @@ class OfflinePrepareTest(unittest.TestCase):
         with self.subTest(case="journal_drift"), self._case() as env:
             calls = 0
 
-            def _journal_drift(phys, old):
+            def _journal_drift(phys, old, **kwargs):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -566,6 +567,93 @@ class OfflinePrepareTest(unittest.TestCase):
                 env.run()
             self.assertEqual(str(ctx.exception), "physical slots changed before preparation completed")
             self.assertEqual(p_calls, 3)
+            env.assert_untouched()
+
+    def test_legacy_recovery_descriptor_is_migrated_before_prepare(self) -> None:
+        with self._case(model="TB322FC") as env:
+            state = {"migrated": False, "calls": []}
+
+            def _snapshot(version: int) -> SimpleNamespace:
+                return SimpleNamespace(
+                    layout=SimpleNamespace(
+                        descriptor_version=version,
+                        partition_uuid=RECOVERY_UUID.bytes,
+                        installation_uuid=INSTALL_UUID.bytes,
+                        board=1,
+                    ),
+                    header=b"H" * 65536,
+                    region=b"R" * 65536,
+                    record=None,
+                    selected=None,
+                )
+
+            legacy = _snapshot(1)
+            current = _snapshot(3)
+            evidence = {
+                "fromVersion": 1,
+                "toVersion": 3,
+                "descriptorSha256": "a" * 64,
+                "regionSha256Before": "b" * 64,
+                "regionSha256After": "c" * 64,
+                "recordSlotOffsets": [28672, 32768],
+            }
+
+            def _check_recovery(physical, old, *, allow_legacy=False):
+                state["calls"].append((allow_legacy, state["migrated"]))
+                if not allow_legacy and not state["migrated"]:
+                    raise updates.trial_store.TrialStoreError(
+                        "unsupported recovery descriptor version: 1")
+                return current if state["migrated"] else legacy
+
+            def _migrate(initial):
+                self.assertFalse(state["migrated"])
+                state["migrated"] = True
+                return evidence
+
+            env.recovery.side_effect = _check_recovery
+            with mock.patch.object(
+                    offline_prepare, "_migrate_recovery_descriptor",
+                    side_effect=_migrate) as migrate:
+                status = env.run()
+
+            migrate.assert_called_once()
+            self.assertEqual(state["calls"][0], (True, False))
+            self.assertTrue(
+                any(not allow_legacy and migrated
+                    for allow_legacy, migrated in state["calls"]))
+            self.assertEqual(status["recoveryDescriptorMigration"], evidence)
+            manifest = json.loads(
+                (env.work / "recovery-manifest.json").read_text("utf-8"))
+            self.assertEqual(manifest["recoveryDescriptorMigration"], evidence)
+            self.assertEqual(manifest["installationUuid"], str(INSTALL_UUID))
+
+    def test_legacy_descriptor_migration_failure_stops_before_import(self) -> None:
+        with self._case(model="TB322FC") as env:
+            legacy = SimpleNamespace(
+                layout=SimpleNamespace(
+                    descriptor_version=1,
+                    partition_uuid=RECOVERY_UUID.bytes,
+                    installation_uuid=INSTALL_UUID.bytes,
+                    board=1,
+                ),
+                header=b"H" * 65536,
+                region=b"R" * 65536,
+                record=None,
+                selected=None,
+            )
+            env.recovery.side_effect = (
+                lambda physical, old, **kwargs: legacy)
+            with mock.patch.object(
+                    offline_prepare, "_migrate_recovery_descriptor",
+                    side_effect=updates.trial_store.TrialStoreError(
+                        "legacy reserved tail is not zero")):
+                with self.assertRaisesRegex(
+                        system_transaction.SystemTransactionError,
+                        "legacy reserved tail is not zero"):
+                    env.run()
+            env.import_payload.assert_not_called()
+            env.capture.assert_not_called()
+            env.deploy.assert_not_called()
             env.assert_untouched()
 
     def test_path_and_export_containment_guards(self) -> None:

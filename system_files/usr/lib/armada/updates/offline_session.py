@@ -327,9 +327,11 @@ class OfflineSessionStore:
             raise OfflineSessionError('this package requires an existing ARMADA_BOOT installation')
         if boot_source == 'armada_boot':
             boot_disk_switch.check_ready_readonly(root, physical)
-            offline_prepare._read_recovery_for_disk(physical)
+            journal = offline_prepare._read_recovery_for_disk(
+                physical, allow_legacy=True)
         else:
-            system_transaction._check_recovery(physical, binding)
+            journal = system_transaction._check_recovery(
+                physical, binding, allow_legacy=True)
         if session_id is not None:
             storage_dir, stored_bytes = self._preflight_bound_payload(
                 session_id, physical, channel, document, signature_b64,
@@ -346,6 +348,9 @@ class OfflineSessionStore:
             'recoveryPartUuid': physical['recoveryPartUuid'],
             'actualSlot': physical['actualSlot'],
             'channel': channel,
+            'recoveryDescriptorVersion': journal.layout.descriptor_version,
+            'recoveryMigrationRequired': (
+                journal.layout.descriptor_version != trial_record.DESCRIPTOR_MIN_VERSION),
         }
         if session_id is not None:
             result['sessionId'] = session_id

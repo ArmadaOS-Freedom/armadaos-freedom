@@ -247,8 +247,21 @@ class SourceTests(unittest.TestCase):
         self.check_deployment_history(1)
 
     def test_pending_image_does_not_change_selected_commit(self):
+        before_refs = {
+            r for r in self.refs() if r.startswith('ostree/container/image/')
+        }
         run(*EXT, "pull", self.path, oci(self.work / "v2", "pending image"))
-        pending_ref = next(r for r in self.refs() if "/v2_3A_latest" in r)
+        after_refs = {
+            r for r in self.refs() if r.startswith('ostree/container/image/')
+        }
+        new_refs = sorted(after_refs - before_refs)
+        self.assertEqual(
+            len(new_refs), 1,
+            f"expected exactly one new image ref after pull; "
+            f"before={sorted(before_refs)!r} after={sorted(after_refs)!r} "
+            f"new={new_refs!r}",
+        )
+        pending_ref = new_refs[0]
         pending = run("ostree", "rev-parse", f"--repo={self.path}", pending_ref)
         run("ostree", "refs", f"--repo={self.path}", "--force", f"--create={self.image_ref}", pending)
         before = {ref: run("ostree", "rev-parse", f"--repo={self.path}", ref) for ref in self.refs()}
