@@ -85,6 +85,22 @@ class TestUpdateRecoveryDevice(unittest.TestCase):
         (res_edl, _, _) = self._locate(require_edl=True)
         self.assertEqual(res_edl, (self.dev.resolve(), PART_UUID, 1, 0))
 
+    def test_locate_tb710fu_ufshc_controller(self):
+        # SM8650 (TB710FU) names its UFS host `<addr>.ufshc` in sysfs, not `<addr>.ufs` (issue #227).
+        (self.dt / 'compatible').write_bytes(b'lenovo,tb710fu\0qcom,sm8650\0')
+        self._write_settings(**{'1': 3})  # the launcher reports board 3
+        (self.sys_block / '0:0').unlink()
+        node = self._make_sysfs_node('1d84000.ufshc/host0/target0:0:0/0:0:0:0/block/sda/sda17')
+        (self.sys_block / '0:0').symlink_to(node)
+        (res, _, _) = self._locate()
+        self.assertEqual(res, (self.dev.resolve(), PART_UUID, 3, 0))
+
+    def test_ufs_controller_names(self):
+        for name in ('1d84000.ufs', '1d84000.ufshc'):
+            self.assertTrue(rd.is_ufs_controller(name), name)
+        for name in ('1d84000.mmc', 'ufshc', '1d84000.ufshc0', 'sda17', None):
+            self.assertFalse(rd.is_ufs_controller(name), name)
+
     def test_locate_invalid_settings_fails_before_blkid(self):
         self._write_settings(**{'13': 0})
         with (

@@ -9,6 +9,16 @@ from .models import RECOVERY_PROFILES
 from .recovery_layout import SIZE, RecoveryLayoutError
 
 
+# sysfs names of the internal UFS host controller: Y700 (SM8750/SM8850) `<addr>.ufs`, TB710FU (SM8650)
+# `<addr>.ufshc`.  The shared test for every caller that locates the internal medium by its controller.
+UFS_CONTROLLER_SUFFIXES = ('.ufs', '.ufshc')
+
+
+def is_ufs_controller(name):
+    """True when a sysfs path component names an internal UFS host controller."""
+    return isinstance(name, str) and name.endswith(UFS_CONTROLLER_SUFFIXES)
+
+
 def _require(condition, message):
     if not condition:
         raise RecoveryLayoutError(message)
@@ -43,7 +53,7 @@ def locate_recovery_partition(*, require_edl=False):
         info = dev.stat()
         _require(stat.S_ISBLK(info.st_mode), 'Backup path is not a block device')
         node = Path('/sys/dev/block/%d:%d' % (os.major(info.st_rdev), os.minor(info.st_rdev))).resolve()
-        if not any(part.endswith('.ufs') for part in node.parts):
+        if not any(is_ufs_controller(part) for part in node.parts):
             continue
         _require((node / 'partition').is_file() and int((node / 'size').read_text()) * 512 == SIZE,
                  'Internal backup partition is not exactly 2GiB')
