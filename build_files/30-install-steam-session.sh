@@ -124,6 +124,14 @@ dnf5 -y install --setopt=install_weak_deps=False \
 
 dnf5 -y install --setopt=install_weak_deps=False /packages/fex/fex-emu-*.rpm
 
+# Patched PipeWire: backported upstream LHDC v5 Bluetooth codec with liblhdcv5.
+mapfile -t installed_pipewire < <(rpm -qa --qf '%{NAME}\n' 'pipewire*' | sort -u)
+pipewire_rpms=(/packages/pipewire/liblhdcv5-[0-9]*.aarch64.rpm)
+for pkg in "${installed_pipewire[@]}"; do
+    pipewire_rpms+=(/packages/pipewire/"${pkg}"-[0-9]*.rpm)
+done
+dnf5 -y install --setopt=install_weak_deps=False "${pipewire_rpms[@]}"
+
 # Use Arch rootfs for better compatibility with Linux games targeting SteamOS
 mkdir -p /usr/share/fex-emu/RootFS
 ARCH_ROOTFS_URL="https://rootfs.fex-emu.gg/ArchLinux/2026-08-11/ArchLinux.sqsh"

@@ -33,6 +33,7 @@ ARG KSHIM_TOOLS_REF
 ARG BTOP_CN_REF
 ARG HEXAGONRPC_REF
 ARG IIO_SENSOR_PROXY_REF
+ARG PIPEWIRE_REF
 
 FROM ${STEAM_BOOTSTRAP_REF} AS steam-bootstrap
 
@@ -89,6 +90,8 @@ FROM ${BTOP_CN_REF} AS btop-cn
 FROM ${HEXAGONRPC_REF} AS hexagonrpc
 
 FROM ${IIO_SENSOR_PROXY_REF} AS iio-sensor-proxy
+
+FROM ${PIPEWIRE_REF} AS pipewire
 
 FROM docker.io/library/node:22-slim AS decky-build
 WORKDIR /build/freedom-control
@@ -255,6 +258,7 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=btop-cn,source=/rpms,target=/packages/btop-cn \
     --mount=type=bind,from=hexagonrpc,source=/rpms,target=/packages/hexagonrpc \
     --mount=type=bind,from=iio-sensor-proxy,source=/rpms,target=/packages/iio-sensor-proxy \
+    --mount=type=bind,from=pipewire,source=/rpms,target=/packages/pipewire \
     --mount=type=bind,from=decky-build,source=/build/freedom-control/dist,target=/packages/decky-dist \
     --mount=type=bind,from=decky-build,source=/build/armada-store/dist,target=/packages/decky-store-dist \
     --mount=type=secret,id=decky_releases,target=/run/secrets/decky_releases,required=false \
